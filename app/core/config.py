@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_CACHE_TTL_SECONDS: int = 300
 
+    OTP_LENGTH: int = 6
+    OTP_EXPIRE_SECONDS: int = 300  # 5 minutes
+    OTP_PROVIDER: str = "mock"  # mock | twilio
+
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_PHONE_NUMBER: str = ""
+
     RATE_LIMIT_TIMES: int = 60
     RATE_LIMIT_SECONDS: int = 60
 

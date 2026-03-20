@@ -1,17 +1,26 @@
 import enum
-from datetime import datetime
+from datetime import date
 from typing import Optional
 
-from sqlalchemy import Boolean, Enum, Integer, String
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Boolean, Date, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
+
+# Exact role values for RBAC - use these in API and DB
+ROLES = [
+    "Admin",
+    "ProjectManager",
+    "SiteEngineer",
+    "Contractor",
+    "Accountant",
+]
 
 
 class UserRole(str, enum.Enum):
     ADMIN = "Admin"
-    PROJECT_MANAGER = "Project Manager"
-    SITE_ENGINEER = "Site Engineer"
+    PROJECT_MANAGER = "ProjectManager"
+    SITE_ENGINEER = "SiteEngineer"
     CONTRACTOR = "Contractor"
     ACCOUNTANT = "Accountant"
 
@@ -21,17 +30,36 @@ class User(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
-    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    email: Mapped[Optional[str]] = mapped_column(String(255), unique=True, nullable=True, index=True)
+    hashed_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    mobile: Mapped[Optional[str]] = mapped_column(String(20), unique=True, nullable=True, index=True)
 
     role: Mapped[UserRole] = mapped_column(
-        Enum(UserRole, name="user_role"),
+        Enum(UserRole, name="user_role", values_callable=lambda x: [e.value for e in x]),
         nullable=False,
         default=UserRole.SITE_ENGINEER,
     )
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    pan_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    aadhaar_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    profile_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)  # URL or path
+    designation: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    joining_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    owner_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    owner: Mapped[Optional["User"]] = relationship("User", remote_side=[id])
+
+    @property
+    def user_id(self) -> int:
+        return self.id
+
+    @property
+    def mobile_number(self) -> Optional[str]:
+        return self.mobile
 
     # created_at/updated_at are provided by TimestampMixin
 

@@ -1,12 +1,20 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from app.api.v1.api import api_router
+from app.api.ai import router as ai_router
+from app.api.auth import router as auth_router
+from app.api.document import router as document_router
+from app.api.equipment import router as equipment_router
+from app.api.labour import router as labour_router
+from app.api.material import router as material_router
+from app.api.project import router as project_router
+from app.api.boq import router as boq_router
+from app.api.user import router as user_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.middlewares.rate_limiter import init_rate_limiter
@@ -31,6 +39,17 @@ async def lifespan(app: FastAPI):
         app.state.rate_limiter = None
         app.state.redis = None
 
+    logger.info(
+        "Application ready. Open in browser: http://localhost:%s  (docs: http://localhost:%s/docs)",
+        settings.APP_PORT,
+        settings.APP_PORT,
+    )
+    if settings.APP_HOST == "0.0.0.0":
+        logger.info(
+            "NOTE: Use http://localhost:%s (NOT http://0.0.0.0:%s) - 0.0.0.0 is not routable in browsers.",
+            settings.APP_PORT,
+            settings.APP_PORT,
+        )
     try:
         yield
     finally:
@@ -70,6 +89,17 @@ def create_app() -> FastAPI:
     @application.get("/health", tags=["health"])
     async def health():
         return {"status": "ok"}
+
+    api_router = APIRouter()
+    api_router.include_router(auth_router)
+    api_router.include_router(user_router)
+    api_router.include_router(project_router)
+    api_router.include_router(boq_router)
+    api_router.include_router(material_router)
+    api_router.include_router(labour_router)
+    api_router.include_router(equipment_router)
+    api_router.include_router(document_router)
+    api_router.include_router(ai_router)
 
     application.include_router(api_router, prefix="/api/v1")
     return application

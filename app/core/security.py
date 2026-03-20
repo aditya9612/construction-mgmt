@@ -9,13 +9,25 @@ from app.core.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+_BCRYPT_MAX_SECRET_BYTES = 72
+
+
+def _truncate_secret_to_bcrypt_limit(secret: str) -> bytes:
+    """
+    bcrypt limits the secret to 72 bytes (UTF-8 encoded) before hashing.
+    Newer `passlib` versions raise instead of implicitly truncating.
+    """
+    return secret.encode("utf-8")[:_BCRYPT_MAX_SECRET_BYTES]
+
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    # Ensure we never pass >72-byte secrets to passlib/bcrypt.
+    return pwd_context.hash(_truncate_secret_to_bcrypt_limit(password))
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    # Verify using the same truncated secret bytes as hashing.
+    return pwd_context.verify(_truncate_secret_to_bcrypt_limit(plain_password), hashed_password)
 
 
 def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:

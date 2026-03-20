@@ -10,7 +10,6 @@ class ProjectCreate(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[str] = "Planned"
-    owner_id: Optional[int] = None
 
 
 class ProjectUpdate(BaseSchema):
@@ -19,7 +18,6 @@ class ProjectUpdate(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[str] = None
-    owner_id: Optional[int] = None
 
 
 class ProjectOut(BaseSchema):
@@ -29,5 +27,4 @@ class ProjectOut(BaseSchema):
     start_date: Optional[date]
     end_date: Optional[date]
     status: str
-    owner_id: Optional[int]
 
