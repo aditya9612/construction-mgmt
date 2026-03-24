@@ -12,7 +12,7 @@ from app.models.material import Material
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.material import MaterialCreate, MaterialOut, MaterialUpdate
-from app.utils.helpers import NotFoundError
+from app.core.errors import NotFoundError
 
 
 router = APIRouter(prefix="/materials", tags=["materials"], dependencies=[default_rate_limiter_dependency()])

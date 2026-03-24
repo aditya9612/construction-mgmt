@@ -12,8 +12,7 @@ from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.user import ROLES, User, UserRole
 from app.schemas.base import PaginationMeta, PaginatedResponse
 from app.schemas.user import UserOut, UserCreatePayload, UserUpdatePayload
-from app.utils.helpers import AppError, ConflictError, NotFoundError
-
+from app.core.errors import AppError, ConflictError, NotFoundError
 
 router = APIRouter(prefix="/users", tags=["users"], dependencies=[default_rate_limiter_dependency()])
 

@@ -13,7 +13,7 @@ from app.models.boq import BOQ
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.boq import BOQCreate, BOQOut, BOQUpdate
-from app.utils.helpers import NotFoundError
+from app.core.errors import NotFoundError
 
 
 router = APIRouter(prefix="/boq", tags=["boq"], dependencies=[default_rate_limiter_dependency()])

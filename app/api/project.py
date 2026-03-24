@@ -4,18 +4,37 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
-from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
+from app.cache.redis import (
+    bump_cache_version,
+    cache_get_json,
+    cache_set_json,
+    get_cache_version,
+)
+from app.core.dependencies import (
+    get_current_active_user,
+    get_request_redis,
+    require_roles,
+)
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
+
 from app.models.project import Project
+from app.models.owner import Owner
 from app.models.user import User, UserRole
+
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.project import ProjectCreate, ProjectOut, ProjectUpdate
-from app.utils.helpers import NotFoundError
+
+from app.core.errors import NotFoundError, BadRequestError
+
+from app.utils.id_generator import generate_business_id
 
 
-router = APIRouter(prefix="/projects", tags=["projects"], dependencies=[default_rate_limiter_dependency()])
+router = APIRouter(
+    prefix="/projects",
+    tags=["projects"],
+    dependencies=[default_rate_limiter_dependency()],
+)
 
 VERSION_KEY = "cache_version:projects"
 
@@ -23,15 +42,55 @@ VERSION_KEY = "cache_version:projects"
 @router.post("", response_model=ProjectOut)
 async def create_project(
     payload: ProjectCreate,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     data = payload.model_dump(exclude_unset=True)
+
+    owner = await db.scalar(select(Owner).where(Owner.id == data["owner_id"]))
+    if not owner:
+        raise NotFoundError("Owner not found")
+
+    if data.get("advance_paid", 0) > data.get("budget", 0):
+        raise BadRequestError("Advance cannot be greater than budget")
+
+    if data["end_date"] < data["start_date"]:
+        raise BadRequestError("End date must be after start date")
+
+    data["project_id"] = await generate_business_id(db, Project, "project_id", "PRJ")
+    data["remaining_balance"] = data["budget"] - data.get("advance_paid", 0)
+
     obj = Project(**data)
-    db.add(obj)
-    await db.flush()
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        db.add(obj)
+        await db.flush()
+        await db.commit()
+        await db.refresh(obj)
+
+        await bump_cache_version(redis, VERSION_KEY)
+
+    except Exception:
+        await db.rollback()
+        raise
+
+    return ProjectOut.model_validate(obj)
+
+
+@router.get("/{project_id}", response_model=ProjectOut)
+async def get_project(
+    project_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.scalar(select(Project).where(Project.id == project_id))
+
+    if not obj:
+        raise NotFoundError("Project not found")
+
     return ProjectOut.model_validate(obj)
 
 
@@ -47,8 +106,9 @@ async def list_projects(
 ):
     version = await get_cache_version(redis, VERSION_KEY)
     cache_key = f"cache:projects:list:{version}:{limit}:{offset}:{search}:{status}"
+
     cached = await cache_get_json(redis, cache_key)
-    if cached is not None:
+    if cached:
         return PaginatedResponse[ProjectOut].model_validate(cached)
 
     query = select(Project)
@@ -69,52 +129,66 @@ async def list_projects(
     rows = (await db.execute(query)).scalars().all()
 
     items = [ProjectOut.model_validate(r).model_dump() for r in rows]
+
     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
+
     result = {"items": items, "meta": meta.model_dump()}
+
     await cache_set_json(redis, cache_key, result)
+
     return PaginatedResponse[ProjectOut].model_validate(result)
-
-
-@router.get("/{project_id}", response_model=ProjectOut)
-async def get_project(
-    project_id: int,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(get_request_redis),
-):
-    version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:projects:get:{version}:{project_id}"
-    cached_json = await cache_get_json(redis, cache_key)
-    if cached_json is not None:
-        return ProjectOut.model_validate(cached_json)
-
-    obj = await db.scalar(select(Project).where(Project.id == project_id))
-    if obj is None:
-        raise NotFoundError("Project not found")
-
-    out = ProjectOut.model_validate(obj)
-    await cache_set_json(redis, cache_key, out.model_dump())
-    return out
 
 
 @router.put("/{project_id}", response_model=ProjectOut)
 async def update_project(
     project_id: int,
     payload: ProjectUpdate,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     obj = await db.scalar(select(Project).where(Project.id == project_id))
-    if obj is None:
+
+    if not obj:
         raise NotFoundError("Project not found")
 
     data = payload.model_dump(exclude_unset=True)
+
+    if "owner_id" in data:
+        owner = await db.scalar(select(Owner).where(Owner.id == data["owner_id"]))
+        if not owner:
+            raise NotFoundError("Owner not found")
+
+    new_budget = data.get("budget", obj.budget)
+    new_advance = data.get("advance_paid", obj.advance_paid)
+
+    if new_advance > new_budget:
+        raise BadRequestError("Advance cannot be greater than budget")
+
+    new_start = data.get("start_date", obj.start_date)
+    new_end = data.get("end_date", obj.end_date)
+
+    if new_start and new_end and new_end < new_start:
+        raise BadRequestError("End date must be after start date")
+
     for k, v in data.items():
         setattr(obj, k, v)
 
-    await db.flush()
-    await bump_cache_version(redis, VERSION_KEY)
+    obj.remaining_balance = obj.budget - obj.advance_paid
+
+    try:
+        await db.flush()
+        await db.commit()
+        await db.refresh(obj)
+
+        await bump_cache_version(redis, VERSION_KEY)
+
+    except Exception:
+        await db.rollback()
+        raise
+
     return ProjectOut.model_validate(obj)
 
 
@@ -126,10 +200,19 @@ async def delete_project(
     redis=Depends(get_request_redis),
 ):
     obj = await db.scalar(select(Project).where(Project.id == project_id))
-    if obj is None:
+
+    if not obj:
         raise NotFoundError("Project not found")
 
-    await db.delete(obj)
-    await db.flush()
-    await bump_cache_version(redis, VERSION_KEY)
+    try:
+        await db.delete(obj)
+        await db.flush()
+        await db.commit()
+
+        await bump_cache_version(redis, VERSION_KEY)
+
+    except Exception:
+        await db.rollback()
+        raise
+
     return None

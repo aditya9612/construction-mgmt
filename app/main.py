@@ -15,13 +15,18 @@ from app.api.material import router as material_router
 from app.api.project import router as project_router
 from app.api.boq import router as boq_router
 from app.api.user import router as user_router
+from app.api.owner import router as owner_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.middlewares.rate_limiter import init_rate_limiter
-from app.utils.helpers import AppError
+from app.core.errors import AppError   # ✅ UPDATED IMPORT
 from app.utils.logger import configure_logging
 
+from fastapi.security import HTTPBearer
 
+app = FastAPI()
+
+bearer_scheme = HTTPBearer()
 logger = logging.getLogger("construction-mgmt")
 
 
@@ -77,9 +82,18 @@ def create_app() -> FastAPI:
             logger.exception("request.error method=%s path=%s", request.method, request.url.path)
             raise
 
+    # ✅ UPDATED EXCEPTION HANDLER
     @application.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "success": False,
+                "message": exc.message,
+                "error_code": exc.error_code,
+                "details": exc.details,
+            },
+        )
 
     @application.exception_handler(SQLAlchemyError)
     async def sqlalchemy_error_handler(request: Request, exc: SQLAlchemyError):
@@ -100,10 +114,10 @@ def create_app() -> FastAPI:
     api_router.include_router(equipment_router)
     api_router.include_router(document_router)
     api_router.include_router(ai_router)
+    api_router.include_router(owner_router)
 
     application.include_router(api_router, prefix="/api/v1")
     return application
 
 
 app = create_app()
-

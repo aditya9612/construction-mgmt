@@ -13,7 +13,7 @@ from app.models.equipment import Equipment
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.equipment import EquipmentCreate, EquipmentOut, EquipmentUpdate
-from app.utils.helpers import NotFoundError
+from app.core.errors import NotFoundError
 
 
 router = APIRouter(prefix="/equipment", tags=["equipment"], dependencies=[default_rate_limiter_dependency()])

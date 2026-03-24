@@ -20,4 +20,3 @@ class TimestampMixin:
         default=func.now(),
         onupdate=func.now(),
     )
-

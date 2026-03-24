@@ -1,0 +1,23 @@
+{
+  "owner_name": "Rohit Sharma",
+  "mobile": "9876543210",
+  "email": "rohit@test.com",
+  "address": "Pune",
+  "pan": "ABCDE1234F"
+}
+
+{
+  "owner_id": 1,
+  "name": "Building A",
+  "site_address": "Pune",
+  "site_area": 2000,
+  "type": "Residential",
+  "start_date": "2026-04-01",
+  "end_date": "2026-10-01",
+  "estimated_duration": "6 Months",
+  "budget": 1000000,
+  "advance_paid": 200000,
+  "payment_terms": "Monthly",
+  "engineer_name": "Rahul Sharma",
+  "status": "Ongoing"
+}

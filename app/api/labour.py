@@ -13,8 +13,7 @@ from app.models.labour import Labour
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.labour import LabourCreate, LabourOut, LabourUpdate
-from app.utils.helpers import NotFoundError
-
+from app.core.errors import NotFoundError
 
 router = APIRouter(prefix="/labour", tags=["labour"], dependencies=[default_rate_limiter_dependency()])
 

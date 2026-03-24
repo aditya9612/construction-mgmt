@@ -12,7 +12,7 @@ from app.models.document import Document
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.document import DocumentCreate, DocumentOut, DocumentUpdate
-from app.utils.helpers import NotFoundError
+from app.core.errors import NotFoundError
 
 
 router = APIRouter(prefix="/documents", tags=["documents"], dependencies=[default_rate_limiter_dependency()])

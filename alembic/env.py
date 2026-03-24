@@ -11,6 +11,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+
 from app.core.config import settings
 from app.models.base import Base
 import app.db.base  # noqa: F401
@@ -26,6 +27,7 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
+print(Base.metadata.tables.keys())
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""

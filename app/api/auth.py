@@ -15,7 +15,14 @@ from app.schemas.token import AuthResponse, Token
 from app.schemas.user import OTPLoginResponse, OTPVerify, UserLogin
 from app.services.otp import check_otp_rate_limit, generate_otp, store_otp, verify_otp as verify_otp_service
 from app.services.sms import send_otp_sms
-from app.utils.helpers import AppError
+
+# ERROR IMPORTS
+from app.core.errors import (
+    BadRequestError,
+    UnauthorizedError,
+    PermissionDeniedError,
+    InternalServerError,
+)
 
 
 router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[default_rate_limiter_dependency()])
@@ -35,20 +42,21 @@ def _build_token(user: User) -> Token:
 async def login(payload: UserLogin, redis: Redis | None = Depends(get_request_redis)):
     """Request OTP for mobile number (OTP-only login)."""
     if redis is None and settings.APP_ENV == "production":
-        raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
+        raise InternalServerError("OTP service unavailable (Redis required)")
 
     mobile = _normalize_mobile(payload.mobile)
     if len(mobile) < 10:
-        raise AppError(status_code=422, message="Invalid mobile number")
+        raise BadRequestError("Invalid mobile number")
 
     if not await check_otp_rate_limit(redis, mobile):
-        raise AppError(status_code=429, message="Too many OTP requests. Try again later.")
+        raise BadRequestError("Too many OTP requests. Try again later.")
 
     otp = generate_otp()
     await store_otp(redis, mobile, otp)
     sent = await send_otp_sms(mobile, otp)
+
     if not sent:
-        raise AppError(status_code=503, message="Failed to send OTP")
+        raise InternalServerError("Failed to send OTP")
 
     return OTPLoginResponse(message="OTP sent", mobile=mobile)
 
@@ -61,16 +69,17 @@ async def verify_otp(
 ):
     """Verify OTP and return token. Creates user if first-time mobile login."""
     if redis is None and settings.APP_ENV == "production":
-        raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
+        raise InternalServerError("OTP service unavailable (Redis required)")
 
     mobile = _normalize_mobile(payload.mobile)
     if len(mobile) < 10:
-        raise AppError(status_code=422, message="Invalid mobile number")
+        raise BadRequestError("Invalid mobile number")
 
     if not await verify_otp_service(redis, mobile, payload.otp):
-        raise AppError(status_code=401, message="Invalid or expired OTP")
+        raise UnauthorizedError("Invalid or expired OTP")
 
     user = await db.scalar(select(User).where(User.mobile == mobile))
+
     if user is None:
         # Auto-register OTP user with default role
         placeholder_email = f"otp_{mobile}@construction.local"
@@ -86,7 +95,7 @@ async def verify_otp(
         await db.flush()
 
     if not user.is_active:
-        raise AppError(status_code=403, message="User is inactive")
+        raise PermissionDeniedError("User is inactive")
 
     token = _build_token(user)
     return {"token": token, "user_id": user.id}
