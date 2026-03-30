@@ -22,6 +22,13 @@ class BOQ(Base, TimestampMixin):
     item_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    category: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        default="Civil",
+        index=True,
+    )
+
     quantity: Mapped[Decimal] = mapped_column(DECIMAL(18, 3), nullable=False, default=0)
     unit: Mapped[str] = mapped_column(String(50), nullable=False, default="unit")
 
@@ -29,4 +36,3 @@ class BOQ(Base, TimestampMixin):
     total_cost: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), nullable=False, default=0)
 
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="Active", index=True)
-

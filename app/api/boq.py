@@ -21,6 +21,9 @@ router = APIRouter(prefix="/boq", tags=["boq"], dependencies=[default_rate_limit
 VERSION_KEY = "cache_version:boq"
 
 
+# -------------------------
+# CREATE
+# -------------------------
 @router.post("", response_model=BOQOut)
 async def create_boq(
     payload: BOQCreate,
@@ -29,15 +32,21 @@ async def create_boq(
     redis=Depends(get_request_redis),
 ):
     data = payload.model_dump(exclude_unset=True)
+
     if data.get("total_cost") is None:
         data["total_cost"] = Decimal(data.get("quantity")) * Decimal(data.get("unit_cost"))
+
     obj = BOQ(**data)
     db.add(obj)
     await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
+
     return BOQOut.model_validate(obj)
 
 
+# -------------------------
+# LIST (WITH FILTERS)
+# -------------------------
 @router.get("", response_model=PaginatedResponse[BOQOut])
 async def list_boq(
     limit: int = Query(20, ge=1, le=100),
@@ -45,12 +54,13 @@ async def list_boq(
     search: Optional[str] = None,
     status: Optional[str] = None,
     project_id: Optional[int] = None,
+    category: Optional[str] = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:boq:list:{version}:{limit}:{offset}:{search}:{status}:{project_id}"
+    cache_key = f"cache:boq:list:{version}:{limit}:{offset}:{search}:{status}:{project_id}:{category}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
         return PaginatedResponse[BOQOut].model_validate(cached)
@@ -71,6 +81,10 @@ async def list_boq(
         query = query.where(BOQ.project_id == project_id)
         count_query = count_query.where(BOQ.project_id == project_id)
 
+    if category:
+        query = query.where(BOQ.category == category)
+        count_query = count_query.where(BOQ.category == category)
+
     query = query.order_by(BOQ.id.desc()).limit(limit).offset(offset)
 
     total = await db.scalar(count_query)
@@ -78,11 +92,16 @@ async def list_boq(
 
     items = [BOQOut.model_validate(r).model_dump() for r in rows]
     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
+
     result = {"items": items, "meta": meta.model_dump()}
     await cache_set_json(redis, cache_key, result)
+
     return PaginatedResponse[BOQOut].model_validate(result)
 
 
+# -------------------------
+# GET SINGLE
+# -------------------------
 @router.get("/{boq_id}", response_model=BOQOut)
 async def get_boq(
     boq_id: int,
@@ -90,21 +109,75 @@ async def get_boq(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:boq:get:{version}:{boq_id}"
-    cached = await cache_get_json(redis, cache_key)
-    if cached is not None:
-        return BOQOut.model_validate(cached)
-
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
+
     if obj is None:
         raise NotFoundError("BOQ item not found")
 
-    out = BOQOut.model_validate(obj)
-    await cache_set_json(redis, cache_key, out.model_dump())
-    return out
+    return BOQOut.model_validate(obj)
 
 
+# -------------------------
+# PROJECT-WISE BOQ
+# -------------------------
+@router.get("/project/{project_id}", response_model=list[BOQOut])
+async def get_boq_by_project(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    rows = (await db.execute(
+        select(BOQ).where(BOQ.project_id == project_id)
+    )).scalars().all()
+
+    return [BOQOut.model_validate(r) for r in rows]
+
+
+# -------------------------
+# SUMMARY
+# -------------------------
+@router.get("/summary/{project_id}")
+async def boq_summary(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    total_items = await db.scalar(
+        select(func.count()).where(BOQ.project_id == project_id)
+    )
+
+    total_amount = await db.scalar(
+        select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id)
+    )
+
+    return {
+        "total_items": total_items or 0,
+        "total_amount": float(total_amount or 0),
+    }
+
+
+# -------------------------
+# ANALYSIS
+# -------------------------
+@router.get("/analysis/{project_id}")
+async def boq_analysis(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    boq_total = await db.scalar(
+        select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id)
+    )
+
+    expense_total = 0  # will connect later
+
+    return {
+        "boq_total": float(boq_total or 0),
+        "expense_total": expense_total,
+        "difference": float((boq_total or 0) - expense_total),
+    }
+
+
+# -------------------------
+# UPDATE
+# -------------------------
 @router.put("/{boq_id}", response_model=BOQOut)
 async def update_boq(
     boq_id: int,
@@ -114,10 +187,12 @@ async def update_boq(
     redis=Depends(get_request_redis),
 ):
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
+
     if obj is None:
         raise NotFoundError("BOQ item not found")
 
     data = payload.model_dump(exclude_unset=True)
+
     for k, v in data.items():
         setattr(obj, k, v)
 
@@ -126,9 +201,13 @@ async def update_boq(
 
     await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
+
     return BOQOut.model_validate(obj)
 
 
+# -------------------------
+# DELETE
+# -------------------------
 @router.delete("/{boq_id}", status_code=204)
 async def delete_boq(
     boq_id: int,
@@ -137,10 +216,12 @@ async def delete_boq(
     redis=Depends(get_request_redis),
 ):
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
+
     if obj is None:
         raise NotFoundError("BOQ item not found")
 
     await db.delete(obj)
     await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
+
     return None
