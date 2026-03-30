@@ -1,7 +1,7 @@
 from typing import Callable, Iterable, List
 
 from fastapi import Depends, HTTPException, Request, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,13 +9,14 @@ from app.core.security import decode_access_token
 from app.db.session import get_db_session
 from app.models.user import User, UserRole
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
-
+security = HTTPBearer()
 
 async def get_current_user(
-    token: str = Depends(oauth2_scheme),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db_session),
 ) -> User:
+    token = credentials.credentials
+
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -33,8 +34,8 @@ async def get_current_user(
     user = await db.scalar(select(User).where(User.id == int(user_id)))
     if user is None:
         raise credentials_exception
-    return user
 
+    return user
 
 async def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
     if not current_user.is_active:

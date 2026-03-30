@@ -3,7 +3,10 @@ from typing import Optional
 
 from sqlalchemy import CheckConstraint, Date, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from app.models.owner import Owner
 from app.models.base import Base, TimestampMixin
 from app.models.user import User
 
@@ -21,8 +24,13 @@ class Project(Base, TimestampMixin):
 
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="Planned", index=True)
 
-    owner_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    owner_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("owners.id"),
+        nullable=True
+    )
 
+    owner: Mapped["Owner"] = relationship("Owner", back_populates="projects")
+    
     members: Mapped[list["ProjectMember"]] = relationship(
         "ProjectMember",
         back_populates="project",
