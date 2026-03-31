@@ -9,7 +9,7 @@ class Settings(BaseSettings):
 
     DB_NAME: str = "construction_management"
     DB_USER: str = "root"
-    DB_PASSWORD: str = "root"
+    DB_PASSWORD: str = "ROOT"
     DB_HOST: str = "localhost"
     DB_PORT: int = 3306
 
@@ -33,7 +33,10 @@ class Settings(BaseSettings):
     RATE_LIMIT_TIMES: int = 60
     RATE_LIMIT_SECONDS: int = 60
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file="c:/Users/gdhay/OneDrive/Desktop/construction-mgmt/.env",
+        extra="ignore",
+    )
 
     @property
     def DATABASE_URL_ASYNC(self) -> str:
@@ -53,4 +56,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
