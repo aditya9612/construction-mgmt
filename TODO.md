@@ -1,0 +1,1 @@
+- [x] Update config.py with absolute .env path
