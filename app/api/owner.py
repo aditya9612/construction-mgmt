@@ -6,8 +6,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
-from app.models.owner import Owner
-from app.schemas.owner import OwnerCreate, OwnerUpdate, OwnerOut
+from app.models.owner import Owner, OwnerTransaction
+from app.schemas.owner import (
+    OwnerCreate,
+    OwnerUpdate,
+    OwnerOut,
+    OwnerLedgerResponse,
+    OwnerTransactionOut,
+)
 from app.utils.helpers import NotFoundError
 
 
@@ -132,3 +138,51 @@ async def delete_owner(
         raise
 
     return None
+
+
+# =========================
+# OWNER PAYMENTS (TRANSACTIONS)
+# =========================
+@router.get("/{owner_id}/payments")
+async def get_owner_payments(
+    owner_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    owner = await db.get(Owner, owner_id)
+    if not owner:
+        raise NotFoundError("Owner not found")
+
+    result = await db.execute(
+        select(OwnerTransaction).where(OwnerTransaction.owner_id == owner_id)
+    )
+    rows = result.scalars().all()
+
+    return [OwnerTransactionOut.model_validate(r) for r in rows]
+
+
+# =========================
+# OWNER LEDGER (FULL)
+# =========================
+@router.get("/{owner_id}/ledger", response_model=OwnerLedgerResponse)
+async def get_owner_ledger(
+    owner_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    owner = await db.get(Owner, owner_id)
+    if not owner:
+        raise NotFoundError("Owner not found")
+
+    result = await db.execute(
+        select(OwnerTransaction).where(OwnerTransaction.owner_id == owner_id)
+    )
+    transactions = result.scalars().all()
+
+    total_credit = sum(float(t.amount) for t in transactions if t.type == "credit")
+    total_debit = sum(float(t.amount) for t in transactions if t.type == "debit")
+
+    return OwnerLedgerResponse(
+        total_credit=total_credit,
+        total_debit=total_debit,
+        balance=total_credit - total_debit,
+        transactions=[OwnerTransactionOut.model_validate(t) for t in transactions],
+    )

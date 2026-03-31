@@ -1,24 +1,27 @@
 from decimal import Decimal
 from typing import Optional
+from datetime import date
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, extract
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
 from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
-from app.models.labour import Labour
+from app.models.labour import Labour, LabourAttendance
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.labour import LabourCreate, LabourOut, LabourUpdate
+from app.schemas.labour import LabourAttendanceCreate, LabourAttendanceOut
 from app.utils.helpers import NotFoundError
 
 
 router = APIRouter(prefix="/labour", tags=["labour"], dependencies=[default_rate_limiter_dependency()])
 
 VERSION_KEY = "cache_version:labour"
+ATTENDANCE_VERSION_KEY = "cache_version:labour_attendance"
 
 
 @router.post("", response_model=LabourOut)
@@ -148,3 +151,157 @@ async def delete_labour(
     await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
     return None
+
+
+# =========================
+# LABOUR ATTENDANCE APIs
+# =========================
+
+@router.post("/{labour_id}/attendance", response_model=LabourAttendanceOut)
+async def create_attendance(
+    labour_id: int,
+    payload: LabourAttendanceCreate,
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER])
+    ),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+    labour = await db.get(Labour, labour_id)
+    if not labour:
+        raise NotFoundError("Labour not found")
+
+    obj = LabourAttendance(
+        labour_id=labour_id,
+        **payload.model_dump()
+    )
+
+    db.add(obj)
+    await db.flush()
+
+    total_wage = (
+        float(labour.unit_cost) * float(obj.working_hours)
+        + float(labour.unit_cost) * float(obj.overtime_hours)
+    )
+
+    await bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
+
+    return LabourAttendanceOut(
+        id=obj.id,
+        labour_id=labour_id,
+        total_wage=total_wage,
+        **payload.model_dump()
+    )
+
+
+@router.get("/{labour_id}/attendance", response_model=list[LabourAttendanceOut])
+async def get_attendance(
+    labour_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+    version = await get_cache_version(redis, ATTENDANCE_VERSION_KEY)
+    cache_key = f"cache:labour:attendance:{version}:{labour_id}"
+
+    cached = await cache_get_json(redis, cache_key)
+    if cached:
+        return cached
+
+    labour = await db.get(Labour, labour_id)
+    if not labour:
+        raise NotFoundError("Labour not found")
+
+    result = await db.execute(
+        select(LabourAttendance).where(LabourAttendance.labour_id == labour_id)
+    )
+    rows = result.scalars().all()
+
+    data = []
+    for r in rows:
+        total_wage = (
+            float(labour.unit_cost) * float(r.working_hours)
+            + float(labour.unit_cost) * float(r.overtime_hours)
+        )
+
+        data.append(
+            LabourAttendanceOut(
+                id=r.id,
+                labour_id=labour_id,
+                project_id=r.project_id,
+                date=r.date,
+                working_hours=float(r.working_hours),
+                overtime_hours=float(r.overtime_hours),
+                task_description=r.task_description,
+                total_wage=total_wage,
+            ).model_dump()
+        )
+
+    await cache_set_json(redis, cache_key, data)
+    return data
+
+
+@router.get("/{labour_id}/weekly-report")
+async def weekly_report(
+    labour_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    labour = await db.get(Labour, labour_id)
+    if not labour:
+        raise NotFoundError("Labour not found")
+
+    result = await db.execute(
+        select(
+            extract("week", LabourAttendance.attendance_date).label("week"),
+            func.sum(LabourAttendance.working_hours).label("hours"),
+            func.sum(LabourAttendance.overtime_hours).label("ot"),
+        )
+        .where(LabourAttendance.labour_id == labour_id)
+        .group_by("week")
+    )
+
+    rows = result.all()
+
+    return [
+        {
+            "week": int(r.week),
+            "total_hours": float(r.hours or 0),
+            "overtime_hours": float(r.ot or 0),
+            "total_wage": float(labour.unit_cost) * float((r.hours or 0) + (r.ot or 0)),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/{labour_id}/monthly-report")
+async def monthly_report(
+    labour_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    labour = await db.get(Labour, labour_id)
+    if not labour:
+        raise NotFoundError("Labour not found")
+
+    result = await db.execute(
+        select(
+            extract("month", LabourAttendance.attendance_date).label("month"),
+            func.sum(LabourAttendance.working_hours).label("hours"),
+            func.sum(LabourAttendance.overtime_hours).label("ot"),
+        )
+        .where(LabourAttendance.labour_id == labour_id)
+        .group_by("month")
+    )
+
+    rows = result.all()
+
+    return [
+        {
+            "month": int(r.month),
+            "total_hours": float(r.hours or 0),
+            "overtime_hours": float(r.ot or 0),
+            "total_wage": float(labour.unit_cost) * float((r.hours or 0) + (r.ot or 0)),
+        }
+        for r in rows
+    ]

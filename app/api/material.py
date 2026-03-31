@@ -4,9 +4,18 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
-from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
+from app.models.owner import OwnerTransaction
+from app.cache.redis import (
+    bump_cache_version,
+    cache_get_json,
+    cache_set_json,
+    get_cache_version,
+)
+from app.core.dependencies import (
+    get_current_active_user,
+    get_request_redis,
+    require_roles,
+)
 from app.db.session import get_db_session
 from app.models.material import Material
 from app.models.project import Project
@@ -20,13 +29,12 @@ router = APIRouter(prefix="/materials", tags=["materials"])
 VERSION_KEY = "cache_version:materials"
 
 
-# -------------------------
-# 1. CREATE MATERIAL
-# -------------------------
 @router.post("", response_model=MaterialOut)
 async def create_material(
     payload: MaterialCreate,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -49,14 +57,22 @@ async def create_material(
     db.add(obj)
     await db.flush()
 
+    owner_transaction = OwnerTransaction(
+        owner_id=project.owner_id,
+        project_id=obj.project_id,
+        type="debit",
+        amount=total_cost,
+        reference_type="material",
+        reference_id=obj.id,
+        description="Material purchase",
+    )
+    db.add(owner_transaction)
+
     await bump_cache_version(redis, VERSION_KEY)
 
     return MaterialOut.model_validate(obj)
 
 
-# -------------------------
-# 2. LIST MATERIALS
-# -------------------------
 @router.get("", response_model=PaginatedResponse[MaterialOut])
 async def list_materials(
     limit: int = Query(20, ge=1, le=100),
@@ -99,7 +115,9 @@ async def list_materials(
 
     result = {
         "items": items,
-        "meta": PaginationMeta(total=int(total or 0), limit=limit, offset=offset).model_dump(),
+        "meta": PaginationMeta(
+            total=int(total or 0), limit=limit, offset=offset
+        ).model_dump(),
     }
 
     await cache_set_json(redis, cache_key, result)
@@ -107,9 +125,6 @@ async def list_materials(
     return PaginatedResponse[MaterialOut].model_validate(result)
 
 
-# -------------------------
-# 3. GET SINGLE MATERIAL
-# -------------------------
 @router.get("/{material_id}", response_model=MaterialOut)
 async def get_material(
     material_id: int,
@@ -124,14 +139,13 @@ async def get_material(
     return MaterialOut.model_validate(obj)
 
 
-# -------------------------
-# 4. UPDATE MATERIAL
-# -------------------------
 @router.put("/{material_id}", response_model=MaterialOut)
 async def update_material(
     material_id: int,
     payload: MaterialUpdate,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -151,13 +165,12 @@ async def update_material(
     return MaterialOut.model_validate(obj)
 
 
-# -------------------------
-# 5. DELETE MATERIAL
-# -------------------------
 @router.delete("/{material_id}", status_code=204)
 async def delete_material(
     material_id: int,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -174,9 +187,6 @@ async def delete_material(
     return None
 
 
-# -------------------------
-# 6. PURCHASE ENTRY
-# -------------------------
 @router.post("/{material_id}/purchase", response_model=MaterialOut)
 async def add_purchase(
     material_id: int,
@@ -196,14 +206,24 @@ async def add_purchase(
     obj.payment_given += payment
     obj.payment_pending = total_cost - obj.payment_given
 
+    project = await db.get(Project, obj.project_id)
+
+    owner_transaction = OwnerTransaction(
+        owner_id=project.owner_id,
+        project_id=obj.project_id,
+        type="debit",
+        amount=float(quantity * obj.purchase_rate),
+        reference_type="material",
+        reference_id=obj.id,
+        description="Material purchase (additional)",
+    )
+    db.add(owner_transaction)
+
     await db.flush()
 
     return MaterialOut.model_validate(obj)
 
 
-# -------------------------
-# 7. USAGE ENTRY
-# -------------------------
 @router.post("/{material_id}/usage", response_model=MaterialOut)
 async def add_usage(
     material_id: int,
@@ -225,9 +245,6 @@ async def add_usage(
     return MaterialOut.model_validate(obj)
 
 
-# -------------------------
-# 8. STOCK SUMMARY
-# -------------------------
 @router.get("/summary")
 async def material_summary(db: AsyncSession = Depends(get_db_session)):
     total_materials = await db.scalar(select(func.count()).select_from(Material))
@@ -244,24 +261,20 @@ async def material_summary(db: AsyncSession = Depends(get_db_session)):
     }
 
 
-# -------------------------
-# 9. LOW STOCK ALERT
-# -------------------------
 @router.get("/low-stock", response_model=list[MaterialOut])
 async def low_stock(
     threshold: Decimal = Decimal("10"),
     db: AsyncSession = Depends(get_db_session),
 ):
-    rows = (await db.execute(
-        select(Material).where(Material.remaining_stock < threshold)
-    )).scalars().all()
+    rows = (
+        (await db.execute(select(Material).where(Material.remaining_stock < threshold)))
+        .scalars()
+        .all()
+    )
 
     return [MaterialOut.model_validate(r) for r in rows]
 
 
-# -------------------------
-# 10. MATERIAL REPORT
-# -------------------------
 @router.get("/report")
 async def material_report(
     project_id: Optional[int] = None,
@@ -289,16 +302,15 @@ async def material_report(
     ]
 
 
-# -------------------------
-# 11. PROJECT-WISE MATERIAL
-# -------------------------
 @router.get("/project/{project_id}", response_model=list[MaterialOut])
 async def materials_by_project(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
 ):
-    rows = (await db.execute(
-        select(Material).where(Material.project_id == project_id)
-    )).scalars().all()
+    rows = (
+        (await db.execute(select(Material).where(Material.project_id == project_id)))
+        .scalars()
+        .all()
+    )
 
     return [MaterialOut.model_validate(r) for r in rows]

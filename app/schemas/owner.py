@@ -59,3 +59,28 @@ class OwnerOut(BaseSchema):
 
     class Config:
         from_attributes = True
+
+
+# =========================
+# OWNER TRANSACTION
+# =========================
+
+class OwnerTransactionOut(BaseSchema):
+    id: int
+    owner_id: int
+    project_id: int
+    type: str
+    amount: float
+    reference_type: str
+    reference_id: Optional[int]
+    description: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+
+class OwnerLedgerResponse(BaseSchema):
+    total_credit: float
+    total_debit: float
+    balance: float
+    transactions: list[OwnerTransactionOut]

@@ -8,3 +8,7 @@ from app.models.material import Material  # noqa: F401
 from app.models.project import Project  # noqa: F401
 from app.models.user import User  # noqa: F401
 from app.models.owner import Owner
+from app.models.contractor import Contractor
+from app.models.expense import Expense
+from app.models.invoice import Invoice
+from app.models.final_measurement import FinalMeasurement

@@ -1,6 +1,7 @@
 from decimal import Decimal
 from typing import Optional
-
+from pydantic import BaseModel
+from datetime import date
 from app.schemas.base import BaseSchema
 
 
@@ -32,4 +33,24 @@ class LabourOut(BaseSchema):
     total_cost: Decimal
     status: str
     notes: Optional[str]
+
+class LabourAttendanceBase(BaseModel):
+    project_id: int
+    attendance_date: date
+    working_hours: float
+    overtime_hours: float = 0
+    task_description: str
+
+
+class LabourAttendanceCreate(LabourAttendanceBase):
+    pass
+
+
+class LabourAttendanceOut(LabourAttendanceBase):
+    id: int
+    labour_id: int
+    total_wage: float
+
+    class Config:
+        from_attributes = True
 
