@@ -864,6 +864,8 @@ class TasksService:
             created_by_user_id=current_user.id,
         )
 
+        await db.refresh(progress_obj)
+
         # Side effect: store latest completion on the task row.
         await self.tasks_repo.update_task(
             db, obj=obj, data={"completion_percentage": int(payload.percentage)}
