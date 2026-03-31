@@ -2,12 +2,13 @@ import enum
 from datetime import date
 from typing import Optional
 
-from sqlalchemy import Boolean, Date, Enum, ForeignKey, Integer, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import Boolean, Date, Enum, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
 
-# Exact role values for RBAC - use these in API and DB
+
+# Exact role values for RBAC
 ROLES = [
     "Admin",
     "ProjectManager",
@@ -46,12 +47,9 @@ class User(Base, TimestampMixin):
     address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     pan_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     aadhaar_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
-    profile_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)  # URL or path
+    profile_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     designation: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     joining_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    owner_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-
-    owner: Mapped[Optional["User"]] = relationship("User", remote_side=[id])
 
     @property
     def user_id(self) -> int:
@@ -60,6 +58,3 @@ class User(Base, TimestampMixin):
     @property
     def mobile_number(self) -> Optional[str]:
         return self.mobile
-
-    # created_at/updated_at are provided by TimestampMixin
-

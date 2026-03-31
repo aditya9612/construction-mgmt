@@ -1,14 +1,14 @@
 from datetime import date
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, Date, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import CheckConstraint, Date, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from typing import TYPE_CHECKING
+
+from app.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
     from app.models.owner import Owner
-from app.models.base import Base, TimestampMixin
-from app.models.user import User
+    from app.models.user import User
 
 
 class Project(Base, TimestampMixin):
@@ -16,7 +16,7 @@ class Project(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    project_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -24,27 +24,37 @@ class Project(Base, TimestampMixin):
 
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="Planned", index=True)
 
-    owner_id: Mapped[Optional[int]] = mapped_column(
+    owner_id: Mapped[int] = mapped_column(
         ForeignKey("owners.id"),
-        nullable=True
+        nullable=False,
+        index=True
     )
 
     owner: Mapped["Owner"] = relationship("Owner", back_populates="projects")
-    
+
     members: Mapped[list["ProjectMember"]] = relationship(
         "ProjectMember",
         back_populates="project",
         cascade="all, delete-orphan",
     )
+
     milestones: Mapped[list["Milestone"]] = relationship(
         "Milestone",
         back_populates="project",
         cascade="all, delete-orphan",
     )
+
     tasks: Mapped[list["Task"]] = relationship(
         "Task",
         back_populates="project",
         cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "end_date IS NULL OR start_date IS NULL OR end_date >= start_date",
+            name="check_project_dates"
+        ),
     )
 
 
@@ -111,22 +121,23 @@ class Task(Base):
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
-    assigned_user_id: Mapped[int] = mapped_column(
+    assigned_user_id: Mapped[Optional[int]] = mapped_column(
         Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 
     completion_percentage: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     project: Mapped["Project"] = relationship("Project", back_populates="tasks")
+
     progress_entries: Mapped[list["TaskProgress"]] = relationship(
         "TaskProgress",
         back_populates="task",
         cascade="all, delete-orphan",
-        order_by="TaskProgress.created_at",
     )
+
     comments: Mapped[list["Comment"]] = relationship(
         "Comment",
         back_populates="task",
@@ -159,7 +170,7 @@ class TaskProgress(Base, TimestampMixin):
     task: Mapped["Task"] = relationship("Task", back_populates="progress_entries")
 
     __table_args__ = (
-        CheckConstraint("percentage >= 0 AND percentage <= 100", name="ck_task_progress_percentage_range"),
+        CheckConstraint("percentage >= 0 AND percentage <= 100"),
     )
 
 
@@ -185,4 +196,3 @@ class Comment(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     task: Mapped["Task"] = relationship("Task", back_populates="comments")
-

@@ -2,7 +2,7 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
@@ -10,19 +10,23 @@ from app.core.dependencies import get_current_active_user, get_request_redis, re
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.boq import BOQ
+from app.models.project import Project
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.boq import BOQCreate, BOQOut, BOQUpdate
 from app.utils.helpers import NotFoundError
 
-
-router = APIRouter(prefix="/boq", tags=["boq"], dependencies=[default_rate_limiter_dependency()])
+router = APIRouter(
+    prefix="/boq",
+    tags=["boq"],
+    dependencies=[default_rate_limiter_dependency()],
+)
 
 VERSION_KEY = "cache_version:boq"
 
 
 # -------------------------
-# CREATE
+# CREATE (WITH VERSIONING)
 # -------------------------
 @router.post("", response_model=BOQOut)
 async def create_boq(
@@ -31,21 +35,51 @@ async def create_boq(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    project = await db.scalar(select(Project).where(Project.id == payload.project_id))
+    if not project:
+        raise NotFoundError("Project not found")
+
+    # VERSIONING
+    max_version = await db.scalar(
+        select(func.max(BOQ.version_no)).where(BOQ.project_id == payload.project_id)
+    )
+    new_version = (max_version or 0) + 1
+
+    # mark old versions as not latest
+    await db.execute(
+        update(BOQ)
+        .where(BOQ.project_id == payload.project_id)
+        .values(is_latest=False)
+    )
+
     data = payload.model_dump(exclude_unset=True)
 
-    if data.get("total_cost") is None:
-        data["total_cost"] = Decimal(data.get("quantity")) * Decimal(data.get("unit_cost"))
+    quantity = Decimal(str(data.get("quantity", 0)))
+    unit_cost = Decimal(str(data.get("unit_cost", 0)))
+    total_cost = quantity * unit_cost
+
+    actual_cost = Decimal(str(data.get("actual_cost", 0)))
+    variance = total_cost - actual_cost
+
+    data.update({
+        "total_cost": total_cost,
+        "variance_cost": variance,
+        "version_no": new_version,
+        "boq_group_id": new_version,
+        "is_latest": True,
+    })
 
     obj = BOQ(**data)
     db.add(obj)
     await db.flush()
+
     await bump_cache_version(redis, VERSION_KEY)
 
     return BOQOut.model_validate(obj)
 
 
 # -------------------------
-# LIST (WITH FILTERS)
+# LIST (FULL - CACHE + FILTER + VERSION)
 # -------------------------
 @router.get("", response_model=PaginatedResponse[BOQOut])
 async def list_boq(
@@ -55,12 +89,15 @@ async def list_boq(
     status: Optional[str] = None,
     project_id: Optional[int] = None,
     category: Optional[str] = None,
+    version_no: Optional[int] = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:boq:list:{version}:{limit}:{offset}:{search}:{status}:{project_id}:{category}"
+
+    cache_key = f"cache:boq:list:{version}:{limit}:{offset}:{search}:{status}:{project_id}:{category}:{version_no}"
+
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
         return PaginatedResponse[BOQOut].model_validate(cached)
@@ -85,6 +122,14 @@ async def list_boq(
         query = query.where(BOQ.category == category)
         count_query = count_query.where(BOQ.category == category)
 
+    # VERSION FILTER
+    if version_no:
+        query = query.where(BOQ.version_no == version_no)
+        count_query = count_query.where(BOQ.version_no == version_no)
+    else:
+        query = query.where(BOQ.is_latest == True)
+        count_query = count_query.where(BOQ.is_latest == True)
+
     query = query.order_by(BOQ.id.desc()).limit(limit).offset(offset)
 
     total = await db.scalar(count_query)
@@ -94,6 +139,7 @@ async def list_boq(
     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
 
     result = {"items": items, "meta": meta.model_dump()}
+
     await cache_set_json(redis, cache_key, result)
 
     return PaginatedResponse[BOQOut].model_validate(result)
@@ -107,7 +153,6 @@ async def get_boq(
     boq_id: int,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
-    redis=Depends(get_request_redis),
 ):
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
 
@@ -118,7 +163,7 @@ async def get_boq(
 
 
 # -------------------------
-# PROJECT-WISE BOQ
+# PROJECT-WISE BOQ (LATEST)
 # -------------------------
 @router.get("/project/{project_id}", response_model=list[BOQOut])
 async def get_boq_by_project(
@@ -126,10 +171,52 @@ async def get_boq_by_project(
     db: AsyncSession = Depends(get_db_session),
 ):
     rows = (await db.execute(
-        select(BOQ).where(BOQ.project_id == project_id)
+        select(BOQ).where(BOQ.project_id == project_id, BOQ.is_latest == True)
     )).scalars().all()
 
     return [BOQOut.model_validate(r) for r in rows]
+
+
+# -------------------------
+# VERSION HISTORY
+# -------------------------
+@router.get("/versions/{project_id}")
+async def get_versions(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    result = await db.execute(
+        select(BOQ.version_no)
+        .where(BOQ.project_id == project_id)
+        .distinct()
+        .order_by(BOQ.version_no.desc())
+    )
+
+    return {"versions": [v[0] for v in result.fetchall()]}
+
+
+# -------------------------
+# ACTUALS UPDATE
+# -------------------------
+@router.post("/{boq_id}/actuals", response_model=BOQOut)
+async def update_actuals(
+    boq_id: int,
+    actual_quantity: Decimal,
+    actual_cost: Decimal,
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
+
+    if not obj:
+        raise NotFoundError("BOQ not found")
+
+    obj.actual_quantity = actual_quantity
+    obj.actual_cost = actual_cost
+    obj.variance_cost = obj.total_cost - actual_cost
+
+    await db.flush()
+
+    return BOQOut.model_validate(obj)
 
 
 # -------------------------
@@ -141,17 +228,46 @@ async def boq_summary(
     db: AsyncSession = Depends(get_db_session),
 ):
     total_items = await db.scalar(
-        select(func.count()).where(BOQ.project_id == project_id)
+        select(func.count()).where(BOQ.project_id == project_id, BOQ.is_latest == True)
     )
 
-    total_amount = await db.scalar(
-        select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id)
+    estimated = await db.scalar(
+        select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id, BOQ.is_latest == True)
+    )
+
+    actual = await db.scalar(
+        select(func.sum(BOQ.actual_cost)).where(BOQ.project_id == project_id, BOQ.is_latest == True)
     )
 
     return {
         "total_items": total_items or 0,
-        "total_amount": float(total_amount or 0),
+        "estimated": float(estimated or 0),
+        "actual": float(actual or 0),
+        "difference": float((estimated or 0) - (actual or 0)),
     }
+
+
+# -------------------------
+# COMPARISON
+# -------------------------
+@router.get("/comparison/{project_id}")
+async def boq_comparison(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    rows = (await db.execute(
+        select(BOQ).where(BOQ.project_id == project_id, BOQ.is_latest == True)
+    )).scalars().all()
+
+    return [
+        {
+            "item_name": r.item_name,
+            "estimated": float(r.total_cost),
+            "actual": float(r.actual_cost),
+            "variance": float(r.variance_cost),
+        }
+        for r in rows
+    ]
 
 
 # -------------------------
@@ -163,15 +279,17 @@ async def boq_analysis(
     db: AsyncSession = Depends(get_db_session),
 ):
     boq_total = await db.scalar(
-        select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id)
+        select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id, BOQ.is_latest == True)
     )
 
-    expense_total = 0  # will connect later
+    actual_total = await db.scalar(
+        select(func.sum(BOQ.actual_cost)).where(BOQ.project_id == project_id, BOQ.is_latest == True)
+    )
 
     return {
         "boq_total": float(boq_total or 0),
-        "expense_total": expense_total,
-        "difference": float((boq_total or 0) - expense_total),
+        "actual_total": float(actual_total or 0),
+        "difference": float((boq_total or 0) - (actual_total or 0)),
     }
 
 
@@ -196,8 +314,11 @@ async def update_boq(
     for k, v in data.items():
         setattr(obj, k, v)
 
-    if "quantity" in data or "unit_cost" in data:
-        obj.total_cost = Decimal(obj.quantity) * Decimal(obj.unit_cost)
+    quantity = Decimal(str(obj.quantity))
+    unit_cost = Decimal(str(obj.unit_cost))
+    obj.total_cost = quantity * unit_cost
+
+    obj.variance_cost = obj.total_cost - Decimal(str(obj.actual_cost or 0))
 
     await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
@@ -222,6 +343,7 @@ async def delete_boq(
 
     await db.delete(obj)
     await db.flush()
+
     await bump_cache_version(redis, VERSION_KEY)
 
     return None

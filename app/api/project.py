@@ -13,6 +13,7 @@ from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.project import Comment, Milestone, Project, ProjectMember, Task, TaskProgress
 from app.models.user import User, UserRole
+from app.models.owner import Owner
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.project import (
     CommentCreate,
@@ -68,8 +69,8 @@ class ProjectsRepository:
 
         if search:
             like = f"%{search}%"
-            query = query.where(Project.name.ilike(like))
-            count_query = count_query.where(Project.name.ilike(like))
+            query = query.where(Project.project_name.ilike(like))
+            count_query = count_query.where(Project.project_name.ilike(like))
 
         if status:
             query = query.where(Project.status == status)
@@ -361,12 +362,21 @@ class ProjectsService:
     async def create_project(self, db: AsyncSession, current_user: User, payload: ProjectCreate) -> ProjectOut:
         self._assert_project_mutation_role(current_user)
         data = payload.model_dump(exclude_unset=True)
+        owner = await db.scalar(select(Owner).where(Owner.id == payload.owner_id))
+        if not owner:
+            raise NotFoundError("Owner not found")
+
+        if payload.start_date and payload.end_date:
+            if payload.end_date < payload.start_date:
+                raise ValidationError("end_date cannot be before start_date")
+
         obj = await self.projects_repo.create_project(db, data)
         completion_map = await self._compute_completion_percentage_by_project_ids(db, [obj.id])
         completion = completion_map.get(obj.id, 0.0)
         return ProjectOut(
             id=obj.id,
-            name=obj.name,
+            project_name=obj.project_name,
+            owner_id=obj.owner_id,
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
@@ -392,7 +402,8 @@ class ProjectsService:
         items = [
             ProjectOut(
                 id=p.id,
-                name=p.name,
+                project_name=p.project_name,
+                owner_id=p.owner_id,
                 description=p.description,
                 start_date=p.start_date,
                 end_date=p.end_date,
@@ -412,7 +423,8 @@ class ProjectsService:
         completion = completion_map.get(obj.id, 0.0)
         return ProjectOut(
             id=obj.id,
-            name=obj.name,
+            project_name=obj.project_name,
+            owner_id=obj.owner_id,
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
@@ -428,8 +440,8 @@ class ProjectsService:
         if obj is None:
             raise NotFoundError("Project not found")
         data = payload.model_dump(exclude_unset=True)
-        if "name" in data and data["name"] is None:
-            raise ValidationError("name cannot be null")
+        if "project_name" in data and data["project_name"] is None:
+            raise ValidationError("project_name cannot be null")
         if "status" in data and data["status"] is None:
             raise ValidationError("status cannot be null")
         await self.projects_repo.update_project(db, obj, data)
@@ -437,7 +449,8 @@ class ProjectsService:
         completion = completion_map.get(obj.id, 0.0)
         return ProjectOut(
             id=obj.id,
-            name=obj.name,
+            project_name=obj.project_name,
+            owner_id=obj.owner_id,
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
@@ -723,9 +736,10 @@ class TasksService:
         if project is None:
             raise NotFoundError("Project not found")
 
-        assigned_user = await db.scalar(select(User).where(User.id == payload.assigned_user_id))
-        if assigned_user is None:
-            raise NotFoundError("User not found")
+        if payload.assigned_user_id:
+            assigned_user = await db.scalar(select(User).where(User.id == payload.assigned_user_id))
+            if assigned_user is None:
+                raise NotFoundError("User not found")
 
         data = payload.model_dump(exclude_unset=True)
         obj = await self.tasks_repo.create_task(db, project_id=project_id, data=data)
@@ -799,9 +813,10 @@ class TasksService:
             assigned_user_id = data["assigned_user_id"]
             if assigned_user_id is None:
                 raise ValidationError("assigned_user_id cannot be null")
-            assigned_user = await db.scalar(select(User).where(User.id == assigned_user_id))
-            if assigned_user is None:
-                raise NotFoundError("User not found")
+            if payload.assigned_user_id:
+                assigned_user = await db.scalar(select(User).where(User.id == payload.assigned_user_id))
+                if assigned_user is None:
+                    raise NotFoundError("User not found")
 
         await self.tasks_repo.update_task(db, obj=obj, data=data)
         is_delayed = self._is_delayed(task=obj, current_date=date.today())

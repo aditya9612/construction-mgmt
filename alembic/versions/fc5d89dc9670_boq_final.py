@@ -1,8 +1,8 @@
-"""add owner fk
+"""boq final
 
-Revision ID: 97a3bc8c7591
+Revision ID: fc5d89dc9670
 Revises: 
-Create Date: 2026-03-30 16:57:49.567699
+Create Date: 2026-03-31 11:55:40.799000
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '97a3bc8c7591'
+revision = 'fc5d89dc9670'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -31,20 +31,6 @@ def upgrade():
     )
     op.create_index(op.f('ix_owners_id'), 'owners', ['id'], unique=False)
     op.create_index(op.f('ix_owners_mobile'), 'owners', ['mobile'], unique=True)
-    op.create_table('projects',
-    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('name', sa.String(length=255), nullable=False),
-    sa.Column('description', sa.Text(), nullable=True),
-    sa.Column('start_date', sa.Date(), nullable=True),
-    sa.Column('end_date', sa.Date(), nullable=True),
-    sa.Column('status', sa.String(length=50), nullable=False),
-    sa.Column('owner_id', sa.Integer(), nullable=True),
-    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index(op.f('ix_projects_name'), 'projects', ['name'], unique=False)
-    op.create_index(op.f('ix_projects_status'), 'projects', ['status'], unique=False)
     op.create_table('users',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('email', sa.String(length=255), nullable=True),
@@ -59,10 +45,8 @@ def upgrade():
     sa.Column('profile_image', sa.String(length=500), nullable=True),
     sa.Column('designation', sa.String(length=100), nullable=True),
     sa.Column('joining_date', sa.Date(), nullable=True),
-    sa.Column('owner_id', sa.Integer(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
-    sa.ForeignKeyConstraint(['owner_id'], ['users.id'], ondelete='SET NULL'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_users_email'), 'users', ['email'], unique=True)
@@ -81,23 +65,50 @@ def upgrade():
     )
     op.create_index(op.f('ix_ai_predictions_created_by_user_id'), 'ai_predictions', ['created_by_user_id'], unique=False)
     op.create_index(op.f('ix_ai_predictions_module_name'), 'ai_predictions', ['module_name'], unique=False)
+    op.create_table('projects',
+    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+    sa.Column('project_name', sa.String(length=255), nullable=False),
+    sa.Column('description', sa.Text(), nullable=True),
+    sa.Column('start_date', sa.Date(), nullable=True),
+    sa.Column('end_date', sa.Date(), nullable=True),
+    sa.Column('status', sa.String(length=50), nullable=False),
+    sa.Column('owner_id', sa.Integer(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.CheckConstraint('end_date IS NULL OR start_date IS NULL OR end_date >= start_date', name='check_project_dates'),
+    sa.ForeignKeyConstraint(['owner_id'], ['owners.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_projects_owner_id'), 'projects', ['owner_id'], unique=False)
+    op.create_index(op.f('ix_projects_project_name'), 'projects', ['project_name'], unique=False)
+    op.create_index(op.f('ix_projects_status'), 'projects', ['status'], unique=False)
     op.create_table('boq_items',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
+    sa.Column('boq_group_id', sa.Integer(), nullable=False),
+    sa.Column('version_no', sa.Integer(), server_default='1', nullable=False),
+    sa.Column('is_latest', sa.Boolean(), server_default='1', nullable=False),
     sa.Column('item_name', sa.String(length=255), nullable=False),
+    sa.Column('category', sa.String(length=100), nullable=False),
     sa.Column('description', sa.Text(), nullable=True),
-    sa.Column('quantity', sa.DECIMAL(precision=18, scale=3), nullable=False),
-    sa.Column('unit', sa.String(length=50), nullable=False),
-    sa.Column('unit_cost', sa.DECIMAL(precision=18, scale=2), nullable=False),
-    sa.Column('total_cost', sa.DECIMAL(precision=18, scale=2), nullable=False),
-    sa.Column('status', sa.String(length=50), nullable=False),
+    sa.Column('quantity', sa.DECIMAL(precision=18, scale=3), server_default='0', nullable=False),
+    sa.Column('unit', sa.String(length=50), server_default='unit', nullable=False),
+    sa.Column('unit_cost', sa.DECIMAL(precision=18, scale=2), server_default='0', nullable=False),
+    sa.Column('total_cost', sa.DECIMAL(precision=18, scale=2), server_default='0', nullable=False),
+    sa.Column('actual_quantity', sa.DECIMAL(precision=18, scale=3), server_default='0', nullable=False),
+    sa.Column('actual_cost', sa.DECIMAL(precision=18, scale=2), server_default='0', nullable=False),
+    sa.Column('variance_cost', sa.DECIMAL(precision=18, scale=2), server_default='0', nullable=False),
+    sa.Column('is_completed', sa.Boolean(), server_default='0', nullable=False),
+    sa.Column('status', sa.String(length=50), server_default='Active', nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_index('idx_boq_group', 'boq_items', ['boq_group_id'], unique=False)
+    op.create_index('idx_boq_project', 'boq_items', ['project_id'], unique=False)
+    op.create_index(op.f('ix_boq_items_is_latest'), 'boq_items', ['is_latest'], unique=False)
     op.create_index(op.f('ix_boq_items_item_name'), 'boq_items', ['item_name'], unique=False)
-    op.create_index(op.f('ix_boq_items_project_id'), 'boq_items', ['project_id'], unique=False)
     op.create_index(op.f('ix_boq_items_status'), 'boq_items', ['status'], unique=False)
     op.create_table('documents',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
@@ -154,21 +165,24 @@ def upgrade():
     op.create_table('materials',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
-    sa.Column('name', sa.String(length=255), nullable=False),
-    sa.Column('category', sa.String(length=100), nullable=True),
-    sa.Column('unit', sa.String(length=50), nullable=False),
-    sa.Column('quantity_required', sa.DECIMAL(precision=18, scale=3), nullable=False),
-    sa.Column('quantity_available', sa.DECIMAL(precision=18, scale=3), nullable=False),
-    sa.Column('unit_cost', sa.DECIMAL(precision=18, scale=2), nullable=False),
-    sa.Column('status', sa.String(length=50), nullable=False),
+    sa.Column('material_name', sa.String(length=255), nullable=False),
+    sa.Column('category', sa.String(length=100), nullable=False),
+    sa.Column('unit', sa.String(length=50), server_default='unit', nullable=False),
+    sa.Column('supplier_name', sa.String(length=255), nullable=False),
+    sa.Column('purchase_rate', sa.DECIMAL(precision=18, scale=2), server_default='0', nullable=False),
+    sa.Column('rate_type', sa.String(length=50), nullable=False),
+    sa.Column('quantity_purchased', sa.DECIMAL(precision=18, scale=3), server_default='0', nullable=False),
+    sa.Column('quantity_used', sa.DECIMAL(precision=18, scale=3), server_default='0', nullable=False),
+    sa.Column('remaining_stock', sa.DECIMAL(precision=18, scale=3), server_default='0', nullable=False),
+    sa.Column('payment_given', sa.DECIMAL(precision=18, scale=2), server_default='0', nullable=False),
+    sa.Column('payment_pending', sa.DECIMAL(precision=18, scale=2), server_default='0', nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index(op.f('ix_materials_name'), 'materials', ['name'], unique=False)
-    op.create_index(op.f('ix_materials_project_id'), 'materials', ['project_id'], unique=False)
-    op.create_index(op.f('ix_materials_status'), 'materials', ['status'], unique=False)
+    op.create_index('idx_material_project', 'materials', ['project_id'], unique=False)
+    op.create_index(op.f('ix_materials_material_name'), 'materials', ['material_name'], unique=False)
     op.create_table('milestones',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -198,9 +212,9 @@ def upgrade():
     sa.Column('status', sa.String(length=50), nullable=False),
     sa.Column('start_date', sa.Date(), nullable=True),
     sa.Column('end_date', sa.Date(), nullable=True),
-    sa.Column('assigned_user_id', sa.Integer(), nullable=False),
+    sa.Column('assigned_user_id', sa.Integer(), nullable=True),
     sa.Column('completion_percentage', sa.Integer(), nullable=False),
-    sa.ForeignKeyConstraint(['assigned_user_id'], ['users.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['assigned_user_id'], ['users.id'], ondelete='SET NULL'),
     sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
@@ -227,7 +241,7 @@ def upgrade():
     sa.Column('created_by_user_id', sa.Integer(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
-    sa.CheckConstraint('percentage >= 0 AND percentage <= 100', name='ck_task_progress_percentage_range'),
+    sa.CheckConstraint('percentage >= 0 AND percentage <= 100'),
     sa.ForeignKeyConstraint(['created_by_user_id'], ['users.id'], ondelete='SET NULL'),
     sa.ForeignKeyConstraint(['task_id'], ['tasks.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
@@ -254,9 +268,8 @@ def downgrade():
     op.drop_index(op.f('ix_milestones_title'), table_name='milestones')
     op.drop_index(op.f('ix_milestones_project_id'), table_name='milestones')
     op.drop_table('milestones')
-    op.drop_index(op.f('ix_materials_status'), table_name='materials')
-    op.drop_index(op.f('ix_materials_project_id'), table_name='materials')
-    op.drop_index(op.f('ix_materials_name'), table_name='materials')
+    op.drop_index(op.f('ix_materials_material_name'), table_name='materials')
+    op.drop_index('idx_material_project', table_name='materials')
     op.drop_table('materials')
     op.drop_index(op.f('ix_labour_status'), table_name='labour')
     op.drop_index(op.f('ix_labour_project_id'), table_name='labour')
@@ -271,18 +284,21 @@ def downgrade():
     op.drop_index(op.f('ix_documents_project_id'), table_name='documents')
     op.drop_table('documents')
     op.drop_index(op.f('ix_boq_items_status'), table_name='boq_items')
-    op.drop_index(op.f('ix_boq_items_project_id'), table_name='boq_items')
     op.drop_index(op.f('ix_boq_items_item_name'), table_name='boq_items')
+    op.drop_index(op.f('ix_boq_items_is_latest'), table_name='boq_items')
+    op.drop_index('idx_boq_project', table_name='boq_items')
+    op.drop_index('idx_boq_group', table_name='boq_items')
     op.drop_table('boq_items')
+    op.drop_index(op.f('ix_projects_status'), table_name='projects')
+    op.drop_index(op.f('ix_projects_project_name'), table_name='projects')
+    op.drop_index(op.f('ix_projects_owner_id'), table_name='projects')
+    op.drop_table('projects')
     op.drop_index(op.f('ix_ai_predictions_module_name'), table_name='ai_predictions')
     op.drop_index(op.f('ix_ai_predictions_created_by_user_id'), table_name='ai_predictions')
     op.drop_table('ai_predictions')
     op.drop_index(op.f('ix_users_mobile'), table_name='users')
     op.drop_index(op.f('ix_users_email'), table_name='users')
     op.drop_table('users')
-    op.drop_index(op.f('ix_projects_status'), table_name='projects')
-    op.drop_index(op.f('ix_projects_name'), table_name='projects')
-    op.drop_table('projects')
     op.drop_index(op.f('ix_owners_mobile'), table_name='owners')
     op.drop_index(op.f('ix_owners_id'), table_name='owners')
     op.drop_table('owners')

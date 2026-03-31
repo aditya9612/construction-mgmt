@@ -1,37 +1,61 @@
 from datetime import date, datetime
 from typing import Optional
+from enum import Enum
 
 from pydantic import conint
-
 from app.schemas.base import BaseSchema
 
+from typing_extensions import Annotated
+from pydantic import Field
 
+
+# -------------------------
+# ENUM
+# -------------------------
+class ProjectStatus(str, Enum):
+    PLANNED = "Planned"
+    ONGOING = "Ongoing"
+    COMPLETED = "Completed"
+    ON_HOLD = "On Hold"
+
+
+# -------------------------
+# PROJECT
+# -------------------------
 class ProjectCreate(BaseSchema):
-    name: str
+    project_name: str
+    owner_id: int
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    status: Optional[str] = "Planned"
+    status: Optional[ProjectStatus] = ProjectStatus.PLANNED
 
 
 class ProjectUpdate(BaseSchema):
-    name: Optional[str] = None
+    project_name: Optional[str] = None
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    status: Optional[str] = None
+    status: Optional[ProjectStatus] = None
 
 
 class ProjectOut(BaseSchema):
     id: int
-    name: str
+    project_name: str
+    owner_id: int
     description: Optional[str]
     start_date: Optional[date]
     end_date: Optional[date]
     status: str
     completion_percentage: float = 0.0
 
+    class Config:
+        from_attributes = True
 
+
+# -------------------------
+# MEMBERS
+# -------------------------
 class ProjectMemberAssign(BaseSchema):
     user_id: int
 
@@ -43,6 +67,9 @@ class ProjectMemberOut(BaseSchema):
     role: Optional[str] = None
 
 
+# -------------------------
+# MILESTONE
+# -------------------------
 class MilestoneCreate(BaseSchema):
     title: str
     description: Optional[str] = None
@@ -66,6 +93,9 @@ class MilestoneOut(BaseSchema):
     end_date: Optional[date] = None
 
 
+# -------------------------
+# TASK
+# -------------------------
 class TaskCreate(BaseSchema):
     title: str
     description: Optional[str] = None
@@ -73,7 +103,7 @@ class TaskCreate(BaseSchema):
     status: str = "Planned"
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    assigned_user_id: int
+    assigned_user_id: Optional[int] = None
 
 
 class TaskUpdate(BaseSchema):
@@ -95,13 +125,16 @@ class TaskOut(BaseSchema):
     status: str
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    assigned_user_id: int
+    assigned_user_id: Optional[int]
     completion_percentage: int
     is_delayed: bool
 
 
+# -------------------------
+# TASK PROGRESS
+# -------------------------
 class TaskProgressUpdate(BaseSchema):
-    percentage: conint(ge=0, le=100)
+    percentage: Annotated[int, Field(ge=0, le=100)]
     remarks: Optional[str] = None
 
 
@@ -113,6 +146,9 @@ class TaskProgressOut(BaseSchema):
     created_at: datetime
 
 
+# -------------------------
+# COMMENTS
+# -------------------------
 class CommentCreate(BaseSchema):
     content: str
 
@@ -122,4 +158,3 @@ class CommentOut(BaseSchema):
     task_id: int
     author_user_id: int
     content: str
-
