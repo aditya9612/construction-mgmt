@@ -41,7 +41,22 @@ from app.schemas.project import (
     TaskUpdate,
 )
 from app.utils.helpers import ConflictError, NotFoundError, PermissionDeniedError, ValidationError
+from datetime import date
 
+def compute_project_status(project):
+    today = date.today()
+
+    # Manual override
+    if project.status == "Completed":
+        return "Completed"
+
+    if project.start_date and today < project.start_date:
+        return "Planned"
+
+    if project.end_date and today > project.end_date:
+        return "Delayed"
+
+    return "Active"
 
 router = APIRouter(
     prefix="/projects",
@@ -370,6 +385,7 @@ class ProjectsService:
     async def create_project(self, db: AsyncSession, current_user: User, payload: ProjectCreate) -> ProjectOut:
         self._assert_project_mutation_role(current_user)
         data = payload.model_dump(exclude_unset=True)
+        data["status"] = "Planned"
         owner = await db.scalar(select(Owner).where(Owner.id == payload.owner_id))
         if not owner:
             raise NotFoundError("Owner not found")
@@ -388,7 +404,7 @@ class ProjectsService:
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
-            status=obj.status,
+            status=compute_project_status(obj),
             completion_percentage=completion,
         )
 
@@ -415,7 +431,7 @@ class ProjectsService:
                 description=p.description,
                 start_date=p.start_date,
                 end_date=p.end_date,
-                status=p.status,
+                status=compute_project_status(p),
                 completion_percentage=completion_map.get(p.id, 0.0),
             )
             for p in rows
@@ -436,7 +452,7 @@ class ProjectsService:
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
-            status=obj.status,
+            status=compute_project_status(obj),
             completion_percentage=completion,
         )
 
@@ -450,8 +466,9 @@ class ProjectsService:
         data = payload.model_dump(exclude_unset=True)
         if "project_name" in data and data["project_name"] is None:
             raise ValidationError("project_name cannot be null")
-        if "status" in data and data["status"] is None:
-            raise ValidationError("status cannot be null")
+        if "status" in data:
+            if data["status"] != "Completed":
+                data.pop("status")
         await self.projects_repo.update_project(db, obj, data)
         completion_map = await self._compute_completion_percentage_by_project_ids(db, [obj.id])
         completion = completion_map.get(obj.id, 0.0)
@@ -462,7 +479,7 @@ class ProjectsService:
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
-            status=obj.status,
+            status=compute_project_status(obj),
             completion_percentage=completion,
         )
 

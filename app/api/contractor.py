@@ -3,16 +3,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from decimal import Decimal
 from datetime import date
-
 from app.core.dependencies import get_current_active_user, require_roles
 from app.models.user import User, UserRole
-
 from app.db.session import get_db_session
 from app.models.contractor import Contractor, ContractorProject
 from app.models.project import Project
 from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
 from app.schemas.contractor import ContractorCreate, ContractorUpdate, ContractorOut
+from app.models.invoice import Invoice
 
 
 router = APIRouter(prefix="/api/v1/contractors", tags=["Contractors"])
@@ -143,22 +142,24 @@ async def assign_project(
 
 @router.get("/{contractor_id}/payments")
 async def contractor_payments(
-    contractor_id: int, db: AsyncSession = Depends(get_db_session)
+    contractor_id: int,
+    db: AsyncSession = Depends(get_db_session),
 ):
     contractor = await db.get(Contractor, contractor_id)
 
     if not contractor:
         raise HTTPException(status_code=404, detail="Contractor not found")
 
+    total = float(contractor.total_work_assigned or 0)
+    paid = float(contractor.payment_given or 0)
+    pending = total - paid
+
     return {
         "contractor_id": contractor.id,
-        "name": contractor.name,
-        "total_work": contractor.total_work_assigned,
-        "paid": contractor.payment_given,
-        "pending": (contractor.total_work_assigned or 0)
-        - (contractor.payment_given or 0),
+        "total_work": total,
+        "payment_given": paid,
+        "payment_pending": pending,
     }
-
 
 @router.get("/pending-report")
 async def pending_report(db: AsyncSession = Depends(get_db_session)):
@@ -230,3 +231,59 @@ async def pay_contractor(
         "message": "Payment recorded successfully",
         "paid_total": float(contractor.payment_given),
     }
+
+
+@router.get("/{contractor_id}/projects")
+async def contractor_projects(
+    contractor_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    contractor = await db.get(Contractor, contractor_id)
+    if not contractor:
+        raise HTTPException(status_code=404, detail="Contractor not found")
+
+    result = await db.execute(
+        select(Project)
+        .join(ContractorProject, ContractorProject.project_id == Project.id)
+        .where(ContractorProject.contractor_id == contractor_id)
+    )
+
+    projects = result.scalars().all()
+
+    return [
+        {
+            "project_id": p.id,
+            "project_name": p.project_name,
+            "status": p.status,
+        }
+        for p in projects
+    ]
+
+
+@router.get("/{contractor_id}/invoices")
+async def contractor_invoices(
+    contractor_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    contractor = await db.get(Contractor, contractor_id)
+    if not contractor:
+        raise HTTPException(status_code=404, detail="Contractor not found")
+
+    result = await db.execute(
+        select(Invoice).where(
+            Invoice.type == "contractor",
+            Invoice.reference_id == contractor_id,
+        )
+    )
+
+    invoices = result.scalars().all()
+
+    return [
+        {
+            "invoice_id": inv.id,
+            "amount": float(inv.total_amount),
+            "status": inv.status,
+            "created_at": inv.created_at,
+        }
+        for inv in invoices
+    ]

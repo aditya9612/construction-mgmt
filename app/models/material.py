@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import DECIMAL, ForeignKey, Integer, String, Text, Index
+from sqlalchemy import DECIMAL, Column, Date, ForeignKey, Integer, String, Text, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -94,3 +94,16 @@ class Material(Base, TimestampMixin):
         Index("idx_material_project", "project_id"),
         Index("idx_material_category", "category"),
     )
+
+
+class MaterialUsage(Base, TimestampMixin):
+    __tablename__ = "material_usage"
+
+    id = Column(Integer, primary_key=True)
+
+    material_id = Column(Integer, ForeignKey("materials.id"))
+    project_id = Column(Integer, ForeignKey("projects.id"))
+
+    quantity_used = Column(DECIMAL(18,3), nullable=False)
+
+    usage_date = Column(Date, nullable=False, index=True)

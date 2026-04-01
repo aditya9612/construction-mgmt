@@ -13,7 +13,7 @@ class ExpenseBase(BaseModel):
 
 
 class ExpenseCreate(ExpenseBase):
-    pass
+    boq_item_id: Optional[int] = None
 
 
 class ExpenseUpdate(BaseModel):

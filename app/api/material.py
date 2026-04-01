@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 from typing import Optional
 
@@ -17,7 +18,7 @@ from app.core.dependencies import (
     require_roles,
 )
 from app.db.session import get_db_session
-from app.models.material import Material
+from app.models.material import Material, MaterialUsage
 from app.models.project import Project
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
@@ -239,6 +240,14 @@ async def add_usage(
 
     obj.quantity_used += quantity
     obj.remaining_stock = obj.quantity_purchased - obj.quantity_used
+
+    usage = MaterialUsage(
+        material_id=obj.id,
+        project_id=obj.project_id,
+        quantity_used=quantity,
+        usage_date=date.today(),
+    )
+    db.add(usage)
 
     await db.flush()
 
