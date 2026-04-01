@@ -1,4 +1,4 @@
-from sqlalchemy import Integer, String, ForeignKey, Date, DECIMAL
+from sqlalchemy import Column, Integer, String, ForeignKey, Date, DECIMAL
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -14,6 +14,13 @@ class Expense(Base, TimestampMixin):
         ForeignKey("projects.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
+    )
+
+    boq_item_id = Column(
+    Integer,
+    ForeignKey("boq_items.id", ondelete="SET NULL"),
+    nullable=True,
+    index=True,
     )
 
     category: Mapped[str] = mapped_column(String(50), nullable=False, index=True)

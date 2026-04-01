@@ -4,6 +4,7 @@ from typing import Optional
 from app.schemas.base import BaseSchema
 
 
+
 class BOQCreate(BaseSchema):
     project_id: int
     item_name: str
@@ -12,11 +13,8 @@ class BOQCreate(BaseSchema):
     quantity: Decimal = Decimal("0")
     unit: str = "unit"
     unit_cost: Decimal = Decimal("0")
-
-    actual_quantity: Decimal = Decimal("0")
-    actual_cost: Decimal = Decimal("0")
-
     status: Optional[str] = "Active"
+
 
 
 class BOQUpdate(BaseSchema):
@@ -26,12 +24,9 @@ class BOQUpdate(BaseSchema):
     quantity: Optional[Decimal] = None
     unit: Optional[str] = None
     unit_cost: Optional[Decimal] = None
-
-    actual_quantity: Optional[Decimal] = None
-    actual_cost: Optional[Decimal] = None
-
     is_completed: Optional[bool] = None
     status: Optional[str] = None
+
 
 
 class BOQOut(BaseSchema):
@@ -50,6 +45,7 @@ class BOQOut(BaseSchema):
     unit: str
     unit_cost: Decimal
     total_cost: Decimal
+
 
     actual_quantity: Decimal
     actual_cost: Decimal

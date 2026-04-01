@@ -25,9 +25,7 @@ router = APIRouter(
 VERSION_KEY = "cache_version:boq"
 
 
-# -------------------------
-# CREATE (WITH VERSIONING)
-# -------------------------
+
 @router.post("", response_model=BOQOut)
 async def create_boq(
     payload: BOQCreate,
@@ -45,7 +43,6 @@ async def create_boq(
     )
     new_version = (max_version or 0) + 1
 
-    # mark old versions as not latest
     await db.execute(
         update(BOQ)
         .where(BOQ.project_id == payload.project_id)
@@ -58,12 +55,12 @@ async def create_boq(
     unit_cost = Decimal(str(data.get("unit_cost", 0)))
     total_cost = quantity * unit_cost
 
-    actual_cost = Decimal(str(data.get("actual_cost", 0)))
-    variance = total_cost - actual_cost
 
     data.update({
         "total_cost": total_cost,
-        "variance_cost": variance,
+        "actual_quantity": Decimal(0),
+        "actual_cost": Decimal(0),
+        "variance_cost": total_cost,  # initially full variance
         "version_no": new_version,
         "boq_group_id": new_version,
         "is_latest": True,
@@ -78,9 +75,7 @@ async def create_boq(
     return BOQOut.model_validate(obj)
 
 
-# -------------------------
-# LIST (FULL - CACHE + FILTER + VERSION)
-# -------------------------
+
 @router.get("", response_model=PaginatedResponse[BOQOut])
 async def list_boq(
     limit: int = Query(20, ge=1, le=100),
@@ -145,9 +140,7 @@ async def list_boq(
     return PaginatedResponse[BOQOut].model_validate(result)
 
 
-# -------------------------
-# GET SINGLE
-# -------------------------
+
 @router.get("/{boq_id}", response_model=BOQOut)
 async def get_boq(
     boq_id: int,
@@ -162,9 +155,6 @@ async def get_boq(
     return BOQOut.model_validate(obj)
 
 
-# -------------------------
-# PROJECT-WISE BOQ (LATEST)
-# -------------------------
 @router.get("/project/{project_id}", response_model=list[BOQOut])
 async def get_boq_by_project(
     project_id: int,
@@ -177,9 +167,7 @@ async def get_boq_by_project(
     return [BOQOut.model_validate(r) for r in rows]
 
 
-# -------------------------
-# VERSION HISTORY
-# -------------------------
+
 @router.get("/versions/{project_id}")
 async def get_versions(
     project_id: int,
@@ -195,9 +183,7 @@ async def get_versions(
     return {"versions": [v[0] for v in result.fetchall()]}
 
 
-# -------------------------
-# ACTUALS UPDATE
-# -------------------------
+
 @router.post("/{boq_id}/actuals", response_model=BOQOut)
 async def update_actuals(
     boq_id: int,
@@ -219,9 +205,7 @@ async def update_actuals(
     return BOQOut.model_validate(obj)
 
 
-# -------------------------
-# SUMMARY
-# -------------------------
+
 @router.get("/summary/{project_id}")
 async def boq_summary(
     project_id: int,
@@ -247,9 +231,7 @@ async def boq_summary(
     }
 
 
-# -------------------------
-# COMPARISON
-# -------------------------
+
 @router.get("/comparison/{project_id}")
 async def boq_comparison(
     project_id: int,
@@ -270,9 +252,7 @@ async def boq_comparison(
     ]
 
 
-# -------------------------
-# ANALYSIS
-# -------------------------
+
 @router.get("/analysis/{project_id}")
 async def boq_analysis(
     project_id: int,
@@ -293,9 +273,7 @@ async def boq_analysis(
     }
 
 
-# -------------------------
-# UPDATE
-# -------------------------
+
 @router.put("/{boq_id}", response_model=BOQOut)
 async def update_boq(
     boq_id: int,
@@ -318,17 +296,15 @@ async def update_boq(
     unit_cost = Decimal(str(obj.unit_cost))
     obj.total_cost = quantity * unit_cost
 
-    obj.variance_cost = obj.total_cost - Decimal(str(obj.actual_cost or 0))
-
+    obj.variance_cost = obj.total_cost - (obj.actual_cost or Decimal(0))
+    
     await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
 
     return BOQOut.model_validate(obj)
 
 
-# -------------------------
-# DELETE
-# -------------------------
+
 @router.delete("/{boq_id}", status_code=204)
 async def delete_boq(
     boq_id: int,
