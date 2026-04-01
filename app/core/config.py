@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_SECONDS: int = 60
 
     model_config = SettingsConfigDict(
-        env_file="c:/Users/gdhay/OneDrive/Desktop/construction-mgmt/.env",
+        env_file=".env",
         extra="ignore",
     )
 

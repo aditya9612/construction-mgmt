@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, ForeignKey, DECIMAL, DateTime
 from sqlalchemy.sql import func
 from app.models.base import Base
-
+from sqlalchemy import JSON
 
 class Invoice(Base):
     __tablename__ = "invoices"
@@ -10,6 +10,8 @@ class Invoice(Base):
 
     project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     owner_id = Column(Integer, ForeignKey("owners.id", ondelete="CASCADE"), index=True)
+
+    linked_expense_ids = Column(JSON, nullable=True)
 
     type = Column(String(50), nullable=False)
     reference_id = Column(Integer, nullable=True)

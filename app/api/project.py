@@ -6,6 +6,14 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.expense import Expense
+from app.models.invoice import Invoice
+from app.db.session import get_db_session
+from app.utils.helpers import NotFoundError
 
 from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
 from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
@@ -1379,6 +1387,45 @@ async def list_comments(
         offset=offset,
     )
 
+
+
+@router.get("/{project_id}/profit-loss")
+async def project_profit_loss(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    project = await db.get(Project, project_id)
+    if not project:
+        raise NotFoundError("Project not found")
+
+
+    total_expense = await db.scalar(
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id
+        )
+    )
+
+
+    total_invoice = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(
+            Invoice.project_id == project_id
+        )
+    )
+
+    total_expense = float(total_expense or 0)
+    total_invoice = float(total_invoice or 0)
+
+
+    profit = total_invoice - total_expense
+
+    return {
+        "project_id": project_id,
+        "total_invoice": total_invoice,
+        "total_expense": total_expense,
+        "profit": profit,
+        "status": "profit" if profit >= 0 else "loss"
+    }
 
 router.include_router(milestones_router)
 router.include_router(tasks_router)

@@ -1,9 +1,10 @@
 from decimal import Decimal
 from typing import Optional
+from datetime import date
 
 from sqlalchemy import DECIMAL, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
-from datetime import date
+
 from app.models.base import Base, TimestampMixin
 
 
@@ -19,16 +20,20 @@ class Labour(Base, TimestampMixin):
         index=True,
     )
 
-    labour_title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    quantity: Mapped[Decimal] = mapped_column(DECIMAL(18, 3), nullable=False, default=0)
-    unit_cost: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), nullable=False, default=0)
-    total_cost: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), nullable=False, default=0)
+    labour_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    skill_type: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="Active", index=True)
+    daily_wage_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), nullable=False)
+
+    contractor_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("contractors.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="Active")
     notes: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
-
-# ✅ ADD THIS BELOW (NEW TABLE)
 
 class LabourAttendance(Base, TimestampMixin):
     __tablename__ = "labour_attendance"
@@ -49,8 +54,12 @@ class LabourAttendance(Base, TimestampMixin):
         index=True,
     )
 
-    attendance_date: Mapped[date] = mapped_column(nullable=False, index=True)    
+    attendance_date: Mapped[date] = mapped_column(nullable=False, index=True)
+
     working_hours: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), nullable=False, default=0)
+
     overtime_hours: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), nullable=False, default=0)
+
+    overtime_rate: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False, default=0)
 
     task_description: Mapped[str] = mapped_column(String(255), nullable=False)

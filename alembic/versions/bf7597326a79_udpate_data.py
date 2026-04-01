@@ -1,8 +1,8 @@
-"""contractor changes
+"""udpate data
 
-Revision ID: 876e4a211ac5
+Revision ID: bf7597326a79
 Revises: 
-Create Date: 2026-03-31 16:11:15.793499
+Create Date: 2026-04-01 10:50:47.451915
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '876e4a211ac5'
+revision = 'bf7597326a79'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -204,6 +204,7 @@ def upgrade():
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=True),
     sa.Column('owner_id', sa.Integer(), nullable=True),
+    sa.Column('linked_expense_ids', sa.JSON(), nullable=True),
     sa.Column('type', sa.String(length=50), nullable=False),
     sa.Column('reference_id', sa.Integer(), nullable=True),
     sa.Column('amount', sa.DECIMAL(precision=18, scale=2), nullable=False),
@@ -225,20 +226,20 @@ def upgrade():
     op.create_table('labour',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
-    sa.Column('labour_title', sa.String(length=255), nullable=False),
-    sa.Column('quantity', sa.DECIMAL(precision=18, scale=3), nullable=False),
-    sa.Column('unit_cost', sa.DECIMAL(precision=18, scale=2), nullable=False),
-    sa.Column('total_cost', sa.DECIMAL(precision=18, scale=2), nullable=False),
+    sa.Column('labour_name', sa.String(length=255), nullable=False),
+    sa.Column('skill_type', sa.String(length=100), nullable=False),
+    sa.Column('daily_wage_rate', sa.DECIMAL(precision=18, scale=2), nullable=False),
+    sa.Column('contractor_id', sa.Integer(), nullable=True),
     sa.Column('status', sa.String(length=50), nullable=False),
     sa.Column('notes', sa.String(length=500), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['contractor_id'], ['contractors.id'], ondelete='SET NULL'),
     sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index(op.f('ix_labour_labour_title'), 'labour', ['labour_title'], unique=False)
+    op.create_index(op.f('ix_labour_labour_name'), 'labour', ['labour_name'], unique=False)
     op.create_index(op.f('ix_labour_project_id'), 'labour', ['project_id'], unique=False)
-    op.create_index(op.f('ix_labour_status'), 'labour', ['status'], unique=False)
     op.create_table('materials',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -335,6 +336,7 @@ def upgrade():
     sa.Column('attendance_date', sa.Date(), nullable=False),
     sa.Column('working_hours', sa.DECIMAL(precision=5, scale=2), nullable=False),
     sa.Column('overtime_hours', sa.DECIMAL(precision=5, scale=2), nullable=False),
+    sa.Column('overtime_rate', sa.DECIMAL(precision=10, scale=2), nullable=False),
     sa.Column('task_description', sa.String(length=255), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
@@ -392,9 +394,8 @@ def downgrade():
     op.drop_index('idx_material_project', table_name='materials')
     op.drop_index('idx_material_category', table_name='materials')
     op.drop_table('materials')
-    op.drop_index(op.f('ix_labour_status'), table_name='labour')
     op.drop_index(op.f('ix_labour_project_id'), table_name='labour')
-    op.drop_index(op.f('ix_labour_labour_title'), table_name='labour')
+    op.drop_index(op.f('ix_labour_labour_name'), table_name='labour')
     op.drop_table('labour')
     op.drop_index(op.f('ix_invoices_project_id'), table_name='invoices')
     op.drop_index(op.f('ix_invoices_owner_id'), table_name='invoices')

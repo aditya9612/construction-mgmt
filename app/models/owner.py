@@ -21,13 +21,10 @@ class Owner(Base):
 
     projects = relationship("Project", back_populates="owner", cascade="all, delete")
 
-    # ✅ NEW RELATION
-    transactions = relationship("OwnerTransaction", back_populates="owner", cascade="all, delete")
+    transactions = relationship(
+        "OwnerTransaction", back_populates="owner", cascade="all, delete"
+    )
 
-
-# =========================
-# NEW TABLE (ADD BELOW)
-# =========================
 
 class OwnerTransaction(Base):
     __tablename__ = "owner_transactions"
@@ -35,7 +32,9 @@ class OwnerTransaction(Base):
     id = Column(Integer, primary_key=True, index=True)
 
     owner_id = Column(Integer, ForeignKey("owners.id", ondelete="CASCADE"), index=True)
-    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    project_id = Column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
 
     type = Column(String(10))  # credit / debit
     amount = Column(DECIMAL(18, 2))

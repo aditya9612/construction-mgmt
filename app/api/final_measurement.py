@@ -11,14 +11,12 @@ from app.schemas.final_measurement import (
     FinalMeasurementOut,
 )
 from app.utils.helpers import NotFoundError
+from app.models.invoice import Invoice
 
 
 router = APIRouter(prefix="/measurements", tags=["measurements"])
 
 
-# -------------------------
-# CREATE
-# -------------------------
 @router.post("", response_model=FinalMeasurementOut)
 async def create_measurement(
     payload: FinalMeasurementCreate,
@@ -27,6 +25,14 @@ async def create_measurement(
     project = await db.get(Project, payload.project_id)
     if not project:
         raise NotFoundError("Project not found")
+
+    existing = await db.scalar(
+        select(FinalMeasurement).where(
+            FinalMeasurement.project_id == payload.project_id
+        )
+    )
+    if existing:
+        raise ValueError("Final measurement already exists for this project")
 
     total_area = payload.final_area + payload.extra_area
     total_amount = (
@@ -47,9 +53,6 @@ async def create_measurement(
     return FinalMeasurementOut.model_validate(obj)
 
 
-# -------------------------
-# GET BY ID
-# -------------------------
 @router.get("/{id}", response_model=FinalMeasurementOut)
 async def get_measurement(id: int, db: AsyncSession = Depends(get_db_session)):
     obj = await db.get(FinalMeasurement, id)
@@ -60,9 +63,6 @@ async def get_measurement(id: int, db: AsyncSession = Depends(get_db_session)):
     return FinalMeasurementOut.model_validate(obj)
 
 
-# -------------------------
-# GET BY PROJECT
-# -------------------------
 @router.get("/project/{project_id}")
 async def get_by_project(project_id: int, db: AsyncSession = Depends(get_db_session)):
     result = await db.execute(
@@ -73,9 +73,6 @@ async def get_by_project(project_id: int, db: AsyncSession = Depends(get_db_sess
     return [FinalMeasurementOut.model_validate(r) for r in rows]
 
 
-# -------------------------
-# UPDATE
-# -------------------------
 @router.put("/{id}", response_model=FinalMeasurementOut)
 async def update_measurement(
     id: int,
@@ -87,12 +84,17 @@ async def update_measurement(
     if not obj:
         raise NotFoundError("Measurement not found")
 
+    invoice_exists = await db.scalar(
+        select(Invoice).where(Invoice.project_id == obj.project_id)
+    )
+    if invoice_exists:
+        raise ValueError("Measurement is locked. Invoice already generated.")
+
     data = payload.model_dump(exclude_unset=True)
 
     for k, v in data.items():
         setattr(obj, k, v)
 
-    # recalculate
     final_area = obj.final_area or 0
     extra_area = obj.extra_area or 0
     approved_rate = obj.approved_rate or 0
@@ -105,3 +107,26 @@ async def update_measurement(
     await db.refresh(obj)
 
     return FinalMeasurementOut.model_validate(obj)
+
+
+@router.delete("/{id}", status_code=204)
+async def delete_measurement(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(FinalMeasurement, id)
+
+    if not obj:
+        raise NotFoundError("Measurement not found")
+
+    invoice_exists = await db.scalar(
+        select(Invoice).where(Invoice.project_id == obj.project_id)
+    )
+
+    if invoice_exists:
+        raise ValueError("Cannot delete measurement. Invoice already exists.")
+
+    await db.delete(obj)
+    await db.commit()
+
+    return None
