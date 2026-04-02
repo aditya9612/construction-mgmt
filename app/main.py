@@ -21,6 +21,9 @@ from app.api.expense import router as expense_router
 from app.api.invoice import router as invoice_router
 from app.api.final_measurement import router as final_measurement_router
 from app.api.dashboard import router as dashboard_router
+from app.api.dsr import router as dsr_router
+from app.api.ra_bill import router as ra_bill_router
+from app.api.issue import router as issue_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.middlewares.rate_limiter import init_rate_limiter
@@ -112,6 +115,9 @@ def create_app() -> FastAPI:
     api_router.include_router(invoice_router)
     api_router.include_router(final_measurement_router)
     api_router.include_router(dashboard_router)
+    api_router.include_router(dsr_router)
+    api_router.include_router(ra_bill_router)
+    api_router.include_router(issue_router)
 
     application.include_router(api_router, prefix="/api/v1")
     return application
