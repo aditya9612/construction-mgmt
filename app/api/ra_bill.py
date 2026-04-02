@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import date
 
 from app.db.session import get_db_session
 from app.models.ra_bill import RABill
@@ -14,9 +15,7 @@ from app.utils.helpers import NotFoundError
 router = APIRouter(prefix="/ra-bills", tags=["RA Bills"])
 
 
-# -------------------------
-# CREATE
-# -------------------------
+
 @router.post("", response_model=RABillOut)
 async def create_ra_bill(
     payload: RABillCreate,
@@ -31,8 +30,37 @@ async def create_ra_bill(
     if not contractor:
         raise NotFoundError("Contractor not found")
 
+    if payload.quantity <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+
+    if payload.rate <= 0:
+        raise HTTPException(status_code=400, detail="Rate must be greater than 0")
+
+    if payload.deductions < 0:
+        raise HTTPException(status_code=400, detail="Deductions cannot be negative")
+
     gross = payload.quantity * payload.rate
+
+    if payload.deductions > gross:
+        raise HTTPException(status_code=400, detail="Deductions cannot exceed gross amount")
+
+    if payload.gst_percent < 0 or payload.gst_percent > 28:
+        raise HTTPException(status_code=400, detail="Invalid GST percent")
+
+    if payload.bill_date > date.today():
+        raise HTTPException(status_code=400, detail="Future bill date not allowed")
+
+    existing = await db.scalar(
+        select(RABill).where(RABill.bill_number == payload.bill_number)
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Bill number already exists")
+
     net = gross - payload.deductions
+
+    if net < 0:
+        raise HTTPException(status_code=400, detail="Net amount cannot be negative")
+
     gst_amount = (net * payload.gst_percent) / 100
     total = net + gst_amount
 
@@ -46,7 +74,7 @@ async def create_ra_bill(
     db.add(obj)
     await db.flush()
 
-    # ✅ OWNER LEDGER (DEBIT)
+    # OWNER LEDGER (DEBIT)
     owner_txn = OwnerTransaction(
         owner_id=project.owner_id,
         project_id=project.id,
@@ -65,9 +93,7 @@ async def create_ra_bill(
     return RABillOut.model_validate(obj)
 
 
-# -------------------------
-# LIST
-# -------------------------
+
 @router.get("", response_model=list[RABillOut])
 async def list_ra_bills(db: AsyncSession = Depends(get_db_session)):
     result = await db.execute(select(RABill))
@@ -75,9 +101,7 @@ async def list_ra_bills(db: AsyncSession = Depends(get_db_session)):
     return [RABillOut.model_validate(r) for r in rows]
 
 
-# -------------------------
-# GET
-# -------------------------
+
 @router.get("/{id}", response_model=RABillOut)
 async def get_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
     obj = await db.get(RABill, id)
@@ -88,9 +112,7 @@ async def get_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
     return RABillOut.model_validate(obj)
 
 
-# -------------------------
-# UPDATE
-# -------------------------
+
 @router.put("/{id}", response_model=RABillOut)
 async def update_ra_bill(
     id: int,
@@ -102,12 +124,38 @@ async def update_ra_bill(
     if not obj:
         raise NotFoundError("RA Bill not found")
 
+
+    if payload.quantity is not None and payload.quantity <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+
+    if payload.rate is not None and payload.rate <= 0:
+        raise HTTPException(status_code=400, detail="Rate must be greater than 0")
+
+    if payload.deductions is not None and payload.deductions < 0:
+        raise HTTPException(status_code=400, detail="Deductions cannot be negative")
+
+    if payload.gst_percent is not None and (
+        payload.gst_percent < 0 or payload.gst_percent > 28
+    ):
+        raise HTTPException(status_code=400, detail="Invalid GST percent")
+
+    if payload.bill_date is not None and payload.bill_date > date.today():
+        raise HTTPException(status_code=400, detail="Future bill date not allowed")
+
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
-    # recalc
+
     gross = obj.quantity * obj.rate
+
+    if obj.deductions and obj.deductions > gross:
+        raise HTTPException(status_code=400, detail="Deductions cannot exceed gross amount")
+
     net = gross - (obj.deductions or 0)
+
+    if net < 0:
+        raise HTTPException(status_code=400, detail="Net amount cannot be negative")
+
     gst_amount = (net * (obj.gst_percent or 0)) / 100
     total = net + gst_amount
 
@@ -121,9 +169,7 @@ async def update_ra_bill(
     return RABillOut.model_validate(obj)
 
 
-# -------------------------
-# DELETE
-# -------------------------
+
 @router.delete("/{id}", status_code=204)
 async def delete_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
     obj = await db.get(RABill, id)
@@ -137,9 +183,7 @@ async def delete_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
     return None
 
 
-# -------------------------
-# BY CONTRACTOR
-# -------------------------
+
 @router.get("/contractor/{contractor_id}")
 async def bills_by_contractor(
     contractor_id: int,

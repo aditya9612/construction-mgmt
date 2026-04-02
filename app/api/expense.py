@@ -77,6 +77,16 @@ async def create_expense(
 
     return ExpenseOut.model_validate(obj)
 
+@router.get("/date-range")
+async def get_by_date_range(
+    start: date, end: date, db: AsyncSession = Depends(get_db_session)
+):
+    result = await db.execute(
+        select(Expense).where(Expense.expense_date.between(start, end))
+    )
+    rows = result.scalars().all()
+    return [ExpenseOut.model_validate(r) for r in rows]
+
 @router.get("", response_model=list[ExpenseOut])
 async def list_expenses(db: AsyncSession = Depends(get_db_session)):
     result = await db.execute(select(Expense))
@@ -149,17 +159,6 @@ async def get_by_project(project_id: int, db: AsyncSession = Depends(get_db_sess
 @router.get("/category/{category}")
 async def get_by_category(category: str, db: AsyncSession = Depends(get_db_session)):
     result = await db.execute(select(Expense).where(Expense.category == category))
-    rows = result.scalars().all()
-    return [ExpenseOut.model_validate(r) for r in rows]
-
-
-@router.get("/date-range")
-async def get_by_date_range(
-    start: date, end: date, db: AsyncSession = Depends(get_db_session)
-):
-    result = await db.execute(
-        select(Expense).where(Expense.expense_date.between(start, end))
-    )
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 

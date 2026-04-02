@@ -44,9 +44,7 @@ async def create_dsr(
     return DSROut.model_validate(obj)
 
 
-# -------------------------
-# GET BY PROJECT
-# -------------------------
+
 @router.get("/project/{project_id}")
 async def get_project_dsr(
     project_id: int,
@@ -62,9 +60,7 @@ async def get_project_dsr(
     return [DSROut.model_validate(r) for r in rows]
 
 
-# -------------------------
-# GET SINGLE
-# -------------------------
+
 @router.get("/{id}", response_model=DSROut)
 async def get_dsr(id: int, db: AsyncSession = Depends(get_db_session)):
     obj = await db.get(DailySiteReport, id)
@@ -75,9 +71,7 @@ async def get_dsr(id: int, db: AsyncSession = Depends(get_db_session)):
     return DSROut.model_validate(obj)
 
 
-# -------------------------
-# UPDATE
-# -------------------------
+
 @router.put("/{id}", response_model=DSROut)
 async def update_dsr(
     id: int,

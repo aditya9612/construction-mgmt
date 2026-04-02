@@ -203,6 +203,7 @@ async def delete_labour(
     return None
 
 
+
 @router.post("/{labour_id}/attendance", response_model=LabourAttendanceOut)
 async def create_attendance(
     labour_id: int,
@@ -215,7 +216,6 @@ async def create_attendance(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-
     labour = await db.get(Labour, labour_id)
     if not labour:
         raise NotFoundError("Labour not found")
@@ -234,14 +234,17 @@ async def create_attendance(
         raise ValueError("Future attendance not allowed")
 
     obj = LabourAttendance(labour_id=labour_id, **payload.model_dump())
-
     db.add(obj)
     await db.flush()
     await db.refresh(obj)
 
-    total_wage = float(labour.daily_wage_rate) * float(obj.working_hours) + float(
-        obj.overtime_rate
-    ) * float(obj.overtime_hours)
+
+    hourly_rate = float(labour.daily_wage_rate) / 8
+
+    total_wage = (
+        hourly_rate * float(obj.working_hours)
+        + float(obj.overtime_rate) * float(obj.overtime_hours)
+    )
 
     project = await db.get(Project, labour.project_id)
     if not project:
@@ -256,12 +259,10 @@ async def create_attendance(
     )
 
     if existing_expense:
-
         existing_expense.amount = Decimal(existing_expense.amount) + Decimal(total_wage)
         await db.flush()
         expense = existing_expense
     else:
-
         expense = Expense(
             project_id=labour.project_id,
             category="Labour",
@@ -284,7 +285,6 @@ async def create_attendance(
     )
 
     db.add(owner_transaction)
-
     await db.commit()
 
     await bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
@@ -292,6 +292,7 @@ async def create_attendance(
     return LabourAttendanceOut(
         id=obj.id, labour_id=labour_id, total_wage=total_wage, **payload.model_dump()
     )
+
 
 
 @router.get("/{labour_id}/attendance", response_model=list[LabourAttendanceOut])
@@ -309,22 +310,22 @@ async def get_attendance(
         return cached
 
     labour = await db.get(Labour, labour_id)
-
     if not labour:
         raise NotFoundError("Labour not found")
 
     result = await db.execute(
         select(LabourAttendance).where(LabourAttendance.labour_id == labour_id)
     )
-
     rows = result.scalars().all()
 
     data = []
+    hourly_rate = float(labour.daily_wage_rate) / 8
 
     for r in rows:
-        total_wage = float(labour.daily_wage_rate) * float(r.working_hours) + float(
-            r.overtime_rate
-        ) * float(r.overtime_hours)
+        total_wage = (
+            hourly_rate * float(r.working_hours)
+            + float(r.overtime_rate) * float(r.overtime_hours)
+        )
 
         data.append(
             LabourAttendanceOut(
@@ -341,7 +342,6 @@ async def get_attendance(
         )
 
     await cache_set_json(redis, cache_key, data)
-
     return data
 
 
@@ -352,7 +352,6 @@ async def weekly_report(
     db: AsyncSession = Depends(get_db_session),
 ):
     labour = await db.get(Labour, labour_id)
-
     if not labour:
         raise NotFoundError("Labour not found")
 
@@ -361,12 +360,16 @@ async def weekly_report(
             extract("week", LabourAttendance.attendance_date).label("week"),
             func.sum(LabourAttendance.working_hours).label("hours"),
             func.sum(LabourAttendance.overtime_hours).label("ot"),
+            func.sum(
+                LabourAttendance.overtime_hours * LabourAttendance.overtime_rate
+            ).label("ot_wage"),
         )
         .where(LabourAttendance.labour_id == labour_id)
         .group_by("week")
     )
 
     rows = result.all()
+    hourly_rate = float(labour.daily_wage_rate) / 8
 
     return [
         {
@@ -374,8 +377,8 @@ async def weekly_report(
             "total_hours": float(r.hours or 0),
             "overtime_hours": float(r.ot or 0),
             "total_wage": (
-                float(labour.daily_wage_rate) * float(r.hours or 0)
-                + float(labour.daily_wage_rate) * 1.5 * float(r.ot or 0)
+                hourly_rate * float(r.hours or 0)
+                + float(r.ot_wage or 0)
             ),
         }
         for r in rows
@@ -389,7 +392,6 @@ async def monthly_report(
     db: AsyncSession = Depends(get_db_session),
 ):
     labour = await db.get(Labour, labour_id)
-
     if not labour:
         raise NotFoundError("Labour not found")
 
@@ -398,12 +400,16 @@ async def monthly_report(
             extract("month", LabourAttendance.attendance_date).label("month"),
             func.sum(LabourAttendance.working_hours).label("hours"),
             func.sum(LabourAttendance.overtime_hours).label("ot"),
+            func.sum(
+                LabourAttendance.overtime_hours * LabourAttendance.overtime_rate
+            ).label("ot_wage"),
         )
         .where(LabourAttendance.labour_id == labour_id)
         .group_by("month")
     )
 
     rows = result.all()
+    hourly_rate = float(labour.daily_wage_rate) / 8
 
     return [
         {
@@ -411,8 +417,8 @@ async def monthly_report(
             "total_hours": float(r.hours or 0),
             "overtime_hours": float(r.ot or 0),
             "total_wage": (
-                float(labour.daily_wage_rate) * float(r.hours or 0)
-                + float(labour.daily_wage_rate) * 1.5 * float(r.ot or 0)
+                hourly_rate * float(r.hours or 0)
+                + float(r.ot_wage or 0)
             ),
         }
         for r in rows

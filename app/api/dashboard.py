@@ -20,6 +20,7 @@ from datetime import date
 from app.models.invoice import Invoice
 from sqlalchemy import case
 from sqlalchemy import or_, and_
+from app.models.material import MaterialUsage
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -33,12 +34,14 @@ async def client_dashboard(
     if not project:
         raise NotFoundError("Project not found")
 
+
     avg_progress = await db.scalar(
         select(func.avg(Task.completion_percentage)).where(
             Task.project_id == project_id
         )
     )
     progress = float(avg_progress or 0)
+
 
     boq_total = await db.scalar(
         select(func.sum(BOQ.total_cost)).where(
@@ -55,15 +58,16 @@ async def client_dashboard(
 
     budget_used_percent = (expense_total / budget_total) * 100 if budget_total else 0
 
-    total_milestones = await db.scalar(
-        select(func.count(Milestone.id)).where(Milestone.project_id == project_id)
-    )
 
-    completed_milestones = await db.scalar(
+    total_milestones = await db.scalar(
         select(func.count(Milestone.id)).where(
-            Milestone.project_id == project_id, Milestone.status == "Completed"
+            Milestone.project_id == project_id
         )
     )
+
+
+    completed_milestones = 0  # Not applicable (no status field)
+
 
     total_tasks = await db.scalar(
         select(func.count(Task.id)).where(Task.project_id == project_id)
@@ -71,28 +75,36 @@ async def client_dashboard(
 
     completed_tasks = await db.scalar(
         select(func.count(Task.id)).where(
-            Task.project_id == project_id, Task.completion_percentage == 100
+            Task.project_id == project_id,
+            Task.completion_percentage == 100
         )
     )
+
+    days_remaining = None
+    if project.end_date:
+        days_remaining = (project.end_date - date.today()).days
 
     return {
         "project_id": project_id,
         "status": compute_project_status(project),
         "progress_percent": round(progress, 2),
+
         "budget_total": budget_total,
         "total_expense": expense_total,
         "budget_used_percent": round(budget_used_percent, 2),
+        "remaining_budget": budget_total - expense_total,
+
         "milestones_total": total_milestones or 0,
-        "milestones_completed": completed_milestones or 0,
+        "milestones_completed": completed_milestones,  # always 0 (correct for now)
+
         "tasks_total": total_tasks or 0,
         "tasks_completed": completed_tasks or 0,
+
         "start_date": project.start_date,
         "end_date": project.end_date,
-        "remaining_budget": budget_total - expense_total,
+        "days_remaining": days_remaining,
     }
 
-
-from app.models.material import MaterialUsage
 
 
 @router.get("/engineer/{project_id}")

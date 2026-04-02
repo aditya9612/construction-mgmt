@@ -15,6 +15,14 @@ from app.schemas.owner import (
     OwnerTransactionOut,
 )
 from app.utils.helpers import NotFoundError
+from fastapi.responses import StreamingResponse
+from io import BytesIO , StringIO
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+import csv
+from fastapi.responses import StreamingResponse
 
 
 router = APIRouter(
@@ -167,10 +175,6 @@ async def get_owner_ledger(
     )
 
 
-from fastapi.responses import StreamingResponse
-from io import BytesIO
-
-
 @router.get("/{owner_id}/ledger/pdf")
 async def export_owner_ledger_pdf(
     owner_id: int,
@@ -192,41 +196,58 @@ async def export_owner_ledger_pdf(
 
     buffer = BytesIO()
 
-    content = f"""
-    OWNER LEDGER REPORT
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
 
-    Owner: {owner.owner_name}
+    elements = []
 
-    ----------------------------------
-    TOTAL CREDIT: {total_credit}
-    TOTAL DEBIT: {total_debit}
-    BALANCE: {total_credit - total_debit}
-    ----------------------------------
+    # Title
+    elements.append(Paragraph("OWNER LEDGER REPORT", styles["Title"]))
+    elements.append(Spacer(1, 10))
 
-    TRANSACTIONS:
+    # Owner info
+    elements.append(Paragraph(f"Owner: {owner.owner_name}", styles["Normal"]))
+    elements.append(Spacer(1, 10))
 
-    """
+    # Summary
+    elements.append(Paragraph(f"Total Credit: {total_credit}", styles["Normal"]))
+    elements.append(Paragraph(f"Total Debit: {total_debit}", styles["Normal"]))
+    elements.append(Paragraph(f"Balance: {total_credit - total_debit}", styles["Normal"]))
+    elements.append(Spacer(1, 15))
+
+    # Table data
+    data = [["Date", "Type", "Amount", "Reference", "Description"]]
 
     for t in transactions:
-        content += f"""
-        Date: {t.created_at}
-        Type: {t.type}
-        Amount: {t.amount}
-        Ref: {t.reference_type} ({t.reference_id})
-        Desc: {t.description}
-        -------------------------
-        """
+        data.append([
+            str(t.created_at),
+            t.type,
+            float(t.amount),
+            f"{t.reference_type} ({t.reference_id})",
+            t.description or ""
+        ])
 
-    buffer.write(content.encode())
+    table = Table(data)
+
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 1, colors.black),
+    ]))
+
+    elements.append(table)
+
+    doc.build(elements)
+
     buffer.seek(0)
 
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=owner_ledger_{owner_id}.pdf"},
+        headers={
+            "Content-Disposition": f"attachment; filename=owner_ledger_{owner_id}.pdf"
+        },
     )
-
-import csv
 
 
 @router.get("/{owner_id}/ledger/excel")
@@ -245,8 +266,8 @@ async def export_owner_ledger_excel(
     )
     transactions = result.scalars().all()
 
-    buffer = BytesIO()
-    writer = csv.writer(buffer)
+    string_buffer = StringIO()
+    writer = csv.writer(string_buffer)
 
     # HEADER
     writer.writerow([
@@ -266,13 +287,17 @@ async def export_owner_ledger_excel(
             float(t.amount),
             t.reference_type,
             t.reference_id,
-            t.description,
+            t.description or "",
         ])
 
-    buffer.seek(0)
+    byte_buffer = BytesIO()
+    byte_buffer.write(string_buffer.getvalue().encode("utf-8"))
+    byte_buffer.seek(0)
 
     return StreamingResponse(
-        buffer,
+        byte_buffer,
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=owner_ledger_{owner_id}.csv"},
+        headers={
+            "Content-Disposition": f"attachment; filename=owner_ledger_{owner_id}.csv"
+        },
     )

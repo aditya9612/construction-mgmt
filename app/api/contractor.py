@@ -14,7 +14,7 @@ from app.schemas.contractor import ContractorCreate, ContractorUpdate, Contracto
 from app.models.invoice import Invoice
 
 
-router = APIRouter(prefix="/api/v1/contractors", tags=["Contractors"])
+router = APIRouter(prefix="/contractors", tags=["Contractors"])
 
 
 def build_response(contractor: Contractor) -> ContractorOut:
@@ -46,6 +46,21 @@ async def create_contractor(
 
     return build_response(contractor)
 
+
+@router.get("/pending-report")
+async def pending_report(db: AsyncSession = Depends(get_db_session)):
+    result = await db.execute(select(Contractor))
+    contractors = result.scalars().all()
+
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "pending": (c.total_work_assigned or 0) - (c.payment_given or 0),
+        }
+        for c in contractors
+        if (c.total_work_assigned or 0) - (c.payment_given or 0) > 0
+    ]
 
 @router.get("", response_model=list[ContractorOut])
 async def list_contractors(db: AsyncSession = Depends(get_db_session)):
@@ -161,20 +176,6 @@ async def contractor_payments(
         "payment_pending": pending,
     }
 
-@router.get("/pending-report")
-async def pending_report(db: AsyncSession = Depends(get_db_session)):
-    result = await db.execute(select(Contractor))
-    contractors = result.scalars().all()
-
-    return [
-        {
-            "id": c.id,
-            "name": c.name,
-            "pending": (c.total_work_assigned or 0) - (c.payment_given or 0),
-        }
-        for c in contractors
-        if (c.total_work_assigned or 0) - (c.payment_given or 0) > 0
-    ]
 
 
 @router.post("/{contractor_id}/pay")

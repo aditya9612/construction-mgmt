@@ -30,6 +30,77 @@ router = APIRouter(prefix="/materials", tags=["materials"])
 VERSION_KEY = "cache_version:materials"
 
 
+@router.get("/summary")
+async def material_summary(db: AsyncSession = Depends(get_db_session)):
+    total_materials = await db.scalar(select(func.count()).select_from(Material))
+    total_stock = await db.scalar(select(func.sum(Material.remaining_stock)))
+
+    low_stock_count = await db.scalar(
+        select(func.count()).where(Material.remaining_stock < 10)
+    )
+
+    return {
+        "total_materials": total_materials or 0,
+        "total_stock": float(total_stock or 0),
+        "low_stock_count": low_stock_count or 0,
+    }
+
+
+@router.get("/low-stock", response_model=list[MaterialOut])
+async def low_stock(
+    threshold: Decimal = Decimal("10"),
+    db: AsyncSession = Depends(get_db_session),
+):
+    rows = (
+        (await db.execute(select(Material).where(Material.remaining_stock < threshold)))
+        .scalars()
+        .all()
+    )
+
+    return [MaterialOut.model_validate(r) for r in rows]
+
+
+@router.get("/report")
+async def material_report(
+    project_id: Optional[int] = None,
+    category: Optional[str] = None,
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(Material)
+
+    if project_id:
+        query = query.where(Material.project_id == project_id)
+
+    if category:
+        query = query.where(Material.category == category)
+
+    rows = (await db.execute(query)).scalars().all()
+
+    return [
+        {
+            "material_name": r.material_name,
+            "category": r.category,
+            "total_cost": float(r.quantity_purchased * r.purchase_rate),
+            "remaining_stock": float(r.remaining_stock),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/project/{project_id}", response_model=list[MaterialOut])
+async def materials_by_project(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    rows = (
+        (await db.execute(select(Material).where(Material.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+
+    return [MaterialOut.model_validate(r) for r in rows]
+
+
 @router.post("", response_model=MaterialOut)
 async def create_material(
     payload: MaterialCreate,
@@ -252,74 +323,3 @@ async def add_usage(
     await db.flush()
 
     return MaterialOut.model_validate(obj)
-
-
-@router.get("/summary")
-async def material_summary(db: AsyncSession = Depends(get_db_session)):
-    total_materials = await db.scalar(select(func.count()).select_from(Material))
-    total_stock = await db.scalar(select(func.sum(Material.remaining_stock)))
-
-    low_stock_count = await db.scalar(
-        select(func.count()).where(Material.remaining_stock < 10)
-    )
-
-    return {
-        "total_materials": total_materials or 0,
-        "total_stock": float(total_stock or 0),
-        "low_stock_count": low_stock_count or 0,
-    }
-
-
-@router.get("/low-stock", response_model=list[MaterialOut])
-async def low_stock(
-    threshold: Decimal = Decimal("10"),
-    db: AsyncSession = Depends(get_db_session),
-):
-    rows = (
-        (await db.execute(select(Material).where(Material.remaining_stock < threshold)))
-        .scalars()
-        .all()
-    )
-
-    return [MaterialOut.model_validate(r) for r in rows]
-
-
-@router.get("/report")
-async def material_report(
-    project_id: Optional[int] = None,
-    category: Optional[str] = None,
-    db: AsyncSession = Depends(get_db_session),
-):
-    query = select(Material)
-
-    if project_id:
-        query = query.where(Material.project_id == project_id)
-
-    if category:
-        query = query.where(Material.category == category)
-
-    rows = (await db.execute(query)).scalars().all()
-
-    return [
-        {
-            "material_name": r.material_name,
-            "category": r.category,
-            "total_cost": float(r.quantity_purchased * r.purchase_rate),
-            "remaining_stock": float(r.remaining_stock),
-        }
-        for r in rows
-    ]
-
-
-@router.get("/project/{project_id}", response_model=list[MaterialOut])
-async def materials_by_project(
-    project_id: int,
-    db: AsyncSession = Depends(get_db_session),
-):
-    rows = (
-        (await db.execute(select(Material).where(Material.project_id == project_id)))
-        .scalars()
-        .all()
-    )
-
-    return [MaterialOut.model_validate(r) for r in rows]
