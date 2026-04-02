@@ -38,7 +38,6 @@ async def create_invoice(
     if type not in allowed_types:
         raise ValueError("Invalid invoice type")
 
-
     if type == "owner":
         existing_invoice = await db.scalar(
             select(Invoice).where(
@@ -110,6 +109,17 @@ async def create_invoice(
     await db.refresh(obj)
 
     return InvoiceOut.model_validate(obj)
+
+
+@router.get("/pending")
+async def pending_invoices(db: AsyncSession = Depends(get_db_session)):
+    rows = (
+        (await db.execute(select(Invoice).where(Invoice.status == "pending")))
+        .scalars()
+        .all()
+    )
+
+    return [InvoiceOut.model_validate(r) for r in rows]
 
 
 @router.get("", response_model=list[InvoiceOut])
@@ -210,17 +220,6 @@ async def mark_paid(id: int, db: AsyncSession = Depends(get_db_session)):
     return {"message": "Invoice marked as paid"}
 
 
-@router.get("/pending")
-async def pending_invoices(db: AsyncSession = Depends(get_db_session)):
-    rows = (
-        (await db.execute(select(Invoice).where(Invoice.status == "pending")))
-        .scalars()
-        .all()
-    )
-
-    return [InvoiceOut.model_validate(r) for r in rows]
-
-
 @router.get("/{id}/pdf")
 async def generate_invoice_pdf(id: int, db: AsyncSession = Depends(get_db_session)):
     obj = await db.get(Invoice, id)
@@ -267,7 +266,6 @@ async def create_labour_invoice(
 
     description = f"Labour invoice ({start_date} to {end_date})"
 
-
     existing_invoice = await db.scalar(
         select(Invoice).where(
             Invoice.project_id == project_id,
@@ -278,7 +276,6 @@ async def create_labour_invoice(
 
     if existing_invoice:
         raise ValueError("Labour invoice already exists for this date range")
-
 
     result = await db.execute(
         select(LabourAttendance).where(
@@ -291,9 +288,8 @@ async def create_labour_invoice(
     if not attendances:
         raise NotFoundError("No labour attendance found for given period")
 
-
     total_amount = Decimal(0)
-    attendance_ids = [] 
+    attendance_ids = []
 
     for att in attendances:
         labour = await db.get(Labour, att.labour_id)
@@ -305,13 +301,11 @@ async def create_labour_invoice(
 
         daily_rate = Decimal(labour.daily_wage_rate or 0)
 
-        wage = (
-            daily_rate * Decimal(att.working_hours)
-            + Decimal(att.overtime_rate or 0) * Decimal(att.overtime_hours)
-        )
+        wage = daily_rate * Decimal(att.working_hours) + Decimal(
+            att.overtime_rate or 0
+        ) * Decimal(att.overtime_hours)
 
         total_amount += wage
-
 
     obj = Invoice(
         project_id=project_id,
@@ -330,7 +324,6 @@ async def create_labour_invoice(
 
     db.add(obj)
     await db.flush()
-
 
     owner_txn = OwnerTransaction(
         owner_id=project.owner_id,
