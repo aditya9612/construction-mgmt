@@ -1,8 +1,6 @@
 from decimal import Decimal
 from typing import Optional
-
 from app.schemas.base import BaseSchema
-
 
 
 class BOQCreate(BaseSchema):
@@ -16,7 +14,6 @@ class BOQCreate(BaseSchema):
     status: Optional[str] = "Active"
 
 
-
 class BOQUpdate(BaseSchema):
     item_name: Optional[str] = None
     category: Optional[str] = None
@@ -27,6 +24,15 @@ class BOQUpdate(BaseSchema):
     is_completed: Optional[bool] = None
     status: Optional[str] = None
 
+
+class BOQActualsUpdate(BaseSchema):
+    actual_quantity: Decimal
+    actual_cost: Decimal
+
+
+from decimal import Decimal
+from typing import Optional
+from app.schemas.base import BaseSchema
 
 
 class BOQOut(BaseSchema):
@@ -41,18 +47,21 @@ class BOQOut(BaseSchema):
     category: str
     description: Optional[str]
 
-    quantity: Decimal
+    quantity: float
     unit: str
-    unit_cost: Decimal
-    total_cost: Decimal
+    unit_cost: float 
+    total_cost: float 
 
-
-    actual_quantity: Decimal
-    actual_cost: Decimal
-    variance_cost: Decimal
+    actual_quantity: float
+    actual_cost: float
+    variance_cost: float
 
     is_completed: bool
     status: str
 
     class Config:
         from_attributes = True
+
+        json_encoders = {
+            Decimal: float
+        }
