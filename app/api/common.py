@@ -1,8 +1,3 @@
-"""
-Consolidated API - All endpoints in one file (reference structure).
-Prefix: /api/v1/common | Tags: Common v1
-No separate services - logic inline (reference skeletons only).
-"""
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query

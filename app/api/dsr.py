@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date
-
 from app.db.session import get_db_session
 from app.models.dsr import DailySiteReport
 from app.models.project import Project

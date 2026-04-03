@@ -4,24 +4,38 @@ from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.expense import Expense
-from app.models.invoice import Invoice
-from app.db.session import get_db_session
-from app.utils.helpers import NotFoundError
-
-from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
-from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
-from app.models.project import Comment, Milestone, Project, ProjectMember, Task, TaskProgress
+
+from app.cache.redis import (
+    bump_cache_version,
+    cache_get_json,
+    cache_set_json,
+    get_cache_version,
+)
+
+from app.core.dependencies import (
+    get_current_active_user,
+    get_request_redis,
+    require_roles,
+)
+
+from app.models.project import (
+    Comment,
+    Milestone,
+    Project,
+    ProjectMember,
+    Task,
+    TaskProgress,
+)
 from app.models.user import User, UserRole
 from app.models.owner import Owner
+from app.models.expense import Expense
+from app.models.invoice import Invoice
+
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.project import (
     CommentCreate,
@@ -40,8 +54,13 @@ from app.schemas.project import (
     TaskProgressUpdate,
     TaskUpdate,
 )
-from app.utils.helpers import ConflictError, NotFoundError, PermissionDeniedError, ValidationError
-from datetime import date
+
+from app.utils.helpers import (
+    NotFoundError,
+    ConflictError,
+    PermissionDeniedError,
+    ValidationError,
+)
 
 def compute_project_status(project):
     today = date.today()
@@ -59,14 +78,11 @@ def compute_project_status(project):
     return "Active"
 
 router = APIRouter(
-    prefix="/projects",
-    tags=["project_management"],
+    prefix="/projects",tags=["project_management"],
     dependencies=[default_rate_limiter_dependency()],
 )
 
-# Shared cache version for all project completion affecting entities.
 VERSION_KEY = "cache_version:projects"
-
 
 class ProjectsRepository:
     async def create_project(self, db: AsyncSession, data: dict) -> Project:
@@ -105,7 +121,9 @@ class ProjectsRepository:
         rows = (await db.execute(query)).scalars().all()
         return rows, int(total or 0)
 
-    async def update_project(self, db: AsyncSession, obj: Project, data: dict) -> Project:
+    async def update_project(
+        self, db: AsyncSession, obj: Project, data: dict
+    ) -> Project:
         for k, v in data.items():
             setattr(obj, k, v)
         await db.flush()
@@ -126,22 +144,32 @@ class ProjectMembersRepository:
             )
         )
 
-    async def assign_member(self, db: AsyncSession, *, project_id: int, user_id: int) -> ProjectMember:
+    async def assign_member(
+        self, db: AsyncSession, *, project_id: int, user_id: int
+    ) -> ProjectMember:
         obj = ProjectMember(project_id=project_id, user_id=user_id)
         db.add(obj)
         await db.flush()
         return obj
 
-    async def remove_member(self, db: AsyncSession, *, project_id: int, user_id: int) -> None:
+    async def remove_member(
+        self, db: AsyncSession, *, project_id: int, user_id: int
+    ) -> None:
         obj = await self.get_member(db, project_id=project_id, user_id=user_id)
         if obj is None:
             return
         await db.delete(obj)
         await db.flush()
 
-    async def is_member(self, db: AsyncSession, *, project_id: int, user_id: int) -> bool:
-        exists_query = select(func.count()).select_from(ProjectMember).where(
-            ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
+    async def is_member(
+        self, db: AsyncSession, *, project_id: int, user_id: int
+    ) -> bool:
+        exists_query = (
+            select(func.count())
+            .select_from(ProjectMember)
+            .where(
+                ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
+            )
         )
         count = await db.scalar(exists_query)
         return bool(count and int(count) > 0)
@@ -194,7 +222,9 @@ class MilestonesRepository:
             )
         )
 
-    async def list_milestones(self, db: AsyncSession, *, project_id: int) -> list[Milestone]:
+    async def list_milestones(
+        self, db: AsyncSession, *, project_id: int
+    ) -> list[Milestone]:
         query = (
             select(Milestone)
             .where(Milestone.project_id == project_id)
@@ -242,7 +272,9 @@ class TasksRepository:
         offset: int,
     ) -> tuple[list[Task], int]:
         query = select(Task).where(Task.project_id == project_id)
-        count_query = select(func.count()).select_from(Task).where(Task.project_id == project_id)
+        count_query = (
+            select(func.count()).select_from(Task).where(Task.project_id == project_id)
+        )
 
         if status is not None:
             query = query.where(Task.status == status)
@@ -274,10 +306,12 @@ class TasksRepository:
         if not project_ids:
             return []
 
-        query = select(Task.project_id, Task.completion_percentage).where(Task.project_id.in_(project_ids))
+        query = select(Task.project_id, Task.completion_percentage).where(
+            Task.project_id.in_(project_ids)
+        )
         rows = (await db.execute(query)).all()
         return [(int(pid), int(pct)) for pid, pct in rows]
-
+    
 
 class TaskProgressRepository:
     async def create_progress(
@@ -307,7 +341,11 @@ class TaskProgressRepository:
         limit: int,
         offset: int,
     ) -> tuple[list[TaskProgress], int]:
-        count_query = select(func.count()).select_from(TaskProgress).where(TaskProgress.task_id == task_id)
+        count_query = (
+            select(func.count())
+            .select_from(TaskProgress)
+            .where(TaskProgress.task_id == task_id)
+        )
         query = (
             select(TaskProgress)
             .where(TaskProgress.task_id == task_id)
@@ -342,7 +380,9 @@ class CommentsRepository:
         limit: int,
         offset: int,
     ) -> tuple[list[Comment], int]:
-        count_query = select(func.count()).select_from(Comment).where(Comment.task_id == task_id)
+        count_query = (
+            select(func.count()).select_from(Comment).where(Comment.task_id == task_id)
+        )
         query = (
             select(Comment)
             .where(Comment.task_id == task_id)
@@ -371,7 +411,9 @@ class ProjectsService:
     async def _compute_completion_percentage_by_project_ids(
         self, db: AsyncSession, project_ids: list[int]
     ) -> dict[int, float]:
-        completion_rows = await self.tasks_repo.list_task_completion_by_project_ids(db, project_ids)
+        completion_rows = await self.tasks_repo.list_task_completion_by_project_ids(
+            db, project_ids
+        )
         completion_map: dict[int, list[int]] = {pid: [] for pid in project_ids}
         for pid, pct in completion_rows:
             completion_map[pid].append(pct)
@@ -382,7 +424,9 @@ class ProjectsService:
             out[pid] = (float(sum(values)) / len(values)) if values else 0.0
         return out
 
-    async def create_project(self, db: AsyncSession, current_user: User, payload: ProjectCreate) -> ProjectOut:
+    async def create_project(
+        self, db: AsyncSession, current_user: User, payload: ProjectCreate
+    ) -> ProjectOut:
         self._assert_project_mutation_role(current_user)
         data = payload.model_dump(exclude_unset=True)
         data["status"] = "Planned"
@@ -395,7 +439,9 @@ class ProjectsService:
                 raise ValidationError("end_date cannot be before start_date")
 
         obj = await self.projects_repo.create_project(db, data)
-        completion_map = await self._compute_completion_percentage_by_project_ids(db, [obj.id])
+        completion_map = await self._compute_completion_percentage_by_project_ids(
+            db, [obj.id]
+        )
         completion = completion_map.get(obj.id, 0.0)
         return ProjectOut(
             id=obj.id,
@@ -421,7 +467,9 @@ class ProjectsService:
             db, limit=limit, offset=offset, search=search, status=status
         )
         project_ids = [p.id for p in rows]
-        completion_map = await self._compute_completion_percentage_by_project_ids(db, project_ids)
+        completion_map = await self._compute_completion_percentage_by_project_ids(
+            db, project_ids
+        )
 
         items = [
             ProjectOut(
@@ -443,7 +491,9 @@ class ProjectsService:
         obj = await self.projects_repo.get_project(db, project_id=project_id)
         if obj is None:
             raise NotFoundError("Project not found")
-        completion_map = await self._compute_completion_percentage_by_project_ids(db, [obj.id])
+        completion_map = await self._compute_completion_percentage_by_project_ids(
+            db, [obj.id]
+        )
         completion = completion_map.get(obj.id, 0.0)
         return ProjectOut(
             id=obj.id,
@@ -457,7 +507,12 @@ class ProjectsService:
         )
 
     async def update_project(
-        self, db: AsyncSession, current_user: User, *, project_id: int, payload: ProjectUpdate
+        self,
+        db: AsyncSession,
+        current_user: User,
+        *,
+        project_id: int,
+        payload: ProjectUpdate,
     ) -> ProjectOut:
         self._assert_project_mutation_role(current_user)
         obj = await self.projects_repo.get_project(db, project_id=project_id)
@@ -470,7 +525,9 @@ class ProjectsService:
             if data["status"] != "Completed":
                 data.pop("status")
         await self.projects_repo.update_project(db, obj, data)
-        completion_map = await self._compute_completion_percentage_by_project_ids(db, [obj.id])
+        completion_map = await self._compute_completion_percentage_by_project_ids(
+            db, [obj.id]
+        )
         completion = completion_map.get(obj.id, 0.0)
         return ProjectOut(
             id=obj.id,
@@ -483,7 +540,9 @@ class ProjectsService:
             completion_percentage=completion,
         )
 
-    async def delete_project(self, db: AsyncSession, current_user: User, *, project_id: int) -> None:
+    async def delete_project(
+        self, db: AsyncSession, current_user: User, *, project_id: int
+    ) -> None:
         self._assert_project_mutation_role(current_user)
         obj = await self.projects_repo.get_project(db, project_id=project_id)
         if obj is None:
@@ -522,11 +581,15 @@ class ProjectMembersService:
         if user is None:
             raise NotFoundError("User not found")
 
-        existing = await self.members_repo.get_member(db, project_id=project_id, user_id=user_id)
+        existing = await self.members_repo.get_member(
+            db, project_id=project_id, user_id=user_id
+        )
         if existing is not None:
             raise ConflictError("User is already assigned to this project")
 
-        await self.members_repo.assign_member(db, project_id=project_id, user_id=user_id)
+        await self.members_repo.assign_member(
+            db, project_id=project_id, user_id=user_id
+        )
         role = user.role.value if hasattr(user.role, "value") else str(user.role)
         return ProjectMemberOut(
             user_id=user.id,
@@ -579,15 +642,21 @@ class ProjectMembersService:
         if project is None:
             raise NotFoundError("Project not found")
 
-        existing = await self.members_repo.get_member(db, project_id=project_id, user_id=user_id)
+        existing = await self.members_repo.get_member(
+            db, project_id=project_id, user_id=user_id
+        )
         if existing is None:
             raise NotFoundError("Member not found")
 
-        await self.members_repo.remove_member(db, project_id=project_id, user_id=user_id)
+        await self.members_repo.remove_member(
+            db, project_id=project_id, user_id=user_id
+        )
 
 
 class MilestonesService:
-    def __init__(self, projects_repo: ProjectsRepository, milestones_repo: MilestonesRepository) -> None:
+    def __init__(
+        self, projects_repo: ProjectsRepository, milestones_repo: MilestonesRepository
+    ) -> None:
         self.projects_repo = projects_repo
         self.milestones_repo = milestones_repo
 
@@ -609,7 +678,9 @@ class MilestonesService:
             raise NotFoundError("Project not found")
 
         data = payload.model_dump(exclude_unset=True)
-        obj = await self.milestones_repo.create_milestone(db, project_id=project_id, data=data)
+        obj = await self.milestones_repo.create_milestone(
+            db, project_id=project_id, data=data
+        )
         return MilestoneOut(
             id=obj.id,
             project_id=obj.project_id,
@@ -619,7 +690,9 @@ class MilestonesService:
             end_date=obj.end_date,
         )
 
-    async def list_milestones(self, db: AsyncSession, *, project_id: int) -> list[MilestoneOut]:
+    async def list_milestones(
+        self, db: AsyncSession, *, project_id: int
+    ) -> list[MilestoneOut]:
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
@@ -684,7 +757,12 @@ class MilestonesService:
         )
 
     async def delete_milestone(
-        self, db: AsyncSession, current_user: User, *, project_id: int, milestone_id: int
+        self,
+        db: AsyncSession,
+        current_user: User,
+        *,
+        project_id: int,
+        milestone_id: int,
     ) -> None:
         self._assert_milestone_mutation_role(current_user)
         obj = await self.milestones_repo.get_milestone(
@@ -729,7 +807,9 @@ class TasksService:
     ) -> None:
         if current_user.id == task.assigned_user_id:
             return
-        allowed = await self.members_repo.is_member(db, project_id=project_id, user_id=current_user.id)
+        allowed = await self.members_repo.is_member(
+            db, project_id=project_id, user_id=current_user.id
+        )
         if not allowed:
             raise PermissionDeniedError("Insufficient permissions")
 
@@ -762,7 +842,9 @@ class TasksService:
             raise NotFoundError("Project not found")
 
         if payload.assigned_user_id:
-            assigned_user = await db.scalar(select(User).where(User.id == payload.assigned_user_id))
+            assigned_user = await db.scalar(
+                select(User).where(User.id == payload.assigned_user_id)
+            )
             if assigned_user is None:
                 raise NotFoundError("User not found")
 
@@ -795,7 +877,12 @@ class TasksService:
             offset=offset,
         )
         current_date = date.today()
-        items = [self._task_to_out(task=t, is_delayed=self._is_delayed(task=t, current_date=current_date)) for t in rows]
+        items = [
+            self._task_to_out(
+                task=t, is_delayed=self._is_delayed(task=t, current_date=current_date)
+            )
+            for t in rows
+        ]
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
         return PaginatedResponse[TaskOut](items=items, meta=meta)
 
@@ -839,7 +926,9 @@ class TasksService:
             if assigned_user_id is None:
                 raise ValidationError("assigned_user_id cannot be null")
             if payload.assigned_user_id:
-                assigned_user = await db.scalar(select(User).where(User.id == payload.assigned_user_id))
+                assigned_user = await db.scalar(
+                    select(User).where(User.id == payload.assigned_user_id)
+                )
                 if assigned_user is None:
                     raise NotFoundError("User not found")
 
@@ -993,11 +1082,21 @@ class TasksService:
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
         return PaginatedResponse[CommentOut](items=items, meta=meta)
 
+def get_tasks_service():
+    return TasksService(
+        ProjectsRepository(),
+        ProjectMembersRepository(),
+        TasksRepository(),
+        TaskProgressRepository(),
+        CommentsRepository(),
+    )
 
 @router.post("", response_model=ProjectOut)
 async def create_project(
     payload: ProjectCreate,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -1027,7 +1126,9 @@ async def list_projects(
             return PaginatedResponse[ProjectOut].model_validate(cached)
 
     service = ProjectsService(ProjectsRepository(), TasksRepository())
-    result = await service.list_projects(db, limit=limit, offset=offset, search=search, status=status)
+    result = await service.list_projects(
+        db, limit=limit, offset=offset, search=search, status=status
+    )
     await cache_set_json(redis, cache_key, result.model_dump())
     return result
 
@@ -1042,7 +1143,11 @@ async def get_project(
     version = await get_cache_version(redis, VERSION_KEY)
     cache_key = f"cache:projects:get:{version}:{project_id}"
     cached_json = await cache_get_json(redis, cache_key)
-    if cached_json is not None and isinstance(cached_json, dict) and "completion_percentage" in cached_json:
+    if (
+        cached_json is not None
+        and isinstance(cached_json, dict)
+        and "completion_percentage" in cached_json
+    ):
         return ProjectOut.model_validate(cached_json)
 
     service = ProjectsService(ProjectsRepository(), TasksRepository())
@@ -1055,12 +1160,16 @@ async def get_project(
 async def update_project(
     project_id: int,
     payload: ProjectUpdate,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     service = ProjectsService(ProjectsRepository(), TasksRepository())
-    out = await service.update_project(db, current_user, project_id=project_id, payload=payload)
+    out = await service.update_project(
+        db, current_user, project_id=project_id, payload=payload
+    )
     await bump_cache_version(redis, VERSION_KEY)
     return out
 
@@ -1068,7 +1177,9 @@ async def update_project(
 @router.delete("/{project_id}", status_code=204)
 async def delete_project(
     project_id: int,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(
+        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -1078,7 +1189,9 @@ async def delete_project(
     return None
 
 
-@router.post("/{project_id}/members/{user_id}", response_model=ProjectMemberOut, status_code=201)
+@router.post(
+    "/{project_id}/members/{user_id}", response_model=ProjectMemberOut, status_code=201
+)
 async def assign_project_member(
     project_id: int,
     user_id: int,
@@ -1087,7 +1200,9 @@ async def assign_project_member(
     redis=Depends(get_request_redis),
 ):
     service = ProjectMembersService(ProjectsRepository(), ProjectMembersRepository())
-    out = await service.assign_member(db, current_user, project_id=project_id, user_id=user_id)
+    out = await service.assign_member(
+        db, current_user, project_id=project_id, user_id=user_id
+    )
     await bump_cache_version(redis, VERSION_KEY)
     return out
 
@@ -1101,7 +1216,9 @@ async def list_project_members(
     db: AsyncSession = Depends(get_db_session),
 ):
     service = ProjectMembersService(ProjectsRepository(), ProjectMembersRepository())
-    return await service.list_members(db, current_user, project_id=project_id, limit=limit, offset=offset)
+    return await service.list_members(
+        db, current_user, project_id=project_id, limit=limit, offset=offset
+    )
 
 
 @router.delete("/{project_id}/members/{user_id}", status_code=204)
@@ -1113,16 +1230,12 @@ async def remove_project_member(
     redis=Depends(get_request_redis),
 ):
     service = ProjectMembersService(ProjectsRepository(), ProjectMembersRepository())
-    await service.remove_member(db, current_user, project_id=project_id, user_id=user_id)
+    await service.remove_member(
+        db, current_user, project_id=project_id, user_id=user_id
+    )
     await bump_cache_version(redis, VERSION_KEY)
     return None
 
-
-#
-# Swagger/OpenAPI: keep project-management endpoints under a single tag.
-# If we assign multiple tags on the router (e.g. ["tasks","progress","comments"]),
-# Swagger UI will render the same endpoint under each tag, which looks like duplicates.
-#
 milestones_router = APIRouter(
     prefix="",
     tags=["project_management"],
@@ -1144,7 +1257,9 @@ async def create_milestone(
     redis=Depends(get_request_redis),
 ):
     service = MilestonesService(ProjectsRepository(), MilestonesRepository())
-    out = await service.create_milestone(db, current_user, project_id=project_id, payload=payload)
+    out = await service.create_milestone(
+        db, current_user, project_id=project_id, payload=payload
+    )
     await bump_cache_version(redis, VERSION_KEY)
     return out
 
@@ -1159,7 +1274,9 @@ async def list_milestones(
     return await service.list_milestones(db, project_id=project_id)
 
 
-@milestones_router.get("/{project_id}/milestones/{milestone_id}", response_model=MilestoneOut)
+@milestones_router.get(
+    "/{project_id}/milestones/{milestone_id}", response_model=MilestoneOut
+)
 async def get_milestone(
     project_id: int,
     milestone_id: int,
@@ -1167,10 +1284,14 @@ async def get_milestone(
     db: AsyncSession = Depends(get_db_session),
 ):
     service = MilestonesService(ProjectsRepository(), MilestonesRepository())
-    return await service.get_milestone(db, project_id=project_id, milestone_id=milestone_id)
+    return await service.get_milestone(
+        db, project_id=project_id, milestone_id=milestone_id
+    )
 
 
-@milestones_router.put("/{project_id}/milestones/{milestone_id}", response_model=MilestoneOut)
+@milestones_router.put(
+    "/{project_id}/milestones/{milestone_id}", response_model=MilestoneOut
+)
 async def update_milestone(
     project_id: int,
     milestone_id: int,
@@ -1181,7 +1302,11 @@ async def update_milestone(
 ):
     service = MilestonesService(ProjectsRepository(), MilestonesRepository())
     out = await service.update_milestone(
-        db, current_user, project_id=project_id, milestone_id=milestone_id, payload=payload
+        db,
+        current_user,
+        project_id=project_id,
+        milestone_id=milestone_id,
+        payload=payload,
     )
     await bump_cache_version(redis, VERSION_KEY)
     return out
@@ -1196,7 +1321,9 @@ async def delete_milestone(
     redis=Depends(get_request_redis),
 ):
     service = MilestonesService(ProjectsRepository(), MilestonesRepository())
-    await service.delete_milestone(db, current_user, project_id=project_id, milestone_id=milestone_id)
+    await service.delete_milestone(
+        db, current_user, project_id=project_id, milestone_id=milestone_id
+    )
     await bump_cache_version(redis, VERSION_KEY)
     return None
 
@@ -1208,15 +1335,11 @@ async def create_task(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
+    service: TasksService = Depends(get_tasks_service),
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
+    out = await service.create_task(
+        db, current_user, project_id=project_id, payload=payload
     )
-    out = await service.create_task(db, current_user, project_id=project_id, payload=payload)
     await bump_cache_version(redis, VERSION_KEY)
     return out
 
@@ -1230,14 +1353,9 @@ async def list_tasks(
     offset: int = Query(0, ge=0),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
+    service: TasksService = Depends(get_tasks_service),
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
-    )
+    
     return await service.list_tasks(
         db,
         current_user,
@@ -1255,15 +1373,12 @@ async def get_task(
     task_id: int,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
+    service: TasksService = Depends(get_tasks_service),
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
+
+    return await service.get_task(
+        db, current_user, project_id=project_id, task_id=task_id
     )
-    return await service.get_task(db, current_user, project_id=project_id, task_id=task_id)
 
 
 @tasks_router.put("/{project_id}/tasks/{task_id}", response_model=TaskOut)
@@ -1274,15 +1389,11 @@ async def update_task(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
+    service: TasksService = Depends(get_tasks_service),
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
+    out = await service.update_task(
+        db, current_user, project_id=project_id, task_id=task_id, payload=payload
     )
-    out = await service.update_task(db, current_user, project_id=project_id, task_id=task_id, payload=payload)
     await bump_cache_version(redis, VERSION_KEY)
     return out
 
@@ -1294,20 +1405,18 @@ async def delete_task(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
+    service: TasksService = Depends(get_tasks_service),
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
+    await service.delete_task(
+        db, current_user, project_id=project_id, task_id=task_id
     )
-    await service.delete_task(db, current_user, project_id=project_id, task_id=task_id)
     await bump_cache_version(redis, VERSION_KEY)
     return None
 
 
-@tasks_router.post("/{project_id}/tasks/{task_id}/progress", response_model=TaskProgressOut)
+@tasks_router.post(
+    "/{project_id}/tasks/{task_id}/progress", response_model=TaskProgressOut
+)
 async def update_task_progress(
     project_id: int,
     task_id: int,
@@ -1315,14 +1424,9 @@ async def update_task_progress(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
+    service: TasksService = Depends(get_tasks_service),
+
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
-    )
     out = await service.update_task_progress(
         db, current_user, project_id=project_id, task_id=task_id, payload=payload
     )
@@ -1330,7 +1434,10 @@ async def update_task_progress(
     return out
 
 
-@tasks_router.get("/{project_id}/tasks/{task_id}/progress", response_model=PaginatedResponse[TaskProgressOut])
+@tasks_router.get(
+    "/{project_id}/tasks/{task_id}/progress",
+    response_model=PaginatedResponse[TaskProgressOut],
+)
 async def list_task_progress_history(
     project_id: int,
     task_id: int,
@@ -1338,14 +1445,9 @@ async def list_task_progress_history(
     offset: int = Query(0, ge=0),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
+    service: TasksService = Depends(get_tasks_service),
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
-    )
+
     return await service.list_task_progress_history(
         db,
         current_user,
@@ -1364,14 +1466,9 @@ async def create_comment(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
+    service: TasksService = Depends(get_tasks_service),
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
-    )
+
     out = await service.create_comment(
         db, current_user, project_id=project_id, task_id=task_id, payload=payload
     )
@@ -1379,7 +1476,10 @@ async def create_comment(
     return out
 
 
-@tasks_router.get("/{project_id}/tasks/{task_id}/comments", response_model=PaginatedResponse[CommentOut])
+@tasks_router.get(
+    "/{project_id}/tasks/{task_id}/comments",
+    response_model=PaginatedResponse[CommentOut],
+)
 async def list_comments(
     project_id: int,
     task_id: int,
@@ -1387,14 +1487,8 @@ async def list_comments(
     offset: int = Query(0, ge=0),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
+    service: TasksService = Depends(get_tasks_service),
 ):
-    service = TasksService(
-        ProjectsRepository(),
-        ProjectMembersRepository(),
-        TasksRepository(),
-        TaskProgressRepository(),
-        CommentsRepository(),
-    )
     return await service.list_comments(
         db,
         current_user,
@@ -1403,7 +1497,6 @@ async def list_comments(
         limit=limit,
         offset=offset,
     )
-
 
 
 @router.get("/{project_id}/profit-loss")
@@ -1416,23 +1509,16 @@ async def project_profit_loss(
     if not project:
         raise NotFoundError("Project not found")
 
-
     total_expense = await db.scalar(
-        select(func.sum(Expense.amount)).where(
-            Expense.project_id == project_id
-        )
+        select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
 
-
     total_invoice = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id
-        )
+        select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
     )
 
     total_expense = float(total_expense or 0)
     total_invoice = float(total_invoice or 0)
-
 
     profit = total_invoice - total_expense
 
@@ -1441,8 +1527,9 @@ async def project_profit_loss(
         "total_invoice": total_invoice,
         "total_expense": total_expense,
         "profit": profit,
-        "status": "profit" if profit >= 0 else "loss"
+        "status": "profit" if profit >= 0 else "loss",
     }
+
 
 router.include_router(milestones_router)
 router.include_router(tasks_router)
