@@ -11,7 +11,12 @@ async def init_rate_limiter(app: FastAPI, redis) -> None:
     """
     Initialize a Redis-backed `pyrate_limiter.Limiter` and store it on `app.state`.
     """
-    rates = [Rate(settings.RATE_LIMIT_TIMES, Duration.SECOND * settings.RATE_LIMIT_SECONDS)]
+    rates = [
+        Rate(
+            settings.RATE_LIMIT_TIMES,
+            Duration.SECOND * settings.RATE_LIMIT_SECONDS,
+        )
+    ]
     bucket_key = "ratelimit:fastapi"
 
     bucket = RedisBucket.init(rates=rates, redis=redis, bucket_key=bucket_key)
@@ -23,13 +28,19 @@ async def init_rate_limiter(app: FastAPI, redis) -> None:
 
 def default_rate_limiter_dependency():
     """
-    FastAPI dependency that applies a default request limit per `client_ip + path`.
+    FastAPI dependency that applies a default request limit per client IP.
     """
     async def _rate_limit(request: Request):
         limiter = getattr(request.app.state, "rate_limiter", None)
+
         if limiter is None:
-            # Fallback: in-memory limiter (shouldn't happen in normal production flow).
-            fallback_rates = [Rate(settings.RATE_LIMIT_TIMES, Duration.SECOND * settings.RATE_LIMIT_SECONDS)]
+            # Fallback: in-memory limiter (dev mode)
+            fallback_rates = [
+                Rate(
+                    settings.RATE_LIMIT_TIMES,
+                    Duration.SECOND * settings.RATE_LIMIT_SECONDS,
+                )
+            ]
             limiter = Limiter(fallback_rates)
 
         forwarded = request.headers.get("X-Forwarded-For")
@@ -40,10 +51,15 @@ def default_rate_limiter_dependency():
         else:
             ip = "127.0.0.1"
 
-        key = f"{ip}:{request.url.path}"
-        allowed = await limiter.try_acquire_async(name=key, blocking=False)
+
+        key = ip
+
+        allowed = await limiter.try_acquire_async(
+            name=key,
+            blocking=False,
+        )
+
         if not allowed:
             raise HTTPException(status_code=429, detail="Too Many Requests")
 
     return Depends(_rate_limit)
-

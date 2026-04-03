@@ -1,9 +1,10 @@
 import secrets
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from pyrate_limiter import Duration, Rate
 
 from app.core.dependencies import get_request_redis
 from app.core.security import create_access_token, get_password_hash
@@ -13,12 +14,43 @@ from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.user import User, UserRole
 from app.schemas.token import AuthResponse, Token
 from app.schemas.user import OTPLoginResponse, OTPVerify, UserLogin
-from app.services.otp import check_otp_rate_limit, generate_otp, store_otp, verify_otp as verify_otp_service
+from app.services.otp import (
+    check_otp_rate_limit,
+    generate_otp,
+    store_otp,
+    verify_otp as verify_otp_service,
+)
 from app.services.sms import send_otp_sms
 from app.utils.helpers import AppError
 
 
-router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[default_rate_limiter_dependency()])
+def otp_rate_limiter_dependency():
+    async def _limit(request: Request):
+        limiter = getattr(request.app.state, "rate_limiter", None)
+
+        if limiter is None:
+            return  # fallback: allow if limiter not initialized
+
+        ip = request.client.host
+        key = f"otp:{ip}"
+
+        allowed = await limiter.try_acquire_async(
+            name=key,
+            rate=Rate(5, Duration.MINUTE),  # 🔥 5 per minute
+            blocking=False,
+        )
+
+        if not allowed:
+            raise HTTPException(status_code=429, detail="Too many OTP requests")
+
+    return Depends(_limit)
+
+
+router = APIRouter(
+    prefix="/auth",
+    tags=["auth"],
+    dependencies=[default_rate_limiter_dependency()],
+)
 
 
 def _normalize_mobile(mobile: str) -> str:
@@ -27,17 +59,26 @@ def _normalize_mobile(mobile: str) -> str:
 
 
 def _build_token(user: User) -> Token:
-    access_token = create_access_token({"sub": str(user.id), "role": user.role.value})
+    access_token = create_access_token(
+        {"sub": str(user.id), "role": user.role.value}
+    )
     return Token(access_token=access_token)
 
 
-@router.post("/login", response_model=OTPLoginResponse)
-async def login(payload: UserLogin, redis: Redis | None = Depends(get_request_redis)):
-    """Request OTP for mobile number (OTP-only login)."""
+@router.post(
+    "/login",
+    response_model=OTPLoginResponse,
+    dependencies=[otp_rate_limiter_dependency()],
+)
+async def login(
+    payload: UserLogin,
+    redis: Redis | None = Depends(get_request_redis),
+):
     if redis is None and settings.APP_ENV == "production":
         raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
 
     mobile = _normalize_mobile(payload.mobile)
+
     if len(mobile) < 10:
         raise AppError(status_code=422, message="Invalid mobile number")
 
@@ -46,6 +87,7 @@ async def login(payload: UserLogin, redis: Redis | None = Depends(get_request_re
 
     otp = generate_otp()
     await store_otp(redis, mobile, otp)
+
     sent = await send_otp_sms(mobile, otp)
     if not sent:
         raise AppError(status_code=503, message="Failed to send OTP")
@@ -53,17 +95,21 @@ async def login(payload: UserLogin, redis: Redis | None = Depends(get_request_re
     return OTPLoginResponse(message="OTP sent", mobile=mobile)
 
 
-@router.post("/verify_otp", response_model=AuthResponse)
+@router.post(
+    "/verify_otp",
+    response_model=AuthResponse,
+    dependencies=[otp_rate_limiter_dependency()],
+)
 async def verify_otp(
     payload: OTPVerify,
     redis: Redis | None = Depends(get_request_redis),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Verify OTP and return token. Creates user if first-time mobile login."""
     if redis is None and settings.APP_ENV == "production":
         raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
 
     mobile = _normalize_mobile(payload.mobile)
+
     if len(mobile) < 10:
         raise AppError(status_code=422, message="Invalid mobile number")
 
@@ -71,8 +117,8 @@ async def verify_otp(
         raise AppError(status_code=401, message="Invalid or expired OTP")
 
     user = await db.scalar(select(User).where(User.mobile == mobile))
+
     if user is None:
-        # Auto-register OTP user with default role
         placeholder_email = f"otp_{mobile}@construction.local"
         user = User(
             email=placeholder_email,
@@ -89,4 +135,8 @@ async def verify_otp(
         raise AppError(status_code=403, message="User is inactive")
 
     token = _build_token(user)
-    return {"token": token, "user_id": user.id}
+
+    return {
+        "token": token,
+        "user_id": user.id,
+    }

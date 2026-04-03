@@ -29,6 +29,8 @@ from app.core.config import settings
 from app.middlewares.rate_limiter import init_rate_limiter
 from app.utils.helpers import AppError
 from app.utils.logger import configure_logging
+from app.middlewares.rate_limiter import default_rate_limiter_dependency
+
 
 
 logger = logging.getLogger("construction-mgmt")
@@ -99,7 +101,10 @@ def create_app() -> FastAPI:
     async def health():
         return {"status": "ok"}
 
-    api_router = APIRouter()
+
+    api_router = APIRouter(
+        dependencies=[default_rate_limiter_dependency()]
+    )
     api_router.include_router(auth_router)
     api_router.include_router(user_router)
     api_router.include_router(project_router)
