@@ -1,8 +1,8 @@
-"""udpate data
+"""update data
 
-Revision ID: bf7597326a79
+Revision ID: 7557e653bb2a
 Revises: 
-Create Date: 2026-04-01 10:50:47.451915
+Create Date: 2026-04-06 18:17:51.345841
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = 'bf7597326a79'
+revision = '7557e653bb2a'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -135,6 +135,24 @@ def upgrade():
     sa.UniqueConstraint('contractor_id', 'project_id', name='uq_contractor_project')
     )
     op.create_index(op.f('ix_contractor_projects_id'), 'contractor_projects', ['id'], unique=False)
+    op.create_table('daily_site_reports',
+    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+    sa.Column('project_id', sa.Integer(), nullable=False),
+    sa.Column('report_date', sa.Date(), nullable=False),
+    sa.Column('weather', sa.String(length=100), nullable=True),
+    sa.Column('work_done', sa.Text(), nullable=False),
+    sa.Column('work_planned', sa.Text(), nullable=True),
+    sa.Column('labour_count', sa.Integer(), nullable=False),
+    sa.Column('material_used', sa.Text(), nullable=True),
+    sa.Column('issues', sa.Text(), nullable=True),
+    sa.Column('remarks', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_daily_site_reports_project_id'), 'daily_site_reports', ['project_id'], unique=False)
+    op.create_index(op.f('ix_daily_site_reports_report_date'), 'daily_site_reports', ['report_date'], unique=False)
     op.create_table('documents',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -170,22 +188,6 @@ def upgrade():
     op.create_index(op.f('ix_equipment_equipment_name'), 'equipment', ['equipment_name'], unique=False)
     op.create_index(op.f('ix_equipment_project_id'), 'equipment', ['project_id'], unique=False)
     op.create_index(op.f('ix_equipment_status'), 'equipment', ['status'], unique=False)
-    op.create_table('expenses',
-    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('project_id', sa.Integer(), nullable=False),
-    sa.Column('category', sa.String(length=50), nullable=False),
-    sa.Column('description', sa.String(length=255), nullable=False),
-    sa.Column('amount', sa.DECIMAL(precision=18, scale=2), nullable=False),
-    sa.Column('expense_date', sa.Date(), nullable=False),
-    sa.Column('payment_mode', sa.String(length=50), nullable=False),
-    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
-    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index(op.f('ix_expenses_category'), 'expenses', ['category'], unique=False)
-    op.create_index(op.f('ix_expenses_expense_date'), 'expenses', ['expense_date'], unique=False)
-    op.create_index(op.f('ix_expenses_project_id'), 'expenses', ['project_id'], unique=False)
     op.create_table('final_measurements',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -223,6 +225,23 @@ def upgrade():
     op.create_index(op.f('ix_invoices_id'), 'invoices', ['id'], unique=False)
     op.create_index(op.f('ix_invoices_owner_id'), 'invoices', ['owner_id'], unique=False)
     op.create_index(op.f('ix_invoices_project_id'), 'invoices', ['project_id'], unique=False)
+    op.create_table('issues',
+    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+    sa.Column('project_id', sa.Integer(), nullable=False),
+    sa.Column('title', sa.String(length=255), nullable=False),
+    sa.Column('category', sa.String(length=100), nullable=False),
+    sa.Column('description', sa.Text(), nullable=True),
+    sa.Column('reported_date', sa.Date(), nullable=False),
+    sa.Column('priority', sa.String(length=50), nullable=False),
+    sa.Column('status', sa.String(length=50), nullable=False),
+    sa.Column('assigned_to', sa.Integer(), nullable=True),
+    sa.Column('resolution', sa.Text(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_issues_project_id'), 'issues', ['project_id'], unique=False)
     op.create_table('labour',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -299,6 +318,31 @@ def upgrade():
     sa.PrimaryKeyConstraint('project_id', 'user_id'),
     sa.UniqueConstraint('project_id', 'user_id', name='uq_project_members_project_id_user_id')
     )
+    op.create_table('ra_bills',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('project_id', sa.Integer(), nullable=False),
+    sa.Column('contractor_id', sa.Integer(), nullable=False),
+    sa.Column('bill_number', sa.String(length=100), nullable=False),
+    sa.Column('work_description', sa.String(length=255), nullable=False),
+    sa.Column('quantity', sa.DECIMAL(precision=18, scale=3), nullable=False),
+    sa.Column('rate', sa.DECIMAL(precision=18, scale=2), nullable=False),
+    sa.Column('gross_amount', sa.DECIMAL(precision=18, scale=2), nullable=False),
+    sa.Column('deductions', sa.DECIMAL(precision=18, scale=2), nullable=True),
+    sa.Column('net_amount', sa.DECIMAL(precision=18, scale=2), nullable=False),
+    sa.Column('gst_percent', sa.DECIMAL(precision=5, scale=2), nullable=True),
+    sa.Column('total_amount', sa.DECIMAL(precision=18, scale=2), nullable=False),
+    sa.Column('bill_date', sa.Date(), nullable=False),
+    sa.Column('status', sa.String(length=50), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['contractor_id'], ['contractors.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('bill_number')
+    )
+    op.create_index(op.f('ix_ra_bills_contractor_id'), 'ra_bills', ['contractor_id'], unique=False)
+    op.create_index(op.f('ix_ra_bills_id'), 'ra_bills', ['id'], unique=False)
+    op.create_index(op.f('ix_ra_bills_project_id'), 'ra_bills', ['project_id'], unique=False)
     op.create_table('tasks',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -329,6 +373,25 @@ def upgrade():
     )
     op.create_index(op.f('ix_comments_author_user_id'), 'comments', ['author_user_id'], unique=False)
     op.create_index(op.f('ix_comments_task_id'), 'comments', ['task_id'], unique=False)
+    op.create_table('expenses',
+    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+    sa.Column('project_id', sa.Integer(), nullable=False),
+    sa.Column('boq_item_id', sa.Integer(), nullable=True),
+    sa.Column('category', sa.String(length=50), nullable=False),
+    sa.Column('description', sa.String(length=255), nullable=False),
+    sa.Column('amount', sa.DECIMAL(precision=18, scale=2), nullable=False),
+    sa.Column('expense_date', sa.Date(), nullable=False),
+    sa.Column('payment_mode', sa.String(length=50), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['boq_item_id'], ['boq_items.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_expenses_boq_item_id'), 'expenses', ['boq_item_id'], unique=False)
+    op.create_index(op.f('ix_expenses_category'), 'expenses', ['category'], unique=False)
+    op.create_index(op.f('ix_expenses_expense_date'), 'expenses', ['expense_date'], unique=False)
+    op.create_index(op.f('ix_expenses_project_id'), 'expenses', ['project_id'], unique=False)
     op.create_table('labour_attendance',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('labour_id', sa.Integer(), nullable=False),
@@ -347,6 +410,19 @@ def upgrade():
     op.create_index(op.f('ix_labour_attendance_attendance_date'), 'labour_attendance', ['attendance_date'], unique=False)
     op.create_index(op.f('ix_labour_attendance_labour_id'), 'labour_attendance', ['labour_id'], unique=False)
     op.create_index(op.f('ix_labour_attendance_project_id'), 'labour_attendance', ['project_id'], unique=False)
+    op.create_table('material_usage',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('material_id', sa.Integer(), nullable=True),
+    sa.Column('project_id', sa.Integer(), nullable=True),
+    sa.Column('quantity_used', sa.DECIMAL(precision=18, scale=3), nullable=False),
+    sa.Column('usage_date', sa.Date(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['material_id'], ['materials.id'], ),
+    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_material_usage_usage_date'), 'material_usage', ['usage_date'], unique=False)
     op.create_table('task_progress',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('task_id', sa.Integer(), nullable=False),
@@ -370,10 +446,17 @@ def downgrade():
     op.drop_index(op.f('ix_task_progress_task_id'), table_name='task_progress')
     op.drop_index(op.f('ix_task_progress_created_by_user_id'), table_name='task_progress')
     op.drop_table('task_progress')
+    op.drop_index(op.f('ix_material_usage_usage_date'), table_name='material_usage')
+    op.drop_table('material_usage')
     op.drop_index(op.f('ix_labour_attendance_project_id'), table_name='labour_attendance')
     op.drop_index(op.f('ix_labour_attendance_labour_id'), table_name='labour_attendance')
     op.drop_index(op.f('ix_labour_attendance_attendance_date'), table_name='labour_attendance')
     op.drop_table('labour_attendance')
+    op.drop_index(op.f('ix_expenses_project_id'), table_name='expenses')
+    op.drop_index(op.f('ix_expenses_expense_date'), table_name='expenses')
+    op.drop_index(op.f('ix_expenses_category'), table_name='expenses')
+    op.drop_index(op.f('ix_expenses_boq_item_id'), table_name='expenses')
+    op.drop_table('expenses')
     op.drop_index(op.f('ix_comments_task_id'), table_name='comments')
     op.drop_index(op.f('ix_comments_author_user_id'), table_name='comments')
     op.drop_table('comments')
@@ -382,6 +465,10 @@ def downgrade():
     op.drop_index(op.f('ix_tasks_project_id'), table_name='tasks')
     op.drop_index(op.f('ix_tasks_assigned_user_id'), table_name='tasks')
     op.drop_table('tasks')
+    op.drop_index(op.f('ix_ra_bills_project_id'), table_name='ra_bills')
+    op.drop_index(op.f('ix_ra_bills_id'), table_name='ra_bills')
+    op.drop_index(op.f('ix_ra_bills_contractor_id'), table_name='ra_bills')
+    op.drop_table('ra_bills')
     op.drop_table('project_members')
     op.drop_index(op.f('ix_owner_transactions_project_id'), table_name='owner_transactions')
     op.drop_index(op.f('ix_owner_transactions_owner_id'), table_name='owner_transactions')
@@ -397,6 +484,8 @@ def downgrade():
     op.drop_index(op.f('ix_labour_project_id'), table_name='labour')
     op.drop_index(op.f('ix_labour_labour_name'), table_name='labour')
     op.drop_table('labour')
+    op.drop_index(op.f('ix_issues_project_id'), table_name='issues')
+    op.drop_table('issues')
     op.drop_index(op.f('ix_invoices_project_id'), table_name='invoices')
     op.drop_index(op.f('ix_invoices_owner_id'), table_name='invoices')
     op.drop_index(op.f('ix_invoices_id'), table_name='invoices')
@@ -404,10 +493,6 @@ def downgrade():
     op.drop_index(op.f('ix_final_measurements_project_id'), table_name='final_measurements')
     op.drop_index(op.f('ix_final_measurements_id'), table_name='final_measurements')
     op.drop_table('final_measurements')
-    op.drop_index(op.f('ix_expenses_project_id'), table_name='expenses')
-    op.drop_index(op.f('ix_expenses_expense_date'), table_name='expenses')
-    op.drop_index(op.f('ix_expenses_category'), table_name='expenses')
-    op.drop_table('expenses')
     op.drop_index(op.f('ix_equipment_status'), table_name='equipment')
     op.drop_index(op.f('ix_equipment_project_id'), table_name='equipment')
     op.drop_index(op.f('ix_equipment_equipment_name'), table_name='equipment')
@@ -416,6 +501,9 @@ def downgrade():
     op.drop_index(op.f('ix_documents_title'), table_name='documents')
     op.drop_index(op.f('ix_documents_project_id'), table_name='documents')
     op.drop_table('documents')
+    op.drop_index(op.f('ix_daily_site_reports_report_date'), table_name='daily_site_reports')
+    op.drop_index(op.f('ix_daily_site_reports_project_id'), table_name='daily_site_reports')
+    op.drop_table('daily_site_reports')
     op.drop_index(op.f('ix_contractor_projects_id'), table_name='contractor_projects')
     op.drop_table('contractor_projects')
     op.drop_index(op.f('ix_boq_items_status'), table_name='boq_items')

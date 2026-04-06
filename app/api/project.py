@@ -1,59 +1,30 @@
 from __future__ import annotations
-
 from datetime import date
 from typing import Optional
-
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
-
 from app.cache.redis import (
     bump_cache_version,
     cache_get_json,
     cache_set_json,
     get_cache_version,
 )
-
 from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
     require_roles,
 )
-
-from app.models.project import (
-    Comment,
-    Milestone,
-    Project,
-    ProjectMember,
-    Task,
-    TaskProgress,
-)
+from app.models import project as m
 from app.models.user import User, UserRole
 from app.models.owner import Owner
 from app.models.expense import Expense
 from app.models.invoice import Invoice
-
 from app.schemas.base import PaginatedResponse, PaginationMeta
-from app.schemas.project import (
-    CommentCreate,
-    CommentOut,
-    MilestoneCreate,
-    MilestoneOut,
-    MilestoneUpdate,
-    ProjectCreate,
-    ProjectMemberAssign,
-    ProjectMemberOut,
-    ProjectOut,
-    ProjectUpdate,
-    TaskCreate,
-    TaskOut,
-    TaskProgressOut,
-    TaskProgressUpdate,
-    TaskUpdate,
-)
+from app.schemas import project as s
+
 
 from app.utils.helpers import (
     NotFoundError,
@@ -61,6 +32,7 @@ from app.utils.helpers import (
     PermissionDeniedError,
     ValidationError,
 )
+from fastapi import HTTPException
 
 def compute_project_status(project):
     today = date.today()
@@ -77,22 +49,25 @@ def compute_project_status(project):
 
     return "Active"
 
+
 router = APIRouter(
-    prefix="/projects",tags=["project_management"],
+    prefix="/projects",
+    tags=["project_management"],
     dependencies=[default_rate_limiter_dependency()],
 )
 
 VERSION_KEY = "cache_version:projects"
 
+
 class ProjectsRepository:
-    async def create_project(self, db: AsyncSession, data: dict) -> Project:
-        obj = Project(**data)
+    async def create_project(self, db: AsyncSession, data: dict) -> m.Project:
+        obj = m.Project(**data)
         db.add(obj)
         await db.flush()
         return obj
 
-    async def get_project(self, db: AsyncSession, project_id: int) -> Optional[Project]:
-        return await db.scalar(select(Project).where(Project.id == project_id))
+    async def get_project(self, db: AsyncSession, project_id: int) -> Optional[m.Project]:
+        return await db.scalar(select(m.Project).where(m.Project.id == project_id))
 
     async def list_projects(
         self,
@@ -102,34 +77,34 @@ class ProjectsRepository:
         offset: int,
         search: Optional[str] = None,
         status: Optional[str] = None,
-    ) -> tuple[list[Project], int]:
-        query = select(Project)
-        count_query = select(func.count()).select_from(Project)
+    ) -> tuple[list[m.Project], int]:
+        query = select(m.Project)
+        count_query = select(func.count()).select_from(m.Project)
 
         if search:
             like = f"%{search}%"
-            query = query.where(Project.project_name.ilike(like))
-            count_query = count_query.where(Project.project_name.ilike(like))
+            query = query.where(m.Project.project_name.ilike(like))
+            count_query = count_query.where(m.Project.project_name.ilike(like))
 
         if status:
-            query = query.where(Project.status == status)
-            count_query = count_query.where(Project.status == status)
+            query = query.where(m.Project.status == status)
+            count_query = count_query.where(m.Project.status == status)
 
-        query = query.order_by(Project.id.desc()).limit(limit).offset(offset)
+        query = query.order_by(m.Project.id.desc()).limit(limit).offset(offset)
 
         total = await db.scalar(count_query)
         rows = (await db.execute(query)).scalars().all()
         return rows, int(total or 0)
 
     async def update_project(
-        self, db: AsyncSession, obj: Project, data: dict
-    ) -> Project:
+        self, db: AsyncSession, obj: m.Project, data: dict
+    ) -> m.Project:
         for k, v in data.items():
             setattr(obj, k, v)
         await db.flush()
         return obj
 
-    async def delete_project(self, db: AsyncSession, obj: Project) -> None:
+    async def delete_project(self, db: AsyncSession, obj: m.Project) -> None:
         await db.delete(obj)
         await db.flush()
 
@@ -137,17 +112,17 @@ class ProjectsRepository:
 class ProjectMembersRepository:
     async def get_member(
         self, db: AsyncSession, *, project_id: int, user_id: int
-    ) -> Optional[ProjectMember]:
+    ) -> Optional[m.ProjectMember]:
         return await db.scalar(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
+            select(m.ProjectMember).where(
+                m.ProjectMember.project_id == project_id, m.ProjectMember.user_id == user_id
             )
         )
 
     async def assign_member(
         self, db: AsyncSession, *, project_id: int, user_id: int
-    ) -> ProjectMember:
-        obj = ProjectMember(project_id=project_id, user_id=user_id)
+    ) -> m.ProjectMember:
+        obj = m.ProjectMember(project_id=project_id, user_id=user_id)
         db.add(obj)
         await db.flush()
         return obj
@@ -166,9 +141,9 @@ class ProjectMembersRepository:
     ) -> bool:
         exists_query = (
             select(func.count())
-            .select_from(ProjectMember)
+            .select_from(m.ProjectMember)
             .where(
-                ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
+                m.ProjectMember.project_id == project_id, m.ProjectMember.user_id == user_id
             )
         )
         count = await db.scalar(exists_query)
@@ -186,14 +161,14 @@ class ProjectMembersRepository:
 
         count_query = (
             select(func.count())
-            .select_from(ProjectMember)
-            .where(ProjectMember.project_id == project_id)
+            .select_from(m.ProjectMember)
+            .where(m.ProjectMember.project_id == project_id)
         )
 
         query = (
             select(User)
-            .join(ProjectMember, ProjectMember.user_id == User.id)
-            .where(ProjectMember.project_id == project_id)
+            .join(m.ProjectMember, m.ProjectMember.user_id == User.id)
+            .where(m.ProjectMember.project_id == project_id)
             .order_by(User.id.desc())
             .limit(limit)
             .offset(offset)
@@ -207,40 +182,40 @@ class ProjectMembersRepository:
 class MilestonesRepository:
     async def create_milestone(
         self, db: AsyncSession, *, project_id: int, data: dict
-    ) -> Milestone:
-        obj = Milestone(project_id=project_id, **data)
+    ) -> m.Milestone:
+        obj = m.Milestone(project_id=project_id, **data)
         db.add(obj)
         await db.flush()
         return obj
 
     async def get_milestone(
         self, db: AsyncSession, *, project_id: int, milestone_id: int
-    ) -> Optional[Milestone]:
+    ) -> Optional[m.Milestone]:
         return await db.scalar(
-            select(Milestone).where(
-                Milestone.project_id == project_id, Milestone.id == milestone_id
+            select(m.Milestone).where(
+                m.Milestone.project_id == project_id, m.Milestone.id == milestone_id
             )
         )
 
     async def list_milestones(
         self, db: AsyncSession, *, project_id: int
-    ) -> list[Milestone]:
+    ) -> list[m.Milestone]:
         query = (
-            select(Milestone)
-            .where(Milestone.project_id == project_id)
-            .order_by(Milestone.id.desc())
+            select(m.Milestone)
+            .where(m.Milestone.project_id == project_id)
+            .order_by(m.Milestone.id.desc())
         )
         return (await db.execute(query)).scalars().all()
 
     async def update_milestone(
-        self, db: AsyncSession, *, obj: Milestone, data: dict
-    ) -> Milestone:
+        self, db: AsyncSession, *, obj: m.Milestone, data: dict
+    ) -> m.Milestone:
         for k, v in data.items():
             setattr(obj, k, v)
         await db.flush()
         return obj
 
-    async def delete_milestone(self, db: AsyncSession, *, obj: Milestone) -> None:
+    async def delete_milestone(self, db: AsyncSession, *, obj: m.Milestone) -> None:
         await db.delete(obj)
         await db.flush()
 
@@ -248,17 +223,17 @@ class MilestonesRepository:
 class TasksRepository:
     async def create_task(
         self, db: AsyncSession, *, project_id: int, data: dict
-    ) -> Task:
-        obj = Task(project_id=project_id, **data)
+    ) -> m.Task:
+        obj = m.Task(project_id=project_id, **data)
         db.add(obj)
         await db.flush()
         return obj
 
     async def get_task(
         self, db: AsyncSession, *, project_id: int, task_id: int
-    ) -> Optional[Task]:
+    ) -> Optional[m.Task]:
         return await db.scalar(
-            select(Task).where(Task.project_id == project_id, Task.id == task_id)
+            select(m.Task).where(m.Task.project_id == project_id, m.Task.id == task_id)
         )
 
     async def list_tasks(
@@ -266,37 +241,37 @@ class TasksRepository:
         db: AsyncSession,
         *,
         project_id: int,
-        status: Optional[str],
+        status: Optional[s.TaskStatus],
         assigned_user_id: Optional[int],
         limit: int,
         offset: int,
-    ) -> tuple[list[Task], int]:
-        query = select(Task).where(Task.project_id == project_id)
+    ) -> tuple[list[m.Task], int]:
+        query = select(m.Task).where(m.Task.project_id == project_id)
         count_query = (
-            select(func.count()).select_from(Task).where(Task.project_id == project_id)
+            select(func.count()).select_from(m.Task).where(m.Task.project_id == project_id)
         )
 
         if status is not None:
-            query = query.where(Task.status == status)
-            count_query = count_query.where(Task.status == status)
+            query = query.where(m.Task.status == status.value)
+            count_query = count_query.where(m.Task.status == status.value)
 
         if assigned_user_id is not None:
-            query = query.where(Task.assigned_user_id == assigned_user_id)
-            count_query = count_query.where(Task.assigned_user_id == assigned_user_id)
+            query = query.where(m.Task.assigned_user_id == assigned_user_id)
+            count_query = count_query.where(m.Task.assigned_user_id == assigned_user_id)
 
-        query = query.order_by(Task.id.desc()).limit(limit).offset(offset)
+        query = query.order_by(m.Task.id.desc()).limit(limit).offset(offset)
 
         total = await db.scalar(count_query)
         rows = (await db.execute(query)).scalars().all()
         return rows, int(total or 0)
 
-    async def update_task(self, db: AsyncSession, *, obj: Task, data: dict) -> Task:
+    async def update_task(self, db: AsyncSession, *, obj: m.Task, data: dict) -> m.Task:
         for k, v in data.items():
             setattr(obj, k, v)
         await db.flush()
         return obj
 
-    async def delete_task(self, db: AsyncSession, *, obj: Task) -> None:
+    async def delete_task(self, db: AsyncSession, *, obj: m.Task) -> None:
         await db.delete(obj)
         await db.flush()
 
@@ -306,12 +281,12 @@ class TasksRepository:
         if not project_ids:
             return []
 
-        query = select(Task.project_id, Task.completion_percentage).where(
-            Task.project_id.in_(project_ids)
+        query = select(m.Task.project_id, m.Task.completion_percentage).where(
+            m.Task.project_id.in_(project_ids)
         )
         rows = (await db.execute(query)).all()
         return [(int(pid), int(pct)) for pid, pct in rows]
-    
+
 
 class TaskProgressRepository:
     async def create_progress(
@@ -322,8 +297,8 @@ class TaskProgressRepository:
         percentage: int,
         remarks: Optional[str],
         created_by_user_id: Optional[int],
-    ) -> TaskProgress:
-        obj = TaskProgress(
+    ) -> m.TaskProgress:
+        obj = m.TaskProgress(
             task_id=task_id,
             percentage=percentage,
             remarks=remarks,
@@ -340,16 +315,16 @@ class TaskProgressRepository:
         task_id: int,
         limit: int,
         offset: int,
-    ) -> tuple[list[TaskProgress], int]:
+    ) -> tuple[list[m.TaskProgress], int]:
         count_query = (
             select(func.count())
-            .select_from(TaskProgress)
-            .where(TaskProgress.task_id == task_id)
+            .select_from(m.TaskProgress)
+            .where(m.TaskProgress.task_id == task_id)
         )
         query = (
-            select(TaskProgress)
-            .where(TaskProgress.task_id == task_id)
-            .order_by(TaskProgress.created_at.desc())
+            select(m.TaskProgress)
+            .where(m.TaskProgress.task_id == task_id)
+            .order_by(m.TaskProgress.created_at.desc())
             .limit(limit)
             .offset(offset)
         )
@@ -366,8 +341,8 @@ class CommentsRepository:
         task_id: int,
         author_user_id: int,
         content: str,
-    ) -> Comment:
-        obj = Comment(task_id=task_id, author_user_id=author_user_id, content=content)
+    ) -> m.Comment:
+        obj = m.Comment(task_id=task_id, author_user_id=author_user_id, content=content)
         db.add(obj)
         await db.flush()
         return obj
@@ -379,14 +354,14 @@ class CommentsRepository:
         task_id: int,
         limit: int,
         offset: int,
-    ) -> tuple[list[Comment], int]:
+    ) -> tuple[list[m.Comment], int]:
         count_query = (
-            select(func.count()).select_from(Comment).where(Comment.task_id == task_id)
+            select(func.count()).select_from(m.Comment).where(m.Comment.task_id == task_id)
         )
         query = (
-            select(Comment)
-            .where(Comment.task_id == task_id)
-            .order_by(Comment.id.desc())
+            select(m.Comment)
+            .where(m.Comment.task_id == task_id)
+            .order_by(m.Comment.id.desc())
             .limit(limit)
             .offset(offset)
         )
@@ -425,8 +400,8 @@ class ProjectsService:
         return out
 
     async def create_project(
-        self, db: AsyncSession, current_user: User, payload: ProjectCreate
-    ) -> ProjectOut:
+        self, db: AsyncSession, current_user: User, payload: s.ProjectCreate
+    ) -> s.ProjectOut:
         self._assert_project_mutation_role(current_user)
         data = payload.model_dump(exclude_unset=True)
         data["status"] = "Planned"
@@ -443,7 +418,7 @@ class ProjectsService:
             db, [obj.id]
         )
         completion = completion_map.get(obj.id, 0.0)
-        return ProjectOut(
+        return s.ProjectOut(
             id=obj.id,
             project_name=obj.project_name,
             owner_id=obj.owner_id,
@@ -462,7 +437,7 @@ class ProjectsService:
         offset: int,
         search: Optional[str] = None,
         status: Optional[str] = None,
-    ) -> PaginatedResponse[ProjectOut]:
+    ) -> PaginatedResponse[s.ProjectOut]:
         rows, total = await self.projects_repo.list_projects(
             db, limit=limit, offset=offset, search=search, status=status
         )
@@ -472,7 +447,7 @@ class ProjectsService:
         )
 
         items = [
-            ProjectOut(
+            s.ProjectOut(
                 id=p.id,
                 project_name=p.project_name,
                 owner_id=p.owner_id,
@@ -485,9 +460,9 @@ class ProjectsService:
             for p in rows
         ]
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
-        return PaginatedResponse[ProjectOut](items=items, meta=meta)
+        return PaginatedResponse[s.ProjectOut](items=items, meta=meta)
 
-    async def get_project(self, db: AsyncSession, project_id: int) -> ProjectOut:
+    async def get_project(self, db: AsyncSession, project_id: int) -> s.ProjectOut:
         obj = await self.projects_repo.get_project(db, project_id=project_id)
         if obj is None:
             raise NotFoundError("Project not found")
@@ -495,7 +470,7 @@ class ProjectsService:
             db, [obj.id]
         )
         completion = completion_map.get(obj.id, 0.0)
-        return ProjectOut(
+        return s.ProjectOut(
             id=obj.id,
             project_name=obj.project_name,
             owner_id=obj.owner_id,
@@ -512,8 +487,8 @@ class ProjectsService:
         current_user: User,
         *,
         project_id: int,
-        payload: ProjectUpdate,
-    ) -> ProjectOut:
+        payload: s.ProjectUpdate,
+    ) -> s.ProjectOut:
         self._assert_project_mutation_role(current_user)
         obj = await self.projects_repo.get_project(db, project_id=project_id)
         if obj is None:
@@ -529,7 +504,7 @@ class ProjectsService:
             db, [obj.id]
         )
         completion = completion_map.get(obj.id, 0.0)
-        return ProjectOut(
+        return s.ProjectOut(
             id=obj.id,
             project_name=obj.project_name,
             owner_id=obj.owner_id,
@@ -570,7 +545,7 @@ class ProjectMembersService:
         *,
         project_id: int,
         user_id: int,
-    ) -> ProjectMemberOut:
+    ) -> s.ProjectMemberOut:
         self._assert_member_mutation_role(current_user)
 
         project = await self.projects_repo.get_project(db, project_id=project_id)
@@ -591,7 +566,7 @@ class ProjectMembersService:
             db, project_id=project_id, user_id=user_id
         )
         role = user.role.value if hasattr(user.role, "value") else str(user.role)
-        return ProjectMemberOut(
+        return s.ProjectMemberOut(
             user_id=user.id,
             full_name=user.full_name,
             email=user.email,
@@ -606,7 +581,7 @@ class ProjectMembersService:
         project_id: int,
         limit: int,
         offset: int,
-    ) -> PaginatedResponse[ProjectMemberOut]:
+    ) -> PaginatedResponse[s.ProjectMemberOut]:
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
@@ -614,11 +589,11 @@ class ProjectMembersService:
         users, total = await self.members_repo.list_members(
             db, project_id=project_id, limit=limit, offset=offset
         )
-        items: list[ProjectMemberOut] = []
+        items: list[s.ProjectMemberOut] = []
         for user in users:
             role = user.role.value if hasattr(user.role, "value") else str(user.role)
             items.append(
-                ProjectMemberOut(
+                s.ProjectMemberOut(
                     user_id=user.id,
                     full_name=user.full_name,
                     email=user.email,
@@ -626,7 +601,7 @@ class ProjectMembersService:
                 )
             )
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
-        return PaginatedResponse[ProjectMemberOut](items=items, meta=meta)
+        return PaginatedResponse[s.ProjectMemberOut](items=items, meta=meta)
 
     async def remove_member(
         self,
@@ -670,8 +645,8 @@ class MilestonesService:
         current_user: User,
         *,
         project_id: int,
-        payload: MilestoneCreate,
-    ) -> MilestoneOut:
+        payload: s.MilestoneCreate,
+    ) -> s.MilestoneOut:
         self._assert_milestone_mutation_role(current_user)
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
@@ -681,7 +656,7 @@ class MilestonesService:
         obj = await self.milestones_repo.create_milestone(
             db, project_id=project_id, data=data
         )
-        return MilestoneOut(
+        return s.MilestoneOut(
             id=obj.id,
             project_id=obj.project_id,
             title=obj.title,
@@ -692,14 +667,14 @@ class MilestonesService:
 
     async def list_milestones(
         self, db: AsyncSession, *, project_id: int
-    ) -> list[MilestoneOut]:
+    ) -> list[s.MilestoneOut]:
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
 
         rows = await self.milestones_repo.list_milestones(db, project_id=project_id)
         return [
-            MilestoneOut(
+            s.MilestoneOut(
                 id=m.id,
                 project_id=m.project_id,
                 title=m.title,
@@ -712,13 +687,13 @@ class MilestonesService:
 
     async def get_milestone(
         self, db: AsyncSession, *, project_id: int, milestone_id: int
-    ) -> MilestoneOut:
+    ) -> s.MilestoneOut:
         obj = await self.milestones_repo.get_milestone(
             db, project_id=project_id, milestone_id=milestone_id
         )
         if obj is None:
             raise NotFoundError("Milestone not found")
-        return MilestoneOut(
+        return s.MilestoneOut(
             id=obj.id,
             project_id=obj.project_id,
             title=obj.title,
@@ -734,8 +709,8 @@ class MilestonesService:
         *,
         project_id: int,
         milestone_id: int,
-        payload: MilestoneUpdate,
-    ) -> MilestoneOut:
+        payload: s.MilestoneUpdate,
+    ) -> s.MilestoneOut:
         self._assert_milestone_mutation_role(current_user)
         obj = await self.milestones_repo.get_milestone(
             db, project_id=project_id, milestone_id=milestone_id
@@ -747,7 +722,7 @@ class MilestonesService:
         if "title" in data and data["title"] is None:
             raise ValidationError("title cannot be null")
         await self.milestones_repo.update_milestone(db, obj=obj, data=data)
-        return MilestoneOut(
+        return s.MilestoneOut(
             id=obj.id,
             project_id=obj.project_id,
             title=obj.title,
@@ -792,7 +767,7 @@ class TasksService:
         if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
             raise PermissionDeniedError("Insufficient permissions")
 
-    def _is_delayed(self, *, task: Task, current_date: date) -> bool:
+    def _is_delayed(self, *, task: m.Task, current_date: date) -> bool:
         if task.end_date is None:
             return False
         return (current_date > task.end_date) and (task.status != "Completed")
@@ -803,7 +778,7 @@ class TasksService:
         *,
         current_user: User,
         project_id: int,
-        task: Task,
+        task: m.Task,
     ) -> None:
         if current_user.id == task.assigned_user_id:
             return
@@ -813,8 +788,8 @@ class TasksService:
         if not allowed:
             raise PermissionDeniedError("Insufficient permissions")
 
-    def _task_to_out(self, *, task: Task, is_delayed: bool) -> TaskOut:
-        return TaskOut(
+    def _task_to_out(self, *, task: m.Task, is_delayed: bool) -> s.TaskOut:
+        return s.TaskOut(
             id=task.id,
             project_id=task.project_id,
             title=task.title,
@@ -834,8 +809,8 @@ class TasksService:
         current_user: User,
         *,
         project_id: int,
-        payload: TaskCreate,
-    ) -> TaskOut:
+        payload: s.TaskCreate,
+    ) -> s.TaskOut:
         self._assert_task_mutation_role(current_user)
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
@@ -859,11 +834,11 @@ class TasksService:
         current_user: User,
         *,
         project_id: int,
-        status: Optional[str],
+        status: Optional[s.TaskStatus],
         assigned_user_id: Optional[int],
         limit: int,
         offset: int,
-    ) -> PaginatedResponse[TaskOut]:
+    ) -> PaginatedResponse[s.TaskOut]:
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
@@ -884,7 +859,7 @@ class TasksService:
             for t in rows
         ]
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
-        return PaginatedResponse[TaskOut](items=items, meta=meta)
+        return PaginatedResponse[s.TaskOut](items=items, meta=meta)
 
     async def get_task(
         self,
@@ -893,7 +868,7 @@ class TasksService:
         *,
         project_id: int,
         task_id: int,
-    ) -> TaskOut:
+    ) -> s.TaskOut:
         obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
         if obj is None:
             raise NotFoundError("Task not found")
@@ -907,8 +882,8 @@ class TasksService:
         *,
         project_id: int,
         task_id: int,
-        payload: TaskUpdate,
-    ) -> TaskOut:
+        payload: s.TaskUpdate,
+    ) -> s.TaskOut:
         self._assert_task_mutation_role(current_user)
         obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
         if obj is None:
@@ -957,8 +932,8 @@ class TasksService:
         *,
         project_id: int,
         task_id: int,
-        payload: TaskProgressUpdate,
-    ) -> TaskProgressOut:
+        payload: s.TaskProgressUpdate,
+    ) -> s.TaskProgressOut:
         obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
         if obj is None:
             raise NotFoundError("Task not found")
@@ -967,8 +942,6 @@ class TasksService:
             db, current_user=current_user, project_id=project_id, task=obj
         )
 
-        if payload.percentage < 0 or payload.percentage > 100:
-            raise ValidationError("percentage must be between 0 and 100")
 
         progress_obj = await self.progress_repo.create_progress(
             db,
@@ -985,7 +958,7 @@ class TasksService:
             db, obj=obj, data={"completion_percentage": int(payload.percentage)}
         )
 
-        return TaskProgressOut(
+        return s.TaskProgressOut(
             id=progress_obj.id,
             task_id=progress_obj.task_id,
             percentage=progress_obj.percentage,
@@ -1002,7 +975,7 @@ class TasksService:
         task_id: int,
         limit: int,
         offset: int,
-    ) -> PaginatedResponse[TaskProgressOut]:
+    ) -> PaginatedResponse[s.TaskProgressOut]:
         obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
         if obj is None:
             raise NotFoundError("Task not found")
@@ -1011,7 +984,7 @@ class TasksService:
             db, task_id=obj.id, limit=limit, offset=offset
         )
         items = [
-            TaskProgressOut(
+            s.TaskProgressOut(
                 id=p.id,
                 task_id=p.task_id,
                 percentage=p.percentage,
@@ -1021,7 +994,7 @@ class TasksService:
             for p in rows
         ]
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
-        return PaginatedResponse[TaskProgressOut](items=items, meta=meta)
+        return PaginatedResponse[s.TaskProgressOut](items=items, meta=meta)
 
     async def create_comment(
         self,
@@ -1030,8 +1003,8 @@ class TasksService:
         *,
         project_id: int,
         task_id: int,
-        payload: CommentCreate,
-    ) -> CommentOut:
+        payload: s.CommentCreate,
+    ) -> s.CommentOut:
         obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
         if obj is None:
             raise NotFoundError("Task not found")
@@ -1046,7 +1019,7 @@ class TasksService:
             author_user_id=current_user.id,
             content=payload.content,
         )
-        return CommentOut(
+        return s.CommentOut(
             id=comment_obj.id,
             task_id=comment_obj.task_id,
             author_user_id=comment_obj.author_user_id,
@@ -1062,7 +1035,7 @@ class TasksService:
         task_id: int,
         limit: int,
         offset: int,
-    ) -> PaginatedResponse[CommentOut]:
+    ) -> PaginatedResponse[s.CommentOut]:
         obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
         if obj is None:
             raise NotFoundError("Task not found")
@@ -1071,7 +1044,7 @@ class TasksService:
             db, task_id=obj.id, limit=limit, offset=offset
         )
         items = [
-            CommentOut(
+            s.CommentOut(
                 id=c.id,
                 task_id=c.task_id,
                 author_user_id=c.author_user_id,
@@ -1080,7 +1053,8 @@ class TasksService:
             for c in rows
         ]
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
-        return PaginatedResponse[CommentOut](items=items, meta=meta)
+        return PaginatedResponse[s.CommentOut](items=items, meta=meta)
+
 
 def get_tasks_service():
     return TasksService(
@@ -1091,9 +1065,10 @@ def get_tasks_service():
         CommentsRepository(),
     )
 
-@router.post("", response_model=ProjectOut)
+
+@router.post("", response_model=s.ProjectOut)
 async def create_project(
-    payload: ProjectCreate,
+    payload: s.ProjectCreate,
     current_user: User = Depends(
         require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
     ),
@@ -1106,7 +1081,7 @@ async def create_project(
     return out
 
 
-@router.get("", response_model=PaginatedResponse[ProjectOut])
+@router.get("", response_model=PaginatedResponse[s.ProjectOut])
 async def list_projects(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -1123,7 +1098,7 @@ async def list_projects(
         # Backward-compatible: older cache entries won't include `completion_percentage`.
         items = cached.get("items") if isinstance(cached, dict) else None
         if items and isinstance(items, list) and "completion_percentage" in items[0]:
-            return PaginatedResponse[ProjectOut].model_validate(cached)
+            return PaginatedResponse[s.ProjectOut].model_validate(cached)
 
     service = ProjectsService(ProjectsRepository(), TasksRepository())
     result = await service.list_projects(
@@ -1133,7 +1108,7 @@ async def list_projects(
     return result
 
 
-@router.get("/{project_id}", response_model=ProjectOut)
+@router.get("/{project_id}", response_model=s.ProjectOut)
 async def get_project(
     project_id: int,
     current_user: User = Depends(get_current_active_user),
@@ -1148,7 +1123,7 @@ async def get_project(
         and isinstance(cached_json, dict)
         and "completion_percentage" in cached_json
     ):
-        return ProjectOut.model_validate(cached_json)
+        return s.ProjectOut.model_validate(cached_json)
 
     service = ProjectsService(ProjectsRepository(), TasksRepository())
     out = await service.get_project(db, project_id=project_id)
@@ -1156,10 +1131,10 @@ async def get_project(
     return out
 
 
-@router.put("/{project_id}", response_model=ProjectOut)
+@router.put("/{project_id}", response_model=s.ProjectOut)
 async def update_project(
     project_id: int,
-    payload: ProjectUpdate,
+    payload: s.ProjectUpdate,
     current_user: User = Depends(
         require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
     ),
@@ -1190,7 +1165,7 @@ async def delete_project(
 
 
 @router.post(
-    "/{project_id}/members/{user_id}", response_model=ProjectMemberOut, status_code=201
+    "/{project_id}/members/{user_id}", response_model=s.ProjectMemberOut, status_code=201
 )
 async def assign_project_member(
     project_id: int,
@@ -1207,7 +1182,7 @@ async def assign_project_member(
     return out
 
 
-@router.get("/{project_id}/members", response_model=PaginatedResponse[ProjectMemberOut])
+@router.get("/{project_id}/members", response_model=PaginatedResponse[s.ProjectMemberOut])
 async def list_project_members(
     project_id: int,
     limit: int = Query(20, ge=1, le=100),
@@ -1236,6 +1211,7 @@ async def remove_project_member(
     await bump_cache_version(redis, VERSION_KEY)
     return None
 
+
 milestones_router = APIRouter(
     prefix="",
     tags=["project_management"],
@@ -1248,10 +1224,10 @@ tasks_router = APIRouter(
 )
 
 
-@milestones_router.post("/{project_id}/milestones", response_model=MilestoneOut)
+@milestones_router.post("/{project_id}/milestones", response_model=s.MilestoneOut)
 async def create_milestone(
     project_id: int,
-    payload: MilestoneCreate,
+    payload: s.MilestoneCreate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -1264,7 +1240,7 @@ async def create_milestone(
     return out
 
 
-@milestones_router.get("/{project_id}/milestones", response_model=list[MilestoneOut])
+@milestones_router.get("/{project_id}/milestones", response_model=list[s.MilestoneOut])
 async def list_milestones(
     project_id: int,
     current_user: User = Depends(get_current_active_user),
@@ -1275,7 +1251,7 @@ async def list_milestones(
 
 
 @milestones_router.get(
-    "/{project_id}/milestones/{milestone_id}", response_model=MilestoneOut
+    "/{project_id}/milestones/{milestone_id}", response_model=s.MilestoneOut
 )
 async def get_milestone(
     project_id: int,
@@ -1290,12 +1266,12 @@ async def get_milestone(
 
 
 @milestones_router.put(
-    "/{project_id}/milestones/{milestone_id}", response_model=MilestoneOut
+    "/{project_id}/milestones/{milestone_id}", response_model=s.MilestoneOut
 )
 async def update_milestone(
     project_id: int,
     milestone_id: int,
-    payload: MilestoneUpdate,
+    payload: s.MilestoneUpdate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -1328,10 +1304,10 @@ async def delete_milestone(
     return None
 
 
-@tasks_router.post("/{project_id}/tasks", response_model=TaskOut)
+@tasks_router.post("/{project_id}/tasks", response_model=s.TaskOut)
 async def create_task(
     project_id: int,
-    payload: TaskCreate,
+    payload: s.TaskCreate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -1344,10 +1320,10 @@ async def create_task(
     return out
 
 
-@tasks_router.get("/{project_id}/tasks", response_model=PaginatedResponse[TaskOut])
+@tasks_router.get("/{project_id}/tasks", response_model=PaginatedResponse[s.TaskOut])
 async def list_tasks(
     project_id: int,
-    status: Optional[str] = Query(default=None),
+    status: Optional[s.TaskStatus] = Query(default=None),
     assigned_user_id: Optional[int] = Query(default=None),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -1355,7 +1331,6 @@ async def list_tasks(
     db: AsyncSession = Depends(get_db_session),
     service: TasksService = Depends(get_tasks_service),
 ):
-    
     return await service.list_tasks(
         db,
         current_user,
@@ -1367,7 +1342,7 @@ async def list_tasks(
     )
 
 
-@tasks_router.get("/{project_id}/tasks/{task_id}", response_model=TaskOut)
+@tasks_router.get("/{project_id}/tasks/{task_id}", response_model=s.TaskOut)
 async def get_task(
     project_id: int,
     task_id: int,
@@ -1381,11 +1356,11 @@ async def get_task(
     )
 
 
-@tasks_router.put("/{project_id}/tasks/{task_id}", response_model=TaskOut)
+@tasks_router.put("/{project_id}/tasks/{task_id}", response_model=s.TaskOut)
 async def update_task(
     project_id: int,
     task_id: int,
-    payload: TaskUpdate,
+    payload: s.TaskUpdate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -1407,25 +1382,22 @@ async def delete_task(
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
 ):
-    await service.delete_task(
-        db, current_user, project_id=project_id, task_id=task_id
-    )
+    await service.delete_task(db, current_user, project_id=project_id, task_id=task_id)
     await bump_cache_version(redis, VERSION_KEY)
     return None
 
 
 @tasks_router.post(
-    "/{project_id}/tasks/{task_id}/progress", response_model=TaskProgressOut
+    "/{project_id}/tasks/{task_id}/progress", response_model=s.TaskProgressOut
 )
 async def update_task_progress(
     project_id: int,
     task_id: int,
-    payload: TaskProgressUpdate,
+    payload: s.TaskProgressUpdate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
-
 ):
     out = await service.update_task_progress(
         db, current_user, project_id=project_id, task_id=task_id, payload=payload
@@ -1436,7 +1408,7 @@ async def update_task_progress(
 
 @tasks_router.get(
     "/{project_id}/tasks/{task_id}/progress",
-    response_model=PaginatedResponse[TaskProgressOut],
+    response_model=PaginatedResponse[s.TaskProgressOut],
 )
 async def list_task_progress_history(
     project_id: int,
@@ -1458,11 +1430,11 @@ async def list_task_progress_history(
     )
 
 
-@tasks_router.post("/{project_id}/tasks/{task_id}/comments", response_model=CommentOut)
+@tasks_router.post("/{project_id}/tasks/{task_id}/comments", response_model=s.CommentOut)
 async def create_comment(
     project_id: int,
     task_id: int,
-    payload: CommentCreate,
+    payload: s.CommentCreate,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -1478,7 +1450,7 @@ async def create_comment(
 
 @tasks_router.get(
     "/{project_id}/tasks/{task_id}/comments",
-    response_model=PaginatedResponse[CommentOut],
+    response_model=PaginatedResponse[s.CommentOut],
 )
 async def list_comments(
     project_id: int,
@@ -1505,7 +1477,7 @@ async def project_profit_loss(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    project = await db.get(Project, project_id)
+    project = await db.get(m.Project, project_id)
     if not project:
         raise NotFoundError("Project not found")
 
@@ -1529,6 +1501,183 @@ async def project_profit_loss(
         "profit": profit,
         "status": "profit" if profit >= 0 else "loss",
     }
+
+
+dsr_router = APIRouter(
+    prefix="/dsr",
+    tags=["DSR"],
+    dependencies=[default_rate_limiter_dependency()],
+)
+
+
+@dsr_router.post("", response_model=s.DSROut)
+async def create_dsr(
+    payload: s.DSRCreate,
+    db: AsyncSession = Depends(get_db_session),
+):
+    project = await db.get(m.Project, payload.project_id)
+    if not project:
+        raise NotFoundError("Project not found")
+
+    existing = await db.scalar(
+        select(m.DailySiteReport).where(
+            m.DailySiteReport.project_id == payload.project_id,
+            m.DailySiteReport.report_date == payload.report_date,
+        )
+    )
+
+    if existing:
+        raise HTTPException(status_code=400, detail="DSR already exists for this date")
+
+    obj = m.DailySiteReport(**payload.model_dump())
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+
+    return s.DSROut.model_validate(obj)
+
+
+@dsr_router.get("/project/{project_id}")
+async def get_project_dsr(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    result = await db.execute(
+        select(m.DailySiteReport).where(m.DailySiteReport.project_id == project_id)
+    )
+    rows = result.scalars().all()
+
+    return [s.DSROut.model_validate(r) for r in rows]
+
+
+@dsr_router.get("/{id}", response_model=s.DSROut)
+async def get_dsr(id: int, db: AsyncSession = Depends(get_db_session)):
+    obj = await db.get(m.DailySiteReport, id)
+
+    if not obj:
+        raise NotFoundError("DSR not found")
+
+    return s.DSROut.model_validate(obj)
+
+
+@dsr_router.put("/{id}", response_model=s.DSROut)
+async def update_dsr(
+    id: int,
+    payload: s.DSRUpdate,
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.DailySiteReport, id)
+
+    if not obj:
+        raise NotFoundError("DSR not found")
+
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(obj, k, v)
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return s.DSROut.model_validate(obj)
+
+
+@dsr_router.delete("/{id}", status_code=204)
+async def delete_dsr(id: int, db: AsyncSession = Depends(get_db_session)):
+    obj = await db.get(m.DailySiteReport, id)
+
+    if not obj:
+        raise NotFoundError("DSR not found")
+
+    await db.delete(obj)
+    await db.commit()
+
+    return None
+
+
+issues_router = APIRouter(
+    prefix="/issues",
+    tags=["Issues"],
+    dependencies=[default_rate_limiter_dependency()],
+)
+
+
+@issues_router.post("", response_model=s.IssueOut)
+async def create_issue(
+    payload: s.IssueCreate,
+    db: AsyncSession = Depends(get_db_session),
+):
+    project = await db.get(m.Project, payload.project_id)
+    if not project:
+        raise NotFoundError("Project not found")
+
+    obj = m.Issue(**payload.model_dump())
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+
+    return s.IssueOut.model_validate(obj)
+
+
+@issues_router.get("", response_model=list[s.IssueOut])
+async def list_issues(db: AsyncSession = Depends(get_db_session)):
+    result = await db.execute(select(m.Issue))
+    rows = result.scalars().all()
+    return [s.IssueOut.model_validate(r) for r in rows]
+
+
+@issues_router.get("/{id}", response_model=s.IssueOut)
+async def get_issue(id: int, db: AsyncSession = Depends(get_db_session)):
+    obj = await db.get(m.Issue, id)
+
+    if not obj:
+        raise NotFoundError("Issue not found")
+
+    return s.IssueOut.model_validate(obj)
+
+
+@issues_router.put("/{id}", response_model=s.IssueOut)
+async def update_issue(
+    id: int,
+    payload: s.IssueUpdate,
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.Issue, id)
+
+    if not obj:
+        raise NotFoundError("Issue not found")
+
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(obj, k, v)
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return s.IssueOut.model_validate(obj)
+
+
+@issues_router.delete("/{id}", status_code=204)
+async def delete_issue(id: int, db: AsyncSession = Depends(get_db_session)):
+    obj = await db.get(m.Issue, id)
+
+    if not obj:
+        raise NotFoundError("Issue not found")
+
+    await db.delete(obj)
+    await db.commit()
+
+    return None
+
+
+@issues_router.get("/project/{project_id}")
+async def issues_by_project(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    result = await db.execute(select(m.Issue).where(m.Issue.project_id == project_id))
+    rows = result.scalars().all()
+
+    return [s.IssueOut.model_validate(r) for r in rows]
 
 
 router.include_router(milestones_router)

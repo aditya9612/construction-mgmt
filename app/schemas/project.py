@@ -2,16 +2,14 @@ from datetime import date, datetime
 from typing import Optional
 from enum import Enum
 
-from pydantic import conint
+from pydantic import Field, field_validator
+from typing_extensions import Annotated
 from app.schemas.base import BaseSchema
 
-from typing_extensions import Annotated
-from pydantic import Field
 
-
-# -------------------------
-# ENUM
-# -------------------------
+# =========================
+# ENUMS
+# =========================
 class ProjectStatus(str, Enum):
     PLANNED = "Planned"
     ONGOING = "Ongoing"
@@ -19,9 +17,40 @@ class ProjectStatus(str, Enum):
     ON_HOLD = "On Hold"
 
 
-# -------------------------
+class IssuePriority(str, Enum):
+    LOW = "Low"
+    MEDIUM = "Medium"
+    HIGH = "High"
+    CRITICAL = "Critical"
+
+
+class IssueStatus(str, Enum):
+    OPEN = "Open"
+    CLOSED = "Closed"
+
+
+class TaskStatus(str, Enum):
+    PLANNED = "Planned"
+    IN_PROGRESS = "In Progress"
+    COMPLETED = "Completed"
+
+
+class WeatherType(str, Enum):
+    SUNNY = "Sunny"
+    RAINY = "Rainy"
+    CLOUDY = "Cloudy"
+    WINDY = "Windy"
+
+
+class IssueCategory(str, Enum):
+    MATERIAL = "Material"
+    LABOUR = "Labour"
+    DELAY = "Delay"
+
+
+# =========================
 # PROJECT
-# -------------------------
+# =========================
 class ProjectCreate(BaseSchema):
     project_name: str
     owner_id: int
@@ -53,9 +82,9 @@ class ProjectOut(BaseSchema):
         from_attributes = True
 
 
-# -------------------------
+# =========================
 # MEMBERS
-# -------------------------
+# =========================
 class ProjectMemberAssign(BaseSchema):
     user_id: int
 
@@ -67,9 +96,9 @@ class ProjectMemberOut(BaseSchema):
     role: Optional[str] = None
 
 
-# -------------------------
+# =========================
 # MILESTONE
-# -------------------------
+# =========================
 class MilestoneCreate(BaseSchema):
     title: str
     description: Optional[str] = None
@@ -93,14 +122,14 @@ class MilestoneOut(BaseSchema):
     end_date: Optional[date] = None
 
 
-# -------------------------
+# =========================
 # TASK
-# -------------------------
+# =========================
 class TaskCreate(BaseSchema):
     title: str
     description: Optional[str] = None
     priority: int = 0
-    status: str = "Planned"
+    status: TaskStatus = TaskStatus.PLANNED
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     assigned_user_id: Optional[int] = None
@@ -110,7 +139,7 @@ class TaskUpdate(BaseSchema):
     title: Optional[str] = None
     description: Optional[str] = None
     priority: Optional[int] = None
-    status: Optional[str] = None
+    status: Optional[TaskStatus] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     assigned_user_id: Optional[int] = None
@@ -122,7 +151,7 @@ class TaskOut(BaseSchema):
     title: str
     description: Optional[str] = None
     priority: int
-    status: str
+    status: TaskStatus
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     assigned_user_id: Optional[int]
@@ -130,9 +159,9 @@ class TaskOut(BaseSchema):
     is_delayed: bool
 
 
-# -------------------------
+# =========================
 # TASK PROGRESS
-# -------------------------
+# =========================
 class TaskProgressUpdate(BaseSchema):
     percentage: Annotated[int, Field(ge=0, le=100)]
     remarks: Optional[str] = None
@@ -146,9 +175,9 @@ class TaskProgressOut(BaseSchema):
     created_at: datetime
 
 
-# -------------------------
+# =========================
 # COMMENTS
-# -------------------------
+# =========================
 class CommentCreate(BaseSchema):
     content: str
 
@@ -158,3 +187,125 @@ class CommentOut(BaseSchema):
     task_id: int
     author_user_id: int
     content: str
+
+
+# =========================
+# DSR
+# =========================
+class DSRBase(BaseSchema):
+    project_id: int
+    report_date: date
+    weather: Optional[WeatherType] = None
+    work_done: str
+    work_planned: Optional[str] = None
+    labour_count: Annotated[int, Field(ge=0)] = 0
+    material_used: Optional[str] = None
+    issues: Optional[str] = None
+    remarks: Optional[str] = None
+
+    @field_validator("work_done")
+    def validate_work_done(cls, v):
+        if not v.strip():
+            raise ValueError("Work done cannot be empty")
+        return v
+
+    @field_validator("report_date")
+    def validate_report_date(cls, v):
+        if v > date.today():
+            raise ValueError("Future report date not allowed")
+        return v
+
+
+class DSRCreate(DSRBase):
+    pass
+
+
+class DSRUpdate(BaseSchema):
+    report_date: Optional[date] = None
+    weather: Optional[WeatherType] = None
+    work_done: Optional[str] = None
+    work_planned: Optional[str] = None
+    labour_count: Optional[Annotated[int, Field(ge=0)]] = None
+    material_used: Optional[str] = None
+    issues: Optional[str] = None
+    remarks: Optional[str] = None
+
+    @field_validator("work_done")
+    def validate_update_work_done(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError("Work done cannot be empty")
+        return v
+
+    @field_validator("report_date")
+    def validate_update_date(cls, v):
+        if v and v > date.today():
+            raise ValueError("Future report date not allowed")
+        return v
+
+
+class DSROut(DSRBase):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+
+# =========================
+# ISSUE
+# =========================
+class IssueBase(BaseSchema):
+    project_id: int
+    title: str
+    category: IssueCategory
+    description: Optional[str] = None
+    reported_date: date
+    priority: IssuePriority = IssuePriority.MEDIUM
+
+    @field_validator("title")
+    def validate_title(cls, v):
+        if not v.strip():
+            raise ValueError("Title cannot be empty")
+        return v
+
+    @field_validator("reported_date")
+    def validate_reported_date(cls, v):
+        if v > date.today():
+            raise ValueError("Future date not allowed")
+        return v
+
+
+class IssueCreate(IssueBase):
+    pass
+
+
+class IssueUpdate(BaseSchema):
+    title: Optional[str] = None
+    category: Optional[IssueCategory] = None
+    description: Optional[str] = None
+    priority: Optional[IssuePriority] = None
+    status: Optional[IssueStatus] = None
+    assigned_to: Optional[int] = None
+    resolution: Optional[str] = None
+    reported_date: Optional[date] = None
+
+    @field_validator("title")
+    def validate_update_title(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError("Title cannot be empty")
+        return v
+
+    @field_validator("reported_date")
+    def validate_update_date(cls, v):
+        if v and v > date.today():
+            raise ValueError("Future date not allowed")
+        return v
+
+
+class IssueOut(IssueBase):
+    id: int
+    status: IssueStatus
+    assigned_to: Optional[int]
+    resolution: Optional[str]
+
+    class Config:
+        from_attributes = True

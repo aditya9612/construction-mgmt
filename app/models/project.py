@@ -1,7 +1,15 @@
 from datetime import date
 from typing import Optional, TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, Date, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    Date,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -22,12 +30,12 @@ class Project(Base, TimestampMixin):
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="Planned", index=True)
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="Planned", index=True
+    )
 
     owner_id: Mapped[int] = mapped_column(
-        ForeignKey("owners.id"),
-        nullable=False,
-        index=True
+        ForeignKey("owners.id"), nullable=False, index=True
     )
 
     owner: Mapped["Owner"] = relationship("Owner", back_populates="projects")
@@ -50,10 +58,20 @@ class Project(Base, TimestampMixin):
         cascade="all, delete-orphan",
     )
 
+    dsr_entries: Mapped[list["DailySiteReport"]] = relationship(
+        "DailySiteReport",
+        cascade="all, delete-orphan",
+    )
+
+    issues: Mapped[list["Issue"]] = relationship(
+        "Issue",
+        cascade="all, delete-orphan",
+    )
+
     __table_args__ = (
         CheckConstraint(
             "end_date IS NULL OR start_date IS NULL OR end_date >= start_date",
-            name="check_project_dates"
+            name="check_project_dates",
         ),
     )
 
@@ -73,7 +91,9 @@ class ProjectMember(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("project_id", "user_id", name="uq_project_members_project_id_user_id"),
+        UniqueConstraint(
+            "project_id", "user_id", name="uq_project_members_project_id_user_id"
+        ),
     )
 
     project: Mapped["Project"] = relationship("Project", back_populates="members")
@@ -116,7 +136,9 @@ class Task(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="Planned", index=True)
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="Planned", index=True
+    )
 
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -128,7 +150,9 @@ class Task(Base):
         index=True,
     )
 
-    completion_percentage: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_percentage: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
 
     project: Mapped["Project"] = relationship("Project", back_populates="tasks")
 
@@ -169,9 +193,7 @@ class TaskProgress(Base, TimestampMixin):
 
     task: Mapped["Task"] = relationship("Task", back_populates="progress_entries")
 
-    __table_args__ = (
-        CheckConstraint("percentage >= 0 AND percentage <= 100"),
-    )
+    __table_args__ = (CheckConstraint("percentage >= 0 AND percentage <= 100"),)
 
 
 class Comment(Base):
@@ -196,3 +218,64 @@ class Comment(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
     task: Mapped["Task"] = relationship("Task", back_populates="comments")
+
+
+class DailySiteReport(Base, TimestampMixin):
+    __tablename__ = "daily_site_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    project_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    report_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+
+    weather: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    work_done: Mapped[str] = mapped_column(Text, nullable=False)
+    work_planned: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    labour_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    material_used: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    issues: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    project: Mapped["Project"] = relationship("Project")
+
+
+class Issue(Base, TimestampMixin):
+    __tablename__ = "issues"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    project_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    category: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    reported_date: Mapped[date] = mapped_column(Date, nullable=False)
+
+    priority: Mapped[str] = mapped_column(String(50), default="Medium")
+
+    status: Mapped[str] = mapped_column(String(50), default="Open")
+
+    assigned_to: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    resolution: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    project: Mapped["Project"] = relationship("Project")

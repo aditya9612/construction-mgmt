@@ -12,6 +12,4 @@ from app.models.contractor import Contractor
 from app.models.expense import Expense
 from app.models.invoice import Invoice
 from app.models.final_measurement import FinalMeasurement
-from app.models.dsr import DailySiteReport
 from app.models.ra_bill import RABill
-from app.models.issue import Issue
