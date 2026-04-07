@@ -1,12 +1,11 @@
 from decimal import Decimal
 from typing import Optional
 
+from pydantic import ConfigDict
+
 from app.schemas.base import BaseSchema
 
 
-# -------------------------
-# CREATE
-# -------------------------
 class MaterialCreate(BaseSchema):
     project_id: int
     material_name: str
@@ -15,14 +14,10 @@ class MaterialCreate(BaseSchema):
     supplier_name: str
     purchase_rate: Decimal = Decimal("0")
     rate_type: str
-
     quantity_purchased: Decimal = Decimal("0")
     payment_given: Decimal = Decimal("0")
 
 
-# -------------------------
-# UPDATE
-# -------------------------
 class MaterialUpdate(BaseSchema):
     material_name: Optional[str] = None
     category: Optional[str] = None
@@ -30,11 +25,9 @@ class MaterialUpdate(BaseSchema):
     supplier_name: Optional[str] = None
     purchase_rate: Optional[Decimal] = None
     rate_type: Optional[str] = None
+    payment_given: Optional[Decimal] = None
 
 
-# -------------------------
-# RESPONSE
-# -------------------------
 class MaterialOut(BaseSchema):
     id: int
     project_id: int
@@ -51,8 +44,11 @@ class MaterialOut(BaseSchema):
     quantity_used: Decimal
     remaining_stock: Decimal
 
+    total_amount: Decimal
     payment_given: Decimal
     payment_pending: Decimal
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_encoders={Decimal: float}
+    )

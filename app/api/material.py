@@ -80,7 +80,7 @@ async def material_report(
         {
             "material_name": r.material_name,
             "category": r.category,
-            "total_cost": float(r.quantity_purchased * r.purchase_rate),
+            "total_cost": float(r.total_amount),
             "remaining_stock": float(r.remaining_stock),
         }
         for r in rows
@@ -122,7 +122,12 @@ async def create_material(
 
     total_cost = purchased * rate
 
+    if payment_given > total_cost:
+        raise ValueError("Payment cannot exceed total amount")
+
+    data["quantity_used"] = Decimal("0")
     data["remaining_stock"] = purchased
+    data["total_amount"] = total_cost
     data["payment_pending"] = total_cost - payment_given
 
     obj = Material(**data)
@@ -133,7 +138,7 @@ async def create_material(
         owner_id=project.owner_id,
         project_id=obj.project_id,
         type="debit",
-        amount=total_cost,
+        amount=float(total_cost),
         reference_type="material",
         reference_id=obj.id,
         description="Material purchase",
@@ -231,6 +236,13 @@ async def update_material(
     for k, v in data.items():
         setattr(obj, k, v)
 
+    obj.remaining_stock = obj.quantity_purchased - obj.quantity_used
+    obj.total_amount = obj.quantity_purchased * obj.purchase_rate
+    obj.payment_pending = obj.total_amount - obj.payment_given
+
+    if obj.payment_given > obj.total_amount:
+        raise ValueError("Payment cannot exceed total amount")
+
     await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
 
@@ -271,12 +283,15 @@ async def add_purchase(
         raise NotFoundError("Material not found")
 
     obj.quantity_purchased += quantity
-    obj.remaining_stock += quantity
+    obj.remaining_stock = obj.quantity_purchased - obj.quantity_used   # ✅ FIXED
 
-    total_cost = obj.quantity_purchased * obj.purchase_rate
+    obj.total_amount = obj.quantity_purchased * obj.purchase_rate
 
     obj.payment_given += payment
-    obj.payment_pending = total_cost - obj.payment_given
+    obj.payment_pending = obj.total_amount - obj.payment_given
+
+    if obj.payment_given > obj.total_amount:
+        raise ValueError("Payment cannot exceed total amount")
 
     project = await db.get(Project, obj.project_id)
 
