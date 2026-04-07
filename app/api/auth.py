@@ -34,11 +34,7 @@ def otp_rate_limiter_dependency():
         ip = request.client.host
         key = f"otp:{ip}"
 
-        allowed = await limiter.try_acquire_async(
-            name=key,
-            rate=Rate(5, Duration.MINUTE),  # 🔥 5 per minute
-            blocking=False,
-        )
+        allowed = await limiter.try_acquire_async(key)
 
         if not allowed:
             raise HTTPException(status_code=429, detail="Too many OTP requests")

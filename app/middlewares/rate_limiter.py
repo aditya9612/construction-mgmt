@@ -54,10 +54,7 @@ def default_rate_limiter_dependency():
 
         key = ip
 
-        allowed = await limiter.try_acquire_async(
-            name=key,
-            blocking=False,
-        )
+        allowed = await limiter.try_acquire_async(key)
 
         if not allowed:
             raise HTTPException(status_code=429, detail="Too Many Requests")
