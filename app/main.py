@@ -121,6 +121,7 @@ def create_app() -> FastAPI:
     api_router.include_router(ra_bill_router)
     api_router.include_router(dsr_router)
     api_router.include_router(issues_router)
+    api_router.include_router(ra_bill_router)
 
     application.include_router(api_router, prefix="/api/v1")
     return application
