@@ -15,7 +15,6 @@ from app.utils.helpers import NotFoundError
 router = APIRouter(prefix="/ra-bills", tags=["RA Bills"])
 
 
-
 @router.post("", response_model=RABillOut)
 async def create_ra_bill(
     payload: RABillCreate,
@@ -61,7 +60,8 @@ async def create_ra_bill(
     if net < 0:
         raise HTTPException(status_code=400, detail="Net amount cannot be negative")
 
-    gst_amount = (net * payload.gst_percent) / 100
+    gst_percent = payload.gst_percent or 0   # ✅ FIXED
+    gst_amount = (net * gst_percent) / 100
     total = net + gst_amount
 
     obj = RABill(
@@ -79,7 +79,7 @@ async def create_ra_bill(
         owner_id=project.owner_id,
         project_id=project.id,
         type="debit",
-        amount=total,
+        amount=float(total),   # ✅ FIXED
         reference_type="ra_bill",
         reference_id=obj.id,
         description="Contractor RA Bill",
@@ -93,13 +93,11 @@ async def create_ra_bill(
     return RABillOut.model_validate(obj)
 
 
-
 @router.get("", response_model=list[RABillOut])
 async def list_ra_bills(db: AsyncSession = Depends(get_db_session)):
     result = await db.execute(select(RABill))
     rows = result.scalars().all()
     return [RABillOut.model_validate(r) for r in rows]
-
 
 
 @router.get("/{id}", response_model=RABillOut)
@@ -112,7 +110,6 @@ async def get_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
     return RABillOut.model_validate(obj)
 
 
-
 @router.put("/{id}", response_model=RABillOut)
 async def update_ra_bill(
     id: int,
@@ -123,7 +120,6 @@ async def update_ra_bill(
 
     if not obj:
         raise NotFoundError("RA Bill not found")
-
 
     if payload.quantity is not None and payload.quantity <= 0:
         raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
@@ -145,10 +141,9 @@ async def update_ra_bill(
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
-
     gross = obj.quantity * obj.rate
 
-    if obj.deductions and obj.deductions > gross:
+    if obj.deductions is not None and obj.deductions > gross:   # ✅ FIXED
         raise HTTPException(status_code=400, detail="Deductions cannot exceed gross amount")
 
     net = gross - (obj.deductions or 0)
@@ -156,7 +151,8 @@ async def update_ra_bill(
     if net < 0:
         raise HTTPException(status_code=400, detail="Net amount cannot be negative")
 
-    gst_amount = (net * (obj.gst_percent or 0)) / 100
+    gst_percent = obj.gst_percent or 0   # ✅ FIXED
+    gst_amount = (net * gst_percent) / 100
     total = net + gst_amount
 
     obj.gross_amount = gross
@@ -167,7 +163,6 @@ async def update_ra_bill(
     await db.refresh(obj)
 
     return RABillOut.model_validate(obj)
-
 
 
 @router.delete("/{id}", status_code=204)
@@ -181,7 +176,6 @@ async def delete_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
     await db.commit()
 
     return None
-
 
 
 @router.get("/contractor/{contractor_id}")
