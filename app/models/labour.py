@@ -1,10 +1,8 @@
 from decimal import Decimal
 from typing import Optional
 from datetime import date
-
-from sqlalchemy import DECIMAL, ForeignKey, Integer, String
-from sqlalchemy.orm import Mapped, mapped_column
-
+from sqlalchemy import DECIMAL, ForeignKey, Integer, String, Column
+from sqlalchemy.orm import Mapped, mapped_column , relationship
 from app.models.base import Base, TimestampMixin
 
 
@@ -56,10 +54,39 @@ class LabourAttendance(Base, TimestampMixin):
 
     attendance_date: Mapped[date] = mapped_column(nullable=False, index=True)
 
-    working_hours: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), nullable=False, default=0)
+    working_hours: Mapped[Decimal] = mapped_column(
+        DECIMAL(5, 2), nullable=False, default=0
+    )
 
-    overtime_hours: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), nullable=False, default=0)
+    overtime_hours: Mapped[Decimal] = mapped_column(
+        DECIMAL(5, 2), nullable=False, default=0
+    )
 
-    overtime_rate: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False, default=0)
+    overtime_rate: Mapped[Decimal] = mapped_column(
+        DECIMAL(10, 2), nullable=False, default=0
+    )
 
     task_description: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
+class LabourPayroll(Base, TimestampMixin):
+    __tablename__ = "labour_payroll"
+
+    id = Column(Integer, primary_key=True)
+
+    labour_id = Column(Integer, ForeignKey("labour.id", ondelete="CASCADE"))
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+
+    month = Column(Integer, nullable=False)
+    year = Column(Integer, nullable=False)
+
+    total_working_hours = Column(DECIMAL(10, 2), default=0)
+    total_overtime_hours = Column(DECIMAL(10, 2), default=0)
+
+    total_wage = Column(DECIMAL(18, 2), nullable=False)
+
+    paid_amount = Column(DECIMAL(18, 2), default=0)
+    remaining_amount = Column(DECIMAL(18, 2), default=0)
+    status = Column(String(50), default="Pending")  # Pending / Paid / Partial
+
+    labour = relationship("Labour")

@@ -1,8 +1,8 @@
 """update data
 
-Revision ID: 692e3f5a9b46
+Revision ID: d5b6d57eed4c
 Revises: 
-Create Date: 2026-04-07 15:21:01.535654
+Create Date: 2026-04-08 09:27:41.094363
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '692e3f5a9b46'
+revision = 'd5b6d57eed4c'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -378,6 +378,7 @@ def upgrade():
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
     sa.Column('boq_item_id', sa.Integer(), nullable=True),
+    sa.Column('labour_id', sa.Integer(), nullable=True),
     sa.Column('category', sa.String(length=50), nullable=False),
     sa.Column('description', sa.String(length=255), nullable=False),
     sa.Column('amount', sa.DECIMAL(precision=18, scale=2), nullable=False),
@@ -386,12 +387,14 @@ def upgrade():
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['boq_item_id'], ['boq_items.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['labour_id'], ['labour.id'], ondelete='SET NULL'),
     sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_expenses_boq_item_id'), 'expenses', ['boq_item_id'], unique=False)
     op.create_index(op.f('ix_expenses_category'), 'expenses', ['category'], unique=False)
     op.create_index(op.f('ix_expenses_expense_date'), 'expenses', ['expense_date'], unique=False)
+    op.create_index(op.f('ix_expenses_labour_id'), 'expenses', ['labour_id'], unique=False)
     op.create_index(op.f('ix_expenses_project_id'), 'expenses', ['project_id'], unique=False)
     op.create_table('labour_attendance',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
@@ -411,6 +414,24 @@ def upgrade():
     op.create_index(op.f('ix_labour_attendance_attendance_date'), 'labour_attendance', ['attendance_date'], unique=False)
     op.create_index(op.f('ix_labour_attendance_labour_id'), 'labour_attendance', ['labour_id'], unique=False)
     op.create_index(op.f('ix_labour_attendance_project_id'), 'labour_attendance', ['project_id'], unique=False)
+    op.create_table('labour_payroll',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('labour_id', sa.Integer(), nullable=True),
+    sa.Column('project_id', sa.Integer(), nullable=True),
+    sa.Column('month', sa.Integer(), nullable=False),
+    sa.Column('year', sa.Integer(), nullable=False),
+    sa.Column('total_working_hours', sa.DECIMAL(precision=10, scale=2), nullable=True),
+    sa.Column('total_overtime_hours', sa.DECIMAL(precision=10, scale=2), nullable=True),
+    sa.Column('total_wage', sa.DECIMAL(precision=18, scale=2), nullable=False),
+    sa.Column('paid_amount', sa.DECIMAL(precision=18, scale=2), nullable=True),
+    sa.Column('remaining_amount', sa.DECIMAL(precision=18, scale=2), nullable=True),
+    sa.Column('status', sa.String(length=50), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['labour_id'], ['labour.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
     op.create_table('material_usage',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('material_id', sa.Integer(), nullable=True),
@@ -449,11 +470,13 @@ def downgrade():
     op.drop_table('task_progress')
     op.drop_index(op.f('ix_material_usage_usage_date'), table_name='material_usage')
     op.drop_table('material_usage')
+    op.drop_table('labour_payroll')
     op.drop_index(op.f('ix_labour_attendance_project_id'), table_name='labour_attendance')
     op.drop_index(op.f('ix_labour_attendance_labour_id'), table_name='labour_attendance')
     op.drop_index(op.f('ix_labour_attendance_attendance_date'), table_name='labour_attendance')
     op.drop_table('labour_attendance')
     op.drop_index(op.f('ix_expenses_project_id'), table_name='expenses')
+    op.drop_index(op.f('ix_expenses_labour_id'), table_name='expenses')
     op.drop_index(op.f('ix_expenses_expense_date'), table_name='expenses')
     op.drop_index(op.f('ix_expenses_category'), table_name='expenses')
     op.drop_index(op.f('ix_expenses_boq_item_id'), table_name='expenses')

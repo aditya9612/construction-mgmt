@@ -34,17 +34,17 @@ class LabourOut(BaseSchema):
     status: str
     notes: Optional[str]
 
+    class Config:
+        from_attributes = True
+        json_encoders = {Decimal: float}
 
-# -------------------------
-# ATTENDANCE
-# -------------------------
 
 class LabourAttendanceBase(BaseModel):
     project_id: int
     attendance_date: date
-    working_hours: float
-    overtime_hours: float = 0
-    overtime_rate: float
+    working_hours: Decimal
+    overtime_hours: Decimal = Decimal("0")
+    overtime_rate: Decimal
     task_description: str
 
 
@@ -55,7 +55,32 @@ class LabourAttendanceCreate(LabourAttendanceBase):
 class LabourAttendanceOut(LabourAttendanceBase):
     id: int
     labour_id: int
-    total_wage: float
+    total_wage: Decimal
 
     class Config:
         from_attributes = True
+        json_encoders = {Decimal: float}
+
+
+class PayrollGenerate(BaseModel):
+    month: int
+    year: int
+
+
+class PayrollOut(BaseModel):
+    labour_id: int
+    project_id: int
+    month: int
+    year: int
+
+    total_working_hours: Decimal
+    total_overtime_hours: Decimal
+    total_wage: Decimal
+
+    paid_amount: Decimal
+    remaining_amount: Decimal
+    status: str
+
+    class Config:
+        from_attributes = True
+        json_encoders = {Decimal: float}

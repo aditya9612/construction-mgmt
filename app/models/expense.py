@@ -1,6 +1,7 @@
+from decimal import Decimal
+from typing import Optional
 from sqlalchemy import Column, Integer, String, ForeignKey, Date, DECIMAL
 from sqlalchemy.orm import Mapped, mapped_column
-
 from app.models.base import Base, TimestampMixin
 
 
@@ -17,16 +18,23 @@ class Expense(Base, TimestampMixin):
     )
 
     boq_item_id = Column(
-    Integer,
-    ForeignKey("boq_items.id", ondelete="SET NULL"),
-    nullable=True,
-    index=True,
+        Integer,
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    labour_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("labour.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     category: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     description: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    amount: Mapped[float] = mapped_column(DECIMAL(18, 2), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), nullable=False)
 
     expense_date: Mapped[str] = mapped_column(Date, nullable=False, index=True)
     payment_mode: Mapped[str] = mapped_column(String(50), nullable=False)
