@@ -13,6 +13,7 @@ from app.models.project import (
     Task,
     TaskProgress,
 )
+from app.core.logger import logger
 from app.utils.helpers import NotFoundError
 from app.models.labour import LabourAttendance
 from app.models.material import Material
@@ -31,9 +32,10 @@ async def client_dashboard(
     db: AsyncSession = Depends(get_db_session),
 ):
     project = await db.get(Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found")
 
+    if not project:
+        logger.warning(f"Project not found for dashboard project_id={project_id}")
+        raise NotFoundError("Project not found")
 
     avg_progress = await db.scalar(
         select(func.avg(Task.completion_percentage)).where(

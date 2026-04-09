@@ -4,12 +4,13 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from app.core.logger import logger
 from app.core.security import decode_access_token
 from app.db.session import get_db_session
 from app.models.user import User, UserRole
 
 security = HTTPBearer()
+
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -29,24 +30,33 @@ async def get_current_user(
         if user_id is None:
             raise credentials_exception
     except Exception:
+        logger.warning("JWT decode failed")
         raise credentials_exception
 
     user = await db.scalar(select(User).where(User.id == int(user_id)))
     if user is None:
+        logger.warning(f"User not found id={user_id}")
         raise credentials_exception
 
     return user
 
-async def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
+
+async def get_current_active_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
     if not current_user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive"
+        )
     return current_user
 
 
 def require_roles(allowed_roles: Iterable[UserRole]) -> Callable[[User], User]:
     allowed: List[UserRole] = list(allowed_roles)
 
-    async def _dependency(current_user: User = Depends(get_current_active_user)) -> User:
+    async def _dependency(
+        current_user: User = Depends(get_current_active_user),
+    ) -> User:
         if current_user.role not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -60,4 +70,3 @@ def require_roles(allowed_roles: Iterable[UserRole]) -> Callable[[User], User]:
 def get_request_redis(request: Request):
     redis = getattr(request.app.state, "redis", None)
     return redis
-

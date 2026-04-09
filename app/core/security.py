@@ -6,6 +6,8 @@ from passlib.context import CryptContext
 
 from app.core.config import settings
 
+from app.core.logger import logger
+from jose import JWTError
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -27,10 +29,14 @@ def get_password_hash(password: str) -> str:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     # Verify using the same truncated secret bytes as hashing.
-    return pwd_context.verify(_truncate_secret_to_bcrypt_limit(plain_password), hashed_password)
+    return pwd_context.verify(
+        _truncate_secret_to_bcrypt_limit(plain_password), hashed_password
+    )
 
 
-def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(
+    data: Dict[str, Any], expires_delta: Optional[timedelta] = None
+) -> str:
     to_encode = dict(data)
     expire = datetime.now(timezone.utc) + (
         expires_delta
@@ -42,5 +48,10 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
 
 
 def decode_access_token(token: str) -> Dict[str, Any]:
-    return jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-
+    try:
+        return jwt.decode(
+            token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM]
+        )
+    except JWTError:
+        logger.warning("JWT decode failed")
+        raise

@@ -1,4 +1,6 @@
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI, Request
@@ -22,29 +24,29 @@ from app.api.invoice import router as invoice_router
 from app.api.final_measurement import router as final_measurement_router
 from app.api.dashboard import router as dashboard_router
 from app.api.ra_bill import router as ra_bill_router
+
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.middlewares.rate_limiter import init_rate_limiter
-from app.utils.helpers import AppError
-from app.utils.logger import configure_logging
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
+from app.utils.helpers import AppError
+from app.core.logger import setup_logger
 
+from app.core.request_context import set_request_id
 
+from app.core.logger import logger
 
-logger = logging.getLogger("construction-mgmt")
-
+SLOW_API_THRESHOLD = 500
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    configure_logging(settings.APP_ENV)
+    setup_logger()
 
-    # Redis is shared across caching + rate limiting.
     app.state.redis = await create_redis_client(settings.REDIS_URL)
     try:
         await init_rate_limiter(app, app.state.redis)
     except (RedisConnectionError, OSError) as exc:
-        # Allow local dev startup even when Redis is not running yet.
-        logger.warning("Redis unavailable; continuing without Redis rate limiting. error=%s", exc)
+        logger.warning(f"Redis unavailable; continuing without Redis rate limiting. error={exc}")
         app.state.rate_limiter = None
         app.state.redis = None
 
@@ -53,12 +55,14 @@ async def lifespan(app: FastAPI):
         settings.APP_PORT,
         settings.APP_PORT,
     )
+
     if settings.APP_HOST == "0.0.0.0":
         logger.info(
-            "NOTE: Use http://localhost:%s (NOT http://0.0.0.0:%s) - 0.0.0.0 is not routable in browsers.",
+            "NOTE: Use http://localhost:%s (NOT http://0.0.0.0:%s)",
             settings.APP_PORT,
             settings.APP_PORT,
         )
+
     try:
         yield
     finally:
@@ -68,28 +72,63 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    application = FastAPI(title=settings.APP_NAME, version="0.1.0", lifespan=lifespan)
+    application = FastAPI(
+        title=settings.APP_NAME,
+        version="0.1.0",
+        lifespan=lifespan
+    )
 
     @application.middleware("http")
     async def log_requests(request: Request, call_next):
-        logger.info("request.start method=%s path=%s", request.method, request.url.path)
+        request_id = str(uuid.uuid4())
+
+        set_request_id(request_id)
+
+        start_time = time.time()
+
+        logger.info(
+            f"START method={request.method} path={request.url.path}"
+        )
+
         try:
             response = await call_next(request)
-            logger.info(
-                "request.end method=%s path=%s status=%s",
-                request.method,
-                request.url.path,
-                response.status_code,
-            )
+
+            process_time = round((time.time() - start_time) * 1000, 2)
+
+            # 🔥 MONITORING ADDITION (IMPORTANT)
+            if process_time > SLOW_API_THRESHOLD:
+                logger.warning(
+                    f"SLOW API method={request.method} path={request.url.path} "
+                    f"status={response.status_code} time={process_time}ms"
+                )
+            else:
+                logger.info(
+                    f"END method={request.method} path={request.url.path} "
+                    f"status={response.status_code} time={process_time}ms"
+                )
+
+            response.headers["X-Request-ID"] = request_id
             return response
+
         except Exception:
-            logger.exception("request.error method=%s path=%s", request.method, request.url.path)
+            process_time = round((time.time() - start_time) * 1000, 2)
+
+            logger.exception(
+                f"ERROR method={request.method} path={request.url.path} "
+                f"time={process_time}ms"
+            )
             raise
 
     @application.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
-
+        logger.warning(
+            f"AppError status={exc.status_code} message={exc.message} path={request.url.path}"
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.message}
+        )
+    
     @application.exception_handler(SQLAlchemyError)
     async def sqlalchemy_error_handler(request: Request, exc: SQLAlchemyError):
         logger.exception("database.error")
@@ -99,10 +138,10 @@ def create_app() -> FastAPI:
     async def health():
         return {"status": "ok"}
 
-
     api_router = APIRouter(
         dependencies=[default_rate_limiter_dependency()]
     )
+
     api_router.include_router(auth_router)
     api_router.include_router(user_router)
     api_router.include_router(project_router)
@@ -121,11 +160,10 @@ def create_app() -> FastAPI:
     api_router.include_router(ra_bill_router)
     api_router.include_router(dsr_router)
     api_router.include_router(issues_router)
-    api_router.include_router(ra_bill_router)
 
     application.include_router(api_router, prefix="/api/v1")
+
     return application
 
 
 app = create_app()
-

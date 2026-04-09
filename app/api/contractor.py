@@ -12,7 +12,8 @@ from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
 from app.schemas.contractor import ContractorCreate, ContractorUpdate, ContractorOut
 from app.models.invoice import Invoice
-
+from app.core.logger import logger
+from app.utils.helpers import NotFoundError
 
 router = APIRouter(prefix="/contractors", tags=["Contractors"])
 
@@ -29,22 +30,9 @@ def build_response(contractor: Contractor) -> ContractorOut:
         total_work_assigned=contractor.total_work_assigned,
         payment_given=contractor.payment_given,
         bank_details=contractor.bank_details,
-        payment_pending=(contractor.total_work_assigned or 0)
-        - (contractor.payment_given or 0),
+        payment_pending = (Decimal(contractor.total_work_assigned or 0)
+                   - Decimal(contractor.payment_given or 0)),
     )
-
-
-@router.post("", response_model=ContractorOut)
-async def create_contractor(
-    data: ContractorCreate, db: AsyncSession = Depends(get_db_session)
-):
-    contractor = Contractor(**data.model_dump())
-
-    db.add(contractor)
-    await db.commit()
-    await db.refresh(contractor)
-
-    return build_response(contractor)
 
 
 @router.get("/pending-report")
@@ -62,6 +50,7 @@ async def pending_report(db: AsyncSession = Depends(get_db_session)):
         if (c.total_work_assigned or 0) - (c.payment_given or 0) > 0
     ]
 
+
 @router.get("", response_model=list[ContractorOut])
 async def list_contractors(db: AsyncSession = Depends(get_db_session)):
     result = await db.execute(select(Contractor))
@@ -77,7 +66,8 @@ async def get_contractor(
     contractor = await db.get(Contractor, contractor_id)
 
     if not contractor:
-        raise HTTPException(status_code=404, detail="Contractor not found")
+        logger.warning(f"Contractor not found id={contractor_id}")
+        raise NotFoundError("Contractor not found")
 
     return build_response(contractor)
 
@@ -88,21 +78,32 @@ async def update_contractor(
     data: ContractorUpdate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Updating contractor id={contractor_id}")
+
     contractor = await db.get(Contractor, contractor_id)
 
     if not contractor:
-        raise HTTPException(status_code=404, detail="Contractor not found")
+        logger.warning(f"Contractor not found for update id={contractor_id}")
+        raise NotFoundError("Contractor not found")
 
     update_data = data.model_dump(exclude_unset=True)
 
-    if "payment_given" in update_data:
-        update_data.pop("payment_given")
+    if not update_data:
+        logger.warning(f"No fields provided for update contractor_id={contractor_id}")
 
     for key, value in update_data.items():
         setattr(contractor, key, value)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Contractor update failed id={contractor_id}")
+        raise
+
     await db.refresh(contractor)
+
+    logger.info(f"Contractor updated id={contractor_id}")
 
     return build_response(contractor)
 
@@ -111,12 +112,16 @@ async def update_contractor(
 async def delete_contractor(
     contractor_id: int, db: AsyncSession = Depends(get_db_session)
 ):
+    logger.info(f"Deleting contractor id={contractor_id}")
+
     contractor = await db.get(Contractor, contractor_id)
 
     if not contractor:
-        raise HTTPException(status_code=404, detail="Contractor not found")
+        logger.warning(f"Contractor not found for delete id={contractor_id}")
+        raise NotFoundError("Contractor not found")
 
     if (contractor.payment_given or 0) > 0:
+        logger.warning(f"Delete blocked: contractor has payment history id={contractor_id}")
         raise HTTPException(
             status_code=400, detail="Cannot delete contractor with payment history"
         )
@@ -124,18 +129,24 @@ async def delete_contractor(
     await db.delete(contractor)
     await db.commit()
 
+    logger.info(f"Contractor deleted id={contractor_id}")
+
     return {"message": "Deleted successfully"}
+
 
 
 @router.post("/{contractor_id}/assign-project/{project_id}")
 async def assign_project(
     contractor_id: int, project_id: int, db: AsyncSession = Depends(get_db_session)
 ):
+    logger.info(f"Assigning contractor={contractor_id} to project={project_id}")
+
     contractor = await db.get(Contractor, contractor_id)
     project = await db.get(Project, project_id)
 
     if not contractor or not project:
-        raise HTTPException(status_code=404, detail="Invalid contractor or project")
+        logger.warning(f"Invalid contractor/project contractor_id={contractor_id} project_id={project_id}")
+        raise NotFoundError("Contractor/Project not found")
 
     result = await db.execute(
         select(ContractorProject).where(
@@ -146,11 +157,14 @@ async def assign_project(
     existing = result.scalar_one_or_none()
 
     if existing:
+        logger.warning(f"Contractor already assigned contractor_id={contractor_id} project_id={project_id}")
         raise HTTPException(status_code=400, detail="Already assigned")
 
     mapping = ContractorProject(contractor_id=contractor_id, project_id=project_id)
     db.add(mapping)
     await db.commit()
+
+    logger.info(f"Contractor assigned contractor_id={contractor_id} project_id={project_id}")
 
     return {"message": "Assigned successfully"}
 
@@ -163,7 +177,8 @@ async def contractor_payments(
     contractor = await db.get(Contractor, contractor_id)
 
     if not contractor:
-        raise HTTPException(status_code=404, detail="Contractor not found")
+        logger.warning(f"Contractor not found for delete id={contractor_id}")
+        raise NotFoundError("Contractor not found")
 
     total = float(contractor.total_work_assigned or 0)
     paid = float(contractor.payment_given or 0)
@@ -177,7 +192,6 @@ async def contractor_payments(
     }
 
 
-
 @router.post("/{contractor_id}/pay")
 async def pay_contractor(
     contractor_id: int,
@@ -185,9 +199,12 @@ async def pay_contractor(
     amount: Decimal,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Contractor payment initiated contractor_id={contractor_id} amount={amount}")
+
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
-        raise HTTPException(status_code=404, detail="Contractor not found")
+        logger.warning(f"Contractor not found for payment id={contractor_id}")
+        raise NotFoundError("Contractor not found")
 
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
@@ -196,13 +213,15 @@ async def pay_contractor(
     paid = Decimal(contractor.payment_given or 0)
 
     if paid + amount > total_work:
+        logger.warning(f"Payment exceeds total work contractor_id={contractor_id}")
         raise HTTPException(status_code=400, detail="Payment exceeds total work amount")
 
     contractor.payment_given = paid + amount
 
     project = await db.get(Project, project_id)
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        logger.warning(f"Project not found for contractor payment project_id={project_id}")
+        raise NotFoundError("Project not found")
 
     expense = Expense(
         project_id=project_id,
@@ -228,6 +247,8 @@ async def pay_contractor(
 
     await db.commit()
 
+    logger.info(f"Contractor payment completed contractor_id={contractor_id} amount={amount}")
+
     return {
         "message": "Payment recorded successfully",
         "paid_total": float(contractor.payment_given),
@@ -241,8 +262,8 @@ async def contractor_projects(
 ):
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
-        raise HTTPException(status_code=404, detail="Contractor not found")
-
+        logger.warning(f"Contractor not found for delete id={contractor_id}")
+        raise NotFoundError("Contractor not found")
     result = await db.execute(
         select(Project)
         .join(ContractorProject, ContractorProject.project_id == Project.id)
@@ -268,7 +289,8 @@ async def contractor_invoices(
 ):
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
-        raise HTTPException(status_code=404, detail="Contractor not found")
+        logger.warning(f"Contractor not found for delete id={contractor_id}")
+        raise NotFoundError("Contractor not found")
 
     result = await db.execute(
         select(Invoice).where(

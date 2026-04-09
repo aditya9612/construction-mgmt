@@ -14,7 +14,7 @@ from app.schemas.owner import (
     OwnerLedgerResponse,
     OwnerTransactionOut,
 )
-from app.utils.helpers import NotFoundError
+from app.utils.helpers import NotFoundError, ValidationError
 from fastapi.responses import StreamingResponse
 from io import BytesIO , StringIO
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -23,7 +23,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 import csv
 from fastapi.responses import StreamingResponse
-
+from app.core.logger import logger
 
 router = APIRouter(
     prefix="/owners",
@@ -36,6 +36,8 @@ async def create_owner(
     payload: OwnerCreate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Creating owner name={payload.owner_name}")
+
     obj = Owner(**payload.model_dump())
 
     try:
@@ -45,10 +47,14 @@ async def create_owner(
         await db.refresh(obj)
     except IntegrityError:
         await db.rollback()
-        raise ValueError("Mobile number already exists")
+        logger.warning("Owner creation failed - duplicate mobile")
+        raise ValidationError("Mobile number already exists")
     except Exception:
         await db.rollback()
+        logger.exception("Owner creation failed")
         raise
+
+    logger.info(f"Owner created id={obj.id}")
 
     return OwnerOut.model_validate(obj)
 
@@ -88,9 +94,12 @@ async def update_owner(
     payload: OwnerUpdate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Updating owner id={owner_id}")
+
     obj = await db.scalar(select(Owner).where(Owner.id == owner_id))
 
     if not obj:
+        logger.warning(f"Owner not found id={owner_id}")
         raise NotFoundError("Owner not found")
 
     data = payload.model_dump(exclude_unset=True)
@@ -104,10 +113,14 @@ async def update_owner(
         await db.refresh(obj)
     except IntegrityError:
         await db.rollback()
-        raise ValueError("Mobile number already exists")
+        logger.warning(f"Owner update failed duplicate mobile id={owner_id}")
+        raise ValidationError("Mobile number already exists")
     except Exception:
         await db.rollback()
+        logger.exception(f"Owner update failed id={owner_id}")
         raise
+
+    logger.info(f"Owner updated id={owner_id}")
 
     return OwnerOut.model_validate(obj)
 
@@ -117,9 +130,12 @@ async def delete_owner(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Deleting owner id={owner_id}")
+
     obj = await db.scalar(select(Owner).where(Owner.id == owner_id))
 
     if not obj:
+        logger.warning(f"Owner not found id={owner_id}")
         raise NotFoundError("Owner not found")
 
     try:
@@ -128,7 +144,10 @@ async def delete_owner(
         await db.commit()
     except Exception:
         await db.rollback()
+        logger.exception(f"Owner delete failed id={owner_id}")
         raise
+
+    logger.info(f"Owner deleted id={owner_id}")
 
     return None
 
@@ -180,66 +199,72 @@ async def export_owner_ledger_pdf(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Generating ledger PDF owner_id={owner_id}")
+
     owner = await db.get(Owner, owner_id)
     if not owner:
+        logger.warning(f"Owner not found id={owner_id}")
         raise NotFoundError("Owner not found")
 
-    result = await db.execute(
-        select(OwnerTransaction)
-        .where(OwnerTransaction.owner_id == owner_id)
-        .order_by(OwnerTransaction.created_at.desc())
-    )
-    transactions = result.scalars().all()
+    try:
+        result = await db.execute(
+            select(OwnerTransaction)
+            .where(OwnerTransaction.owner_id == owner_id)
+            .order_by(OwnerTransaction.created_at.desc())
+        )
+        transactions = result.scalars().all()
 
-    total_credit = sum(float(t.amount) for t in transactions if t.type == "credit")
-    total_debit = sum(float(t.amount) for t in transactions if t.type == "debit")
+        total_credit = sum(float(t.amount) for t in transactions if t.type == "credit")
+        total_debit = sum(float(t.amount) for t in transactions if t.type == "debit")
 
-    buffer = BytesIO()
+        buffer = BytesIO()
 
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
-    styles = getSampleStyleSheet()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        styles = getSampleStyleSheet()
 
-    elements = []
+        elements = []
 
-    # Title
-    elements.append(Paragraph("OWNER LEDGER REPORT", styles["Title"]))
-    elements.append(Spacer(1, 10))
+        elements.append(Paragraph("OWNER LEDGER REPORT", styles["Title"]))
+        elements.append(Spacer(1, 10))
 
-    # Owner info
-    elements.append(Paragraph(f"Owner: {owner.owner_name}", styles["Normal"]))
-    elements.append(Spacer(1, 10))
+        elements.append(Paragraph(f"Owner: {owner.owner_name}", styles["Normal"]))
+        elements.append(Spacer(1, 10))
 
-    # Summary
-    elements.append(Paragraph(f"Total Credit: {total_credit}", styles["Normal"]))
-    elements.append(Paragraph(f"Total Debit: {total_debit}", styles["Normal"]))
-    elements.append(Paragraph(f"Balance: {total_credit - total_debit}", styles["Normal"]))
-    elements.append(Spacer(1, 15))
+        elements.append(Paragraph(f"Total Credit: {total_credit}", styles["Normal"]))
+        elements.append(Paragraph(f"Total Debit: {total_debit}", styles["Normal"]))
+        elements.append(Paragraph(f"Balance: {total_credit - total_debit}", styles["Normal"]))
+        elements.append(Spacer(1, 15))
 
-    # Table data
-    data = [["Date", "Type", "Amount", "Reference", "Description"]]
+        data = [["Date", "Type", "Amount", "Reference", "Description"]]
 
-    for t in transactions:
-        data.append([
-            str(t.created_at),
-            t.type,
-            float(t.amount),
-            f"{t.reference_type} ({t.reference_id})",
-            t.description or ""
-        ])
+        for t in transactions:
+            data.append([
+                str(t.created_at),
+                t.type,
+                float(t.amount),
+                f"{t.reference_type} ({t.reference_id})",
+                t.description or ""
+            ])
 
-    table = Table(data)
+        table = Table(data)
 
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 1, colors.black),
-    ]))
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 1, colors.black),
+        ]))
 
-    elements.append(table)
+        elements.append(table)
 
-    doc.build(elements)
+        doc.build(elements)
 
-    buffer.seek(0)
+        buffer.seek(0)
+
+    except Exception:
+        logger.exception(f"PDF generation failed owner_id={owner_id}")
+        raise
+
+    logger.info(f"Ledger PDF generated owner_id={owner_id}")
 
     return StreamingResponse(
         buffer,
@@ -249,50 +274,57 @@ async def export_owner_ledger_pdf(
         },
     )
 
-
 @router.get("/{owner_id}/ledger/excel")
 async def export_owner_ledger_excel(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Generating ledger CSV owner_id={owner_id}")
+
     owner = await db.get(Owner, owner_id)
     if not owner:
+        logger.warning(f"Owner not found id={owner_id}")
         raise NotFoundError("Owner not found")
 
-    result = await db.execute(
-        select(OwnerTransaction)
-        .where(OwnerTransaction.owner_id == owner_id)
-        .order_by(OwnerTransaction.created_at.desc())
-    )
-    transactions = result.scalars().all()
+    try:
+        result = await db.execute(
+            select(OwnerTransaction)
+            .where(OwnerTransaction.owner_id == owner_id)
+            .order_by(OwnerTransaction.created_at.desc())
+        )
+        transactions = result.scalars().all()
 
-    string_buffer = StringIO()
-    writer = csv.writer(string_buffer)
+        string_buffer = StringIO()
+        writer = csv.writer(string_buffer)
 
-    # HEADER
-    writer.writerow([
-        "Date",
-        "Type",
-        "Amount",
-        "Reference Type",
-        "Reference ID",
-        "Description"
-    ])
-
-    # DATA
-    for t in transactions:
         writer.writerow([
-            str(t.created_at),
-            t.type,
-            float(t.amount),
-            t.reference_type,
-            t.reference_id,
-            t.description or "",
+            "Date",
+            "Type",
+            "Amount",
+            "Reference Type",
+            "Reference ID",
+            "Description"
         ])
 
-    byte_buffer = BytesIO()
-    byte_buffer.write(string_buffer.getvalue().encode("utf-8"))
-    byte_buffer.seek(0)
+        for t in transactions:
+            writer.writerow([
+                str(t.created_at),
+                t.type,
+                float(t.amount),
+                t.reference_type,
+                t.reference_id,
+                t.description or "",
+            ])
+
+        byte_buffer = BytesIO()
+        byte_buffer.write(string_buffer.getvalue().encode("utf-8"))
+        byte_buffer.seek(0)
+
+    except Exception:
+        logger.exception(f"CSV generation failed owner_id={owner_id}")
+        raise
+
+    logger.info(f"Ledger CSV generated owner_id={owner_id}")
 
     return StreamingResponse(
         byte_buffer,

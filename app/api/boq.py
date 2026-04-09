@@ -24,6 +24,7 @@ from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.boq import BOQCreate, BOQOut, BOQUpdate, BOQActualsUpdate
 from app.utils.helpers import NotFoundError
+from app.core.logger import logger
 
 router = APIRouter(
     prefix="/boq",
@@ -43,52 +44,61 @@ async def create_boq(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Creating BOQ project_id={payload.project_id}")
+
     project = await db.scalar(select(Project).where(Project.id == payload.project_id))
     if not project:
+        logger.warning(f"Project not found for BOQ creation project_id={payload.project_id}")
         raise NotFoundError("Project not found")
 
-    # VERSIONING
-    max_version = await db.scalar(
-        select(func.max(BOQ.version_no)).where(BOQ.project_id == payload.project_id)
-    )
-    new_version = (max_version or 0) + 1
+    try:
+        max_version = await db.scalar(
+            select(func.max(BOQ.version_no)).where(BOQ.project_id == payload.project_id)
+        )
+        new_version = (max_version or 0) + 1
 
-    await db.execute(
-        update(BOQ).where(BOQ.project_id == payload.project_id).values(is_latest=False)
-    )
+        await db.execute(
+            update(BOQ).where(BOQ.project_id == payload.project_id).values(is_latest=False)
+        )
 
-    data = payload.model_dump(exclude_unset=True)
+        data = payload.model_dump(exclude_unset=True)
 
-    quantity = Decimal(str(data.get("quantity", 0)))
-    unit_cost = Decimal(str(data.get("unit_cost", 0)))
+        quantity = Decimal(str(data.get("quantity", 0)))
+        unit_cost = Decimal(str(data.get("unit_cost", 0)))
 
-    if quantity <= 0:
-        raise ValueError("Quantity must be greater than 0")
+        if quantity <= 0:
+            raise ValueError("Quantity must be greater than 0")
 
-    if unit_cost <= 0:
-        raise ValueError("Unit cost must be greater than 0")
+        if unit_cost <= 0:
+            raise ValueError("Unit cost must be greater than 0")
 
-    total_cost = quantity * unit_cost
+        total_cost = quantity * unit_cost
 
-    data.update(
-        {
-            "total_cost": total_cost,
-            "actual_quantity": Decimal(0),
-            "actual_cost": Decimal(0),
-            "variance_cost": total_cost,  # initially full variance
-            "version_no": new_version,
-            "boq_group_id": new_version,
-            "is_latest": True,
-        }
-    )
+        data.update(
+            {
+                "total_cost": total_cost,
+                "actual_quantity": Decimal(0),
+                "actual_cost": Decimal(0),
+                "variance_cost": total_cost,
+                "version_no": new_version,
+                "boq_group_id": new_version,
+                "is_latest": True,
+            }
+        )
 
-    obj = BOQ(**data)
-    db.add(obj)
-    await db.flush()
+        obj = BOQ(**data)
+        db.add(obj)
+        await db.flush()
 
-    await bump_cache_version(redis, VERSION_KEY)
+        await bump_cache_version(redis, VERSION_KEY)
 
-    return BOQOut.model_validate(obj)
+        logger.info(f"BOQ created id={obj.id} project_id={payload.project_id}")
+
+        return BOQOut.model_validate(obj)
+
+    except Exception:
+        logger.exception("BOQ creation failed")
+        raise
 
 
 @router.get("", response_model=PaginatedResponse[BOQOut])
@@ -112,6 +122,9 @@ async def list_boq(
     if cached is not None:
         return PaginatedResponse[BOQOut].model_validate(cached)
 
+    if search:
+        logger.info(f"BOQ search query={search}")
+
     query = select(BOQ)
     count_query = select(func.count()).select_from(BOQ)
 
@@ -132,7 +145,6 @@ async def list_boq(
         query = query.where(BOQ.category == category)
         count_query = count_query.where(BOQ.category == category)
 
-    # VERSION FILTER
     if version_no:
         query = query.where(BOQ.version_no == version_no)
         count_query = count_query.where(BOQ.version_no == version_no)
@@ -164,6 +176,7 @@ async def get_boq(
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
 
     if obj is None:
+        logger.warning(f"BOQ not found id={boq_id}")
         raise NotFoundError("BOQ item not found")
 
     return BOQOut.model_validate(obj)
@@ -208,9 +221,12 @@ async def update_actuals(
     payload: BOQActualsUpdate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Updating BOQ actuals id={boq_id}")
+
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
 
     if not obj:
+        logger.warning(f"BOQ not found for actual update id={boq_id}")
         raise NotFoundError("BOQ not found")
 
     obj.actual_quantity = payload.actual_quantity
@@ -218,6 +234,8 @@ async def update_actuals(
     obj.variance_cost = obj.total_cost - payload.actual_cost
 
     await db.flush()
+
+    logger.info(f"BOQ actuals updated id={boq_id}")
 
     return BOQOut.model_validate(obj)
 
@@ -311,32 +329,42 @@ async def update_boq(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Updating BOQ id={boq_id}")
+
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
 
     if obj is None:
+        logger.warning(f"BOQ not found for update id={boq_id}")
         raise NotFoundError("BOQ item not found")
 
-    data = payload.model_dump(exclude_unset=True)
+    try:
+        data = payload.model_dump(exclude_unset=True)
 
-    for k, v in data.items():
-        setattr(obj, k, v)
+        for k, v in data.items():
+            setattr(obj, k, v)
 
-    quantity = Decimal(str(obj.quantity))
-    unit_cost = Decimal(str(obj.unit_cost))
+        quantity = Decimal(str(obj.quantity))
+        unit_cost = Decimal(str(obj.unit_cost))
 
-    if quantity <= 0:
-        raise ValueError("Quantity must be greater than 0")
+        if quantity <= 0:
+            raise ValueError("Quantity must be greater than 0")
 
-    if unit_cost <= 0:
-        raise ValueError("Unit cost must be greater than 0")
-    obj.total_cost = quantity * unit_cost
+        if unit_cost <= 0:
+            raise ValueError("Unit cost must be greater than 0")
+        obj.total_cost = quantity * unit_cost
 
-    obj.variance_cost = obj.total_cost - (obj.actual_cost or Decimal(0))
+        obj.variance_cost = obj.total_cost - (obj.actual_cost or Decimal(0))
 
-    await db.flush()
-    await bump_cache_version(redis, VERSION_KEY)
+        await db.flush()
+        await bump_cache_version(redis, VERSION_KEY)
 
-    return BOQOut.model_validate(obj)
+        logger.info(f"BOQ updated id={boq_id}")
+
+        return BOQOut.model_validate(obj)
+
+    except Exception:
+        logger.exception(f"BOQ update failed id={boq_id}")
+        raise
 
 
 @router.delete("/{boq_id}")
@@ -348,14 +376,19 @@ async def delete_boq(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Deleting BOQ id={boq_id}")
+
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id))
 
     if obj is None:
+        logger.warning(f"BOQ not found for delete id={boq_id}")
         raise NotFoundError("BOQ item not found")
 
     await db.delete(obj)
     await db.flush()
 
     await bump_cache_version(redis, VERSION_KEY)
+
+    logger.info(f"BOQ deleted id={boq_id}")
 
     return {"message": "BOQ deleted successfully"}

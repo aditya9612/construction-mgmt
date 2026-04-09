@@ -23,13 +23,15 @@ from app.services.otp import (
 from app.services.sms import send_otp_sms
 from app.utils.helpers import AppError
 
+from app.core.logger import logger
+
 
 def otp_rate_limiter_dependency():
     async def _limit(request: Request):
         limiter = getattr(request.app.state, "rate_limiter", None)
 
         if limiter is None:
-            return  # fallback: allow if limiter not initialized
+            return
 
         ip = request.client.host
         key = f"otp:{ip}"
@@ -37,6 +39,7 @@ def otp_rate_limiter_dependency():
         allowed = await limiter.try_acquire_async(key)
 
         if not allowed:
+            logger.warning(f"OTP rate limit exceeded ip={ip}")  # ✅ WARNING
             raise HTTPException(status_code=429, detail="Too many OTP requests")
 
     return Depends(_limit)
@@ -70,7 +73,10 @@ async def login(
     payload: UserLogin,
     redis: Redis | None = Depends(get_request_redis),
 ):
+    logger.info(f"OTP login requested mobile={payload.mobile}") 
+
     if redis is None and settings.APP_ENV == "production":
+        logger.error("Redis unavailable for OTP login")  
         raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
 
     mobile = _normalize_mobile(payload.mobile)
@@ -79,16 +85,25 @@ async def login(
         raise AppError(status_code=422, message="Invalid mobile number")
 
     if not await check_otp_rate_limit(redis, mobile):
+        logger.warning(f"OTP rate limit hit for mobile={mobile}") 
         raise AppError(status_code=429, message="Too many OTP requests. Try again later.")
 
-    otp = generate_otp()
-    await store_otp(redis, mobile, otp)
+    try:
+        otp = generate_otp()
+        await store_otp(redis, mobile, otp)
 
-    sent = await send_otp_sms(mobile, otp)
-    if not sent:
-        raise AppError(status_code=503, message="Failed to send OTP")
+        sent = await send_otp_sms(mobile, otp)
+        if not sent:
+            logger.error(f"Failed to send OTP mobile={mobile}") 
+            raise AppError(status_code=503, message="Failed to send OTP")
 
-    return OTPLoginResponse(message="OTP sent", mobile=mobile)
+        logger.info(f"OTP sent successfully mobile={mobile}")  
+
+        return OTPLoginResponse(message="OTP sent", mobile=mobile)
+
+    except Exception:
+        logger.exception("OTP login process failed") 
+        raise
 
 
 @router.post(
@@ -101,7 +116,10 @@ async def verify_otp(
     redis: Redis | None = Depends(get_request_redis),
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"OTP verification attempt mobile={payload.mobile}") 
+
     if redis is None and settings.APP_ENV == "production":
+        logger.error("Redis unavailable for OTP verification")
         raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
 
     mobile = _normalize_mobile(payload.mobile)
@@ -110,29 +128,40 @@ async def verify_otp(
         raise AppError(status_code=422, message="Invalid mobile number")
 
     if not await verify_otp_service(redis, mobile, payload.otp):
+        logger.warning(f"Invalid OTP attempt mobile={mobile}")  
         raise AppError(status_code=401, message="Invalid or expired OTP")
 
-    user = await db.scalar(select(User).where(User.mobile == mobile))
+    try:
+        user = await db.scalar(select(User).where(User.mobile == mobile))
 
-    if user is None:
-        placeholder_email = f"otp_{mobile}@construction.local"
-        user = User(
-            email=placeholder_email,
-            hashed_password=get_password_hash(secrets.token_urlsafe(32)),
-            full_name=None,
-            mobile=mobile,
-            role=UserRole.SITE_ENGINEER,
-            is_active=True,
-        )
-        db.add(user)
-        await db.flush()
+        if user is None:
+            logger.info(f"Creating new user via OTP mobile={mobile}")  
 
-    if not user.is_active:
-        raise AppError(status_code=403, message="User is inactive")
+            placeholder_email = f"otp_{mobile}@construction.local"
+            user = User(
+                email=placeholder_email,
+                hashed_password=get_password_hash(secrets.token_urlsafe(32)),
+                full_name=None,
+                mobile=mobile,
+                role=UserRole.SITE_ENGINEER,
+                is_active=True,
+            )
+            db.add(user)
+            await db.flush()
 
-    token = _build_token(user)
+        if not user.is_active:
+            logger.warning(f"Inactive user login attempt user_id={user.id}")
+            raise AppError(status_code=403, message="User is inactive")
 
-    return {
-        "token": token,
-        "user_id": user.id,
-    }
+        token = _build_token(user)
+
+        logger.info(f"User authenticated successfully user_id={user.id}")
+
+        return {
+            "token": token,
+            "user_id": user.id,
+        }
+
+    except Exception:
+        logger.exception("OTP verification process failed") 
+        raise

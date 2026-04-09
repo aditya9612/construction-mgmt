@@ -1,4 +1,3 @@
-from typing import Optional
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query
@@ -12,10 +11,11 @@ from app.db.session import get_db_session
 from app.models.invoice import Invoice
 from app.models.owner import OwnerTransaction
 from app.schemas.invoice import InvoiceCreate, InvoiceUpdate, InvoiceOut
-from app.utils.helpers import NotFoundError
+from app.utils.helpers import NotFoundError, ValidationError
 from decimal import Decimal
 from fastapi.responses import StreamingResponse
 from io import BytesIO
+from app.core.logger import logger
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
@@ -28,15 +28,18 @@ async def create_invoice(
     payload: InvoiceCreate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Creating invoice type={type} project_id={payload.project_id}")
+
     data = payload.model_dump()
 
     project = await db.get(Project, data["project_id"])
     if not project:
+        logger.warning(f"Project not found id={data['project_id']}")
         raise NotFoundError("Project not found")
 
     allowed_types = ["owner", "contractor", "labour", "material"]
     if type not in allowed_types:
-        raise ValueError("Invalid invoice type")
+        raise ValidationError("Invalid invoice type")
 
     if type == "owner":
         existing_invoice = await db.scalar(
@@ -46,80 +49,72 @@ async def create_invoice(
             )
         )
         if existing_invoice:
-            raise ValueError("Owner invoice already exists for this project")
+            raise ValidationError("Owner invoice already exists")
 
-    # labour/material/contractor → allow multiple
-
-    # -------------------------
-    # OWNER → FROM MEASUREMENT
-    # -------------------------
-    if type == "owner":
-        measurement = await db.scalar(
-            select(FinalMeasurement).where(
-                FinalMeasurement.project_id == data["project_id"]
+    try:
+        if type == "owner":
+            measurement = await db.scalar(
+                select(FinalMeasurement).where(
+                    FinalMeasurement.project_id == data["project_id"]
+                )
             )
+
+            if not measurement:
+                raise NotFoundError("Final measurement not found for project")
+
+            base_amount = Decimal(measurement.total_amount)
+        else:
+            base_amount = Decimal(data["amount"])
+
+        gst_percent = Decimal(data.get("gst_percent", 0))
+        tax_percent = Decimal(data.get("tax_percent", 0))
+
+        gst_amount = (base_amount * gst_percent) / Decimal(100)
+        tax_amount = (base_amount * tax_percent) / Decimal(100)
+
+        total_amount = base_amount + gst_amount + tax_amount
+
+        obj = Invoice(
+            project_id=data["project_id"],
+            owner_id=project.owner_id,
+            type=type,
+            reference_id=data.get("reference_id"),
+            amount=base_amount,
+            gst_percent=gst_percent,
+            gst_amount=gst_amount,
+            tax_percent=tax_percent,
+            tax_amount=tax_amount,
+            total_amount=total_amount,
+            description=data.get("description"),
         )
 
-        if not measurement:
-            raise NotFoundError("Final measurement not found for project")
+        db.add(obj)
+        await db.flush()
 
-        base_amount = Decimal(measurement.total_amount)
+        owner_transaction = OwnerTransaction(
+            owner_id=project.owner_id,
+            project_id=obj.project_id,
+            type="credit",
+            amount=total_amount,
+            reference_type="invoice",
+            reference_id=obj.id,
+            description=f"{type} invoice created",
+        )
 
-    else:
-        base_amount = Decimal(data["amount"])
+        db.add(owner_transaction)
 
-    gst_percent = Decimal(data.get("gst_percent", 0))
-    tax_percent = Decimal(data.get("tax_percent", 0))
+        await db.commit()
 
-    gst_amount = (base_amount * gst_percent) / Decimal(100)
-    tax_amount = (base_amount * tax_percent) / Decimal(100)
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Invoice creation failed type={type}")
+        raise
 
-    total_amount = base_amount + gst_amount + tax_amount
-
-    obj = Invoice(
-        project_id=data["project_id"],
-        owner_id=project.owner_id,
-        type=type,
-        reference_id=data.get("reference_id"),
-        amount=base_amount,
-        gst_percent=gst_percent,
-        gst_amount=gst_amount,
-        tax_percent=tax_percent,
-        tax_amount=tax_amount,
-        total_amount=total_amount,
-        description=data.get("description"),
-    )
-
-    db.add(obj)
-    await db.flush()
-
-    owner_transaction = OwnerTransaction(
-        owner_id=project.owner_id,
-        project_id=obj.project_id,
-        type="credit",
-        amount=total_amount,
-        reference_type="invoice",
-        reference_id=obj.id,
-        description=f"{type} invoice created",
-    )
-
-    db.add(owner_transaction)
-
-    await db.commit()
     await db.refresh(obj)
 
+    logger.info(f"Invoice created id={obj.id}")
+
     return InvoiceOut.model_validate(obj)
-
-
-@router.get("/pending")
-async def pending_invoices(db: AsyncSession = Depends(get_db_session)):
-    rows = (
-        (await db.execute(select(Invoice).where(Invoice.status == "pending")))
-        .scalars()
-        .all()
-    )
-
-    return [InvoiceOut.model_validate(r) for r in rows]
 
 
 @router.get("", response_model=list[InvoiceOut])
@@ -142,29 +137,50 @@ async def get_invoice(id: int, db: AsyncSession = Depends(get_db_session)):
 async def update_invoice(
     id: int, payload: InvoiceUpdate, db: AsyncSession = Depends(get_db_session)
 ):
+    logger.info(f"Updating invoice id={id}")
+
     obj = await db.get(Invoice, id)
 
     if not obj:
+        logger.warning(f"Invoice not found id={id}")
         raise NotFoundError("Invoice not found")
 
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Invoice update failed id={id}")
+        raise
+
     await db.refresh(obj)
+
+    logger.info(f"Invoice updated id={id}")
 
     return InvoiceOut.model_validate(obj)
 
 
 @router.delete("/{id}", status_code=204)
 async def delete_invoice(id: int, db: AsyncSession = Depends(get_db_session)):
+    logger.info(f"Deleting invoice id={id}")
+
     obj = await db.get(Invoice, id)
 
     if not obj:
+        logger.warning(f"Invoice not found id={id}")
         raise NotFoundError("Invoice not found")
 
-    await db.delete(obj)
-    await db.commit()
+    try:
+        await db.delete(obj)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Invoice delete failed id={id}")
+        raise
+
+    logger.info(f"Invoice deleted id={id}")
 
     return None
 
@@ -208,42 +224,62 @@ async def get_by_date_range(
 
 @router.post("/{id}/mark-paid")
 async def mark_paid(id: int, db: AsyncSession = Depends(get_db_session)):
+    logger.info(f"Marking invoice as paid id={id}")
+
     obj = await db.get(Invoice, id)
 
     if not obj:
+        logger.warning(f"Invoice not found id={id}")
         raise NotFoundError("Invoice not found")
 
     obj.status = "paid"
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Mark paid failed id={id}")
+        raise
+
+    logger.info(f"Invoice marked as paid id={id}")
 
     return {"message": "Invoice marked as paid"}
 
 
 @router.get("/{id}/pdf")
 async def generate_invoice_pdf(id: int, db: AsyncSession = Depends(get_db_session)):
+    logger.info(f"Generating invoice PDF id={id}")
+
     obj = await db.get(Invoice, id)
 
     if not obj:
+        logger.warning(f"Invoice not found id={id}")
         raise NotFoundError("Invoice not found")
 
-    buffer = BytesIO()
+    try:
+        buffer = BytesIO()
 
-    content = f"""
-    INVOICE #{obj.id}
-    
-    Type: {obj.type}
-    Amount: {obj.amount}
-    
-    GST ({obj.gst_percent}%): {obj.gst_amount}
-    Tax ({obj.tax_percent}%): {obj.tax_amount}
-    
-    Total Amount: {obj.total_amount}
-    Status: {obj.status}
-    """
+        content = f"""
+        INVOICE #{obj.id}
+        
+        Type: {obj.type}
+        Amount: {obj.amount}
+        
+        GST ({obj.gst_percent}%): {obj.gst_amount}
+        Tax ({obj.tax_percent}%): {obj.tax_amount}
+        
+        Total Amount: {obj.total_amount}
+        Status: {obj.status}
+        """
 
-    buffer.write(content.encode())
-    buffer.seek(0)
+        buffer.write(content.encode())
+        buffer.seek(0)
+
+    except Exception:
+        logger.exception(f"PDF generation failed id={id}")
+        raise
+
+    logger.info(f"Invoice PDF generated id={id}")
 
     return StreamingResponse(
         buffer,

@@ -1,8 +1,8 @@
 """update data
 
-Revision ID: d5b6d57eed4c
+Revision ID: 6925ac886b3d
 Revises: 
-Create Date: 2026-04-08 09:27:41.094363
+Create Date: 2026-04-09 09:54:06.072299
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = 'd5b6d57eed4c'
+revision = '6925ac886b3d'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -26,9 +26,9 @@ def upgrade():
     sa.Column('contact_number', sa.String(length=15), nullable=False),
     sa.Column('gst_number', sa.String(length=20), nullable=True),
     sa.Column('rate_type', sa.String(length=50), nullable=False),
-    sa.Column('total_work_assigned', sa.Float(), nullable=True),
-    sa.Column('payment_given', sa.Float(), nullable=True),
-    sa.Column('bank_details', sa.String(length=255), nullable=False),
+    sa.Column('total_work_assigned', sa.Numeric(precision=12, scale=2), nullable=True),
+    sa.Column('payment_given', sa.Numeric(precision=12, scale=2), nullable=True),
+    sa.Column('bank_details', sa.String(length=255), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_contractors_contractor_id'), 'contractors', ['contractor_id'], unique=True)
@@ -127,8 +127,8 @@ def upgrade():
     op.create_index(op.f('ix_boq_items_status'), 'boq_items', ['status'], unique=False)
     op.create_table('contractor_projects',
     sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('contractor_id', sa.Integer(), nullable=True),
-    sa.Column('project_id', sa.Integer(), nullable=True),
+    sa.Column('contractor_id', sa.Integer(), nullable=False),
+    sa.Column('project_id', sa.Integer(), nullable=False),
     sa.ForeignKeyConstraint(['contractor_id'], ['contractors.id'], ondelete='CASCADE'),
     sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id'),

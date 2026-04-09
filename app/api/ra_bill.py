@@ -9,8 +9,8 @@ from app.models.project import Project
 from app.models.contractor import Contractor
 from app.models.owner import OwnerTransaction
 from app.schemas.ra_bill import RABillCreate, RABillUpdate, RABillOut
-from app.utils.helpers import NotFoundError
-
+from app.utils.helpers import NotFoundError, ValidationError
+from app.core.logger import logger
 
 router = APIRouter(prefix="/ra-bills", tags=["RA Bills"])
 
@@ -20,47 +20,51 @@ async def create_ra_bill(
     payload: RABillCreate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Creating RA bill project_id={payload.project_id}")
+
     project = await db.get(Project, payload.project_id)
     contractor = await db.get(Contractor, payload.contractor_id)
 
     if not project:
+        logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
 
     if not contractor:
+        logger.warning(f"Contractor not found id={payload.contractor_id}")
         raise NotFoundError("Contractor not found")
 
     if payload.quantity <= 0:
-        raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+        raise ValidationError("Quantity must be greater than 0")
 
     if payload.rate <= 0:
-        raise HTTPException(status_code=400, detail="Rate must be greater than 0")
+        raise ValidationError("Rate must be greater than 0")
 
     if payload.deductions < 0:
-        raise HTTPException(status_code=400, detail="Deductions cannot be negative")
+        raise ValidationError("Deductions cannot be negative")
 
     gross = payload.quantity * payload.rate
 
     if payload.deductions > gross:
-        raise HTTPException(status_code=400, detail="Deductions cannot exceed gross amount")
+        raise ValidationError("Deductions cannot exceed gross amount")
 
     if payload.gst_percent < 0 or payload.gst_percent > 28:
-        raise HTTPException(status_code=400, detail="Invalid GST percent")
+        raise ValidationError("Invalid GST percent")
 
     if payload.bill_date > date.today():
-        raise HTTPException(status_code=400, detail="Future bill date not allowed")
+        raise ValidationError("Future bill date not allowed")
 
     existing = await db.scalar(
         select(RABill).where(RABill.bill_number == payload.bill_number)
     )
     if existing:
-        raise HTTPException(status_code=400, detail="Bill number already exists")
+        raise ValidationError("Bill number already exists")
 
     net = gross - payload.deductions
 
     if net < 0:
-        raise HTTPException(status_code=400, detail="Net amount cannot be negative")
+        raise ValidationError("Net amount cannot be negative")
 
-    gst_percent = payload.gst_percent or 0   # ✅ FIXED
+    gst_percent = payload.gst_percent or 0
     gst_amount = (net * gst_percent) / 100
     total = net + gst_amount
 
@@ -72,23 +76,31 @@ async def create_ra_bill(
     )
 
     db.add(obj)
-    await db.flush()
 
-    # OWNER LEDGER (DEBIT)
-    owner_txn = OwnerTransaction(
-        owner_id=project.owner_id,
-        project_id=project.id,
-        type="debit",
-        amount=float(total),   # ✅ FIXED
-        reference_type="ra_bill",
-        reference_id=obj.id,
-        description="Contractor RA Bill",
-    )
+    try:
+        await db.flush()
 
-    db.add(owner_txn)
+        owner_txn = OwnerTransaction(
+            owner_id=project.owner_id,
+            project_id=project.id,
+            type="debit",
+            amount=float(total),
+            reference_type="ra_bill",
+            reference_id=obj.id,
+            description="Contractor RA Bill",
+        )
+        db.add(owner_txn)
 
-    await db.commit()
+        await db.commit()
+
+    except Exception:
+        await db.rollback()
+        logger.exception("RA bill creation failed")
+        raise
+
     await db.refresh(obj)
+
+    logger.info(f"RA bill created id={obj.id}")
 
     return RABillOut.model_validate(obj)
 
@@ -116,42 +128,45 @@ async def update_ra_bill(
     payload: RABillUpdate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Updating RA bill id={id}")
+
     obj = await db.get(RABill, id)
 
     if not obj:
+        logger.warning(f"RA bill not found id={id}")
         raise NotFoundError("RA Bill not found")
 
     if payload.quantity is not None and payload.quantity <= 0:
-        raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+        raise ValidationError("Quantity must be greater than 0")
 
     if payload.rate is not None and payload.rate <= 0:
-        raise HTTPException(status_code=400, detail="Rate must be greater than 0")
+        raise ValidationError("Rate must be greater than 0")
 
     if payload.deductions is not None and payload.deductions < 0:
-        raise HTTPException(status_code=400, detail="Deductions cannot be negative")
+        raise ValidationError("Deductions cannot be negative")
 
     if payload.gst_percent is not None and (
         payload.gst_percent < 0 or payload.gst_percent > 28
     ):
-        raise HTTPException(status_code=400, detail="Invalid GST percent")
+        raise ValidationError("Invalid GST percent")
 
     if payload.bill_date is not None and payload.bill_date > date.today():
-        raise HTTPException(status_code=400, detail="Future bill date not allowed")
+        raise ValidationError("Future bill date not allowed")
 
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
     gross = obj.quantity * obj.rate
 
-    if obj.deductions is not None and obj.deductions > gross:   # ✅ FIXED
-        raise HTTPException(status_code=400, detail="Deductions cannot exceed gross amount")
+    if obj.deductions is not None and obj.deductions > gross:
+        raise ValidationError("Deductions cannot exceed gross amount")
 
     net = gross - (obj.deductions or 0)
 
     if net < 0:
-        raise HTTPException(status_code=400, detail="Net amount cannot be negative")
+        raise ValidationError("Net amount cannot be negative")
 
-    gst_percent = obj.gst_percent or 0   # ✅ FIXED
+    gst_percent = obj.gst_percent or 0
     gst_amount = (net * gst_percent) / 100
     total = net + gst_amount
 
@@ -159,21 +174,39 @@ async def update_ra_bill(
     obj.net_amount = net
     obj.total_amount = total
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"RA bill update failed id={id}")
+        raise
+
     await db.refresh(obj)
+
+    logger.info(f"RA bill updated id={id}")
 
     return RABillOut.model_validate(obj)
 
 
 @router.delete("/{id}", status_code=204)
 async def delete_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
+    logger.info(f"Deleting RA bill id={id}")
+
     obj = await db.get(RABill, id)
 
     if not obj:
+        logger.warning(f"RA bill not found id={id}")
         raise NotFoundError("RA Bill not found")
 
-    await db.delete(obj)
-    await db.commit()
+    try:
+        await db.delete(obj)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"RA bill delete failed id={id}")
+        raise
+
+    logger.info(f"RA bill deleted id={id}")
 
     return None
 

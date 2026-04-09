@@ -9,8 +9,8 @@ import random
 import string
 import time
 from typing import Optional
+from app.core.logger import logger
 
-import logging
 from redis.asyncio import Redis
 
 from app.core.config import settings
@@ -18,7 +18,7 @@ from app.core.config import settings
 OTP_PREFIX = "otp:"
 OTP_RATE_PREFIX = "otp:rate:"
 
-logger = logging.getLogger("construction-mgmt")
+
 
 # In-memory fallback for development/local usage.
 # NOTE: This is per-process, so in multi-worker deployments it won't share state.
@@ -104,23 +104,32 @@ async def get_otp(redis: Optional[Redis], mobile: str) -> Optional[str]:
 
 
 async def check_otp_rate_limit(redis: Optional[Redis], mobile: str) -> bool:
-    """
-    Check if mobile has exceeded OTP request rate (e.g. 1 per minute).
-    Returns True if allowed, False if rate limited.
-    """
     if redis is None:
         key = f"{OTP_RATE_PREFIX}{_normalize_mobile(mobile)}"
         now = time.time()
+
         async with _IN_MEMORY_LOCK:
             count, window_expires_at = _IN_MEMORY_RATE.get(key, (0, 0.0))
+
             if now > window_expires_at:
                 count = 0
-                window_expires_at = now + 60  # 1 minute window
+                window_expires_at = now + 60
+
             count += 1
             _IN_MEMORY_RATE[key] = (count, window_expires_at)
-            return count <= 3  # Max 3 OTP requests per minute
+
+            if count > 3:
+                logger.warning(f"OTP rate limit exceeded mobile={mobile}")
+
+            return count <= 3
+
     key = f"{OTP_RATE_PREFIX}{_normalize_mobile(mobile)}"
     count = await redis.incr(key)
+
     if count == 1:
-        await redis.expire(key, 60)  # 1 minute window
-    return count <= 3  # Max 3 OTP requests per minute
+        await redis.expire(key, 60)
+
+    if count > 3:
+        logger.warning(f"OTP rate limit exceeded mobile={mobile}")
+
+    return count <= 3 # max 3 otp per minute

@@ -4,7 +4,7 @@ from typing import Any, Optional
 import orjson
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
-
+from app.core.logger import logger
 from app.core.config import settings
 
 
@@ -19,16 +19,28 @@ def _dumps(value: Any) -> bytes:
 
 
 def _loads(raw: bytes) -> Any:
-    return orjson.loads(raw)
+    try:
+        return orjson.loads(raw)
+    except Exception:
+        logger.warning("Cache decode failed, returning None")
+        return None
 
 
 async def cache_get_json(redis: Redis, key: str) -> Optional[Any]:
     if redis is None:
         return None
+
     raw = await redis.get(key)
+
     if raw is None:
         return None
-    return _loads(raw)
+
+    data = _loads(raw)
+
+    if data is None:
+        logger.warning(f"Invalid cache data key={key}")
+
+    return data
 
 
 async def cache_set_json(redis: Redis, key: str, value: Any, ttl_seconds: int = None) -> None:

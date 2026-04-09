@@ -13,10 +13,11 @@ from app.models.labour import Labour, LabourAttendance, LabourPayroll
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import labour as s
-from app.utils.helpers import NotFoundError
+from app.utils.helpers import NotFoundError, ValidationError
 from app.models.expense import Expense
 from app.models.project import Project
 from app.models.owner import OwnerTransaction
+from app.core.logger import logger
 
 router = APIRouter(
     prefix="/labour", tags=["labour"], dependencies=[default_rate_limiter_dependency()]
@@ -42,20 +43,29 @@ async def create_labour(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    logger.info(f"Creating labour name={payload.labour_name}")
+
     data = payload.model_dump(exclude_unset=True)
 
     if payload.contractor_id:
         contractor = await db.get(Contractor, payload.contractor_id)
         if not contractor:
-            raise ValueError("Invalid contractor_id")
+            logger.warning(f"Invalid contractor_id={payload.contractor_id}")
+            raise ValidationError("Invalid contractor_id")
 
     obj = Labour(**data)
-
     db.add(obj)
-    await db.flush()
-    await db.refresh(obj)
 
-    await r.bump_cache_version(redis, VERSION_KEY)
+    try:
+        await db.flush()
+        await db.refresh(obj)
+        await r.bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        await db.rollback()
+        logger.exception("Labour creation failed")
+        raise
+
+    logger.info(f"Labour created id={obj.id}")
 
     return s.LabourOut.model_validate(obj)
 
@@ -154,9 +164,12 @@ async def update_labour(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    logger.info(f"Updating labour id={labour_id}")
+
     obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
 
     if obj is None:
+        logger.warning(f"Labour not found id={labour_id}")
         raise NotFoundError("Labour record not found")
 
     data = payload.model_dump(exclude_unset=True)
@@ -164,10 +177,16 @@ async def update_labour(
     for k, v in data.items():
         setattr(obj, k, v)
 
-    await db.flush()
-    await db.refresh(obj)
+    try:
+        await db.flush()
+        await db.refresh(obj)
+        await r.bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Labour update failed id={labour_id}")
+        raise
 
-    await r.bump_cache_version(redis, VERSION_KEY)
+    logger.info(f"Labour updated id={labour_id}")
 
     return s.LabourOut.model_validate(obj)
 
@@ -181,15 +200,24 @@ async def delete_labour(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    logger.info(f"Deleting labour id={labour_id}")
+
     obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
 
     if obj is None:
+        logger.warning(f"Labour not found id={labour_id}")
         raise NotFoundError("Labour record not found")
 
-    await db.delete(obj)
-    await db.flush()
+    try:
+        await db.delete(obj)
+        await db.flush()
+        await r.bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Labour delete failed id={labour_id}")
+        raise
 
-    await r.bump_cache_version(redis, VERSION_KEY)
+    logger.info(f"Labour deleted id={labour_id}")
 
     return None
 
@@ -206,8 +234,11 @@ async def create_attendance(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    logger.info(f"Creating attendance labour_id={labour_id}")
+
     labour = await db.get(Labour, labour_id)
     if not labour:
+        logger.warning(f"Labour not found id={labour_id}")
         raise NotFoundError("Labour not found")
 
     existing = await db.scalar(
@@ -217,78 +248,86 @@ async def create_attendance(
         )
     )
     if existing:
-        raise ValueError("Attendance already exists for this date")
+        raise ValidationError("Attendance already exists for this date")
 
     if payload.attendance_date > date.today():
-        raise ValueError("Future attendance not allowed")
+        raise ValidationError("Future attendance not allowed")
 
     if payload.working_hours > 24:
-        raise ValueError("Working hours cannot exceed 24")
+        raise ValidationError("Working hours cannot exceed 24")
 
     if payload.overtime_hours > 24:
-        raise ValueError("Overtime hours cannot exceed 24")
+        raise ValidationError("Overtime hours cannot exceed 24")
 
     if payload.overtime_rate < 0:
-        raise ValueError("Overtime rate cannot be negative")
+        raise ValidationError("Overtime rate cannot be negative")
 
     if payload.working_hours + payload.overtime_hours > 24:
-        raise ValueError("Total hours cannot exceed 24")
+        raise ValidationError("Total hours cannot exceed 24")
 
     obj = LabourAttendance(labour_id=labour_id, **payload.model_dump())
     db.add(obj)
-    await db.flush()
-    await db.refresh(obj)
 
-    hourly_rate = labour.daily_wage_rate / Decimal("8")
-
-    total_wage = (
-        hourly_rate * obj.working_hours + obj.overtime_rate * obj.overtime_hours
-    )
-
-    project = await db.get(Project, labour.project_id)
-    if not project:
-        raise NotFoundError("Project not found")
-
-    existing_expense = await db.scalar(
-        select(Expense).where(
-            Expense.project_id == labour.project_id,
-            Expense.labour_id == labour_id,
-            Expense.category == "Labour",
-            Expense.expense_date == obj.attendance_date,
-        )
-    )
-
-    if existing_expense:
-        existing_expense.amount = Decimal(existing_expense.amount) + total_wage
+    try:
         await db.flush()
-        expense = existing_expense
-    else:
-        expense = Expense(
+        await db.refresh(obj)
+
+        hourly_rate = labour.daily_wage_rate / Decimal("8")
+
+        total_wage = (
+            hourly_rate * obj.working_hours + obj.overtime_rate * obj.overtime_hours
+        )
+
+        project = await db.get(Project, labour.project_id)
+        if not project:
+            raise NotFoundError("Project not found")
+
+        existing_expense = await db.scalar(
+            select(Expense).where(
+                Expense.project_id == labour.project_id,
+                Expense.labour_id == labour_id,
+                Expense.category == "Labour",
+                Expense.expense_date == obj.attendance_date,
+            )
+        )
+
+        if existing_expense:
+            existing_expense.amount = Decimal(existing_expense.amount) + total_wage
+            await db.flush()
+            expense = existing_expense
+        else:
+            expense = Expense(
+                project_id=labour.project_id,
+                labour_id=labour_id,
+                category="Labour",
+                description=f"Labour expense - {obj.attendance_date}",
+                amount=total_wage,
+                expense_date=obj.attendance_date,
+                payment_mode="auto",
+            )
+            db.add(expense)
+            await db.flush()
+
+        owner_txn = OwnerTransaction(
+            owner_id=project.owner_id,
             project_id=labour.project_id,
-            labour_id=labour_id,
-            category="Labour",
-            description=f"Labour expense - {obj.attendance_date}",
-            amount=total_wage,
-            expense_date=obj.attendance_date,
-            payment_mode="auto",
+            type="debit",
+            amount=float(total_wage),
+            reference_type="labour",
+            reference_id=expense.id,
+            description=f"Labour expense ({obj.attendance_date})",
         )
-        db.add(expense)
-        await db.flush()
+        db.add(owner_txn)
 
-    owner_txn = OwnerTransaction(
-        owner_id=project.owner_id,
-        project_id=labour.project_id,
-        type="debit",
-        amount=float(total_wage),
-        reference_type="labour",
-        reference_id=expense.id,
-        description=f"Labour expense ({obj.attendance_date})",
-    )
-    db.add(owner_txn)
+        await db.commit()
+        await r.bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
 
-    await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Attendance creation failed labour_id={labour_id}")
+        raise
 
-    await r.bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
+    logger.info(f"Attendance created labour_id={labour_id}")
 
     return s.LabourAttendanceOut.model_validate(
         {
@@ -327,7 +366,9 @@ async def get_attendance(
 
     data = []
     for row in rows:
-        total_wage = hourly_rate * row.working_hours + row.overtime_rate * row.overtime_hours
+        total_wage = (
+            hourly_rate * row.working_hours + row.overtime_rate * row.overtime_hours
+        )
 
         data.append(
             s.LabourAttendanceOut(
@@ -430,109 +471,119 @@ async def generate_payroll(
     payload: s.PayrollGenerate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Generating payroll month={payload.month} year={payload.year}")
+
     if payload.month < 1 or payload.month > 12:
-        raise ValueError("Invalid month")
+        raise ValidationError("Invalid month")
 
     if payload.year < 2000:
-        raise ValueError("Invalid year")
+        raise ValidationError("Invalid year")
 
-    result = await db.execute(
-        select(LabourAttendance).where(
-            extract("month", LabourAttendance.attendance_date) == payload.month,
-            extract("year", LabourAttendance.attendance_date) == payload.year,
-        )
-    )
-
-    rows = result.scalars().all()
-
-    if not rows:
-        return []
-
-    payroll_map = {}
-    labour_cache = {}
-
-    for r in rows:
-        if r.labour_id not in labour_cache:
-            labour_cache[r.labour_id] = await db.get(Labour, r.labour_id)
-
-        labour = labour_cache[r.labour_id]
-
-        hourly_rate = labour.daily_wage_rate / Decimal("8")
-
-        wage = hourly_rate * r.working_hours + r.overtime_rate * r.overtime_hours
-
-        key = (r.labour_id, r.project_id)
-
-        if key not in payroll_map:
-            payroll_map[key] = {
-                "working_hours": Decimal("0"),
-                "overtime_hours": Decimal("0"),
-                "total_wage": Decimal("0"),
-            }
-
-        payroll_map[key]["working_hours"] += r.working_hours
-        payroll_map[key]["overtime_hours"] += r.overtime_hours
-        payroll_map[key]["total_wage"] += wage
-
-    output = []
-
-    for (labour_id, project_id), data in payroll_map.items():
-
-        existing = await db.scalar(
-            select(LabourPayroll).where(
-                LabourPayroll.month == payload.month,
-                LabourPayroll.year == payload.year,
-                LabourPayroll.project_id == project_id,
-                LabourPayroll.labour_id == labour_id,
+    try:
+        result = await db.execute(
+            select(LabourAttendance).where(
+                extract("month", LabourAttendance.attendance_date) == payload.month,
+                extract("year", LabourAttendance.attendance_date) == payload.year,
             )
         )
-        if existing:
-            raise ValueError(
-                f"Payroll already exists for labour {labour_id} in project {project_id}"
+
+        rows = result.scalars().all()
+
+        if not rows:
+            return []
+
+        payroll_map = {}
+        labour_cache = {}
+
+        for r in rows:
+            if r.labour_id not in labour_cache:
+                labour_cache[r.labour_id] = await db.get(Labour, r.labour_id)
+
+            labour = labour_cache[r.labour_id]
+
+            hourly_rate = labour.daily_wage_rate / Decimal("8")
+
+            wage = hourly_rate * r.working_hours + r.overtime_rate * r.overtime_hours
+
+            key = (r.labour_id, r.project_id)
+
+            if key not in payroll_map:
+                payroll_map[key] = {
+                    "working_hours": Decimal("0"),
+                    "overtime_hours": Decimal("0"),
+                    "total_wage": Decimal("0"),
+                }
+
+            payroll_map[key]["working_hours"] += r.working_hours
+            payroll_map[key]["overtime_hours"] += r.overtime_hours
+            payroll_map[key]["total_wage"] += wage
+
+        output = []
+
+        for (labour_id, project_id), data in payroll_map.items():
+
+            existing = await db.scalar(
+                select(LabourPayroll).where(
+                    LabourPayroll.month == payload.month,
+                    LabourPayroll.year == payload.year,
+                    LabourPayroll.project_id == project_id,
+                    LabourPayroll.labour_id == labour_id,
+                )
+            )
+            if existing:
+                raise ValidationError(
+                    f"Payroll already exists for labour {labour_id} in project {project_id}"
+                )
+
+            total_wage = data["total_wage"]
+
+            advance = await db.scalar(
+                select(func.sum(Expense.amount)).where(
+                    Expense.labour_id == labour_id,
+                    Expense.project_id == project_id,
+                    Expense.category == "Labour Advance",
+                    extract("month", Expense.expense_date) == payload.month,
+                    extract("year", Expense.expense_date) == payload.year,
+                )
+            ) or Decimal("0")
+
+            remaining_salary = total_wage - advance
+
+            if remaining_salary < 0:
+                remaining_salary = Decimal("0")
+
+            if remaining_salary == 0:
+                status = "Paid"
+            elif advance > 0:
+                status = "Partial"
+            else:
+                status = "Pending"
+
+            obj = LabourPayroll(
+                labour_id=labour_id,
+                project_id=project_id,
+                month=payload.month,
+                year=payload.year,
+                total_working_hours=data["working_hours"],
+                total_overtime_hours=data["overtime_hours"],
+                total_wage=total_wage,
+                paid_amount=advance,
+                remaining_amount=remaining_salary,
+                status=status,
             )
 
-        total_wage = data["total_wage"]
+            db.add(obj)
+            await db.flush()
 
-        advance = await db.scalar(
-            select(func.sum(Expense.amount)).where(
-                Expense.labour_id == labour_id,
-                Expense.project_id == project_id,
-                Expense.category == "Labour Advance",
-                extract("month", Expense.expense_date) == payload.month,
-                extract("year", Expense.expense_date) == payload.year,
-            )
-        ) or Decimal("0")
+            output.append(obj)
 
-        remaining_salary = total_wage - advance
+        await db.commit()
 
-        if remaining_salary < 0:
-            remaining_salary = Decimal("0")
+    except Exception:
+        await db.rollback()
+        logger.exception("Payroll generation failed")
+        raise
 
-        if remaining_salary == 0:
-            status = "Paid"
-        elif advance > 0:
-            status = "Partial"
-        else:
-            status = "Pending"
-
-        obj = LabourPayroll(
-            labour_id=labour_id,
-            project_id=project_id,
-            month=payload.month,
-            year=payload.year,
-            total_working_hours=data["working_hours"],
-            total_overtime_hours=data["overtime_hours"],
-            total_wage=total_wage,
-            paid_amount=advance,
-            remaining_amount=remaining_salary,
-            status=status,
-        )
-
-        db.add(obj)
-        await db.flush()
-
-        output.append(obj)
-
-    await db.commit()
+    logger.info("Payroll generated successfully")
 
     return output

@@ -24,6 +24,7 @@ from app.models.expense import Expense
 from app.models.invoice import Invoice
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import project as s
+from app.core.logger import logger
 
 
 from app.utils.helpers import (
@@ -33,6 +34,7 @@ from app.utils.helpers import (
     ValidationError,
 )
 from fastapi import HTTPException
+
 
 def compute_project_status(project):
     today = date.today()
@@ -66,7 +68,9 @@ class ProjectsRepository:
         await db.flush()
         return obj
 
-    async def get_project(self, db: AsyncSession, project_id: int) -> Optional[m.Project]:
+    async def get_project(
+        self, db: AsyncSession, project_id: int
+    ) -> Optional[m.Project]:
         return await db.scalar(select(m.Project).where(m.Project.id == project_id))
 
     async def list_projects(
@@ -115,7 +119,8 @@ class ProjectMembersRepository:
     ) -> Optional[m.ProjectMember]:
         return await db.scalar(
             select(m.ProjectMember).where(
-                m.ProjectMember.project_id == project_id, m.ProjectMember.user_id == user_id
+                m.ProjectMember.project_id == project_id,
+                m.ProjectMember.user_id == user_id,
             )
         )
 
@@ -143,7 +148,8 @@ class ProjectMembersRepository:
             select(func.count())
             .select_from(m.ProjectMember)
             .where(
-                m.ProjectMember.project_id == project_id, m.ProjectMember.user_id == user_id
+                m.ProjectMember.project_id == project_id,
+                m.ProjectMember.user_id == user_id,
             )
         )
         count = await db.scalar(exists_query)
@@ -248,7 +254,9 @@ class TasksRepository:
     ) -> tuple[list[m.Task], int]:
         query = select(m.Task).where(m.Task.project_id == project_id)
         count_query = (
-            select(func.count()).select_from(m.Task).where(m.Task.project_id == project_id)
+            select(func.count())
+            .select_from(m.Task)
+            .where(m.Task.project_id == project_id)
         )
 
         if status is not None:
@@ -356,7 +364,9 @@ class CommentsRepository:
         offset: int,
     ) -> tuple[list[m.Comment], int]:
         count_query = (
-            select(func.count()).select_from(m.Comment).where(m.Comment.task_id == task_id)
+            select(func.count())
+            .select_from(m.Comment)
+            .where(m.Comment.task_id == task_id)
         )
         query = (
             select(m.Comment)
@@ -942,7 +952,6 @@ class TasksService:
             db, current_user=current_user, project_id=project_id, task=obj
         )
 
-
         progress_obj = await self.progress_repo.create_progress(
             db,
             task_id=obj.id,
@@ -1075,9 +1084,19 @@ async def create_project(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Creating project name={payload.project_name}")
+
     service = ProjectsService(ProjectsRepository(), TasksRepository())
-    out = await service.create_project(db, current_user, payload=payload)
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        out = await service.create_project(db, current_user, payload=payload)
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception("Project creation failed")
+        raise
+
+    logger.info(f"Project created id={out.id}")
+
     return out
 
 
@@ -1141,11 +1160,21 @@ async def update_project(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Updating project id={project_id}")
+
     service = ProjectsService(ProjectsRepository(), TasksRepository())
-    out = await service.update_project(
-        db, current_user, project_id=project_id, payload=payload
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        out = await service.update_project(
+            db, current_user, project_id=project_id, payload=payload
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Project update failed id={project_id}")
+        raise
+
+    logger.info(f"Project updated id={project_id}")
+
     return out
 
 
@@ -1158,14 +1187,26 @@ async def delete_project(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Deleting project id={project_id}")
+
     service = ProjectsService(ProjectsRepository(), TasksRepository())
-    await service.delete_project(db, current_user, project_id=project_id)
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        await service.delete_project(db, current_user, project_id=project_id)
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Project delete failed id={project_id}")
+        raise
+
+    logger.info(f"Project deleted id={project_id}")
+
     return None
 
 
 @router.post(
-    "/{project_id}/members/{user_id}", response_model=s.ProjectMemberOut, status_code=201
+    "/{project_id}/members/{user_id}",
+    response_model=s.ProjectMemberOut,
+    status_code=201,
 )
 async def assign_project_member(
     project_id: int,
@@ -1174,15 +1215,29 @@ async def assign_project_member(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Assigning member user_id={user_id} project_id={project_id}")
+
     service = ProjectMembersService(ProjectsRepository(), ProjectMembersRepository())
-    out = await service.assign_member(
-        db, current_user, project_id=project_id, user_id=user_id
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        out = await service.assign_member(
+            db, current_user, project_id=project_id, user_id=user_id
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(
+            f"Assign member failed user_id={user_id} project_id={project_id}"
+        )
+        raise
+
+    logger.info(f"Member assigned user_id={user_id} project_id={project_id}")
+
     return out
 
 
-@router.get("/{project_id}/members", response_model=PaginatedResponse[s.ProjectMemberOut])
+@router.get(
+    "/{project_id}/members", response_model=PaginatedResponse[s.ProjectMemberOut]
+)
 async def list_project_members(
     project_id: int,
     limit: int = Query(20, ge=1, le=100),
@@ -1204,11 +1259,23 @@ async def remove_project_member(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Removing member user_id={user_id} project_id={project_id}")
+
     service = ProjectMembersService(ProjectsRepository(), ProjectMembersRepository())
-    await service.remove_member(
-        db, current_user, project_id=project_id, user_id=user_id
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        await service.remove_member(
+            db, current_user, project_id=project_id, user_id=user_id
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(
+            f"Remove member failed user_id={user_id} project_id={project_id}"
+        )
+        raise
+
+    logger.info(f"Member removed user_id={user_id} project_id={project_id}")
+
     return None
 
 
@@ -1232,11 +1299,21 @@ async def create_milestone(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Creating milestone project_id={project_id}")
+
     service = MilestonesService(ProjectsRepository(), MilestonesRepository())
-    out = await service.create_milestone(
-        db, current_user, project_id=project_id, payload=payload
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        out = await service.create_milestone(
+            db, current_user, project_id=project_id, payload=payload
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Milestone creation failed project_id={project_id}")
+        raise
+
+    logger.info(f"Milestone created id={out.id}")
+
     return out
 
 
@@ -1276,15 +1353,25 @@ async def update_milestone(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Updating milestone id={milestone_id}")
+
     service = MilestonesService(ProjectsRepository(), MilestonesRepository())
-    out = await service.update_milestone(
-        db,
-        current_user,
-        project_id=project_id,
-        milestone_id=milestone_id,
-        payload=payload,
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        out = await service.update_milestone(
+            db,
+            current_user,
+            project_id=project_id,
+            milestone_id=milestone_id,
+            payload=payload,
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Milestone update failed id={milestone_id}")
+        raise
+
+    logger.info(f"Milestone updated id={milestone_id}")
+
     return out
 
 
@@ -1296,11 +1383,21 @@ async def delete_milestone(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    logger.info(f"Deleting milestone id={milestone_id}")
+
     service = MilestonesService(ProjectsRepository(), MilestonesRepository())
-    await service.delete_milestone(
-        db, current_user, project_id=project_id, milestone_id=milestone_id
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+
+    try:
+        await service.delete_milestone(
+            db, current_user, project_id=project_id, milestone_id=milestone_id
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Milestone delete failed id={milestone_id}")
+        raise
+
+    logger.info(f"Milestone deleted id={milestone_id}")
+
     return None
 
 
@@ -1313,10 +1410,19 @@ async def create_task(
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
 ):
-    out = await service.create_task(
-        db, current_user, project_id=project_id, payload=payload
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+    logger.info(f"Creating task project_id={project_id}")
+
+    try:
+        out = await service.create_task(
+            db, current_user, project_id=project_id, payload=payload
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Task creation failed project_id={project_id}")
+        raise
+
+    logger.info(f"Task created id={out.id}")
+
     return out
 
 
@@ -1366,10 +1472,19 @@ async def update_task(
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
 ):
-    out = await service.update_task(
-        db, current_user, project_id=project_id, task_id=task_id, payload=payload
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+    logger.info(f"Updating task id={task_id}")
+
+    try:
+        out = await service.update_task(
+            db, current_user, project_id=project_id, task_id=task_id, payload=payload
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Task update failed id={task_id}")
+        raise
+
+    logger.info(f"Task updated id={task_id}")
+
     return out
 
 
@@ -1382,8 +1497,19 @@ async def delete_task(
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
 ):
-    await service.delete_task(db, current_user, project_id=project_id, task_id=task_id)
-    await bump_cache_version(redis, VERSION_KEY)
+    logger.info(f"Deleting task id={task_id}")
+
+    try:
+        await service.delete_task(
+            db, current_user, project_id=project_id, task_id=task_id
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Task delete failed id={task_id}")
+        raise
+
+    logger.info(f"Task deleted id={task_id}")
+
     return None
 
 
@@ -1399,10 +1525,19 @@ async def update_task_progress(
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
 ):
-    out = await service.update_task_progress(
-        db, current_user, project_id=project_id, task_id=task_id, payload=payload
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+    logger.info(f"Updating task progress task_id={task_id}")
+
+    try:
+        out = await service.update_task_progress(
+            db, current_user, project_id=project_id, task_id=task_id, payload=payload
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Task progress update failed task_id={task_id}")
+        raise
+
+    logger.info(f"Task progress updated task_id={task_id}")
+
     return out
 
 
@@ -1430,7 +1565,9 @@ async def list_task_progress_history(
     )
 
 
-@tasks_router.post("/{project_id}/tasks/{task_id}/comments", response_model=s.CommentOut)
+@tasks_router.post(
+    "/{project_id}/tasks/{task_id}/comments", response_model=s.CommentOut
+)
 async def create_comment(
     project_id: int,
     task_id: int,
@@ -1440,11 +1577,23 @@ async def create_comment(
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
 ):
+    logger.info(f"Creating comment task_id={task_id}")
 
-    out = await service.create_comment(
-        db, current_user, project_id=project_id, task_id=task_id, payload=payload
-    )
-    await bump_cache_version(redis, VERSION_KEY)
+    try:
+        out = await service.create_comment(
+            db,
+            current_user,
+            project_id=project_id,
+            task_id=task_id,
+            payload=payload,
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Comment creation failed task_id={task_id}")
+        raise
+
+    logger.info(f"Comment created id={out.id}")
+
     return out
 
 
@@ -1515,8 +1664,13 @@ async def create_dsr(
     payload: s.DSRCreate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(
+        f"Creating DSR project_id={payload.project_id} date={payload.report_date}"
+    )
+
     project = await db.get(m.Project, payload.project_id)
     if not project:
+        logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
 
     existing = await db.scalar(
@@ -1527,13 +1681,23 @@ async def create_dsr(
     )
 
     if existing:
+        logger.warning(
+            f"DSR already exists project_id={payload.project_id} date={payload.report_date}"
+        )
         raise HTTPException(status_code=400, detail="DSR already exists for this date")
 
     obj = m.DailySiteReport(**payload.model_dump())
 
-    db.add(obj)
-    await db.commit()
-    await db.refresh(obj)
+    try:
+        db.add(obj)
+        await db.commit()
+        await db.refresh(obj)
+    except Exception:
+        await db.rollback()
+        logger.exception("DSR creation failed")
+        raise
+
+    logger.info(f"DSR created id={obj.id}")
 
     return s.DSROut.model_validate(obj)
 
@@ -1567,29 +1731,53 @@ async def update_dsr(
     payload: s.DSRUpdate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Updating DSR id={id}")
+
     obj = await db.get(m.DailySiteReport, id)
 
     if not obj:
+        logger.warning(f"DSR not found id={id}")
         raise NotFoundError("DSR not found")
 
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"DSR update failed id={id}")
+        raise
+
     await db.refresh(obj)
+
+    logger.info(f"DSR updated id={id}")
 
     return s.DSROut.model_validate(obj)
 
 
 @dsr_router.delete("/{id}", status_code=204)
-async def delete_dsr(id: int, db: AsyncSession = Depends(get_db_session)):
+async def delete_dsr(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    logger.info(f"Deleting DSR id={id}")
+
     obj = await db.get(m.DailySiteReport, id)
 
     if not obj:
+        logger.warning(f"DSR not found id={id}")
         raise NotFoundError("DSR not found")
 
-    await db.delete(obj)
-    await db.commit()
+    try:
+        await db.delete(obj)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"DSR delete failed id={id}")
+        raise
+
+    logger.info(f"DSR deleted id={id}")
 
     return None
 
@@ -1606,15 +1794,24 @@ async def create_issue(
     payload: s.IssueCreate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Creating issue project_id={payload.project_id}")
+
     project = await db.get(m.Project, payload.project_id)
     if not project:
+        logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
 
-    obj = m.Issue(**payload.model_dump())
+    try:
+        obj = m.Issue(**payload.model_dump())
+        db.add(obj)
+        await db.commit()
+        await db.refresh(obj)
+    except Exception:
+        await db.rollback()
+        logger.exception("Issue creation failed")
+        raise
 
-    db.add(obj)
-    await db.commit()
-    await db.refresh(obj)
+    logger.info(f"Issue created id={obj.id}")
 
     return s.IssueOut.model_validate(obj)
 
@@ -1642,29 +1839,53 @@ async def update_issue(
     payload: s.IssueUpdate,
     db: AsyncSession = Depends(get_db_session),
 ):
+    logger.info(f"Updating issue id={id}")
+
     obj = await db.get(m.Issue, id)
 
     if not obj:
+        logger.warning(f"Issue not found id={id}")
         raise NotFoundError("Issue not found")
 
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Issue update failed id={id}")
+        raise
+
     await db.refresh(obj)
+
+    logger.info(f"Issue updated id={id}")
 
     return s.IssueOut.model_validate(obj)
 
 
 @issues_router.delete("/{id}", status_code=204)
-async def delete_issue(id: int, db: AsyncSession = Depends(get_db_session)):
+async def delete_issue(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+):
+    logger.info(f"Deleting issue id={id}")
+
     obj = await db.get(m.Issue, id)
 
     if not obj:
+        logger.warning(f"Issue not found id={id}")
         raise NotFoundError("Issue not found")
 
-    await db.delete(obj)
-    await db.commit()
+    try:
+        await db.delete(obj)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception(f"Issue delete failed id={id}")
+        raise
+
+    logger.info(f"Issue deleted id={id}")
 
     return None
 
