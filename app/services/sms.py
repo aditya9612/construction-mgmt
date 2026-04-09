@@ -9,14 +9,14 @@ from app.core.logger import logger
 
 
 async def send_otp_sms(mobile: str, otp: str) -> bool:
-    """
-    Send OTP via configured provider.
-    """
     if settings.OTP_PROVIDER == "twilio" and settings.TWILIO_ACCOUNT_SID:
         return await _send_via_twilio(mobile, otp)
 
-    logger.info(f"OTP generated for mobile={mobile} (mock mode)")
-
+    logger.info(
+        "OTP mock: mobile=%s otp=%s (set OTP_PROVIDER=twilio for real SMS)",
+        mobile,
+        otp
+    )
     return True
 
 
