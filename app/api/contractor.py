@@ -34,6 +34,21 @@ def build_response(contractor: Contractor) -> ContractorOut:
                    - Decimal(contractor.payment_given or 0)),
     )
 
+@router.post("", response_model=ContractorOut)
+async def create_contractor(
+    data: ContractorCreate, db: AsyncSession = Depends(get_db_session)
+):
+    logger.info(f"Creating contractor name={data.name}")
+
+    contractor = Contractor(**data.model_dump())
+
+    db.add(contractor)
+    await db.commit()
+    await db.refresh(contractor)
+
+    logger.info(f"Contractor created id={contractor.id}")
+
+    return build_response(contractor)
 
 @router.get("/pending-report")
 async def pending_report(db: AsyncSession = Depends(get_db_session)):
