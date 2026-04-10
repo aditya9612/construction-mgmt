@@ -1,8 +1,8 @@
 """update data
 
-Revision ID: 6925ac886b3d
+Revision ID: 0cc6b325f210
 Revises: 
-Create Date: 2026-04-09 09:54:06.072299
+Create Date: 2026-04-10 09:47:42.425055
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '6925ac886b3d'
+revision = '0cc6b325f210'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -121,7 +121,9 @@ def upgrade():
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index('idx_boq_group', 'boq_items', ['boq_group_id'], unique=False)
+    op.create_index('idx_boq_latest', 'boq_items', ['is_latest'], unique=False)
     op.create_index('idx_boq_project', 'boq_items', ['project_id'], unique=False)
+    op.create_index('idx_boq_status', 'boq_items', ['status'], unique=False)
     op.create_index(op.f('ix_boq_items_is_latest'), 'boq_items', ['is_latest'], unique=False)
     op.create_index(op.f('ix_boq_items_item_name'), 'boq_items', ['item_name'], unique=False)
     op.create_index(op.f('ix_boq_items_status'), 'boq_items', ['status'], unique=False)
@@ -363,6 +365,21 @@ def upgrade():
     op.create_index(op.f('ix_tasks_project_id'), 'tasks', ['project_id'], unique=False)
     op.create_index(op.f('ix_tasks_status'), 'tasks', ['status'], unique=False)
     op.create_index(op.f('ix_tasks_title'), 'tasks', ['title'], unique=False)
+    op.create_table('boq_audit_logs',
+    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+    sa.Column('boq_id', sa.Integer(), nullable=False),
+    sa.Column('user_id', sa.Integer(), nullable=True),
+    sa.Column('action', sa.String(length=50), nullable=False),
+    sa.Column('message', sa.String(length=255), nullable=False),
+    sa.Column('changes', sa.JSON(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.ForeignKeyConstraint(['boq_id'], ['boq_items.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index('idx_boq_audit_boq', 'boq_audit_logs', ['boq_id'], unique=False)
+    op.create_index('idx_boq_audit_boq_created', 'boq_audit_logs', ['boq_id', 'created_at'], unique=False)
+    op.create_index(op.f('ix_boq_audit_logs_boq_id'), 'boq_audit_logs', ['boq_id'], unique=False)
     op.create_table('comments',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('task_id', sa.Integer(), nullable=False),
@@ -484,6 +501,10 @@ def downgrade():
     op.drop_index(op.f('ix_comments_task_id'), table_name='comments')
     op.drop_index(op.f('ix_comments_author_user_id'), table_name='comments')
     op.drop_table('comments')
+    op.drop_index(op.f('ix_boq_audit_logs_boq_id'), table_name='boq_audit_logs')
+    op.drop_index('idx_boq_audit_boq_created', table_name='boq_audit_logs')
+    op.drop_index('idx_boq_audit_boq', table_name='boq_audit_logs')
+    op.drop_table('boq_audit_logs')
     op.drop_index(op.f('ix_tasks_title'), table_name='tasks')
     op.drop_index(op.f('ix_tasks_status'), table_name='tasks')
     op.drop_index(op.f('ix_tasks_project_id'), table_name='tasks')
@@ -533,7 +554,9 @@ def downgrade():
     op.drop_index(op.f('ix_boq_items_status'), table_name='boq_items')
     op.drop_index(op.f('ix_boq_items_item_name'), table_name='boq_items')
     op.drop_index(op.f('ix_boq_items_is_latest'), table_name='boq_items')
+    op.drop_index('idx_boq_status', table_name='boq_items')
     op.drop_index('idx_boq_project', table_name='boq_items')
+    op.drop_index('idx_boq_latest', table_name='boq_items')
     op.drop_index('idx_boq_group', table_name='boq_items')
     op.drop_table('boq_items')
     op.drop_index(op.f('ix_projects_status'), table_name='projects')

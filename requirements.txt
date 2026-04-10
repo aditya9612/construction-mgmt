@@ -29,3 +29,4 @@ pytest-asyncio>=0.23.0
 python-magic
 reportlab
 pydantic[email]>=2.1.0
+openpyxl

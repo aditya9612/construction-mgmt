@@ -8,6 +8,7 @@ from app.core.logger import logger
 from app.core.security import decode_access_token
 from app.db.session import get_db_session
 from app.models.user import User, UserRole
+from app.core.request_context import set_current_user_id
 
 security = HTTPBearer()
 
@@ -48,6 +49,10 @@ async def get_current_active_user(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive"
         )
+
+    #  SET USER ID IN CONTEXT
+    set_current_user_id(current_user.id)
+
     return current_user
 
 
