@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
+from urllib.parse import quote_plus
 
 class Settings(BaseSettings):
  
@@ -42,17 +42,21 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+
+
     @property
     def DATABASE_URL_ASYNC(self) -> str:
+        password = quote_plus(self.DB_PASSWORD)
         return (
-            f"mysql+asyncmy://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/"
+            f"mysql+asyncmy://{self.DB_USER}:{password}@{self.DB_HOST}:{self.DB_PORT}/"
             f"{self.DB_NAME}?charset=utf8mb4"
         )
 
     @property
     def DATABASE_URL_SYNC(self) -> str:
+        password = quote_plus(self.DB_PASSWORD)
         return (
-            f"mysql+pymysql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/"
+            f"mysql+pymysql://{self.DB_USER}:{password}@{self.DB_HOST}:{self.DB_PORT}/"
             f"{self.DB_NAME}?charset=utf8mb4"
         )
 

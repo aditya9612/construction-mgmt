@@ -26,7 +26,7 @@ from app.models.boq import BOQ
 from app.models.project import Project
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
-from app.schemas.boq import BOQCreate, BOQOut, BOQUpdate, BOQActualsUpdate
+from app.schemas.boq import BOQCreate, BOQOut, BOQUpdate, BOQActualsUpdate , BOQBulkCreate
 from app.utils.helpers import NotFoundError
 from app.core.logger import logger
 from app.models.boq import BOQAudit
@@ -586,6 +586,61 @@ async def update_item(
     await bump_cache_version(redis, VERSION_KEY)
 
     return BOQOut.model_validate(obj)
+
+@router.post("/{boq_id}/items/bulk")
+async def bulk_add_items(
+    boq_id: int,
+    payload: BOQBulkCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+    parent = await db.scalar(
+        select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted")
+    )
+
+    if not parent:
+        raise NotFoundError("BOQ not found")
+
+    created_items = []
+
+    for item in payload.items:
+        quantity = Decimal(str(item.quantity))
+        unit_cost = Decimal(str(item.unit_cost))
+
+        validate_cost_inputs(quantity, unit_cost)
+        total_cost, variance = calculate_cost(quantity, unit_cost)
+
+        obj = BOQ(
+            project_id=item.project_id,
+            boq_group_id=parent.boq_group_id,
+            version_no=parent.version_no,
+            is_latest=True,
+
+            item_name=item.item_name,
+            category=item.category,
+            description=item.description,
+
+            quantity=quantity,
+            unit=item.unit,
+            unit_cost=unit_cost,
+
+            total_cost=total_cost,
+            variance_cost=variance,
+
+            status=item.status,
+        )
+
+        db.add(obj)
+        created_items.append(obj)
+
+    await db.flush()
+    await bump_cache_version(redis, VERSION_KEY)
+
+    return {
+        "message": f"{len(created_items)} items created",
+        "items": [BOQOut.model_validate(i) for i in created_items]
+    }
 
 
 @router.delete("/items/{item_id}")

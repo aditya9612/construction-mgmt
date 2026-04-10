@@ -4,6 +4,8 @@ from typing import Optional, TYPE_CHECKING
 from sqlalchemy import (
     CheckConstraint,
     Date,
+    Enum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -13,6 +15,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
+from app.schemas.project import IssueCategory, IssuePriority, IssueStatus, ProjectStatus, TaskStatus
 
 if TYPE_CHECKING:
     from app.models.owner import Owner
@@ -30,8 +33,8 @@ class Project(Base, TimestampMixin):
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
-    status: Mapped[str] = mapped_column(
-        String(50), nullable=False, default="Planned", index=True
+    status: Mapped[ProjectStatus] = mapped_column(
+        Enum(ProjectStatus), default=ProjectStatus.PLANNED
     )
 
     owner_id: Mapped[int] = mapped_column(
@@ -119,6 +122,9 @@ class Milestone(Base):
 
     project: Mapped["Project"] = relationship("Project", back_populates="milestones")
 
+    __table_args__ = (
+        UniqueConstraint("project_id", "title", name="uq_milestone_project_title"),
+    )
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -136,8 +142,9 @@ class Task(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    status: Mapped[str] = mapped_column(
-        String(50), nullable=False, default="Planned", index=True
+
+    status: Mapped[TaskStatus] = mapped_column(
+        Enum(TaskStatus), default=TaskStatus.PLANNED
     )
 
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -150,9 +157,7 @@ class Task(Base):
         index=True,
     )
 
-    completion_percentage: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0
-    )
+    completion_percentage: Mapped[float] = mapped_column(Float, default=0)
 
     project: Mapped["Project"] = relationship("Project", back_populates="tasks")
 
@@ -166,6 +171,10 @@ class Task(Base):
         "Comment",
         back_populates="task",
         cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "title", name="uq_task_project_title"),
     )
 
 
@@ -196,7 +205,7 @@ class TaskProgress(Base, TimestampMixin):
     __table_args__ = (CheckConstraint("percentage >= 0 AND percentage <= 100"),)
 
 
-class Comment(Base):
+class Comment(Base, TimestampMixin):
     __tablename__ = "comments"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -264,18 +273,32 @@ class Issue(Base, TimestampMixin):
 
     title: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    category: Mapped[str] = mapped_column(String(100), nullable=False)
+    category: Mapped[IssueCategory] = mapped_column(
+        Enum(IssueCategory), nullable=False
+    )
 
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     reported_date: Mapped[date] = mapped_column(Date, nullable=False)
 
-    priority: Mapped[str] = mapped_column(String(50), default="Medium")
+    priority: Mapped[IssuePriority] = mapped_column(
+        Enum(IssuePriority), default=IssuePriority.MEDIUM
+    )
 
-    status: Mapped[str] = mapped_column(String(50), default="Open")
+    status: Mapped[IssueStatus] = mapped_column(
+        Enum(IssueStatus), default=IssueStatus.OPEN
+    )
 
-    assigned_to: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    assigned_to: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True
+    )
 
     resolution: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     project: Mapped["Project"] = relationship("Project")
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "title", name="uq_issue_project_title"),
+    )

@@ -65,3 +65,6 @@ class BOQOut(BaseSchema):
         json_encoders = {
             Decimal: float
         }
+
+class BOQBulkCreate(BaseSchema):
+    items: list[BOQCreate]

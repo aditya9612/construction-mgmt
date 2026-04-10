@@ -5,11 +5,9 @@ from enum import Enum
 from pydantic import Field, field_validator
 from typing_extensions import Annotated
 from app.schemas.base import BaseSchema
+from pydantic_core.core_schema import ValidationInfo
 
 
-# =========================
-# ENUMS
-# =========================
 class ProjectStatus(str, Enum):
     PLANNED = "Planned"
     ONGOING = "Ongoing"
@@ -48,9 +46,7 @@ class IssueCategory(str, Enum):
     DELAY = "Delay"
 
 
-# =========================
-# PROJECT
-# =========================
+
 class ProjectCreate(BaseSchema):
     project_name: str
     owner_id: int
@@ -58,6 +54,15 @@ class ProjectCreate(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[ProjectStatus] = ProjectStatus.PLANNED
+
+    @field_validator("end_date")
+    def validate_dates(cls, v, info: ValidationInfo):
+        start_date = info.data.get("start_date")
+
+        if v and start_date and v < start_date:
+            raise ValueError("End date cannot be before start date")
+
+        return v
 
 
 class ProjectUpdate(BaseSchema):
@@ -82,9 +87,6 @@ class ProjectOut(BaseSchema):
         from_attributes = True
 
 
-# =========================
-# MEMBERS
-# =========================
 class ProjectMemberAssign(BaseSchema):
     user_id: int
 
@@ -96,9 +98,6 @@ class ProjectMemberOut(BaseSchema):
     role: Optional[str] = None
 
 
-# =========================
-# MILESTONE
-# =========================
 class MilestoneCreate(BaseSchema):
     title: str
     description: Optional[str] = None
@@ -122,13 +121,10 @@ class MilestoneOut(BaseSchema):
     end_date: Optional[date] = None
 
 
-# =========================
-# TASK
-# =========================
 class TaskCreate(BaseSchema):
     title: str
     description: Optional[str] = None
-    priority: int = 0
+    priority: Annotated[int, Field(ge=0, le=5)]
     status: TaskStatus = TaskStatus.PLANNED
     start_date: Optional[date] = None
     end_date: Optional[date] = None
@@ -155,13 +151,10 @@ class TaskOut(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     assigned_user_id: Optional[int]
-    completion_percentage: int
+    completion_percentage: float
     is_delayed: bool
 
 
-# =========================
-# TASK PROGRESS
-# =========================
 class TaskProgressUpdate(BaseSchema):
     percentage: Annotated[int, Field(ge=0, le=100)]
     remarks: Optional[str] = None
@@ -175,9 +168,6 @@ class TaskProgressOut(BaseSchema):
     created_at: datetime
 
 
-# =========================
-# COMMENTS
-# =========================
 class CommentCreate(BaseSchema):
     content: str
 
@@ -189,9 +179,6 @@ class CommentOut(BaseSchema):
     content: str
 
 
-# =========================
-# DSR
-# =========================
 class DSRBase(BaseSchema):
     project_id: int
     report_date: date
@@ -250,9 +237,6 @@ class DSROut(DSRBase):
         from_attributes = True
 
 
-# =========================
-# ISSUE
-# =========================
 class IssueBase(BaseSchema):
     project_id: int
     title: str
