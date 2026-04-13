@@ -144,3 +144,6 @@ temp/
 *.temp
 *.bak
 *.swp
+
+# Uploads (user files)
+uploads/

@@ -31,7 +31,7 @@ from app.middlewares.rate_limiter import init_rate_limiter
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.utils.helpers import AppError
 from app.core.logger import setup_logger
-
+from fastapi.staticfiles import StaticFiles
 from app.core.request_context import set_request_id
 
 from app.core.logger import logger
@@ -78,6 +78,8 @@ def create_app() -> FastAPI:
         lifespan=lifespan
     )
 
+    application.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
     @application.middleware("http")
     async def log_requests(request: Request, call_next):
         request_id = str(uuid.uuid4())
@@ -95,7 +97,6 @@ def create_app() -> FastAPI:
 
             process_time = round((time.time() - start_time) * 1000, 2)
 
-            # 🔥 MONITORING ADDITION (IMPORTANT)
             if process_time > SLOW_API_THRESHOLD:
                 logger.warning(
                     f"SLOW API method={request.method} path={request.url.path} "

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import date
-from typing import Optional
+from typing import Annotated, List, Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,8 @@ from app.cache.redis import (
     cache_set_json,
     get_cache_version,
 )
+from fastapi import Request
+
 from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
@@ -25,13 +27,14 @@ from app.models.invoice import Invoice
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import project as s
 from app.core.logger import logger
-import io
+import io , os
 import pandas as pd
 from fastapi.responses import StreamingResponse
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from sqlalchemy.exc import IntegrityError
-
+from fastapi import UploadFile, File
+import uuid
 from app.utils.helpers import (
     BadRequestError,
     NotFoundError,
@@ -62,6 +65,8 @@ router = APIRouter(
     dependencies=[default_rate_limiter_dependency()],
 )
 
+
+
 VERSION_KEY = "cache_version:projects"
 
 PROJECT_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
@@ -69,7 +74,9 @@ PROJECT_DELETE_ROLES = [UserRole.ADMIN]
 
 TASK_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 TASK_DELETE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
-
+DSR_WRITE_ROLES = [UserRole.ADMIN,UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
+DSR_READ_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
+DSR_DELETE_ROLES = [UserRole.ADMIN]
 ISSUE_CREATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 ISSUE_UPDATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
 ISSUE_DELETE_ROLES = [UserRole.ADMIN]
@@ -2158,7 +2165,7 @@ dsr_router = APIRouter(
 @dsr_router.post("", response_model=s.DSROut)
 async def create_dsr(
     payload: s.DSRCreate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User =Depends(require_roles(DSR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(
@@ -2167,7 +2174,6 @@ async def create_dsr(
 
     project = await db.get(m.Project, payload.project_id)
     if not project:
-        logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
 
     existing = await db.scalar(
@@ -2178,12 +2184,16 @@ async def create_dsr(
     )
 
     if existing:
-        logger.warning(
-            f"DSR already exists project_id={payload.project_id} date={payload.report_date}"
-        )
         raise BadRequestError("DSR already exists for this date")
 
-    obj = m.DailySiteReport(**payload.model_dump())
+    data = payload.model_dump()
+
+    if data.get("contractor_name"):
+        data["contractor_name"] = data["contractor_name"].strip()
+
+    data["created_by_user_id"] = current_user.id
+
+    obj = m.DailySiteReport(**data)
 
     try:
         db.add(obj)
@@ -2191,43 +2201,96 @@ async def create_dsr(
         await db.refresh(obj)
     except Exception:
         await db.rollback()
-        logger.exception("DSR creation failed")
         raise
 
-    logger.info(f"DSR created id={obj.id}")
+    dsr_out = s.DSROut.model_validate(obj)
 
-    return s.DSROut.model_validate(obj)
+    if obj.created_by:
+        dsr_out.created_by_name = obj.created_by.full_name
+
+    return dsr_out
 
 
-@dsr_router.get("/project/{project_id}")
+@dsr_router.get("/project/{project_id}", response_model=PaginatedResponse[s.DSROut])
 async def get_project_dsr(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    start_date: Optional[date] = Query(default=None),
+    end_date: Optional[date] = Query(default=None),
+    contractor_name: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, le=100),
+    offset: int = Query(default=0),
+    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(
-        select(m.DailySiteReport).where(m.DailySiteReport.project_id == project_id)
+    if start_date and end_date and end_date < start_date:
+        raise BadRequestError("end_date cannot be before start_date")
+
+    base_query = select(m.DailySiteReport).where(
+        m.DailySiteReport.project_id == project_id
     )
+
+    if start_date:
+        base_query = base_query.where(m.DailySiteReport.report_date >= start_date)
+
+    if end_date:
+        base_query = base_query.where(m.DailySiteReport.report_date <= end_date)
+
+    if contractor_name:
+        contractor_name = contractor_name.strip()
+        base_query = base_query.where(
+            m.DailySiteReport.contractor_name.ilike(f"%{contractor_name}%")
+        )
+
+    count_query = select(func.count()).select_from(base_query.subquery())
+    total = await db.scalar(count_query)
+
+    query = base_query.order_by(
+        m.DailySiteReport.report_date.desc()
+    ).limit(limit).offset(offset)
+
+    result = await db.execute(query)
     rows = result.scalars().all()
 
-    return [s.DSROut.model_validate(r) for r in rows]
+    items = []
+    for r in rows:
+        item = s.DSROut.model_validate(r)
+        if r.created_by:
+            item.created_by_name = r.created_by.full_name
+        items.append(item)
+
+    return PaginatedResponse[s.DSROut](
+        items=items,
+        meta=PaginationMeta(
+            total=int(total or 0),
+            limit=limit,
+            offset=offset,
+        ),
+    )
 
 
 @dsr_router.get("/{id}", response_model=s.DSROut)
-async def get_dsr(id: int, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(READ_ROLES)),):
+async def get_dsr(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
     obj = await db.get(m.DailySiteReport, id)
 
     if not obj:
         raise NotFoundError("DSR not found")
 
-    return s.DSROut.model_validate(obj)
+    dsr_out = s.DSROut.model_validate(obj)
 
+    if obj.created_by:
+        dsr_out.created_by_name = obj.created_by.full_name
+
+    return dsr_out
 
 @dsr_router.put("/{id}", response_model=s.DSROut)
 async def update_dsr(
     id: int,
     payload: s.DSRUpdate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Updating DSR id={id}")
@@ -2235,11 +2298,27 @@ async def update_dsr(
     obj = await db.get(m.DailySiteReport, id)
 
     if not obj:
-        logger.warning(f"DSR not found id={id}")
         raise NotFoundError("DSR not found")
 
-    for k, v in payload.model_dump(exclude_unset=True).items():
-        setattr(obj, k, v)
+    if payload.report_date:
+        existing = await db.scalar(
+            select(m.DailySiteReport).where(
+                m.DailySiteReport.project_id == obj.project_id,
+                m.DailySiteReport.report_date == payload.report_date,
+                m.DailySiteReport.id != id,
+            )
+        )
+        if existing:
+            raise BadRequestError("DSR already exists for this date")
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    if "contractor_name" in update_data and update_data["contractor_name"]:
+        update_data["contractor_name"] = update_data["contractor_name"].strip()
+
+    for k, v in update_data.items():
+        if k not in ["project_id", "created_by_user_id"]:
+            setattr(obj, k, v)
 
     try:
         await db.flush()
@@ -2250,15 +2329,162 @@ async def update_dsr(
 
     await db.refresh(obj)
 
-    logger.info(f"DSR updated id={id}")
+    dsr_out = s.DSROut.model_validate(obj)
 
-    return s.DSROut.model_validate(obj)
+    if obj.created_by:
+        dsr_out.created_by_name = obj.created_by.full_name
 
+    logger.info(f"DSR updated successfully id={id}")
 
+    return dsr_out
+
+@dsr_router.post("/{dsr_id}/photos")
+async def upload_dsr_photos(
+    dsr_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    dsr = await db.get(m.DailySiteReport, dsr_id)
+    if not dsr:
+        raise NotFoundError("DSR not found")
+
+    upload_dir = "uploads/dsr"
+    os.makedirs(upload_dir, exist_ok=True)
+
+    if not file.content_type.startswith("image/"):
+        raise BadRequestError("Only image files are allowed")
+
+    content = await file.read()
+
+    if len(content) > 5 * 1024 * 1024:
+        raise BadRequestError("File too large (max 5MB)")
+
+    filename = f"{uuid.uuid4()}_{file.filename}"
+    path = os.path.join(upload_dir, filename).replace("\\", "/")
+
+    with open(path, "wb") as f:
+        f.write(content)
+
+    photo = m.DSRPhoto(dsr_id=dsr_id, file_url=path)
+    db.add(photo)
+
+    await db.flush()
+
+    normalized_path = path 
+    base_url = str(request.base_url).rstrip("/")
+    file_url = f"{base_url}/{normalized_path}"
+
+    return {
+        "status": "success",
+        "uploaded": [file_url],
+    }
+
+@dsr_router.get("/project/{project_id}/map")
+async def get_dsr_map_points(
+    project_id: int,
+    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    result = await db.execute(
+        select(
+            m.DailySiteReport.latitude,
+            m.DailySiteReport.longitude,
+            m.DailySiteReport.report_date,
+        ).where(
+            m.DailySiteReport.project_id == project_id,
+            m.DailySiteReport.latitude.isnot(None),
+            m.DailySiteReport.longitude.isnot(None),
+        )
+    )
+
+    rows = result.all()
+
+    return [
+        {
+            "lat": r[0],
+            "lng": r[1],
+            "date": r[2],
+        }
+        for r in rows
+    ]
+
+@dsr_router.get("/project/{project_id}/analytics/labour")
+async def labour_trend(
+    project_id: int,
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    if start_date and end_date and end_date < start_date:
+        raise BadRequestError("end_date cannot be before start_date")
+
+    query = select(
+        m.DailySiteReport.report_date,
+        func.sum(m.DailySiteReport.labour_count),
+    ).where(m.DailySiteReport.project_id == project_id)
+
+    if start_date:
+        query = query.where(m.DailySiteReport.report_date >= start_date)
+
+    if end_date:
+        query = query.where(m.DailySiteReport.report_date <= end_date)
+
+    query = query.group_by(m.DailySiteReport.report_date).order_by(
+        m.DailySiteReport.report_date
+    )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    return [
+        {
+            "date": r[0],
+            "labour": int(r[1] or 0),
+        }
+        for r in rows
+    ]
+
+@dsr_router.get("/project/{project_id}/analytics/contractor")
+async def contractor_analytics(
+    project_id: int,
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    if start_date and end_date and end_date < start_date:
+        raise BadRequestError("end_date cannot be before start_date")
+
+    query = select(
+        m.DailySiteReport.contractor_name,
+        func.count(),
+    ).where(m.DailySiteReport.project_id == project_id)
+
+    if start_date:
+        query = query.where(m.DailySiteReport.report_date >= start_date)
+
+    if end_date:
+        query = query.where(m.DailySiteReport.report_date <= end_date)
+
+    query = query.group_by(m.DailySiteReport.contractor_name)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    return [
+        {
+            "contractor": r[0] or "Unknown",
+            "entries": r[1],
+        }
+        for r in rows
+    ]
 @dsr_router.delete("/{id}")
 async def delete_dsr(
     id: int,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(DSR_DELETE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Deleting DSR id={id}")
@@ -2283,6 +2509,109 @@ async def delete_dsr(
         "success": True,
         "message": "DSR deleted successfully"
     }
+
+
+@dsr_router.get("/{dsr_id}/photos")
+async def get_dsr_photos(
+    dsr_id: int,
+    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    dsr = await db.get(m.DailySiteReport, dsr_id)
+    if not dsr:
+        raise NotFoundError("DSR not found")
+
+    result = await db.execute(
+        select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == dsr_id)
+    )
+    rows = result.scalars().all()
+
+    return [{"id": p.id, "url": p.file_url} for p in rows]
+
+@dsr_router.delete("/photo/{photo_id}")
+async def delete_dsr_photo(
+    photo_id: int,
+    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.DSRPhoto, photo_id)
+
+    if not obj:
+        raise NotFoundError("Photo not found")
+
+    try:
+        await db.delete(obj)
+        await db.flush()
+    except Exception:
+        await db.rollback()
+        raise
+
+    return {"status": "success"}
+
+@dsr_router.get("/project/{project_id}/export")
+async def export_dsr_excel(
+    project_id: int,
+    start_date: Optional[date] = Query(default=None),
+    end_date: Optional[date] = Query(default=None),
+    contractor_name: Optional[str] = Query(default=None),
+    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    logger.info(f"Exporting DSR Excel project_id={project_id}")
+
+    query = select(m.DailySiteReport).where(
+        m.DailySiteReport.project_id == project_id
+    )
+
+    if start_date:
+        query = query.where(m.DailySiteReport.report_date >= start_date)
+
+    if end_date:
+        query = query.where(m.DailySiteReport.report_date <= end_date)
+
+    if contractor_name:
+        contractor_name = contractor_name.strip()
+        query = query.where(
+            m.DailySiteReport.contractor_name.ilike(f"%{contractor_name}%")
+        )
+
+    query = query.order_by(m.DailySiteReport.report_date.desc())
+
+    result = await db.execute(query)
+    rows = result.scalars().all()
+
+    if not rows:
+        raise NotFoundError("No DSR data found")
+
+    data = []
+    for r in rows:
+        data.append({
+            "Date": r.report_date,
+            "Project ID": r.project_id,
+            "Contractor": r.contractor_name,
+            "Weather": r.weather,
+            "Work Done": r.work_done,
+            "Work Planned": r.work_planned,
+            "Labour Count": r.labour_count,
+            "Material Used": r.material_used,
+            "Issues": r.issues,
+            "Remarks": r.remarks,
+            "Created By": r.created_by.full_name if r.created_by else None,
+        })
+
+    df = pd.DataFrame(data)
+
+    stream = io.BytesIO()
+    df.to_excel(stream, index=False)
+    stream.seek(0)
+
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename=dsr_project_{project_id}.xlsx"
+        },
+    )
 
 
 issues_router = APIRouter(
@@ -2490,6 +2819,42 @@ async def issues_by_project(
 
     return [s.IssueOut.model_validate(r) for r in rows]
 
+
+@dsr_router.get("/project/{project_id}/analytics/issues")
+async def issue_analytics(
+    project_id: int,
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    if start_date and end_date and end_date < start_date:
+        raise BadRequestError("end_date cannot be before start_date")
+
+    base_query = select(m.DailySiteReport).where(
+        m.DailySiteReport.project_id == project_id
+    )
+
+    if start_date:
+        base_query = base_query.where(m.DailySiteReport.report_date >= start_date)
+
+    if end_date:
+        base_query = base_query.where(m.DailySiteReport.report_date <= end_date)
+
+    total = await db.scalar(
+        select(func.count()).select_from(base_query.subquery())
+    )
+
+    issues = await db.scalar(
+        select(func.count()).select_from(
+            base_query.where(m.DailySiteReport.issues.isnot(None)).subquery()
+        )
+    )
+
+    return {
+        "total_reports": int(total or 0),
+        "reports_with_issues": int(issues or 0),
+    }
 
 router.include_router(milestones_router)
 router.include_router(tasks_router)

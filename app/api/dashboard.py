@@ -17,6 +17,7 @@ from app.core.logger import logger
 from app.utils.helpers import NotFoundError
 from app.models.labour import LabourAttendance
 from app.models.material import Material
+from app.models import project as m
 from datetime import date
 from app.models.invoice import Invoice
 from sqlalchemy import case
@@ -116,6 +117,8 @@ async def engineer_dashboard(
 ):
     today = date.today()
 
+    # ------------------ BASIC METRICS ------------------
+
     labour_count = await db.scalar(
         select(func.count(LabourAttendance.id)).where(
             LabourAttendance.project_id == project_id,
@@ -142,7 +145,8 @@ async def engineer_dashboard(
 
     completed_tasks = await db.scalar(
         select(func.count(Task.id)).where(
-            Task.project_id == project_id, Task.completion_percentage == 100
+            Task.project_id == project_id,
+            Task.completion_percentage == 100,
         )
     )
 
@@ -152,12 +156,78 @@ async def engineer_dashboard(
         else 0
     )
 
+    # ------------------ 📊 ANALYTICS ------------------
+
+    # 🔹 Labour Trend
+    labour_trend_result = await db.execute(
+        select(
+            m.DailySiteReport.report_date,
+            func.sum(m.DailySiteReport.labour_count),
+        )
+        .where(m.DailySiteReport.project_id == project_id)
+        .group_by(m.DailySiteReport.report_date)
+        .order_by(m.DailySiteReport.report_date)
+    )
+
+    labour_trend = [
+        {
+            "date": r[0],
+            "labour": int(r[1] or 0),
+        }
+        for r in labour_trend_result.all()
+    ]
+
+    # 🔹 Contractor Analytics
+    contractor_result = await db.execute(
+        select(
+            m.DailySiteReport.contractor_name,
+            func.count(),
+        )
+        .where(m.DailySiteReport.project_id == project_id)
+        .group_by(m.DailySiteReport.contractor_name)
+    )
+
+    contractor_stats = [
+        {
+            "contractor": r[0] or "Unknown",
+            "entries": r[1],
+        }
+        for r in contractor_result.all()
+    ]
+
+    # 🔹 Issue Analytics
+    total_reports = await db.scalar(
+        select(func.count()).where(
+            m.DailySiteReport.project_id == project_id
+        )
+    )
+
+    issue_reports = await db.scalar(
+        select(func.count()).where(
+            m.DailySiteReport.project_id == project_id,
+            m.DailySiteReport.issues.isnot(None),
+        )
+    )
+
+    issue_summary = {
+        "total_reports": int(total_reports or 0),
+        "reports_with_issues": int(issue_reports or 0),
+    }
+
+    # ------------------ FINAL RESPONSE ------------------
+
     return {
         "project_id": project_id,
+
+        # 🔹 existing
         "labour_today": labour_count or 0,
         "material_used_today": float(material_used_today or 0),
         "material_used_total": float(material_used_total or 0),
         "tasks_done_percent": round(progress_percent, 2),
+
+        "labour_trend": labour_trend,
+        "contractor_stats": contractor_stats,
+        "issue_summary": issue_summary,
     }
 
 

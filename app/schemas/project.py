@@ -8,6 +8,8 @@ from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
 
 
+# ===================== ENUMS =====================
+
 class ProjectStatus(str, Enum):
     PLANNED = "Planned"
     ONGOING = "Ongoing"
@@ -46,6 +48,7 @@ class IssueCategory(str, Enum):
     DELAY = "Delay"
 
 
+# ===================== PROJECT =====================
 
 class ProjectCreate(BaseSchema):
     project_name: str
@@ -58,10 +61,8 @@ class ProjectCreate(BaseSchema):
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
         start_date = info.data.get("start_date")
-
         if v and start_date and v < start_date:
             raise ValueError("End date cannot be before start date")
-
         return v
 
 
@@ -98,6 +99,8 @@ class ProjectMemberOut(BaseSchema):
     role: Optional[str] = None
 
 
+# ===================== MILESTONE =====================
+
 class MilestoneCreate(BaseSchema):
     title: str
     description: Optional[str] = None
@@ -120,6 +123,8 @@ class MilestoneOut(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
 
+
+# ===================== TASK =====================
 
 class TaskCreate(BaseSchema):
     title: str
@@ -168,6 +173,8 @@ class TaskProgressOut(BaseSchema):
     created_at: datetime
 
 
+# ===================== COMMENTS =====================
+
 class CommentCreate(BaseSchema):
     content: str
 
@@ -178,16 +185,29 @@ class CommentOut(BaseSchema):
     author_user_id: int
     content: str
 
+# ===================== DSR BASE =====================
 
 class DSRBase(BaseSchema):
     project_id: int
     report_date: date
+
+    site_location: Optional[str] = None
+    contractor_name: Optional[str] = None
+
     weather: Optional[WeatherType] = None
+
     work_done: str
     work_planned: Optional[str] = None
+
     labour_count: Annotated[int, Field(ge=0)] = 0
+
+    machinery_used: Optional[str] = None
+    material_received: Optional[str] = None
     material_used: Optional[str] = None
+
     issues: Optional[str] = None
+    safety_observations: Optional[str] = None
+
     remarks: Optional[str] = None
 
     @field_validator("work_done")
@@ -202,20 +222,57 @@ class DSRBase(BaseSchema):
             raise ValueError("Future report date not allowed")
         return v
 
+    @field_validator("contractor_name")
+    def validate_contractor(cls, v):
+        if v and not v.strip():
+            raise ValueError("Contractor name cannot be empty")
+        return v
+
+
+# ===================== CREATE =====================
 
 class DSRCreate(DSRBase):
-    pass
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
+    @field_validator("latitude")
+    def validate_lat(cls, v):
+        if v is not None and not (-90 <= v <= 90):
+            raise ValueError("Invalid latitude")
+        return v
+    
+    @field_validator("longitude")
+    def validate_lng(cls, v):
+        if v is not None and not (-180 <= v <= 180):
+            raise ValueError("Invalid longitude")
+        return v
+
+
+# ===================== UPDATE =====================
 
 class DSRUpdate(BaseSchema):
     report_date: Optional[date] = None
+    site_location: Optional[str] = None
+    contractor_name: Optional[str] = None
+
     weather: Optional[WeatherType] = None
+
     work_done: Optional[str] = None
     work_planned: Optional[str] = None
-    labour_count: Optional[Annotated[int, Field(ge=0)]] = None
+
+    labour_count: Optional[int] = None
+
+    machinery_used: Optional[str] = None
+    material_received: Optional[str] = None
     material_used: Optional[str] = None
+
     issues: Optional[str] = None
+    safety_observations: Optional[str] = None
+
     remarks: Optional[str] = None
+
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
     @field_validator("work_done")
     def validate_update_work_done(cls, v):
@@ -229,13 +286,43 @@ class DSRUpdate(BaseSchema):
             raise ValueError("Future report date not allowed")
         return v
 
+    @field_validator("site_location")
+    def validate_site_location(cls, v):
+        if v and not v.strip():
+            raise ValueError("Site location cannot be empty")
+        return v
+
+    @field_validator("contractor_name")
+    def validate_update_contractor(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError("Contractor name cannot be empty")
+        return v
+
+
+# ===================== OUTPUT =====================
 
 class DSROut(DSRBase):
     id: int
+    created_at: datetime
+    updated_at: datetime
+    created_by_user_id: Optional[int] = None
+    created_by_name: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
     class Config:
         from_attributes = True
 
+
+# ===================== PAGINATION META =====================
+
+class PaginationMeta(BaseSchema):
+    total: int
+    limit: int
+    offset: int
+
+
+# ===================== ISSUES =====================
 
 class IssueBase(BaseSchema):
     project_id: int

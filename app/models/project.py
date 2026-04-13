@@ -1,6 +1,6 @@
 from datetime import date
 from typing import Optional, TYPE_CHECKING
-
+from app.schemas.project import WeatherType
 from sqlalchemy import (
     CheckConstraint,
     Date,
@@ -15,7 +15,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
-from app.schemas.project import IssueCategory, IssuePriority, IssueStatus, ProjectStatus, TaskStatus
+from app.schemas.project import IssueCategory, IssuePriority, IssueStatus, ProjectStatus, TaskStatus, WeatherType
 
 if TYPE_CHECKING:
     from app.models.owner import Owner
@@ -63,11 +63,13 @@ class Project(Base, TimestampMixin):
 
     dsr_entries: Mapped[list["DailySiteReport"]] = relationship(
         "DailySiteReport",
+        back_populates="project",
         cascade="all, delete-orphan",
     )
 
     issues: Mapped[list["Issue"]] = relationship(
         "Issue",
+        back_populates="project",
         cascade="all, delete-orphan",
     )
 
@@ -77,6 +79,7 @@ class Project(Base, TimestampMixin):
             name="check_project_dates",
         ),
     )
+
 
 
 class ProjectMember(Base):
@@ -229,35 +232,71 @@ class Comment(Base, TimestampMixin):
     task: Mapped["Task"] = relationship("Task", back_populates="comments")
 
 
+# ===================== DSR =====================
+
 class DailySiteReport(Base, TimestampMixin):
     __tablename__ = "daily_site_reports"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     project_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
         index=True,
     )
 
-    report_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
-    weather: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    created_by: Mapped[Optional["User"]] = relationship("User")
 
-    work_done: Mapped[str] = mapped_column(Text, nullable=False)
+    report_date: Mapped[date] = mapped_column(Date, index=True)
+
+    site_location: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    contractor_name = mapped_column(String(255), index=True)
+
+    weather: Mapped[Optional[WeatherType]] = mapped_column(
+        Enum(WeatherType),
+        nullable=True
+    )
+    work_done: Mapped[str] = mapped_column(Text)
     work_planned: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     labour_count: Mapped[int] = mapped_column(Integer, default=0)
 
+    machinery_used: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    material_received: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     material_used: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     issues: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    safety_observations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    project: Mapped["Project"] = relationship("Project")
+    latitude = mapped_column(Float, index=True, nullable=True)
+    longitude = mapped_column(Float, index=True, nullable=True)
 
+    photos = relationship(
+        "DSRPhoto",
+        back_populates="dsr",
+        cascade="all, delete-orphan"
+    )
+
+    project: Mapped["Project"] = relationship(
+        "Project",
+        back_populates="dsr_entries"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "report_date", name="uq_project_dsr_date"),
+    )
+
+
+# ===================== ISSUE =====================
 
 class Issue(Base, TimestampMixin):
     __tablename__ = "issues"
@@ -297,8 +336,23 @@ class Issue(Base, TimestampMixin):
 
     resolution: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    project: Mapped["Project"] = relationship("Project")
+    project: Mapped["Project"] = relationship(
+        "Project",
+        back_populates="issues"
+    )
 
     __table_args__ = (
         UniqueConstraint("project_id", "title", name="uq_issue_project_title"),
     )
+
+class DSRPhoto(Base, TimestampMixin):
+    __tablename__ = "dsr_photos"
+
+    id = mapped_column(Integer, primary_key=True)
+    dsr_id = mapped_column(
+        ForeignKey("daily_site_reports.id", ondelete="CASCADE"),
+        index=True
+    )
+    file_url = mapped_column(String(500), nullable=False)
+
+    dsr = relationship("DailySiteReport", back_populates="photos")
