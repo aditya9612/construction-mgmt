@@ -1,8 +1,8 @@
 """update data
 
-Revision ID: 9a93a478063b
+Revision ID: 3758f9a44849
 Revises: 
-Create Date: 2026-04-14 12:34:29.735433
+Create Date: 2026-04-14 21:12:07.201485
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '9a93a478063b'
+revision = '3758f9a44849'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -258,6 +258,11 @@ def upgrade():
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('project_id', 'title', name='uq_issue_project_title')
     )
+    op.create_index('idx_issue_priority', 'issues', ['priority'], unique=False)
+    op.create_index('idx_issue_project_priority', 'issues', ['project_id', 'priority'], unique=False)
+    op.create_index('idx_issue_project_status', 'issues', ['project_id', 'status'], unique=False)
+    op.create_index('idx_issue_reported_date', 'issues', ['reported_date'], unique=False)
+    op.create_index('idx_issue_status', 'issues', ['status'], unique=False)
     op.create_index(op.f('ix_issues_project_id'), 'issues', ['project_id'], unique=False)
     op.create_table('labour',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
@@ -337,6 +342,7 @@ def upgrade():
     sa.PrimaryKeyConstraint('project_id', 'user_id'),
     sa.UniqueConstraint('project_id', 'user_id', name='uq_project_members_project_id_user_id')
     )
+    op.create_index('idx_project_member_user', 'project_members', ['user_id'], unique=False)
     op.create_table('ra_bills',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -543,6 +549,7 @@ def downgrade():
     op.drop_index(op.f('ix_ra_bills_id'), table_name='ra_bills')
     op.drop_index(op.f('ix_ra_bills_contractor_id'), table_name='ra_bills')
     op.drop_table('ra_bills')
+    op.drop_index('idx_project_member_user', table_name='project_members')
     op.drop_table('project_members')
     op.drop_index(op.f('ix_owner_transactions_project_id'), table_name='owner_transactions')
     op.drop_index(op.f('ix_owner_transactions_owner_id'), table_name='owner_transactions')
@@ -559,6 +566,11 @@ def downgrade():
     op.drop_index(op.f('ix_labour_labour_name'), table_name='labour')
     op.drop_table('labour')
     op.drop_index(op.f('ix_issues_project_id'), table_name='issues')
+    op.drop_index('idx_issue_status', table_name='issues')
+    op.drop_index('idx_issue_reported_date', table_name='issues')
+    op.drop_index('idx_issue_project_status', table_name='issues')
+    op.drop_index('idx_issue_project_priority', table_name='issues')
+    op.drop_index('idx_issue_priority', table_name='issues')
     op.drop_table('issues')
     op.drop_index(op.f('ix_invoices_project_id'), table_name='invoices')
     op.drop_index(op.f('ix_invoices_owner_id'), table_name='invoices')

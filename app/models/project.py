@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Index,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -100,6 +101,7 @@ class ProjectMember(Base):
         UniqueConstraint(
             "project_id", "user_id", name="uq_project_members_project_id_user_id"
         ),
+        Index("idx_project_member_user", "user_id"),
     )
 
     project: Mapped["Project"] = relationship("Project", back_populates="members")
@@ -343,6 +345,13 @@ class Issue(Base, TimestampMixin):
 
     __table_args__ = (
         UniqueConstraint("project_id", "title", name="uq_issue_project_title"),
+
+        Index("idx_issue_reported_date", "reported_date"),
+        Index("idx_issue_priority", "priority"),
+        Index("idx_issue_status", "status"),
+
+        Index("idx_issue_project_status", "project_id", "status"),
+        Index("idx_issue_project_priority", "project_id", "priority"),
     )
 
 class DSRPhoto(Base, TimestampMixin):

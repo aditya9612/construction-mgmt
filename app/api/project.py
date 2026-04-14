@@ -1,10 +1,9 @@
 from __future__ import annotations
 from datetime import date
-import pathlib , re , io , os , uuid
+import pathlib, re, io, os, uuid
 from openpyxl import Workbook
 from typing import Annotated, List, Optional
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
@@ -21,6 +20,7 @@ from app.core.dependencies import (
     get_request_redis,
     require_roles,
 )
+from sqlalchemy import select, func, or_
 from app.models import project as m
 from app.models.user import User, UserRole
 from app.models.owner import Owner
@@ -75,7 +75,6 @@ router = APIRouter(
 )
 
 
-
 VERSION_KEY = "cache_version:projects"
 
 PROJECT_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
@@ -83,7 +82,7 @@ PROJECT_DELETE_ROLES = [UserRole.ADMIN]
 
 TASK_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 TASK_DELETE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
-DSR_WRITE_ROLES = [UserRole.ADMIN,UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
+DSR_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 DSR_READ_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 DSR_DELETE_ROLES = [UserRole.ADMIN]
 ISSUE_CREATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
@@ -252,9 +251,7 @@ class MilestonesRepository:
         offset: int,
     ) -> tuple[list[m.Milestone], int]:
 
-        count_query = select(func.count()).where(
-            m.Milestone.project_id == project_id
-        )
+        count_query = select(func.count()).where(m.Milestone.project_id == project_id)
 
         query = (
             select(m.Milestone)
@@ -533,12 +530,7 @@ class ProjectsService:
         )
         total = await db.scalar(count_query)
 
-        query = (
-            base_query
-            .order_by(m.Project.id.desc())
-            .limit(limit)
-            .offset(offset)
-        )
+        query = base_query.order_by(m.Project.id.desc()).limit(limit).offset(offset)
 
         rows = (await db.execute(query)).scalars().all()
 
@@ -664,7 +656,6 @@ class ProjectMembersService:
     def _assert_member_mutation_role(self, current_user: User) -> None:
         if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
             raise PermissionDeniedError("Insufficient permissions")
-
 
     async def assign_member(
         self,
@@ -795,7 +786,9 @@ class MilestonesService:
             )
         except IntegrityError:
             await db.rollback()
-            raise ConflictError("Milestone with this title already exists in this project")
+            raise ConflictError(
+                "Milestone with this title already exists in this project"
+            )
         except Exception:
             await db.rollback()
             logger.exception(f"Milestone create failed")
@@ -886,13 +879,15 @@ class MilestonesService:
         data = payload.model_dump(exclude_unset=True)
         if "title" in data and data["title"] is None:
             raise ValidationError("title cannot be null")
-        
+
         try:
             await self.milestones_repo.update_milestone(db, obj=obj, data=data)
             await db.refresh(obj)
         except IntegrityError:
             await db.rollback()
-            raise ConflictError("Milestone with this title already exists in this project")
+            raise ConflictError(
+                "Milestone with this title already exists in this project"
+            )
         except Exception:
             await db.rollback()
             logger.exception(f"Milestone update failed id={milestone_id}")
@@ -955,7 +950,9 @@ class TasksService:
     def _is_delayed(self, *, task: m.Task, current_date: date) -> bool:
         if task.end_date is None:
             return False
-        return (current_date > task.end_date) and (task.status != s.TaskStatus.COMPLETED)
+        return (current_date > task.end_date) and (
+            task.status != s.TaskStatus.COMPLETED
+        )
 
     async def _assert_progress_or_comment_auth(
         self,
@@ -1478,8 +1475,7 @@ class AlertsService:
         total = await db.scalar(count_query)
 
         query = (
-            base_query
-            .order_by(m.Project.end_date.asc())
+            base_query.order_by(m.Project.end_date.asc())
             .limit(pagination.limit)
             .offset(pagination.offset)
         )
@@ -1531,12 +1527,11 @@ class AlertsService:
 
         count_query = select(func.count()).select_from(
             base_query.order_by(None).subquery()
-        )       
+        )
         total = await db.scalar(count_query)
 
         query = (
-            base_query
-            .order_by(m.Task.end_date.asc())
+            base_query.order_by(m.Task.end_date.asc())
             .limit(pagination.limit)
             .offset(pagination.offset)
         )
@@ -1592,7 +1587,6 @@ class ReportsService:
             "end_date": project.end_date,
         }
 
-
     async def export_excel(
         self,
         db: AsyncSession,
@@ -1608,13 +1602,15 @@ class ReportsService:
         headers = ["ID", "Name", "Status", "Start Date", "End Date"]
         ws.append(headers)
 
-        ws.append([
-            data["id"],
-            data["name"],
-            str(data["status"]),
-            str(data["start_date"]),
-            str(data["end_date"]),
-        ])
+        ws.append(
+            [
+                data["id"],
+                data["name"],
+                str(data["status"]),
+                str(data["start_date"]),
+                str(data["end_date"]),
+            ]
+        )
 
         stream = io.BytesIO()
         wb.save(stream)
@@ -1883,10 +1879,7 @@ async def delete_project(
 
     logger.info(f"Project deleted id={project_id}")
 
-    return {
-        "success": True,
-        "message": f"Project_id {project_id} deleted successfully"
-    }
+    return {"success": True, "message": f"Project_id {project_id} deleted successfully"}
 
 
 @router.post(
@@ -1960,10 +1953,7 @@ async def remove_project_member(
 
     logger.info(f"Member removed user_id={user_id} project_id={project_id}")
 
-    return {
-        "success": True,
-        "message": "Member Remove successfully"
-    }
+    return {"success": True, "message": "Member Remove successfully"}
 
 
 @router.get("/{project_id}/report/excel")
@@ -2002,6 +1992,7 @@ async def get_project_logs(
         "project_id": project_id,
         "message": "Logs available in logging system (file/ELK)",
     }
+
 
 milestones_router = APIRouter(
     prefix="",
@@ -2129,7 +2120,7 @@ async def delete_milestone(
 
     return {
         "success": True,
-        "message": f"Milestone_id {milestone_id}  deleted successfully"
+        "message": f"Milestone_id {milestone_id}  deleted successfully",
     }
 
 
@@ -2242,10 +2233,7 @@ async def delete_task(
 
     logger.info(f"Task deleted id={task_id}")
 
-    return {
-        "success": True,
-        "message": f"Task_id {task_id} deleted successfully"
-    }
+    return {"success": True, "message": f"Task_id {task_id} deleted successfully"}
 
 
 @tasks_router.post(
@@ -2404,7 +2392,7 @@ dsr_router = APIRouter(
 @dsr_router.post("", response_model=s.DSROut)
 async def create_dsr(
     payload: s.DSRCreate,
-    current_user: User =Depends(require_roles(DSR_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(
@@ -2414,7 +2402,7 @@ async def create_dsr(
     project = await db.get(m.Project, payload.project_id)
     if not project:
         raise NotFoundError("Project not found")
-    
+
     await assert_project_access(
         db,
         project_id=payload.project_id,
@@ -2486,9 +2474,7 @@ async def get_project_dsr(
 
     if contractor_name:
         contractor_name = contractor_name.strip()
-        filters.append(
-            m.DailySiteReport.contractor_name.ilike(f"%{contractor_name}%")
-        )
+        filters.append(m.DailySiteReport.contractor_name.ilike(f"%{contractor_name}%"))
 
     count_query = select(func.count()).where(*filters)
     total = await db.scalar(count_query)
@@ -2531,7 +2517,7 @@ async def get_dsr(
 
     if not obj:
         raise NotFoundError("DSR not found")
-    
+
     await assert_project_access(
         db,
         project_id=obj.project_id,
@@ -2544,6 +2530,7 @@ async def get_dsr(
         dsr_out.created_by_name = obj.created_by.full_name
 
     return dsr_out
+
 
 @dsr_router.put("/{id}", response_model=s.DSROut)
 async def update_dsr(
@@ -2558,7 +2545,7 @@ async def update_dsr(
 
     if not obj:
         raise NotFoundError("DSR not found")
-    
+
     await assert_project_access(
         db,
         project_id=obj.project_id,
@@ -2603,6 +2590,7 @@ async def update_dsr(
 
     return dsr_out
 
+
 @dsr_router.post("/{dsr_id}/photos")
 async def upload_dsr_photos(
     dsr_id: int,
@@ -2623,7 +2611,6 @@ async def upload_dsr_photos(
 
     upload_dir = "uploads/dsr"
     os.makedirs(upload_dir, exist_ok=True)
-
 
     if not file.content_type or not file.content_type.startswith("image/"):
         raise BadRequestError("Only image files are allowed")
@@ -2648,7 +2635,6 @@ async def upload_dsr_photos(
     if ext not in allowed_extensions:
         raise BadRequestError("Only JPG, JPEG, PNG allowed")
 
-
     filename = f"{uuid.uuid4()}_{safe_name}"
 
     path = os.path.join(upload_dir, filename).replace("\\", "/")
@@ -2668,6 +2654,7 @@ async def upload_dsr_photos(
         "status": "success",
         "uploaded": [file_url],
     }
+
 
 @dsr_router.get("/project/{project_id}/map")
 async def get_dsr_map_points(
@@ -2697,6 +2684,7 @@ async def get_dsr_map_points(
         }
         for r in rows
     ]
+
 
 @dsr_router.get("/project/{project_id}/analytics/labour")
 async def labour_trend(
@@ -2735,6 +2723,7 @@ async def labour_trend(
         for r in rows
     ]
 
+
 @dsr_router.get("/project/{project_id}/analytics/contractor")
 async def contractor_analytics(
     project_id: int,
@@ -2769,6 +2758,8 @@ async def contractor_analytics(
         }
         for r in rows
     ]
+
+
 @dsr_router.delete("/{id}")
 async def delete_dsr(
     id: int,
@@ -2793,10 +2784,7 @@ async def delete_dsr(
 
     logger.info(f"DSR deleted id={id}")
 
-    return {
-        "success": True,
-        "message": "DSR deleted successfully"
-    }
+    return {"success": True, "message": "DSR deleted successfully"}
 
 
 @dsr_router.get("/{dsr_id}/photos")
@@ -2809,12 +2797,11 @@ async def get_dsr_photos(
     if not dsr:
         raise NotFoundError("DSR not found")
 
-    result = await db.execute(
-        select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == dsr_id)
-    )
+    result = await db.execute(select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == dsr_id))
     rows = result.scalars().all()
 
     return [{"id": p.id, "url": p.file_url} for p in rows]
+
 
 @dsr_router.delete("/photo/{photo_id}")
 async def delete_dsr_photo(
@@ -2854,9 +2841,7 @@ async def export_dsr_excel(
         current_user=current_user,
     )
 
-    query = select(m.DailySiteReport).where(
-        m.DailySiteReport.project_id == project_id
-    )
+    query = select(m.DailySiteReport).where(m.DailySiteReport.project_id == project_id)
 
     if start_date:
         query = query.where(m.DailySiteReport.report_date >= start_date)
@@ -2898,19 +2883,21 @@ async def export_dsr_excel(
     ws.append(headers)
 
     for r in rows:
-        ws.append([
-            str(r.report_date),
-            r.project_id,
-            r.contractor_name,
-            r.weather,
-            r.work_done,
-            r.work_planned,
-            r.labour_count,
-            r.material_used,
-            r.issues,
-            r.remarks,
-            r.created_by.full_name if r.created_by else None,
-        ])
+        ws.append(
+            [
+                str(r.report_date),
+                r.project_id,
+                r.contractor_name,
+                r.weather,
+                r.work_done,
+                r.work_planned,
+                r.labour_count,
+                r.material_used,
+                r.issues,
+                r.remarks,
+                r.created_by.full_name if r.created_by else None,
+            ]
+        )
 
     stream = io.BytesIO()
     wb.save(stream)
@@ -2946,15 +2933,9 @@ async def create_issue(
         logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
 
-    if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
-        is_member = await db.scalar(
-            select(func.count()).select_from(m.ProjectMember).where(
-                m.ProjectMember.project_id == payload.project_id,
-                m.ProjectMember.user_id == current_user.id,
-            )
-        )
-        if not is_member:
-            raise PermissionDeniedError("User is not part of this project")
+    await assert_project_access(
+        db, project_id=payload.project_id, current_user=current_user
+    )
 
     if not payload.title or not payload.title.strip():
         raise ValidationError("title is required")
@@ -2963,15 +2944,18 @@ async def create_issue(
 
     existing = await db.scalar(
         select(m.Issue).where(
-            m.Issue.project_id == payload.project_id,
-            m.Issue.title == title
+            m.Issue.project_id == payload.project_id, m.Issue.title == title
         )
     )
     if existing:
         raise ConflictError("Issue with same title already exists in this project")
 
     try:
-        obj = m.Issue(**{**payload.model_dump(), "title": title})
+        data = payload.model_dump()
+        data["title"] = title
+
+        obj = m.Issue(**data)
+
         db.add(obj)
         await db.flush()
         await db.refresh(obj)
@@ -2995,19 +2979,69 @@ async def create_issue(
 @issues_router.get("", response_model=PaginatedResponse[s.IssueOut])
 async def list_issues(
     pagination: PaginationParams = Depends(),
+    status: Optional[s.IssueStatus] = Query(None),
+    priority: Optional[s.IssuePriority] = Query(None),
+    assigned_to: Optional[int] = Query(None),
+    category: Optional[s.IssueCategory] = Query(None),
+    search: Optional[str] = Query(None),
+    sort_by: Optional[str] = Query("id"),
+    order: Optional[str] = Query("desc"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(READ_ROLES)),
 ):
     pagination = pagination.normalized()
 
-    total = await db.scalar(select(func.count()).select_from(m.Issue))
+    if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+        base_query = select(m.Issue)
+    else:
+        subquery = (
+            select(m.ProjectMember.project_id)
+            .where(m.ProjectMember.user_id == current_user.id)
+        )
 
-    query = (
-        select(m.Issue)
-        .order_by(m.Issue.id.desc())
-        .offset(pagination.offset)
-        .limit(pagination.limit)
-    )
+        base_query = select(m.Issue).where(
+            m.Issue.project_id.in_(subquery)
+        )
+
+    if status is not None:
+        base_query = base_query.where(m.Issue.status == status)
+
+    if priority is not None:
+        base_query = base_query.where(m.Issue.priority == priority)
+
+    if assigned_to is not None:
+        base_query = base_query.where(m.Issue.assigned_to == assigned_to)
+
+    if category is not None:
+        base_query = base_query.where(m.Issue.category == category)
+
+    if search and search.strip():
+        search_term = f"%{search.strip()}%"
+        base_query = base_query.where(
+            or_(
+                m.Issue.title.ilike(search_term),
+                func.coalesce(m.Issue.description, "").ilike(search_term),
+            )
+        )
+
+    sort_mapping = {
+        "id": m.Issue.id,
+        "priority": m.Issue.priority,
+        "reported_date": m.Issue.reported_date,
+        "status": m.Issue.status,
+    }
+
+    sort_column = sort_mapping.get(sort_by, m.Issue.id)
+
+    if order.lower() == "asc":
+        base_query = base_query.order_by(sort_column.asc())
+    else:
+        base_query = base_query.order_by(sort_column.desc())
+
+    count_query = select(func.count()).select_from(base_query.order_by(None).subquery())
+    total = await db.scalar(count_query)
+
+    query = base_query.offset(pagination.offset).limit(pagination.limit)
 
     rows = (await db.execute(query)).scalars().all()
 
@@ -3024,11 +3058,19 @@ async def list_issues(
 
 
 @issues_router.get("/{id}", response_model=s.IssueOut)
-async def get_issue(id: int, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(READ_ROLES)),):
+async def get_issue(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
     obj = await db.get(m.Issue, id)
 
     if not obj:
         raise NotFoundError("Issue not found")
+
+    await assert_project_access(
+        db, project_id=obj.project_id, current_user=current_user
+    )
 
     return s.IssueOut.model_validate(obj)
 
@@ -3049,15 +3091,9 @@ async def update_issue(
         logger.warning(f"Issue not found id={id}")
         raise NotFoundError("Issue not found")
 
-    if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
-        is_member = await db.scalar(
-            select(func.count()).select_from(m.ProjectMember).where(
-                m.ProjectMember.project_id == obj.project_id,
-                m.ProjectMember.user_id == current_user.id,
-            )
-        )
-        if not is_member:
-            raise PermissionDeniedError("User is not part of this project")
+    await assert_project_access(
+        db, project_id=obj.project_id, current_user=current_user
+    )
 
     data = payload.model_dump(exclude_unset=True)
 
@@ -3075,6 +3111,25 @@ async def update_issue(
             raise ConflictError("Issue with same title already exists in this project")
 
         data["title"] = title
+
+    if "assigned_to" in data and data["assigned_to"] is not None:
+        user = await db.scalar(select(User).where(User.id == data["assigned_to"]))
+        if not user:
+            raise NotFoundError("Assigned user not found")
+
+        is_member = await db.scalar(
+            select(func.count())
+            .select_from(m.ProjectMember)
+            .where(
+                m.ProjectMember.project_id == obj.project_id,
+                m.ProjectMember.user_id == data["assigned_to"],
+            )
+        )
+        if not is_member:
+            raise ValidationError("Assigned user is not part of this project")
+
+    if data.get("status") == s.IssueStatus.CLOSED and not data.get("resolution"):
+        raise ValidationError("Resolution is required to close the issue")
 
     for k, v in data.items():
         setattr(obj, k, v)
@@ -3117,7 +3172,9 @@ async def delete_issue(
 
     if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
         is_member = await db.scalar(
-            select(func.count()).select_from(m.ProjectMember).where(
+            select(func.count())
+            .select_from(m.ProjectMember)
+            .where(
                 m.ProjectMember.project_id == obj.project_id,
                 m.ProjectMember.user_id == current_user.id,
             )
@@ -3137,13 +3194,12 @@ async def delete_issue(
 
     await bump_cache_version(redis, VERSION_KEY)
 
-    return {
-        "success": True,
-        "message": "Issue deleted successfully"
-    }
+    return {"success": True, "message": "Issue deleted successfully"}
 
 
-@issues_router.get("/project/{project_id}", response_model=PaginatedResponse[s.IssueOut])
+@issues_router.get(
+    "/project/{project_id}", response_model=PaginatedResponse[s.IssueOut]
+)
 async def issues_by_project(
     project_id: int,
     pagination: PaginationParams = Depends(),
@@ -3199,9 +3255,7 @@ async def issue_analytics(
     if end_date:
         base_query = base_query.where(m.DailySiteReport.report_date <= end_date)
 
-    total = await db.scalar(
-        select(func.count()).select_from(base_query.subquery())
-    )
+    total = await db.scalar(select(func.count()).select_from(base_query.subquery()))
 
     issues = await db.scalar(
         select(func.count()).select_from(
@@ -3213,6 +3267,7 @@ async def issue_analytics(
         "total_reports": int(total or 0),
         "reports_with_issues": int(issues or 0),
     }
+
 
 router.include_router(milestones_router)
 router.include_router(tasks_router)
