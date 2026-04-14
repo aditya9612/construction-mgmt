@@ -2992,11 +2992,35 @@ async def create_issue(
     return s.IssueOut.model_validate(obj)
 
 
-@issues_router.get("", response_model=list[s.IssueOut])
-async def list_issues(db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(READ_ROLES)),):
-    result = await db.execute(select(m.Issue))
-    rows = result.scalars().all()
-    return [s.IssueOut.model_validate(r) for r in rows]
+@issues_router.get("", response_model=PaginatedResponse[s.IssueOut])
+async def list_issues(
+    pagination: PaginationParams = Depends(),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    pagination = pagination.normalized()
+
+    total = await db.scalar(select(func.count()).select_from(m.Issue))
+
+    query = (
+        select(m.Issue)
+        .order_by(m.Issue.id.desc())
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+    )
+
+    rows = (await db.execute(query)).scalars().all()
+
+    items = [s.IssueOut.model_validate(r) for r in rows]
+
+    return PaginatedResponse(
+        items=items,
+        meta=PaginationMeta(
+            total=int(total or 0),
+            limit=pagination.limit,
+            offset=pagination.offset,
+        ),
+    )
 
 
 @issues_router.get("/{id}", response_model=s.IssueOut)
@@ -3119,16 +3143,39 @@ async def delete_issue(
     }
 
 
-@issues_router.get("/project/{project_id}")
+@issues_router.get("/project/{project_id}", response_model=PaginatedResponse[s.IssueOut])
 async def issues_by_project(
     project_id: int,
+    pagination: PaginationParams = Depends(),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(select(m.Issue).where(m.Issue.project_id == project_id))
-    rows = result.scalars().all()
+    pagination = pagination.normalized()
 
-    return [s.IssueOut.model_validate(r) for r in rows]
+    total = await db.scalar(
+        select(func.count()).where(m.Issue.project_id == project_id)
+    )
+
+    query = (
+        select(m.Issue)
+        .where(m.Issue.project_id == project_id)
+        .order_by(m.Issue.id.desc())
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+    )
+
+    rows = (await db.execute(query)).scalars().all()
+
+    items = [s.IssueOut.model_validate(r) for r in rows]
+
+    return PaginatedResponse(
+        items=items,
+        meta=PaginationMeta(
+            total=int(total or 0),
+            limit=pagination.limit,
+            offset=pagination.offset,
+        ),
+    )
 
 
 @dsr_router.get("/project/{project_id}/analytics/issues")

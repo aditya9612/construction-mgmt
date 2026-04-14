@@ -18,7 +18,7 @@ class RABillBase(BaseModel):
 
     @field_validator("quantity", "rate", "deductions", "gst_percent")
     def validate_positive(cls, v):
-        if v is not None and v < 0:   # ✅ FIXED
+        if v is not None and v < 0: 
             raise ValueError("Value cannot be negative")
         return v
 
@@ -67,4 +67,4 @@ class RABillOut(BaseModel):
 
     class Config:
         from_attributes = True
-        json_encoders = {Decimal: float}   # ✅ for API response
+        json_encoders = {Decimal: float}  

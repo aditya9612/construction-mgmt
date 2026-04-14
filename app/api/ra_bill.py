@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date
-
+from fastapi import Query
+from app.utils.pagination import PaginationParams
 from app.db.session import get_db_session
 from app.models.ra_bill import RABill
 from app.models.project import Project
@@ -11,6 +12,8 @@ from app.models.owner import OwnerTransaction
 from app.schemas.ra_bill import RABillCreate, RABillUpdate, RABillOut
 from app.utils.helpers import NotFoundError, ValidationError
 from app.core.logger import logger
+from sqlalchemy import select, func
+from app.schemas.base import PaginatedResponse, PaginationMeta
 
 router = APIRouter(prefix="/ra-bills", tags=["RA Bills"])
 
@@ -105,11 +108,37 @@ async def create_ra_bill(
     return RABillOut.model_validate(obj)
 
 
-@router.get("", response_model=list[RABillOut])
-async def list_ra_bills(db: AsyncSession = Depends(get_db_session)):
-    result = await db.execute(select(RABill))
-    rows = result.scalars().all()
-    return [RABillOut.model_validate(r) for r in rows]
+
+@router.get("", response_model=PaginatedResponse[RABillOut])
+async def list_ra_bills(
+    pagination: PaginationParams = Depends(),
+    db: AsyncSession = Depends(get_db_session),
+):
+    pagination = pagination.normalized()
+
+    # total
+    total = await db.scalar(select(func.count()).select_from(RABill))
+
+    # data
+    query = (
+        select(RABill)
+        .order_by(RABill.id.desc())
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+    )
+
+    rows = (await db.execute(query)).scalars().all()
+
+    items = [RABillOut.model_validate(r) for r in rows]
+
+    return PaginatedResponse(
+        items=items,
+        meta=PaginationMeta(
+            total=int(total or 0),
+            limit=pagination.limit,
+            offset=pagination.offset,
+        ),
+    )
 
 
 @router.get("/{id}", response_model=RABillOut)
@@ -188,7 +217,7 @@ async def update_ra_bill(
     return RABillOut.model_validate(obj)
 
 
-@router.delete("/{id}", status_code=204)
+@router.delete("/{id}")
 async def delete_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
     logger.info(f"Deleting RA bill id={id}")
 
@@ -208,17 +237,43 @@ async def delete_ra_bill(id: int, db: AsyncSession = Depends(get_db_session)):
 
     logger.info(f"RA bill deleted id={id}")
 
-    return None
+    return {
+        "success": True,
+        "message": "RA Bill deleted successfully"
+    }
 
 
-@router.get("/contractor/{contractor_id}")
+@router.get("/contractor/{contractor_id}", response_model=PaginatedResponse[RABillOut])
 async def bills_by_contractor(
     contractor_id: int,
+    pagination: PaginationParams = Depends(),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(
-        select(RABill).where(RABill.contractor_id == contractor_id)
-    )
-    rows = result.scalars().all()
+    pagination = pagination.normalized()
 
-    return [RABillOut.model_validate(r) for r in rows]
+    # 🔹 Total count
+    total = await db.scalar(
+        select(func.count()).where(RABill.contractor_id == contractor_id)
+    )
+
+    # 🔹 Data query
+    query = (
+        select(RABill)
+        .where(RABill.contractor_id == contractor_id)
+        .order_by(RABill.id.desc())
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+    )
+
+    rows = (await db.execute(query)).scalars().all()
+
+    items = [RABillOut.model_validate(r) for r in rows]
+
+    return PaginatedResponse(
+        items=items,
+        meta=PaginationMeta(
+            total=int(total or 0),
+            limit=pagination.limit,
+            offset=pagination.offset,
+        ),
+    )
