@@ -1,12 +1,14 @@
 import logging
 import time
 import uuid
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from redis.exceptions import ConnectionError as RedisConnectionError
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.ai import router as ai_router
 from app.api.auth import router as auth_router
@@ -37,6 +39,7 @@ from app.core.request_context import set_request_id
 from app.core.logger import logger
 
 SLOW_API_THRESHOLD = 500
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -77,6 +80,25 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan
     )
+
+    # ✅ CORS CONFIG (MAIN FIX)
+    origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",   # Vite
+        "http://localhost:4200",   # Angular
+        "https://infrapilot.in",
+    ]
+
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    os.makedirs("uploads", exist_ok=True)
 
     application.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
@@ -129,7 +151,7 @@ def create_app() -> FastAPI:
             status_code=exc.status_code,
             content={"detail": exc.message}
         )
-    
+
     @application.exception_handler(SQLAlchemyError)
     async def sqlalchemy_error_handler(request: Request, exc: SQLAlchemyError):
         logger.exception("database.error")

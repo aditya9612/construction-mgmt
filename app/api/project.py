@@ -1,5 +1,7 @@
 from __future__ import annotations
 from datetime import date
+import pathlib , re , io , os , uuid
+from openpyxl import Workbook
 from typing import Annotated, List, Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func
@@ -13,7 +15,7 @@ from app.cache.redis import (
     get_cache_version,
 )
 from fastapi import Request
-
+from PIL import Image
 from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
@@ -27,14 +29,11 @@ from app.models.invoice import Invoice
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import project as s
 from app.core.logger import logger
-import io , os
-import pandas as pd
 from fastapi.responses import StreamingResponse
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from sqlalchemy.exc import IntegrityError
 from fastapi import UploadFile, File
-import uuid
 from app.utils.helpers import (
     BadRequestError,
     NotFoundError,
@@ -42,6 +41,8 @@ from app.utils.helpers import (
     PermissionDeniedError,
     ValidationError,
 )
+from app.utils.pagination import PaginationParams
+from app.utils.common import assert_project_access
 
 
 def compute_project_status(project):
@@ -57,6 +58,14 @@ def compute_project_status(project):
         return "Delayed"
 
     return "Active"
+
+
+def get_pagination(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    search: Optional[str] = Query(None),
+) -> PaginationParams:
+    return PaginationParams(limit=limit, offset=offset, search=search).normalized()
 
 
 router = APIRouter(
@@ -235,14 +244,30 @@ class MilestonesRepository:
         )
 
     async def list_milestones(
-        self, db: AsyncSession, *, project_id: int
-    ) -> list[m.Milestone]:
+        self,
+        db: AsyncSession,
+        *,
+        project_id: int,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[m.Milestone], int]:
+
+        count_query = select(func.count()).where(
+            m.Milestone.project_id == project_id
+        )
+
         query = (
             select(m.Milestone)
             .where(m.Milestone.project_id == project_id)
             .order_by(m.Milestone.id.desc())
+            .limit(limit)
+            .offset(offset)
         )
-        return (await db.execute(query)).scalars().all()
+
+        total = await db.scalar(count_query)
+        rows = (await db.execute(query)).scalars().all()
+
+        return rows, int(total or 0)
 
     async def update_milestone(
         self, db: AsyncSession, *, obj: m.Milestone, data: dict
@@ -479,14 +504,44 @@ class ProjectsService:
         self,
         db: AsyncSession,
         *,
+        current_user: User,
         limit: int,
         offset: int,
         search: Optional[str] = None,
         status: Optional[s.ProjectStatus] = None,
     ) -> PaginatedResponse[s.ProjectOut]:
-        rows, total = await self.projects_repo.list_projects(
-            db, limit=limit, offset=offset, search=search, status=status
+
+        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+            base_query = select(m.Project)
+        else:
+            base_query = (
+                select(m.Project)
+                .join(m.ProjectMember, m.ProjectMember.project_id == m.Project.id)
+                .where(m.ProjectMember.user_id == current_user.id)
+            )
+
+        if search:
+            base_query = base_query.where(
+                m.Project.project_name.ilike(f"%{search.strip()}%")
+            )
+
+        if status:
+            base_query = base_query.where(m.Project.status == status)
+
+        count_query = select(func.count()).select_from(
+            base_query.order_by(None).subquery()
         )
+        total = await db.scalar(count_query)
+
+        query = (
+            base_query
+            .order_by(m.Project.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+
+        rows = (await db.execute(query)).scalars().all()
+
         project_ids = [p.id for p in rows]
         completion_map = await self._compute_completion_percentage_by_project_ids(
             db, project_ids
@@ -505,17 +560,32 @@ class ProjectsService:
             )
             for p in rows
         ]
-        meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
+
+        meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
+
         return PaginatedResponse[s.ProjectOut](items=items, meta=meta)
 
-    async def get_project(self, db: AsyncSession, project_id: int) -> s.ProjectOut:
+    async def get_project(
+        self,
+        db: AsyncSession,
+        project_id: int,
+        current_user: User,
+    ) -> s.ProjectOut:
         obj = await self.projects_repo.get_project(db, project_id=project_id)
         if obj is None:
             raise NotFoundError("Project not found")
+
+        await assert_project_access(
+            db,
+            project_id=obj.id,
+            current_user=current_user,
+        )
+
         completion_map = await self._compute_completion_percentage_by_project_ids(
             db, [obj.id]
         )
         completion = completion_map.get(obj.id, 0.0)
+
         return s.ProjectOut(
             id=obj.id,
             project_name=obj.project_name,
@@ -741,14 +811,25 @@ class MilestonesService:
         )
 
     async def list_milestones(
-        self, db: AsyncSession, *, project_id: int
-    ) -> list[s.MilestoneOut]:
+        self,
+        db: AsyncSession,
+        *,
+        project_id: int,
+        pagination: PaginationParams,
+    ) -> PaginatedResponse[s.MilestoneOut]:
+
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
 
-        rows = await self.milestones_repo.list_milestones(db, project_id=project_id)
-        return [
+        rows, total = await self.milestones_repo.list_milestones(
+            db,
+            project_id=project_id,
+            limit=pagination.limit,
+            offset=pagination.offset,
+        )
+
+        items = [
             s.MilestoneOut(
                 id=m.id,
                 project_id=m.project_id,
@@ -759,6 +840,15 @@ class MilestonesService:
             )
             for m in rows
         ]
+
+        return PaginatedResponse(
+            items=items,
+            meta=PaginationMeta(
+                total=total,
+                limit=pagination.limit,
+                offset=pagination.offset,
+            ),
+        )
 
     async def get_milestone(
         self, db: AsyncSession, *, project_id: int, milestone_id: int
@@ -854,25 +944,6 @@ class TasksService:
         self.progress_repo = progress_repo
         self.comments_repo = comments_repo
 
-    async def _assert_project_access(
-        self,
-        db: AsyncSession,
-        *,
-        project_id: int,
-        current_user: User,
-    ):
-        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
-            return
-
-        is_member = await self.members_repo.is_member(
-            db,
-            project_id=project_id,
-            user_id=current_user.id,
-        )
-
-        if not is_member:
-            raise PermissionDeniedError("User is not part of this project")
-
     def _assert_task_mutation_role(self, current_user: User) -> None:
         if current_user.role not in (
             UserRole.ADMIN,
@@ -894,11 +965,18 @@ class TasksService:
         project_id: int,
         task: m.Task,
     ) -> None:
+        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+            return
+
         if current_user.id == task.assigned_user_id:
             return
+
         allowed = await self.members_repo.is_member(
-            db, project_id=project_id, user_id=current_user.id
+            db,
+            project_id=project_id,
+            user_id=current_user.id,
         )
+
         if not allowed:
             raise PermissionDeniedError("Insufficient permissions")
 
@@ -931,7 +1009,7 @@ class TasksService:
         if project is None:
             raise NotFoundError("Project not found")
 
-        await self._assert_project_access(
+        await assert_project_access(
             db,
             project_id=project_id,
             current_user=current_user,
@@ -983,7 +1061,7 @@ class TasksService:
         if project is None:
             raise NotFoundError("Project not found")
 
-        await self._assert_project_access(
+        await assert_project_access(
             db,
             project_id=project_id,
             current_user=current_user,
@@ -1020,7 +1098,7 @@ class TasksService:
         if project is None:
             raise NotFoundError("Project not found")
 
-        await self._assert_project_access(
+        await assert_project_access(
             db,
             project_id=project_id,
             current_user=current_user,
@@ -1053,7 +1131,7 @@ class TasksService:
         if obj is None:
             raise NotFoundError("Task not found")
 
-        await self._assert_project_access(
+        await assert_project_access(
             db,
             project_id=project_id,
             current_user=current_user,
@@ -1119,7 +1197,7 @@ class TasksService:
         if obj is None:
             raise NotFoundError("Task not found")
 
-        await self._assert_project_access(
+        await assert_project_access(
             db,
             project_id=project_id,
             current_user=current_user,
@@ -1143,6 +1221,12 @@ class TasksService:
         obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
         if obj is None:
             raise NotFoundError("Task not found")
+
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
 
         await self._assert_progress_or_comment_auth(
             db, current_user=current_user, project_id=project_id, task=obj
@@ -1194,7 +1278,7 @@ class TasksService:
         if obj is None:
             raise NotFoundError("Task not found")
 
-        await self._assert_project_access(
+        await assert_project_access(
             db,
             project_id=project_id,
             current_user=current_user,
@@ -1235,8 +1319,17 @@ class TasksService:
         if obj is None:
             raise NotFoundError("Task not found")
 
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+
         await self._assert_progress_or_comment_auth(
-            db, current_user=current_user, project_id=project_id, task=obj
+            db,
+            current_user=current_user,
+            project_id=project_id,
+            task=obj,
         )
 
         comment_obj = await self.comments_repo.create_comment(
@@ -1245,6 +1338,7 @@ class TasksService:
             author_user_id=current_user.id,
             content=payload.content,
         )
+
         return s.CommentOut(
             id=comment_obj.id,
             task_id=comment_obj.task_id,
@@ -1271,7 +1365,7 @@ class TasksService:
         if obj is None:
             raise NotFoundError("Task not found")
 
-        await self._assert_project_access(
+        await assert_project_access(
             db,
             project_id=project_id,
             current_user=current_user,
@@ -1352,16 +1446,47 @@ class AlertsService:
         self.projects_repo = projects_repo
         self.tasks_repo = tasks_repo
 
-    async def get_project_alerts(self, db: AsyncSession):
+    async def get_project_alerts(
+        self,
+        db: AsyncSession,
+        current_user: User,
+        pagination: PaginationParams,
+    ):
         today = date.today()
 
-        query = select(m.Project).where(
-            m.Project.end_date < today, m.Project.status != s.ProjectStatus.COMPLETED
+        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+            base_query = select(m.Project).where(
+                m.Project.end_date < today,
+                m.Project.status != s.ProjectStatus.COMPLETED,
+            )
+        else:
+            base_query = (
+                select(m.Project)
+                .join(m.ProjectMember, m.ProjectMember.project_id == m.Project.id)
+                .where(
+                    m.ProjectMember.user_id == current_user.id,
+                    m.Project.end_date < today,
+                    m.Project.status != s.ProjectStatus.COMPLETED,
+                )
+            )
+
+        base_query = base_query.distinct()
+
+        count_query = select(func.count()).select_from(
+            base_query.order_by(None).subquery()
+        )
+        total = await db.scalar(count_query)
+
+        query = (
+            base_query
+            .order_by(m.Project.end_date.asc())
+            .limit(pagination.limit)
+            .offset(pagination.offset)
         )
 
         rows = (await db.execute(query)).scalars().all()
 
-        return [
+        items = [
             {
                 "project_id": p.id,
                 "project_name": p.project_name,
@@ -1371,21 +1496,54 @@ class AlertsService:
             for p in rows
         ]
 
-    async def get_task_alerts(self, db: AsyncSession):
+        return PaginatedResponse(
+            items=items,
+            meta=PaginationMeta(
+                total=int(total or 0),
+                limit=pagination.limit,
+                offset=pagination.offset,
+            ),
+        )
+
+    async def get_task_alerts(
+        self,
+        db: AsyncSession,
+        current_user: User,
+        pagination: PaginationParams,
+    ):
         today = date.today()
 
-        query = select(m.Task).where(
-            m.Task.end_date < today, m.Task.status != s.TaskStatus.COMPLETED
+        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+            base_query = select(m.Task).where(
+                m.Task.end_date < today,
+                m.Task.status != s.TaskStatus.COMPLETED,
+            )
+        else:
+            base_query = (
+                select(m.Task)
+                .join(m.ProjectMember, m.ProjectMember.project_id == m.Task.project_id)
+                .where(
+                    m.ProjectMember.user_id == current_user.id,
+                    m.Task.end_date < today,
+                    m.Task.status != s.TaskStatus.COMPLETED,
+                )
+            )
+
+        count_query = select(func.count()).select_from(
+            base_query.order_by(None).subquery()
+        )       
+        total = await db.scalar(count_query)
+
+        query = (
+            base_query
+            .order_by(m.Task.end_date.asc())
+            .limit(pagination.limit)
+            .offset(pagination.offset)
         )
-        tasks = (await db.execute(query)).scalars().all()
 
-        delayed = [
-            t
-            for t in tasks
-            if t.end_date and t.end_date < today and t.status != s.TaskStatus.COMPLETED
-        ]
+        rows = (await db.execute(query)).scalars().all()
 
-        return [
+        items = [
             {
                 "task_id": t.id,
                 "project_id": t.project_id,
@@ -1393,18 +1551,38 @@ class AlertsService:
                 "end_date": t.end_date,
                 "status": "Delayed",
             }
-            for t in delayed
+            for t in rows
         ]
+
+        return PaginatedResponse(
+            items=items,
+            meta=PaginationMeta(
+                total=int(total or 0),
+                limit=pagination.limit,
+                offset=pagination.offset,
+            ),
+        )
 
 
 class ReportsService:
     def __init__(self, projects_repo: ProjectsRepository):
         self.projects_repo = projects_repo
 
-    async def get_project_data(self, db: AsyncSession, project_id: int):
+    async def get_project_data(
+        self,
+        db: AsyncSession,
+        project_id: int,
+        current_user: User,
+    ):
         project = await self.projects_repo.get_project(db, project_id)
         if not project:
             raise NotFoundError("Project not found")
+
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
 
         return {
             "id": project.id,
@@ -1414,12 +1592,32 @@ class ReportsService:
             "end_date": project.end_date,
         }
 
-    async def export_excel(self, db: AsyncSession, project_id: int):
-        data = await self.get_project_data(db, project_id)
 
-        df = pd.DataFrame([data])
+    async def export_excel(
+        self,
+        db: AsyncSession,
+        project_id: int,
+        current_user: User,
+    ):
+        data = await self.get_project_data(db, project_id, current_user)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Project Report"
+
+        headers = ["ID", "Name", "Status", "Start Date", "End Date"]
+        ws.append(headers)
+
+        ws.append([
+            data["id"],
+            data["name"],
+            str(data["status"]),
+            str(data["start_date"]),
+            str(data["end_date"]),
+        ])
+
         stream = io.BytesIO()
-        df.to_excel(stream, index=False)
+        wb.save(stream)
         stream.seek(0)
 
         return StreamingResponse(
@@ -1428,8 +1626,13 @@ class ReportsService:
             headers={"Content-Disposition": "attachment; filename=project.xlsx"},
         )
 
-    async def export_pdf(self, db: AsyncSession, project_id: int):
-        data = await self.get_project_data(db, project_id)
+    async def export_pdf(
+        self,
+        db: AsyncSession,
+        project_id: int,
+        current_user: User,
+    ):
+        data = await self.get_project_data(db, project_id, current_user)
 
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer)
@@ -1520,7 +1723,7 @@ async def list_projects(
     service: ProjectsService = Depends(get_projects_service),
 ):
     version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:projects:list:{version}:{limit}:{offset}:{search}:{status}"
+    cache_key = f"cache:projects:list:{version}:{current_user.id}:{current_user.role}:{limit}:{offset}:{search}:{status}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
         items = cached.get("items") if isinstance(cached, dict) else None
@@ -1528,7 +1731,12 @@ async def list_projects(
             return PaginatedResponse[s.ProjectOut].model_validate(cached)
 
     result = await service.list_projects(
-        db, limit=limit, offset=offset, search=search, status=status
+        db,
+        current_user=current_user,
+        limit=limit,
+        offset=offset,
+        search=search,
+        status=status,
     )
     await cache_set_json(redis, cache_key, result.model_dump())
     return result
@@ -1543,7 +1751,7 @@ async def get_project(
     service: ProjectsService = Depends(get_projects_service),
 ):
     version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:projects:get:{version}:{project_id}"
+    cache_key = f"cache:projects:get:{version}:{current_user.id}:{current_user.role}:{project_id}"
     cached_json = await cache_get_json(redis, cache_key)
     if (
         cached_json is not None
@@ -1552,7 +1760,11 @@ async def get_project(
     ):
         return s.ProjectOut.model_validate(cached_json)
 
-    out = await service.get_project(db, project_id=project_id)
+    out = await service.get_project(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
     await cache_set_json(redis, cache_key, out.model_dump())
     return out
 
@@ -1619,8 +1831,11 @@ async def get_project_progress(
     db: AsyncSession = Depends(get_db_session),
     service: ProjectsService = Depends(get_projects_service),
 ):
-
-    project = await service.get_project(db, project_id)
+    project = await service.get_project(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
 
     return {
         "project_id": project_id,
@@ -1631,20 +1846,22 @@ async def get_project_progress(
 
 @router.get("/alerts/projects")
 async def get_project_alerts(
+    pagination: PaginationParams = Depends(get_pagination),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(READ_ROLES)),
     service: AlertsService = Depends(get_alerts_service),
 ):
-    return await service.get_project_alerts(db)
+    return await service.get_project_alerts(db, current_user, pagination)
 
 
 @router.get("/alerts/tasks")
 async def get_task_alerts(
+    pagination: PaginationParams = Depends(get_pagination),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(READ_ROLES)),
     service: AlertsService = Depends(get_alerts_service),
 ):
-    return await service.get_task_alerts(db)
+    return await service.get_task_alerts(db, current_user, pagination)
 
 
 @router.delete("/{project_id}", status_code=200)
@@ -1756,7 +1973,7 @@ async def export_project_excel(
     db: AsyncSession = Depends(get_db_session),
     service: ReportsService = Depends(get_reports_service),
 ):
-    return await service.export_excel(db, project_id)
+    return await service.export_excel(db, project_id, current_user)
 
 
 @router.get("/{project_id}/report/pdf")
@@ -1766,17 +1983,25 @@ async def export_project_pdf(
     db: AsyncSession = Depends(get_db_session),
     service: ReportsService = Depends(get_reports_service),
 ):
-    return await service.export_pdf(db, project_id)
+    return await service.export_pdf(db, project_id, current_user)
 
 
 @router.get("/{project_id}/logs")
-async def get_project_logs(project_id: int, current_user: User = Depends(require_roles(READ_ROLES)),):
-    # NOTE: Replace with DB logs later
+async def get_project_logs(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
+
     return {
         "project_id": project_id,
         "message": "Logs available in logging system (file/ELK)",
     }
-
 
 milestones_router = APIRouter(
     prefix="",
@@ -1815,14 +2040,22 @@ async def create_milestone(
     return out
 
 
-@milestones_router.get("/{project_id}/milestones", response_model=list[s.MilestoneOut])
+@milestones_router.get(
+    "/{project_id}/milestones",
+    response_model=PaginatedResponse[s.MilestoneOut],
+)
 async def list_milestones(
     project_id: int,
+    pagination: PaginationParams = Depends(get_pagination),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     service: MilestonesService = Depends(get_milestones_service),
 ):
-    return await service.list_milestones(db, project_id=project_id)
+    return await service.list_milestones(
+        db,
+        project_id=project_id,
+        pagination=pagination,
+    )
 
 
 @milestones_router.get(
@@ -2133,6 +2366,12 @@ async def project_profit_loss(
     if not project:
         raise NotFoundError("Project not found")
 
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
+
     total_expense = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
@@ -2175,6 +2414,12 @@ async def create_dsr(
     project = await db.get(m.Project, payload.project_id)
     if not project:
         raise NotFoundError("Project not found")
+    
+    await assert_project_access(
+        db,
+        project_id=payload.project_id,
+        current_user=current_user,
+    )
 
     existing = await db.scalar(
         select(m.DailySiteReport).where(
@@ -2225,28 +2470,36 @@ async def get_project_dsr(
     if start_date and end_date and end_date < start_date:
         raise BadRequestError("end_date cannot be before start_date")
 
-    base_query = select(m.DailySiteReport).where(
-        m.DailySiteReport.project_id == project_id
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
     )
 
+    filters = [m.DailySiteReport.project_id == project_id]
+
     if start_date:
-        base_query = base_query.where(m.DailySiteReport.report_date >= start_date)
+        filters.append(m.DailySiteReport.report_date >= start_date)
 
     if end_date:
-        base_query = base_query.where(m.DailySiteReport.report_date <= end_date)
+        filters.append(m.DailySiteReport.report_date <= end_date)
 
     if contractor_name:
         contractor_name = contractor_name.strip()
-        base_query = base_query.where(
+        filters.append(
             m.DailySiteReport.contractor_name.ilike(f"%{contractor_name}%")
         )
 
-    count_query = select(func.count()).select_from(base_query.subquery())
+    count_query = select(func.count()).where(*filters)
     total = await db.scalar(count_query)
 
-    query = base_query.order_by(
-        m.DailySiteReport.report_date.desc()
-    ).limit(limit).offset(offset)
+    query = (
+        select(m.DailySiteReport)
+        .where(*filters)
+        .order_by(m.DailySiteReport.report_date.desc())
+        .limit(limit)
+        .offset(offset)
+    )
 
     result = await db.execute(query)
     rows = result.scalars().all()
@@ -2278,6 +2531,12 @@ async def get_dsr(
 
     if not obj:
         raise NotFoundError("DSR not found")
+    
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
     dsr_out = s.DSROut.model_validate(obj)
 
@@ -2299,6 +2558,12 @@ async def update_dsr(
 
     if not obj:
         raise NotFoundError("DSR not found")
+    
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
     if payload.report_date:
         existing = await db.scalar(
@@ -2350,10 +2615,17 @@ async def upload_dsr_photos(
     if not dsr:
         raise NotFoundError("DSR not found")
 
+    await assert_project_access(
+        db,
+        project_id=dsr.project_id,
+        current_user=current_user,
+    )
+
     upload_dir = "uploads/dsr"
     os.makedirs(upload_dir, exist_ok=True)
 
-    if not file.content_type.startswith("image/"):
+
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise BadRequestError("Only image files are allowed")
 
     content = await file.read()
@@ -2361,7 +2633,24 @@ async def upload_dsr_photos(
     if len(content) > 5 * 1024 * 1024:
         raise BadRequestError("File too large (max 5MB)")
 
-    filename = f"{uuid.uuid4()}_{file.filename}"
+    try:
+        img = Image.open(io.BytesIO(content))
+        img.verify()
+    except Exception:
+        raise BadRequestError("Invalid image file")
+
+    safe_name = pathlib.Path(file.filename or "file").name
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_name)
+
+    allowed_extensions = {"jpg", "jpeg", "png"}
+    ext = pathlib.Path(safe_name).suffix.lower().replace(".", "")
+
+    if ext not in allowed_extensions:
+        raise BadRequestError("Only JPG, JPEG, PNG allowed")
+
+
+    filename = f"{uuid.uuid4()}_{safe_name}"
+
     path = os.path.join(upload_dir, filename).replace("\\", "/")
 
     with open(path, "wb") as f:
@@ -2372,9 +2661,8 @@ async def upload_dsr_photos(
 
     await db.flush()
 
-    normalized_path = path 
     base_url = str(request.base_url).rstrip("/")
-    file_url = f"{base_url}/{normalized_path}"
+    file_url = f"{base_url}/{path}"
 
     return {
         "status": "success",
@@ -2548,6 +2836,7 @@ async def delete_dsr_photo(
 
     return {"status": "success"}
 
+
 @dsr_router.get("/project/{project_id}/export")
 async def export_dsr_excel(
     project_id: int,
@@ -2558,6 +2847,12 @@ async def export_dsr_excel(
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Exporting DSR Excel project_id={project_id}")
+
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
 
     query = select(m.DailySiteReport).where(
         m.DailySiteReport.project_id == project_id
@@ -2583,26 +2878,42 @@ async def export_dsr_excel(
     if not rows:
         raise NotFoundError("No DSR data found")
 
-    data = []
-    for r in rows:
-        data.append({
-            "Date": r.report_date,
-            "Project ID": r.project_id,
-            "Contractor": r.contractor_name,
-            "Weather": r.weather,
-            "Work Done": r.work_done,
-            "Work Planned": r.work_planned,
-            "Labour Count": r.labour_count,
-            "Material Used": r.material_used,
-            "Issues": r.issues,
-            "Remarks": r.remarks,
-            "Created By": r.created_by.full_name if r.created_by else None,
-        })
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "DSR Report"
 
-    df = pd.DataFrame(data)
+    headers = [
+        "Date",
+        "Project ID",
+        "Contractor",
+        "Weather",
+        "Work Done",
+        "Work Planned",
+        "Labour Count",
+        "Material Used",
+        "Issues",
+        "Remarks",
+        "Created By",
+    ]
+    ws.append(headers)
+
+    for r in rows:
+        ws.append([
+            str(r.report_date),
+            r.project_id,
+            r.contractor_name,
+            r.weather,
+            r.work_done,
+            r.work_planned,
+            r.labour_count,
+            r.material_used,
+            r.issues,
+            r.remarks,
+            r.created_by.full_name if r.created_by else None,
+        ])
 
     stream = io.BytesIO()
-    df.to_excel(stream, index=False)
+    wb.save(stream)
     stream.seek(0)
 
     return StreamingResponse(
