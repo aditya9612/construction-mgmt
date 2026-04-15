@@ -10,14 +10,15 @@ class Settings(BaseSettings):
 
     DB_NAME: str = "construction_management"
     DB_USER: str = "infraDb"
-    DB_PASSWORD: str  # ❗ required from .env
+    DB_PASSWORD: str = "Root@1234"
     DB_HOST: str = "localhost"
     DB_PORT: int = 3306
+
 
     SQL_ECHO: bool = False
 
 
-    JWT_SECRET: str  # ❗ required
+    JWT_SECRET: str = "supersecret"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
   
