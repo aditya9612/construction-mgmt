@@ -1,10 +1,9 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from decimal import Decimal
 
 
 class ContractorBase(BaseModel):
-    contractor_id: str = Field(..., min_length=3, max_length=50)
     name: str = Field(..., min_length=1)
     work_type: str = Field(..., min_length=1)
     contact_number: str = Field(..., min_length=10, max_length=15)
@@ -15,6 +14,12 @@ class ContractorBase(BaseModel):
     payment_given: Decimal = Field(default=Decimal("0"), ge=0)
 
     bank_details: Optional[str] = None
+
+    @field_validator("contact_number")
+    def validate_phone(cls, v):
+        if not v.isdigit() or len(v) != 10:
+            raise ValueError("Invalid phone number")
+        return v
 
 
 class ContractorCreate(ContractorBase):

@@ -9,7 +9,6 @@ from app.core import enums as e
 # LABOUR
 # ======================
 class LabourCreate(BaseModel):
-    worker_code: str
     aadhaar_number: Optional[str]
     project_id: int
     labour_name: str

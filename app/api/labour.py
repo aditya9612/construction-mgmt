@@ -21,7 +21,7 @@ from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
 from app.core.logger import logger
 import pandas as pd
-from app.utils.common import assert_project_access
+from app.utils.common import assert_project_access , generate_business_id
 from app.models.project import Project, ProjectMember
 
 
@@ -64,6 +64,13 @@ async def create_labour(
 
     data = payload.model_dump(exclude_unset=True)
 
+    data["worker_code"] = await generate_business_id(
+        db,
+        Labour,
+        "worker_code",
+        "LAB"
+    )
+
     if payload.contractor_id:
         contractor = await db.get(Contractor, payload.contractor_id)
         if not contractor:
@@ -93,7 +100,6 @@ async def create_labour(
     logger.info(f"Labour created id={obj.id}")
 
     return s.LabourOut.model_validate(obj)
-
 
 @router.get("", response_model=PaginatedResponse[s.LabourOut])
 async def list_labour(

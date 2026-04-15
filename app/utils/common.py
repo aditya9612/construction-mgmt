@@ -26,3 +26,63 @@ async def assert_project_access(
 
     if not exists:
         raise PermissionDeniedError("User is not part of this project")
+    
+
+
+from sqlalchemy import select
+from app.models.contractor import ContractorProject
+from app.models.project import ProjectMember
+from app.models.user import UserRole
+from app.utils.helpers import PermissionDeniedError
+
+
+async def validate_contractor_access(
+    db,
+    contractor_id: int,
+    current_user,
+):
+    """
+    Ensure user has access to contractor via project mapping
+    """
+
+    result = await db.execute(
+        select(ContractorProject.project_id).where(
+            ContractorProject.contractor_id == contractor_id
+        )
+    )
+    contractor_project_ids = [r[0] for r in result.all()]
+
+    if current_user.role == UserRole.ADMIN:
+        return
+
+    result = await db.execute(
+        select(ProjectMember.project_id).where(
+            ProjectMember.user_id == current_user.id
+        )
+    )
+    user_project_ids = [r[0] for r in result.all()]
+
+    if not set(contractor_project_ids).intersection(set(user_project_ids)):
+        raise PermissionDeniedError("Access denied")
+
+
+async def generate_business_id(db, model, column_name: str, prefix: str):
+
+    result = await db.execute(
+        select(model).order_by(model.id.desc()).limit(1)
+    )
+    last_record = result.scalar_one_or_none()
+
+    if last_record and getattr(last_record, column_name):
+        last_id = getattr(last_record, column_name)
+
+        try:
+            last_number = int(last_id[len(prefix):])
+        except ValueError:
+            last_number = 0
+
+        new_number = last_number + 1
+    else:
+        new_number = 1
+
+    return f"{prefix}{str(new_number).zfill(3)}"

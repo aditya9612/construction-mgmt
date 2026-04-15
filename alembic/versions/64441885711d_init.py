@@ -1,8 +1,8 @@
 """init
 
-Revision ID: caf115acc2e0
+Revision ID: 64441885711d
 Revises: 
-Create Date: 2026-04-15 13:08:01.882506
+Create Date: 2026-04-15 20:10:18.325916
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = 'caf115acc2e0'
+revision = '64441885711d'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -139,14 +139,16 @@ def upgrade():
     op.create_table('daily_site_reports',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
-    sa.Column('created_by_user_id', sa.Integer(), nullable=True),
+    sa.Column('created_by_id', sa.Integer(), nullable=True),
     sa.Column('report_date', sa.Date(), nullable=False),
     sa.Column('site_location', sa.String(length=255), nullable=True),
-    sa.Column('contractor_name', sa.String(length=255), nullable=True),
     sa.Column('weather', sa.Enum('SUNNY', 'RAINY', 'CLOUDY', 'WINDY', name='weathertype'), nullable=True),
     sa.Column('work_done', sa.Text(), nullable=False),
     sa.Column('work_planned', sa.Text(), nullable=True),
-    sa.Column('labour_count', sa.Integer(), nullable=False),
+    sa.Column('contractor_id', sa.Integer(), nullable=True),
+    sa.Column('total_labour', sa.Integer(), nullable=True),
+    sa.Column('skilled_labour', sa.Integer(), nullable=True),
+    sa.Column('unskilled_labour', sa.Integer(), nullable=True),
     sa.Column('machinery_used', sa.Text(), nullable=True),
     sa.Column('material_received', sa.Text(), nullable=True),
     sa.Column('material_used', sa.Text(), nullable=True),
@@ -157,13 +159,15 @@ def upgrade():
     sa.Column('longitude', sa.Float(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
-    sa.ForeignKeyConstraint(['created_by_user_id'], ['users.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['contractor_id'], ['contractors.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['created_by_id'], ['users.id'], ondelete='SET NULL'),
     sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('project_id', 'report_date', name='uq_project_dsr_date')
     )
-    op.create_index(op.f('ix_daily_site_reports_contractor_name'), 'daily_site_reports', ['contractor_name'], unique=False)
-    op.create_index(op.f('ix_daily_site_reports_created_by_user_id'), 'daily_site_reports', ['created_by_user_id'], unique=False)
+    op.create_index('idx_dsr_lat_lng', 'daily_site_reports', ['latitude', 'longitude'], unique=False)
+    op.create_index(op.f('ix_daily_site_reports_contractor_id'), 'daily_site_reports', ['contractor_id'], unique=False)
+    op.create_index(op.f('ix_daily_site_reports_created_by_id'), 'daily_site_reports', ['created_by_id'], unique=False)
     op.create_index(op.f('ix_daily_site_reports_latitude'), 'daily_site_reports', ['latitude'], unique=False)
     op.create_index(op.f('ix_daily_site_reports_longitude'), 'daily_site_reports', ['longitude'], unique=False)
     op.create_index(op.f('ix_daily_site_reports_project_id'), 'daily_site_reports', ['project_id'], unique=False)
@@ -270,10 +274,10 @@ def upgrade():
     sa.Column('aadhaar_number', sa.String(length=20), nullable=True),
     sa.Column('project_id', sa.Integer(), nullable=False),
     sa.Column('labour_name', sa.String(length=255), nullable=False),
-    sa.Column('skill_type', sa.String(length=100), nullable=False),
+    sa.Column('skill_type', sa.Enum('SKILLED', 'UNSKILLED', name='skilltype'), nullable=False),
     sa.Column('daily_wage_rate', sa.DECIMAL(precision=18, scale=2), nullable=False),
     sa.Column('contractor_id', sa.Integer(), nullable=True),
-    sa.Column('status', sa.String(length=50), nullable=False),
+    sa.Column('status', sa.Enum('ACTIVE', 'INACTIVE', name='labourstatus'), nullable=False),
     sa.Column('notes', sa.String(length=500), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
@@ -418,6 +422,25 @@ def upgrade():
     )
     op.create_index(op.f('ix_comments_author_user_id'), 'comments', ['author_user_id'], unique=False)
     op.create_index(op.f('ix_comments_task_id'), 'comments', ['task_id'], unique=False)
+    op.create_table('dsr_labour',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('dsr_id', sa.Integer(), nullable=False),
+    sa.Column('labour_id', sa.Integer(), nullable=False),
+    sa.Column('status', sa.Enum('PRESENT', 'ABSENT', 'HALF', name='attendancestatus'), nullable=False),
+    sa.Column('working_hours', sa.DECIMAL(precision=5, scale=2), nullable=False),
+    sa.Column('overtime_hours', sa.DECIMAL(precision=5, scale=2), nullable=False),
+    sa.CheckConstraint('overtime_hours >= 0'),
+    sa.CheckConstraint('working_hours >= 0'),
+    sa.ForeignKeyConstraint(['dsr_id'], ['daily_site_reports.id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['labour_id'], ['labour.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('dsr_id', 'labour_id', name='uq_dsr_labour')
+    )
+    op.create_index('idx_dsr_labour_dsr', 'dsr_labour', ['dsr_id'], unique=False)
+    op.create_index('idx_dsr_labour_dsr_labour', 'dsr_labour', ['dsr_id', 'labour_id'], unique=False)
+    op.create_index('idx_dsr_labour_labour', 'dsr_labour', ['labour_id'], unique=False)
+    op.create_index(op.f('ix_dsr_labour_dsr_id'), 'dsr_labour', ['dsr_id'], unique=False)
+    op.create_index(op.f('ix_dsr_labour_labour_id'), 'dsr_labour', ['labour_id'], unique=False)
     op.create_table('dsr_photos',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('dsr_id', sa.Integer(), nullable=True),
@@ -455,7 +478,7 @@ def upgrade():
     sa.Column('labour_id', sa.Integer(), nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
     sa.Column('attendance_date', sa.Date(), nullable=False),
-    sa.Column('status', sa.String(length=20), nullable=False),
+    sa.Column('status', sa.Enum('PRESENT', 'ABSENT', 'HALF', name='attendancestatus'), nullable=False),
     sa.Column('in_time', sa.Time(), nullable=True),
     sa.Column('out_time', sa.Time(), nullable=True),
     sa.Column('working_hours', sa.DECIMAL(precision=5, scale=2), nullable=False),
@@ -483,7 +506,7 @@ def upgrade():
     sa.Column('total_wage', sa.DECIMAL(precision=18, scale=2), nullable=True),
     sa.Column('paid_amount', sa.DECIMAL(precision=18, scale=2), nullable=True),
     sa.Column('remaining_amount', sa.DECIMAL(precision=18, scale=2), nullable=True),
-    sa.Column('status', sa.String(length=50), nullable=True),
+    sa.Column('status', sa.Enum('PENDING', 'PAID', 'PARTIAL', name='payrollstatus'), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['labour_id'], ['labour.id'], ),
@@ -542,6 +565,12 @@ def downgrade():
     op.drop_table('expenses')
     op.drop_index(op.f('ix_dsr_photos_dsr_id'), table_name='dsr_photos')
     op.drop_table('dsr_photos')
+    op.drop_index(op.f('ix_dsr_labour_labour_id'), table_name='dsr_labour')
+    op.drop_index(op.f('ix_dsr_labour_dsr_id'), table_name='dsr_labour')
+    op.drop_index('idx_dsr_labour_labour', table_name='dsr_labour')
+    op.drop_index('idx_dsr_labour_dsr_labour', table_name='dsr_labour')
+    op.drop_index('idx_dsr_labour_dsr', table_name='dsr_labour')
+    op.drop_table('dsr_labour')
     op.drop_index(op.f('ix_comments_task_id'), table_name='comments')
     op.drop_index(op.f('ix_comments_author_user_id'), table_name='comments')
     op.drop_table('comments')
@@ -600,8 +629,9 @@ def downgrade():
     op.drop_index(op.f('ix_daily_site_reports_project_id'), table_name='daily_site_reports')
     op.drop_index(op.f('ix_daily_site_reports_longitude'), table_name='daily_site_reports')
     op.drop_index(op.f('ix_daily_site_reports_latitude'), table_name='daily_site_reports')
-    op.drop_index(op.f('ix_daily_site_reports_created_by_user_id'), table_name='daily_site_reports')
-    op.drop_index(op.f('ix_daily_site_reports_contractor_name'), table_name='daily_site_reports')
+    op.drop_index(op.f('ix_daily_site_reports_created_by_id'), table_name='daily_site_reports')
+    op.drop_index(op.f('ix_daily_site_reports_contractor_id'), table_name='daily_site_reports')
+    op.drop_index('idx_dsr_lat_lng', table_name='daily_site_reports')
     op.drop_table('daily_site_reports')
     op.drop_index(op.f('ix_contractor_projects_id'), table_name='contractor_projects')
     op.drop_table('contractor_projects')
