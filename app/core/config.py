@@ -8,8 +8,8 @@ class Settings(BaseSettings):
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8000
 
-    DB_NAME: str = "infraDb"
-    DB_USER: str = "root"
+    DB_NAME: str = "construction_management"
+    DB_USER: str = "infraDb"
     DB_PASSWORD: str  # ❗ required from .env
     DB_HOST: str = "localhost"
     DB_PORT: int = 3306
