@@ -44,7 +44,7 @@ class WeatherType(str, Enum):
 
 class IssueCategory(str, Enum):
     MATERIAL = "Material"
-    LABOUR = "Labour"
+    SAFETY = "Safety"
     DELAY = "Delay"
 
 

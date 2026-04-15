@@ -1,363 +1,197 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.api.project import compute_project_status
-from app.db.session import get_db_session
-from app.models.boq import BOQ
-from app.models.expense import Expense
-from app.models.project import (
-    Comment,
-    Milestone,
-    Project,
-    ProjectMember,
-    Task,
-    TaskProgress,
-)
-from app.core.logger import logger
-from app.utils.helpers import NotFoundError
-from app.models.labour import LabourAttendance
-from app.models.material import Material
-from app.models import project as m
 from datetime import date
+
+from app.db.session import get_db_session
+from app.core import dependencies as d
+from app.models.user import User, UserRole
+from app.models.project import Project, ProjectMember
+from app.models.expense import Expense
 from app.models.invoice import Invoice
-from sqlalchemy import case
-from sqlalchemy import or_, and_
+from app.models.labour import LabourAttendance
 from app.models.material import MaterialUsage
+from app.models.boq import BOQ
+from app.cache import redis as r
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
+VERSION_KEY = "dashboard_version"
 
-@router.get("/client/{project_id}")
-async def client_dashboard(
-    project_id: int,
+
+# =========================================
+# HELPER
+# =========================================
+async def get_user_project_ids(db, user: User):
+    if user.role == UserRole.ADMIN:
+        result = await db.execute(select(Project.id))
+        return [r[0] for r in result.all()]
+
+    result = await db.execute(
+        select(ProjectMember.project_id).where(
+            ProjectMember.user_id == user.id
+        )
+    )
+    return [r[0] for r in result.all()]
+
+
+
+# =========================================
+# MAIN DASHBOARD
+# =========================================
+@router.get("")
+async def get_dashboard(
+    project_id: int | None = Query(default=None),
+    current_user: User = Depends(d.get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(d.get_request_redis),
 ):
-    project = await db.get(Project, project_id)
+    version = await r.get_cache_version(redis, VERSION_KEY)
 
-    if not project:
-        logger.warning(f"Project not found for dashboard project_id={project_id}")
-        raise NotFoundError("Project not found")
+    cache_key = f"dashboard:{version}:{current_user.id}:{project_id}"
+    cached = await r.cache_get_json(redis, cache_key)
 
-    avg_progress = await db.scalar(
-        select(func.avg(Task.completion_percentage)).where(
-            Task.project_id == project_id
-        )
-    )
-    progress = float(avg_progress or 0)
+    if cached:
+        return cached
 
+    project_ids = await get_user_project_ids(db, current_user)
 
-    boq_total = await db.scalar(
-        select(func.sum(BOQ.total_cost)).where(
-            BOQ.project_id == project_id, BOQ.is_latest == True
-        )
-    )
+    if project_id:
+        if project_id not in project_ids:
+            return {"error": "Access denied"}
+        project_ids = [project_id]
 
     total_expense = await db.scalar(
-        select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
-    )
-
-    budget_total = float(boq_total or 0)
-    expense_total = float(total_expense or 0)
-
-    budget_used_percent = (expense_total / budget_total) * 100 if budget_total else 0
-
-
-    total_milestones = await db.scalar(
-        select(func.count(Milestone.id)).where(
-            Milestone.project_id == project_id
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id.in_(project_ids)
         )
     )
 
+    total_projects = len(project_ids)
 
-    completed_milestones = 0  # Not applicable (no status field)
-
-
-    total_tasks = await db.scalar(
-        select(func.count(Task.id)).where(Task.project_id == project_id)
-    )
-
-    completed_tasks = await db.scalar(
-        select(func.count(Task.id)).where(
-            Task.project_id == project_id,
-            Task.completion_percentage == 100
+    if current_user.role == UserRole.ADMIN:
+        total_revenue = await db.scalar(
+            select(func.sum(Invoice.total_amount)).where(
+                Invoice.status == "paid"
+            )
         )
-    )
 
-    days_remaining = None
-    if project.end_date:
-        days_remaining = (project.end_date - date.today()).days
+        result = {
+            "role": "admin",
+            "total_projects": total_projects,
+            "total_expense": float(total_expense or 0),
+            "total_revenue": float(total_revenue or 0),
+        }
 
-    return {
-        "project_id": project_id,
-        "status": compute_project_status(project),
-        "progress_percent": round(progress, 2),
+    elif current_user.role == UserRole.ACCOUNTANT:
+        pending = await db.scalar(
+            select(func.sum(Invoice.total_amount)).where(
+                Invoice.status == "pending"
+            )
+        )
 
-        "budget_total": budget_total,
-        "total_expense": expense_total,
-        "budget_used_percent": round(budget_used_percent, 2),
-        "remaining_budget": budget_total - expense_total,
+        result = {
+            "role": "accountant",
+            "total_expense": float(total_expense or 0),
+            "pending_payments": float(pending or 0),
+        }
 
-        "milestones_total": total_milestones or 0,
-        "milestones_completed": completed_milestones,  # always 0 (correct for now)
+    elif current_user.role == UserRole.SITE_ENGINEER:
+        today = date.today()
 
-        "tasks_total": total_tasks or 0,
-        "tasks_completed": completed_tasks or 0,
+        labour_today = await db.scalar(
+            select(func.count(LabourAttendance.id)).where(
+                LabourAttendance.project_id.in_(project_ids),
+                LabourAttendance.attendance_date == today,
+            )
+        )
 
-        "start_date": project.start_date,
-        "end_date": project.end_date,
-        "days_remaining": days_remaining,
-    }
+        material_today = await db.scalar(
+            select(func.sum(MaterialUsage.quantity_used)).where(
+                MaterialUsage.project_id.in_(project_ids),
+                MaterialUsage.usage_date == today,
+            )
+        )
+
+        result = {
+            "role": "engineer",
+            "labour_today": labour_today or 0,
+            "material_today": float(material_today or 0),
+        }
+
+    elif current_user.role == UserRole.PROJECT_MANAGER:
+        total_budget = await db.scalar(
+            select(func.sum(BOQ.total_cost)).where(
+                BOQ.project_id.in_(project_ids),
+                BOQ.is_latest == True,
+            )
+        )
+
+        utilization = (
+            (float(total_expense or 0) / float(total_budget or 1)) * 100
+            if total_budget
+            else 0
+        )
+
+        result = {
+            "role": "manager",
+            "total_projects": total_projects,
+            "budget_utilization": round(utilization, 2),
+        }
+
+    elif current_user.role == UserRole.CLIENT:
+        result = {
+            "role": "client",
+            "total_projects": total_projects,
+            "total_spent": float(total_expense or 0),
+        }
+
+    else:
+        result = {"message": "Unsupported role"}
+
+    await r.cache_set_json(redis, cache_key, result)
+
+    return result
 
 
-
-@router.get("/engineer/{project_id}")
-async def engineer_dashboard(
-    project_id: int,
+# =========================================
+# GRAPH APIs
+# =========================================
+@router.get("/graph/labour")
+async def labour_trend(
+    current_user: User = Depends(d.get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    today = date.today()
+    project_ids = await get_user_project_ids(db, current_user)
 
-    # ------------------ BASIC METRICS ------------------
-
-    labour_count = await db.scalar(
-        select(func.count(LabourAttendance.id)).where(
-            LabourAttendance.project_id == project_id,
-            LabourAttendance.attendance_date == today,
-        )
-    )
-
-    material_used_today = await db.scalar(
-        select(func.sum(MaterialUsage.quantity_used)).where(
-            MaterialUsage.project_id == project_id,
-            MaterialUsage.usage_date == today,
-        )
-    )
-
-    material_used_total = await db.scalar(
-        select(func.sum(Material.quantity_used)).where(
-            Material.project_id == project_id
-        )
-    )
-
-    total_tasks = await db.scalar(
-        select(func.count(Task.id)).where(Task.project_id == project_id)
-    )
-
-    completed_tasks = await db.scalar(
-        select(func.count(Task.id)).where(
-            Task.project_id == project_id,
-            Task.completion_percentage == 100,
-        )
-    )
-
-    progress_percent = (
-        (completed_tasks / total_tasks) * 100
-        if total_tasks and completed_tasks is not None
-        else 0
-    )
-
-    # ------------------ 📊 ANALYTICS ------------------
-
-    # 🔹 Labour Trend
-    labour_trend_result = await db.execute(
+    result = await db.execute(
         select(
-            m.DailySiteReport.report_date,
-            func.sum(m.DailySiteReport.labour_count),
+            LabourAttendance.attendance_date,
+            func.count(LabourAttendance.id),
         )
-        .where(m.DailySiteReport.project_id == project_id)
-        .group_by(m.DailySiteReport.report_date)
-        .order_by(m.DailySiteReport.report_date)
+        .where(LabourAttendance.project_id.in_(project_ids))
+        .group_by(LabourAttendance.attendance_date)
+        .order_by(LabourAttendance.attendance_date)
     )
 
-    labour_trend = [
-        {
-            "date": r[0],
-            "labour": int(r[1] or 0),
-        }
-        for r in labour_trend_result.all()
-    ]
+    return [{"date": r[0], "count": r[1]} for r in result.all()]
 
-    # 🔹 Contractor Analytics
-    contractor_result = await db.execute(
+
+@router.get("/graph/expense")
+async def expense_trend(
+    current_user: User = Depends(d.get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    project_ids = await get_user_project_ids(db, current_user)
+
+    result = await db.execute(
         select(
-            m.DailySiteReport.contractor_name,
-            func.count(),
+            Expense.expense_date,
+            func.sum(Expense.amount),
         )
-        .where(m.DailySiteReport.project_id == project_id)
-        .group_by(m.DailySiteReport.contractor_name)
+        .where(Expense.project_id.in_(project_ids))
+        .group_by(Expense.expense_date)
+        .order_by(Expense.expense_date)
     )
 
-    contractor_stats = [
-        {
-            "contractor": r[0] or "Unknown",
-            "entries": r[1],
-        }
-        for r in contractor_result.all()
-    ]
-
-    # 🔹 Issue Analytics
-    total_reports = await db.scalar(
-        select(func.count()).where(
-            m.DailySiteReport.project_id == project_id
-        )
-    )
-
-    issue_reports = await db.scalar(
-        select(func.count()).where(
-            m.DailySiteReport.project_id == project_id,
-            m.DailySiteReport.issues.isnot(None),
-        )
-    )
-
-    issue_summary = {
-        "total_reports": int(total_reports or 0),
-        "reports_with_issues": int(issue_reports or 0),
-    }
-
-    # ------------------ FINAL RESPONSE ------------------
-
-    return {
-        "project_id": project_id,
-
-        # 🔹 existing
-        "labour_today": labour_count or 0,
-        "material_used_today": float(material_used_today or 0),
-        "material_used_total": float(material_used_total or 0),
-        "tasks_done_percent": round(progress_percent, 2),
-
-        "labour_trend": labour_trend,
-        "contractor_stats": contractor_stats,
-        "issue_summary": issue_summary,
-    }
-
-
-@router.get("/accountant")
-async def accountant_dashboard(
-    db: AsyncSession = Depends(get_db_session),
-):
-
-    total_revenue = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(Invoice.status == "paid")
-    )
-
-    total_invoices = await db.scalar(select(func.count(Invoice.id)))
-
-    pending_amount = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(Invoice.status == "pending")
-    )
-
-    total_expense = await db.scalar(select(func.sum(Expense.amount)))
-
-    return {
-        "total_revenue": float(total_revenue or 0),
-        "total_invoices": total_invoices or 0,
-        "pending_payments": float(pending_amount or 0),
-        "total_expense": float(total_expense or 0),
-    }
-
-
-@router.get("/manager")
-async def manager_dashboard(
-    db: AsyncSession = Depends(get_db_session),
-):
-    projects = (await db.execute(select(Project))).scalars().all()
-
-    total_projects = len(projects)
-
-    active_projects = 0
-    delayed_projects = 0
-
-    for p in projects:
-        status = compute_project_status(p)
-
-        if status in ["Planned", "Active"]:
-            active_projects += 1
-
-        if status == "Delayed":
-            delayed_projects += 1
-
-    total_budget = await db.scalar(
-        select(func.sum(BOQ.total_cost)).where(BOQ.is_latest == True)
-    )
-
-    total_expense = await db.scalar(select(func.sum(Expense.amount)))
-
-    utilization = (
-        (float(total_expense or 0) / float(total_budget or 1)) * 100
-        if total_budget
-        else 0
-    )
-
-    return {
-        "total_projects": total_projects,
-        "active_projects": active_projects,
-        "delayed_projects": delayed_projects,
-        "total_budget": float(total_budget or 0),
-        "total_expense": float(total_expense or 0),
-        "budget_utilization_percent": round(utilization, 2),
-    }
-
-
-@router.get("/admin")
-async def admin_dashboard(
-    db: AsyncSession = Depends(get_db_session),
-):
-
-
-    total_projects = await db.scalar(
-        select(func.count(Project.id))
-    )
-
-
-    total_expense = await db.scalar(
-        select(func.sum(Expense.amount))
-    )
-
-
-    total_revenue = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.status == "paid"
-        )
-    )
-
-
-    recent_projects = (
-        (await db.execute(
-            select(Project).order_by(Project.created_at.desc()).limit(5)
-        ))
-        .scalars()
-        .all()
-    )
-
-    recent_expenses = (
-        (await db.execute(
-            select(Expense).order_by(Expense.created_at.desc()).limit(5)
-        ))
-        .scalars()
-        .all()
-    )
-
-    return {
-        "total_projects": total_projects or 0,
-        "total_expense": float(total_expense or 0),
-        "total_revenue": float(total_revenue or 0),
-
-        "recent_activity": {
-            "projects": [
-                {
-                    "id": p.id,
-                    "name": p.project_name,
-                    "created_at": p.created_at,
-                }
-                for p in recent_projects
-            ],
-            "expenses": [
-                {
-                    "id": e.id,
-                    "amount": float(e.amount),
-                    "created_at": e.created_at,
-                }
-                for e in recent_expenses
-            ],
-        }
-    }
+    return [{"date": r[0], "amount": float(r[1] or 0)} for r in result.all()]
