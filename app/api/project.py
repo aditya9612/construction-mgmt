@@ -5,6 +5,7 @@ from openpyxl import Workbook
 from typing import Annotated, List, Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.enums import LabourStatus, SkillType
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.cache.redis import (
@@ -2388,12 +2389,15 @@ dsr_router = APIRouter(
     dependencies=[default_rate_limiter_dependency()],
 )
 
-
+# =========================
+# CREATE DSR
+# =========================
 @dsr_router.post("", response_model=s.DSROut)
 async def create_dsr(
     payload: s.DSRCreate,
     current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
     logger.info(
         f"Creating DSR project_id={payload.project_id} date={payload.report_date}"
@@ -2419,12 +2423,41 @@ async def create_dsr(
     if existing:
         raise BadRequestError("DSR already exists for this date")
 
+    # Contractor validation
+    if payload.contractor_id:
+        contractor = await db.get(m.Contractor, payload.contractor_id)
+        if not contractor:
+            raise ValidationError("Invalid contractor_id")
+
+    # Labour summary
+    labour_result = await db.execute(
+        select(
+            m.Labour.skill_type,
+            func.count(m.Labour.id),
+        ).where(
+            m.Labour.project_id == payload.project_id,
+            m.Labour.status == LabourStatus.ACTIVE,
+        ).group_by(m.Labour.skill_type)
+    )
+
+    skilled = 0
+    unskilled = 0
+
+    for row in labour_result:
+        if row.skill_type == SkillType.SKILLED:
+            skilled = row[1]
+        else:
+            unskilled += row[1]
+
+    total_labour = skilled + unskilled
+
     data = payload.model_dump()
 
-    if data.get("contractor_name"):
-        data["contractor_name"] = data["contractor_name"].strip()
+    data["created_by_id"] = current_user.id
 
-    data["created_by_user_id"] = current_user.id
+    data["total_labour"] = total_labour
+    data["skilled_labour"] = skilled
+    data["unskilled_labour"] = unskilled
 
     obj = m.DailySiteReport(**data)
 
@@ -2432,11 +2465,16 @@ async def create_dsr(
         db.add(obj)
         await db.flush()
         await db.refresh(obj)
+        await bump_cache_version(redis, "cache_version:dsr")
     except Exception:
         await db.rollback()
+        logger.exception("DSR creation failed")
         raise
 
     dsr_out = s.DSROut.model_validate(obj)
+
+    if obj.contractor:
+        dsr_out.contractor_name = obj.contractor.contractor_name
 
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
@@ -2444,100 +2482,120 @@ async def create_dsr(
     return dsr_out
 
 
+# =========================
+# GET PROJECT DSR
+# =========================
 @dsr_router.get("/project/{project_id}", response_model=PaginatedResponse[s.DSROut])
 async def get_project_dsr(
     project_id: int,
-    start_date: Optional[date] = Query(default=None),
-    end_date: Optional[date] = Query(default=None),
-    contractor_name: Optional[str] = Query(default=None),
-    limit: int = Query(default=50, le=100),
-    offset: int = Query(default=0),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(DSR_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
-    if start_date and end_date and end_date < start_date:
-        raise BadRequestError("end_date cannot be before start_date")
+    logger.info(f"Fetching DSR for project_id={project_id}")
 
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    project = await db.get(m.Project, project_id)
+    if not project:
+        raise NotFoundError("Project not found")
 
-    filters = [m.DailySiteReport.project_id == project_id]
+    await assert_project_access(db, project_id, current_user)
 
-    if start_date:
-        filters.append(m.DailySiteReport.report_date >= start_date)
+    version = await get_cache_version(redis, "cache_version:dsr")
+    cache_key = f"cache:dsr:list:{version}:{project_id}:{limit}:{offset}"
 
-    if end_date:
-        filters.append(m.DailySiteReport.report_date <= end_date)
-
-    if contractor_name:
-        contractor_name = contractor_name.strip()
-        filters.append(m.DailySiteReport.contractor_name.ilike(f"%{contractor_name}%"))
-
-    count_query = select(func.count()).where(*filters)
-    total = await db.scalar(count_query)
+    cached = await cache_get_json(redis, cache_key)
+    if cached:
+        return PaginatedResponse[s.DSROut].model_validate(cached)
 
     query = (
         select(m.DailySiteReport)
-        .where(*filters)
+        .where(m.DailySiteReport.project_id == project_id)
         .order_by(m.DailySiteReport.report_date.desc())
         .limit(limit)
         .offset(offset)
     )
 
-    result = await db.execute(query)
-    rows = result.scalars().all()
-
-    items = []
-    for r in rows:
-        item = s.DSROut.model_validate(r)
-        if r.created_by:
-            item.created_by_name = r.created_by.full_name
-        items.append(item)
-
-    return PaginatedResponse[s.DSROut](
-        items=items,
-        meta=PaginationMeta(
-            total=int(total or 0),
-            limit=limit,
-            offset=offset,
-        ),
+    count_query = (
+        select(func.count())
+        .select_from(m.DailySiteReport)
+        .where(m.DailySiteReport.project_id == project_id)
     )
 
+    total = await db.scalar(count_query)
+    rows = (await db.execute(query)).scalars().all()
 
+    items = []
+    for row in rows:
+        dsr = s.DSROut.model_validate(row)
+
+        if row.contractor:
+            dsr.contractor_name = row.contractor.contractor_name
+
+        if row.created_by:
+            dsr.created_by_name = row.created_by.full_name
+
+        items.append(dsr.model_dump())
+
+    meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
+
+    result = {"items": items, "meta": meta.model_dump()}
+
+    await cache_set_json(redis, cache_key, result)
+
+    return PaginatedResponse[s.DSROut].model_validate(result)
+
+
+# =========================
+# GET DSR BY ID
+# =========================
 @dsr_router.get("/{id}", response_model=s.DSROut)
 async def get_dsr(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    redis=Depends(get_request_redis),
 ):
+    logger.info(f"Fetching DSR id={id}")
+
+    version = await get_cache_version(redis, "cache_version:dsr")
+    cache_key = f"cache:dsr:get:{version}:{id}"
+
+    cached = await cache_get_json(redis, cache_key)
+    if cached:
+        return s.DSROut.model_validate(cached)
+
     obj = await db.get(m.DailySiteReport, id)
 
     if not obj:
         raise NotFoundError("DSR not found")
 
-    await assert_project_access(
-        db,
-        project_id=obj.project_id,
-        current_user=current_user,
-    )
+    await assert_project_access(db, obj.project_id, current_user)
 
     dsr_out = s.DSROut.model_validate(obj)
+
+    if obj.contractor:
+        dsr_out.contractor_name = obj.contractor.contractor_name
 
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
 
+    await cache_set_json(redis, cache_key, dsr_out.model_dump())
+
     return dsr_out
 
 
+# =========================
+# UPDATE DSR
+# =========================
 @dsr_router.put("/{id}", response_model=s.DSROut)
 async def update_dsr(
     id: int,
     payload: s.DSRUpdate,
     current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
     logger.info(f"Updating DSR id={id}")
 
@@ -2546,11 +2604,7 @@ async def update_dsr(
     if not obj:
         raise NotFoundError("DSR not found")
 
-    await assert_project_access(
-        db,
-        project_id=obj.project_id,
-        current_user=current_user,
-    )
+    await assert_project_access(db, obj.project_id, current_user)
 
     if payload.report_date:
         existing = await db.scalar(
@@ -2565,11 +2619,8 @@ async def update_dsr(
 
     update_data = payload.model_dump(exclude_unset=True)
 
-    if "contractor_name" in update_data and update_data["contractor_name"]:
-        update_data["contractor_name"] = update_data["contractor_name"].strip()
-
     for k, v in update_data.items():
-        if k not in ["project_id", "created_by_user_id"]:
+        if k not in ["project_id", "created_by_id"]:
             setattr(obj, k, v)
 
     try:
@@ -2580,13 +2631,15 @@ async def update_dsr(
         raise
 
     await db.refresh(obj)
+    await bump_cache_version(redis, "cache_version:dsr")
 
     dsr_out = s.DSROut.model_validate(obj)
 
+    if obj.contractor:
+        dsr_out.contractor_name = obj.contractor.contractor_name
+
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
-
-    logger.info(f"DSR updated successfully id={id}")
 
     return dsr_out
 
@@ -2765,6 +2818,7 @@ async def delete_dsr(
     id: int,
     current_user: User = Depends(require_roles(DSR_DELETE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis = Depends(get_request_redis),   # ✅ ADD THIS
 ):
     logger.info(f"Deleting DSR id={id}")
 
@@ -2777,6 +2831,9 @@ async def delete_dsr(
     try:
         await db.delete(obj)
         await db.flush()
+
+        await bump_cache_version(redis, "cache_version:dsr")
+
     except Exception:
         await db.rollback()
         logger.exception(f"DSR delete failed id={id}")

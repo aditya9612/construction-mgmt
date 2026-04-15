@@ -192,14 +192,13 @@ class DSRBase(BaseSchema):
     report_date: date
 
     site_location: Optional[str] = None
-    contractor_name: Optional[str] = None
+
+    contractor_id: Optional[int] = None 
 
     weather: Optional[WeatherType] = None
 
     work_done: str
     work_planned: Optional[str] = None
-
-    labour_count: Annotated[int, Field(ge=0)] = 0
 
     machinery_used: Optional[str] = None
     material_received: Optional[str] = None
@@ -221,11 +220,11 @@ class DSRBase(BaseSchema):
         if v > date.today():
             raise ValueError("Future report date not allowed")
         return v
-
-    @field_validator("contractor_name")
-    def validate_contractor(cls, v):
-        if v and not v.strip():
-            raise ValueError("Contractor name cannot be empty")
+    
+    @field_validator("contractor_id")
+    def validate_contractor_id(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("Invalid contractor_id")
         return v
 
 
@@ -253,14 +252,13 @@ class DSRCreate(DSRBase):
 class DSRUpdate(BaseSchema):
     report_date: Optional[date] = None
     site_location: Optional[str] = None
-    contractor_name: Optional[str] = None
+
+    contractor_id: Optional[int] = None
 
     weather: Optional[WeatherType] = None
 
     work_done: Optional[str] = None
     work_planned: Optional[str] = None
-
-    labour_count: Optional[int] = None
 
     machinery_used: Optional[str] = None
     material_received: Optional[str] = None
@@ -292,10 +290,10 @@ class DSRUpdate(BaseSchema):
             raise ValueError("Site location cannot be empty")
         return v
 
-    @field_validator("contractor_name")
-    def validate_update_contractor(cls, v):
-        if v is not None and not v.strip():
-            raise ValueError("Contractor name cannot be empty")
+    @field_validator("contractor_id")
+    def validate_contractor_id(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("Invalid contractor_id")
         return v
 
 
@@ -305,14 +303,19 @@ class DSROut(DSRBase):
     id: int
     created_at: datetime
     updated_at: datetime
-    created_by_user_id: Optional[int] = None
+    created_by_id: Optional[int] = None
     created_by_name: Optional[str] = None
+
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
+    contractor_name: Optional[str] = None
+    total_labour: int = 0
+    skilled_labour: int = 0
+    unskilled_labour: int = 0
+
     class Config:
         from_attributes = True
-
 
 # ===================== PAGINATION META =====================
 

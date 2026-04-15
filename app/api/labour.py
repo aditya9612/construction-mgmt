@@ -8,7 +8,7 @@ from sqlalchemy import func, select, extract
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache import redis as r
 from app.core import dependencies as d
-from app.core.enums import AttendanceStatus, PayrollStatus
+from app.core.enums import AttendanceStatus, LabourStatus, PayrollStatus
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.contractor import Contractor
@@ -100,7 +100,7 @@ async def list_labour(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     search: Optional[str] = None,
-    status: Optional[str] = None,
+    status: Optional[LabourStatus] = None, 
     project_id: Optional[int] = None,
     current_user: User = Depends(d.get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
@@ -112,8 +112,11 @@ async def list_labour(
         await assert_project_access(db, project_id, current_user)
 
     version = await r.get_cache_version(redis, VERSION_KEY)
+
+    status_key = status.value if status else None
+
     cache_key = (
-        f"cache:labour:list:{version}:{limit}:{offset}:{search}:{status}:{project_id}"
+        f"cache:labour:list:{version}:{limit}:{offset}:{search}:{status_key}:{project_id}"
     )
 
     cached = await r.cache_get_json(redis, cache_key)
@@ -314,8 +317,6 @@ async def create_attendance(
     if payload.overtime_rate < 0:
         raise ValidationError("Overtime rate cannot be negative")
 
-    if payload.status not in list(AttendanceStatus):
-        raise ValidationError("Invalid status")
 
     if payload.working_hours + payload.overtime_hours > 24:
         raise ValidationError("Total hours cannot exceed 24")
@@ -374,7 +375,6 @@ async def create_attendance(
         )
         db.add(owner_txn)
 
-        await db.commit()
         await r.bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
         await r.bump_cache_version(redis, "dashboard_version")
 
@@ -628,12 +628,21 @@ async def generate_payroll(
                 )
             )
 
+
             if existing:
                 existing.total_working_hours = data["working_hours"]
                 existing.total_overtime_hours = data["overtime_hours"]
                 existing.total_wage = total_wage
+
+                existing.paid_amount = advance
+
                 existing.remaining_amount = remaining_salary
                 existing.status = status
+
+                await db.flush()
+
+                output.append(existing)
+
                 continue
 
             obj = LabourPayroll(
@@ -651,9 +660,8 @@ async def generate_payroll(
 
             db.add(obj)
             await db.flush()
-            output.append(obj)
 
-        await db.commit()
+            output.append(obj)
 
         await r.bump_cache_version(redis, VERSION_KEY)
         await r.bump_cache_version(redis, "dashboard_version")
@@ -715,24 +723,37 @@ async def bulk_attendance(
             if item.overtime_rate < 0:
                 raise ValidationError("Invalid overtime rate")
 
-            if item.status not in AttendanceStatus:
-                raise ValidationError("Invalid status")
-
             obj = LabourAttendance(**item.model_dump())
             db.add(obj)
+            await db.flush()
 
             hourly = labour.daily_wage_rate / Decimal("8")
             wage = hourly * obj.working_hours + obj.overtime_rate * obj.overtime_hours
 
-            db.add(
-                Expense(
-                    project_id=obj.project_id,
-                    labour_id=obj.labour_id,
-                    category="Labour",
-                    amount=wage,
-                    expense_date=obj.attendance_date,
-                )
+            expense = Expense(
+                project_id=obj.project_id,
+                labour_id=obj.labour_id,
+                category="Labour",
+                amount=wage,
+                expense_date=obj.attendance_date,
             )
+            db.add(expense)
+            await db.flush()
+
+            project = await db.get(Project, obj.project_id)
+
+            if project:
+                db.add(
+                    OwnerTransaction(
+                        owner_id=project.owner_id,
+                        project_id=obj.project_id,
+                        type="debit",
+                        amount=wage,
+                        reference_type="labour",
+                        reference_id=expense.id,
+                        description=f"Labour expense ({obj.attendance_date})",
+                    )
+                )
 
             success.append(
                 {
@@ -751,8 +772,6 @@ async def bulk_attendance(
                     "error": str(e),
                 }
             )
-
-    await db.commit()
 
     if success:
         await r.bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
@@ -791,6 +810,9 @@ async def pay_salary(
     if not payroll:
         raise NotFoundError("Payroll not found")
 
+    if payload.amount > payroll.remaining_amount:
+        raise ValidationError("Amount exceeds remaining salary")
+
     payroll.paid_amount += payload.amount
     payroll.remaining_amount = max(
         Decimal("0"), payroll.remaining_amount - payload.amount
@@ -802,7 +824,7 @@ async def pay_salary(
         else PayrollStatus.PARTIAL
     )
 
-    await db.commit()
+    await db.flush()
 
     await r.bump_cache_version(redis, "dashboard_version")
 
@@ -839,7 +861,7 @@ async def advance_payment(
         )
     )
 
-    await db.commit()
+    await db.flush()
 
     await r.bump_cache_version(redis, "dashboard_version")
 
@@ -895,7 +917,13 @@ async def get_labour_by_contractor(
             Labour.project_id.in_(project_ids),
         )
     )
-    return result.scalars().all()
+
+    rows = result.scalars().all()
+
+    for r in rows:
+        await assert_project_access(db, r.project_id, current_user)
+
+    return [s.LabourOut.model_validate(r) for r in rows]
 
 
 @router.get("/summary/skill")

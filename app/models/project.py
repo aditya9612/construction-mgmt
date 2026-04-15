@@ -1,10 +1,10 @@
 from datetime import date
 from typing import Optional, TYPE_CHECKING
-from app.schemas.project import WeatherType
 from sqlalchemy import (
+    DECIMAL,
     CheckConstraint,
+    Column,
     Date,
-    Enum,
     Float,
     ForeignKey,
     Integer,
@@ -12,15 +12,20 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Index,
+    Enum as SAEnum,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
+from decimal import Decimal
+from app.core.enums import AttendanceStatus
 from app.models.base import Base, TimestampMixin
+from app.models.labour import Labour
 from app.schemas.project import IssueCategory, IssuePriority, IssueStatus, ProjectStatus, TaskStatus, WeatherType
 
 if TYPE_CHECKING:
     from app.models.owner import Owner
     from app.models.user import User
+    from app.models.project import Project
+    from app.models.contractor import Contractor
 
 
 class Project(Base, TimestampMixin):
@@ -35,7 +40,8 @@ class Project(Base, TimestampMixin):
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
     status: Mapped[ProjectStatus] = mapped_column(
-        Enum(ProjectStatus), default=ProjectStatus.PLANNED
+        SAEnum(ProjectStatus),
+        default=ProjectStatus.PLANNED
     )
 
     owner_id: Mapped[int] = mapped_column(
@@ -149,8 +155,9 @@ class Task(Base):
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     status: Mapped[TaskStatus] = mapped_column(
-        Enum(TaskStatus), default=TaskStatus.PLANNED
+        SAEnum(TaskStatus), default=TaskStatus.PLANNED
     )
+
 
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
@@ -236,6 +243,7 @@ class Comment(Base, TimestampMixin):
 
 # ===================== DSR =====================
 
+
 class DailySiteReport(Base, TimestampMixin):
     __tablename__ = "daily_site_reports"
 
@@ -247,7 +255,7 @@ class DailySiteReport(Base, TimestampMixin):
         index=True,
     )
 
-    created_by_user_id: Mapped[Optional[int]] = mapped_column(
+    created_by_id: Mapped[Optional[int]] = mapped_column(
         Integer,
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
@@ -259,16 +267,27 @@ class DailySiteReport(Base, TimestampMixin):
     report_date: Mapped[date] = mapped_column(Date, index=True)
 
     site_location: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    contractor_name = mapped_column(String(255), index=True)
 
     weather: Mapped[Optional[WeatherType]] = mapped_column(
-        Enum(WeatherType),
+        SAEnum(WeatherType),
         nullable=True
     )
+
     work_done: Mapped[str] = mapped_column(Text)
     work_planned: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    labour_count: Mapped[int] = mapped_column(Integer, default=0)
+    contractor_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("contractors.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+
+    contractor: Mapped[Optional["Contractor"]] = relationship("Contractor")
+
+    total_labour = Column(Integer, default=0)
+    skilled_labour = Column(Integer, default=0)
+    unskilled_labour = Column(Integer, default=0)
 
     machinery_used: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     material_received: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -279,8 +298,8 @@ class DailySiteReport(Base, TimestampMixin):
 
     remarks: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    latitude = mapped_column(Float, index=True, nullable=True)
-    longitude = mapped_column(Float, index=True, nullable=True)
+    latitude: Mapped[Optional[float]] = mapped_column(Float, index=True, nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(Float, index=True, nullable=True)
 
     photos = relationship(
         "DSRPhoto",
@@ -293,10 +312,71 @@ class DailySiteReport(Base, TimestampMixin):
         back_populates="dsr_entries"
     )
 
-    __table_args__ = (
-        UniqueConstraint("project_id", "report_date", name="uq_project_dsr_date"),
+    labours: Mapped[list["DSRLabour"]] = relationship(
+        "DSRLabour",
+        back_populates="dsr",
+        cascade="all, delete-orphan"
     )
 
+    __table_args__ = (
+        UniqueConstraint("project_id", "report_date", name="uq_project_dsr_date"),
+        Index("idx_dsr_lat_lng", "latitude", "longitude"),
+    )
+
+
+# ===================== DSR LABOUR =====================
+
+class DSRLabour(Base):
+    __tablename__ = "dsr_labour"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    dsr_id: Mapped[int] = mapped_column(
+        ForeignKey("daily_site_reports.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    labour_id: Mapped[int] = mapped_column(
+        ForeignKey("labour.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    status: Mapped[AttendanceStatus] = mapped_column(
+        SAEnum(AttendanceStatus),
+        default=AttendanceStatus.PRESENT,
+        nullable=False,
+    )
+
+    working_hours: Mapped[Decimal] = mapped_column(
+        DECIMAL(5, 2),
+        nullable=False,
+    )
+
+    overtime_hours: Mapped[Decimal] = mapped_column(
+        DECIMAL(5, 2),
+        default=Decimal("0"),
+        nullable=False,
+    )
+
+    dsr: Mapped["DailySiteReport"] = relationship(
+        "DailySiteReport",
+        back_populates="labours"
+    )
+
+    labour: Mapped["Labour"] = relationship("Labour")
+
+    __table_args__ = (
+        UniqueConstraint("dsr_id", "labour_id", name="uq_dsr_labour"),
+
+        Index("idx_dsr_labour_dsr", "dsr_id"),
+        Index("idx_dsr_labour_labour", "labour_id"),
+        Index("idx_dsr_labour_dsr_labour", "dsr_id", "labour_id"),
+
+        CheckConstraint("working_hours >= 0"),
+        CheckConstraint("overtime_hours >= 0"),
+    )
 
 # ===================== ISSUE =====================
 
@@ -315,7 +395,7 @@ class Issue(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
 
     category: Mapped[IssueCategory] = mapped_column(
-        Enum(IssueCategory), nullable=False
+        SAEnum(IssueCategory), nullable=False
     )
 
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -323,11 +403,11 @@ class Issue(Base, TimestampMixin):
     reported_date: Mapped[date] = mapped_column(Date, nullable=False)
 
     priority: Mapped[IssuePriority] = mapped_column(
-        Enum(IssuePriority), default=IssuePriority.MEDIUM
+        SAEnum(IssuePriority), default=IssuePriority.MEDIUM
     )
 
     status: Mapped[IssueStatus] = mapped_column(
-        Enum(IssueStatus), default=IssueStatus.OPEN
+        SAEnum(IssueStatus), default=IssueStatus.OPEN
     )
 
     assigned_to: Mapped[Optional[int]] = mapped_column(

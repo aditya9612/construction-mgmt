@@ -1,8 +1,18 @@
 from decimal import Decimal
 from typing import Optional
 from datetime import date, time
-from sqlalchemy import DECIMAL, ForeignKey, Integer, String, Column, Time, Index
+from sqlalchemy import (
+    DECIMAL,
+    ForeignKey,
+    Integer,
+    String,
+    Column,
+    Time,
+    Index,
+    Enum as SAEnum,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.core.enums import AttendanceStatus, LabourStatus, PayrollStatus, SkillType
 from app.models.base import Base, TimestampMixin
 
 
@@ -19,7 +29,7 @@ class Labour(Base, TimestampMixin):
     )
 
     labour_name: Mapped[str] = mapped_column(String(255), index=True)
-    skill_type: Mapped[str] = mapped_column(String(100))
+    skill_type: Mapped[SkillType] = mapped_column(SAEnum(SkillType), nullable=False)
 
     daily_wage_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
 
@@ -27,7 +37,9 @@ class Labour(Base, TimestampMixin):
         Integer, ForeignKey("contractors.id", ondelete="SET NULL")
     )
 
-    status: Mapped[str] = mapped_column(String(50), default="Active")
+    status: Mapped[LabourStatus] = mapped_column(
+        SAEnum(LabourStatus), default=LabourStatus.ACTIVE
+    )
     notes: Mapped[Optional[str]] = mapped_column(String(500))
 
 
@@ -46,7 +58,10 @@ class LabourAttendance(Base, TimestampMixin):
 
     attendance_date: Mapped[date] = mapped_column(index=True)
 
-    status: Mapped[str] = mapped_column(String(20), default="Present")
+    status: Mapped[AttendanceStatus] = mapped_column(
+        SAEnum(AttendanceStatus),
+        default=AttendanceStatus.PRESENT
+    )
 
     in_time: Mapped[Optional[time]] = mapped_column(Time)
     out_time: Mapped[Optional[time]] = mapped_column(Time)
@@ -84,6 +99,9 @@ class LabourPayroll(Base, TimestampMixin):
     paid_amount = Column(DECIMAL(18, 2), default=0)
     remaining_amount = Column(DECIMAL(18, 2), default=0)
 
-    status = Column(String(50), default="Pending")
+    status = Column(
+        SAEnum(PayrollStatus),
+        default=PayrollStatus.PENDING
+    )
 
     labour = relationship("Labour")

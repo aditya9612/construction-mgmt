@@ -16,3 +16,8 @@ class PayrollStatus(str, Enum):
 class LabourStatus(str, Enum):
     ACTIVE = "Active"
     INACTIVE = "Inactive"
+    
+
+class SkillType(str, Enum):
+    SKILLED = "Skilled"
+    UNSKILLED = "Unskilled"

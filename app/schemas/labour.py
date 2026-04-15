@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Optional, List
 from datetime import date, time
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from app.core import enums as e
 
 
@@ -13,16 +13,21 @@ class LabourCreate(BaseModel):
     aadhaar_number: Optional[str]
     project_id: int
     labour_name: str
-    skill_type: str
+    skill_type: e.SkillType
     daily_wage_rate: Decimal
     contractor_id: Optional[int]
     status: Optional[e.LabourStatus] = e.LabourStatus.ACTIVE
     notes: Optional[str] = None
 
+    @field_validator("aadhaar_number")
+    def validate_aadhaar(cls, v):
+        if v and (not v.isdigit() or len(v) != 12):
+            raise ValueError("Aadhaar must be 12 digits")
+        return v
 
 class LabourUpdate(BaseModel):
     labour_name: Optional[str]
-    skill_type: Optional[str]
+    skill_type: Optional[e.SkillType]
     daily_wage_rate: Optional[Decimal]
     contractor_id: Optional[int]
     status: Optional[e.LabourStatus]
@@ -35,16 +40,11 @@ class LabourOut(BaseModel):
     aadhaar_number: Optional[str]
     project_id: int
     labour_name: str
-    skill_type: str
+    skill_type: e.SkillType 
     daily_wage_rate: Decimal
     contractor_id: Optional[int]
     status: e.LabourStatus
     notes: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-        json_encoders = {Decimal: float}
-
 
 # ======================
 # ATTENDANCE
@@ -56,7 +56,7 @@ class LabourAttendanceCreate(BaseModel):
     in_time: Optional[time]
     out_time: Optional[time]
     working_hours: Decimal
-    overtime_hours: Decimal = 0
+    overtime_hours: Decimal = Decimal("0")
     overtime_rate: Decimal
     task_description: str
 
@@ -88,7 +88,7 @@ class BulkAttendanceItem(BaseModel):
     in_time: Optional[time]
     out_time: Optional[time]
     working_hours: Decimal
-    overtime_hours: Decimal = 0
+    overtime_hours: Decimal = Decimal("0")
     overtime_rate: Decimal
     task_description: str
 
