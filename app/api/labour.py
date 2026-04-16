@@ -93,7 +93,7 @@ async def create_labour(
 
             logger.info(f"Labour created id={obj.id}")
 
-            return s.LabourOut.model_validate(obj)
+            return s.LabourOut.model_validate(obj, from_attributes=True)
 
         except IntegrityError as e:
             await db.rollback()
@@ -163,7 +163,11 @@ async def list_labour(
     total = await db.scalar(count_query)
     rows = (await db.execute(query)).scalars().all()
 
-    items = [s.LabourOut.model_validate(r).model_dump() for r in rows]
+    items = [
+        s.LabourOut.model_validate(r, from_attributes=True).model_dump()
+        for r in rows
+    ]
+
     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
 
     result = {"items": items, "meta": meta.model_dump()}
@@ -194,9 +198,13 @@ async def get_labour(
     if not obj:
         raise NotFoundError("Labour record not found")
 
-    await assert_project_access(db, obj.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
-    out = s.LabourOut.model_validate(obj)
+    out = s.LabourOut.model_validate(obj, from_attributes=True)
 
     await r.cache_set_json(redis, cache_key, out.model_dump())
 
@@ -229,7 +237,11 @@ async def update_labour(
     if not obj:
         raise NotFoundError("Labour record not found")
 
-    await assert_project_access(db, obj.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
     data = payload.model_dump(exclude_unset=True)
 
@@ -248,7 +260,7 @@ async def update_labour(
         logger.exception(f"Labour update failed id={labour_id}")
         raise
 
-    return s.LabourOut.model_validate(obj)
+    return s.LabourOut.model_validate(obj, from_attributes=True)
 
 
 @router.delete("/{labour_id}", status_code=204)
@@ -269,7 +281,11 @@ async def delete_labour(
     if not obj:
         raise NotFoundError("Labour record not found")
 
-    await assert_project_access(db, obj.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
     try:
         await db.delete(obj)
@@ -429,7 +445,11 @@ async def get_attendance(
     if not labour:
         raise NotFoundError("Labour not found")
 
-    await assert_project_access(db, labour.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=labour.project_id,
+        current_user=current_user,
+    )
 
     result = await db.execute(
         select(LabourAttendance).where(LabourAttendance.labour_id == labour_id)
@@ -477,7 +497,11 @@ async def weekly_report(
     if not labour:
         raise NotFoundError("Labour not found")
 
-    await assert_project_access(db, labour.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=labour.project_id,
+        current_user=current_user,
+    )
 
     result = await db.execute(
         select(
@@ -520,7 +544,11 @@ async def monthly_report(
     if not labour:
         raise NotFoundError("Labour not found")
 
-    await assert_project_access(db, labour.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=labour.project_id,
+        current_user=current_user,
+    )
 
     result = await db.execute(
         select(
@@ -581,7 +609,7 @@ async def generate_payroll(
         if not rows:
             return []
 
-        labour_ids = list({r.labour_id for r in rows})
+        labour_ids = list({row.labour_id for row in rows})
         labour_result = await db.execute(
             select(Labour).where(Labour.id.in_(labour_ids))
         )
@@ -589,15 +617,15 @@ async def generate_payroll(
 
         payroll_map = {}
 
-        for r in rows:
-            labour = labour_map.get(r.labour_id)
+        for row in rows:
+            labour = labour_map.get(row.labour_id)
             if not labour:
                 continue
 
             hourly_rate = labour.daily_wage_rate / Decimal("8")
 
-            wage = hourly_rate * r.working_hours + r.overtime_rate * r.overtime_hours
-            key = (r.labour_id, r.project_id)
+            wage = hourly_rate * row.working_hours + row.overtime_rate * row.overtime_hours
+            key = (row.labour_id, row.project_id)
 
             if key not in payroll_map:
                 payroll_map[key] = {
@@ -606,8 +634,8 @@ async def generate_payroll(
                     "total_wage": Decimal("0"),
                 }
 
-            payroll_map[key]["working_hours"] += r.working_hours
-            payroll_map[key]["overtime_hours"] += r.overtime_hours
+            payroll_map[key]["working_hours"] += row.working_hours
+            payroll_map[key]["overtime_hours"] += row.overtime_hours
             payroll_map[key]["total_wage"] += wage
 
         output = []
@@ -818,7 +846,11 @@ async def pay_salary(
     redis=Depends(d.get_request_redis),
 ):
 
-    await assert_project_access(db, payload.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=payload.project_id,
+        current_user=current_user,
+    )
 
     payroll = await db.scalar(
         select(LabourPayroll).where(
@@ -862,13 +894,20 @@ async def advance_payment(
     redis=Depends(d.get_request_redis),
 ):
 
-    await assert_project_access(db, payload.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=payload.project_id,
+        current_user=current_user,
+    )
 
     labour = await db.get(Labour, payload.labour_id)
     project = await db.get(Project, payload.project_id)
 
     if not labour or not project:
         raise NotFoundError("Invalid labour or project")
+
+    if labour.project_id != payload.project_id:
+        raise ValidationError("Labour does not belong to this project")
 
     db.add(
         Expense(
@@ -878,10 +917,12 @@ async def advance_payment(
             amount=payload.amount,
             description=payload.description,
             expense_date=date.today(),
+            payment_mode="CASH",
         )
     )
 
     await db.flush()
+    await db.commit()
 
     await r.bump_cache_version(redis, "dashboard_version")
 
@@ -947,7 +988,10 @@ async def get_labour_by_contractor(
             current_user=current_user,
         )
 
-    return [s.LabourOut.model_validate(r) for r in rows]
+    return [
+        s.LabourOut.model_validate(r, from_attributes=True)
+        for r in rows
+    ]
 
 
 @router.get("/summary/skill")
@@ -956,7 +1000,11 @@ async def labour_skill_summary(
     current_user: User = Depends(d.get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
 
     result = await db.execute(
         select(Labour.skill_type, func.count(Labour.id))
@@ -964,7 +1012,12 @@ async def labour_skill_summary(
         .group_by(Labour.skill_type)
     )
 
-    return [{"skill_type": r.skill_type, "count": r[1]} for r in result]
+    rows = result.fetchall()
+
+    return [
+        {"skill_type": r[0], "count": r[1]}
+        for r in rows
+    ]
 
 
 # =========================
