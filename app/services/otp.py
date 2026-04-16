@@ -33,11 +33,6 @@ def _normalize_mobile(mobile: str) -> str:
     return digits if digits else mobile
 
 
-# def generate_otp(length: int = None) -> str:
-#     """Generate a numeric OTP."""
-#     length = length or settings.OTP_LENGTH
-#     return "".join(random.choices(string.digits, k=length))
-
 def generate_otp(length: int = None) -> str:
     if settings.APP_ENV == "development":
         return "123456"

@@ -60,26 +60,6 @@ async def validate_contractor_access(
         raise PermissionDeniedError("Access denied")
 
 
-# async def generate_business_id(db, model, column_name: str, prefix: str):
-
-#     result = await db.execute(select(model).order_by(model.id.desc()).limit(1))
-#     last_record = result.scalar_one_or_none()
-
-#     if last_record and getattr(last_record, column_name):
-#         last_id = getattr(last_record, column_name)
-
-#         try:
-#             last_number = int(last_id[len(prefix) :])
-#         except ValueError:
-#             last_number = 0
-
-#         new_number = last_number + 1
-#     else:
-#         new_number = 1
-
-#     return f"{prefix}{str(new_number).zfill(3)}"
-
-
 async def generate_business_id(
     db,
     model,
