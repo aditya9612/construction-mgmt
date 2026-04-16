@@ -5,7 +5,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from pyrate_limiter import Duration, Rate
-
+from app import db
 from app.core.dependencies import get_request_redis
 from app.core.security import create_access_token, get_password_hash
 from app.db.session import get_db_session
@@ -72,6 +72,7 @@ def _build_token(user: User) -> Token:
 async def login(
     payload: UserLogin,
     redis: Redis | None = Depends(get_request_redis),
+    db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"OTP login requested mobile={payload.mobile}") 
 
@@ -79,11 +80,17 @@ async def login(
         logger.error("Redis unavailable for OTP login")  
         raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
 
+
     mobile = _normalize_mobile(payload.mobile)
 
     if len(mobile) < 10:
         raise AppError(status_code=422, message="Invalid mobile number")
 
+    user = await db.scalar(select(User).where(User.mobile == mobile))
+    if user is None:
+        raise AppError(status_code=404, message="User not registered")
+
+    # existing logic continues
     if not await check_otp_rate_limit(redis, mobile):
         logger.warning(f"OTP rate limit hit for mobile={mobile}") 
         raise AppError(status_code=429, message="Too many OTP requests. Try again later.")

@@ -82,18 +82,20 @@ def create_app() -> FastAPI:
         lifespan=lifespan
     )
 
-    # ✅ CORS CONFIG (MAIN FIX)
+    #  CORS CONFIG (MAIN FIX)
     origins = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "http://localhost:5173",   # Vite
-        "http://localhost:4200",   # Angular
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4200",
         "https://infrapilot.in",
+        "https://infra-pilot.netlify.app",
     ]
 
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
+        allow_origins=origins,        # using defined list (NO override)
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

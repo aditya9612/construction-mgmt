@@ -1,8 +1,8 @@
+from decimal import Decimal
 from fastapi import APIRouter, Depends
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date
-
 from app.db.session import get_db_session
 from app.models.billing import RABill
 from app.models.project import Project
@@ -138,18 +138,22 @@ async def create_ra_bill(
         if work_order.total_quantity:
             progress = float((obj.quantity / work_order.total_quantity) * 100)
 
-        total_billed_qty = float(
+        total_billed_qty = (
             await db.scalar(
                 select(func.sum(RABill.quantity)).where(
                     RABill.work_order_id == obj.work_order_id
                 )
             )
-            or 0
+            or Decimal("0")
         )
 
-        remaining_qty = float(work_order.total_quantity - total_billed_qty)
-        available_qty = float(work_order.completed_quantity - total_billed_qty)
+        remaining_qty = work_order.total_quantity - total_billed_qty
+        available_qty = work_order.completed_quantity - total_billed_qty
 
+        total_billed_qty = float(total_billed_qty)
+        remaining_qty = float(remaining_qty)
+        available_qty = float(available_qty)
+        
     return RABillOut.model_validate({
         **obj.__dict__,
         "progress_percent": round(progress, 2) if progress else None,
@@ -199,21 +203,21 @@ async def list_ra_bills(
                         (r.quantity / work_order.total_quantity) * 100
                     )
 
-                total_billed_qty = float(
+                total_billed_qty = (
                     await db.scalar(
                         select(func.sum(RABill.quantity)).where(
                             RABill.work_order_id == r.work_order_id
                         )
                     )
-                    or 0
+                    or Decimal("0")
                 )
 
-                remaining_qty = float(
-                    work_order.total_quantity - total_billed_qty
-                )
-                available_qty = float(
-                    work_order.completed_quantity - total_billed_qty
-                )
+                remaining_qty = work_order.total_quantity - total_billed_qty
+                available_qty = work_order.completed_quantity - total_billed_qty
+
+                total_billed_qty = float(total_billed_qty)
+                remaining_qty = float(remaining_qty)
+                available_qty = float(available_qty)
 
         items.append(
             RABillOut.model_validate({
@@ -269,21 +273,21 @@ async def get_ra_bill(
                     (obj.quantity / work_order.total_quantity) * 100
                 )
 
-            total_billed_qty = float(
+            total_billed_qty = (
                 await db.scalar(
                     select(func.sum(RABill.quantity)).where(
                         RABill.work_order_id == obj.work_order_id
                     )
                 )
-                or 0
+                or Decimal("0")
             )
 
-            remaining_qty = float(
-                work_order.total_quantity - total_billed_qty
-            )
-            available_qty = float(
-                work_order.completed_quantity - total_billed_qty
-            )
+            remaining_qty = work_order.total_quantity - total_billed_qty
+            available_qty = work_order.completed_quantity - total_billed_qty
+
+            total_billed_qty = float(total_billed_qty)
+            remaining_qty = float(remaining_qty)
+            available_qty = float(available_qty)
 
     return RABillOut.model_validate({
         **obj.__dict__,

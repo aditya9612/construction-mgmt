@@ -3077,7 +3077,6 @@ async def submit_dsr(
     obj.status = "Submitted"
 
     await db.flush()
-    # await db.commit() 
 
     return {"message": "DSR submitted successfully"}
 
@@ -3104,7 +3103,6 @@ async def approve_dsr(
     obj.status = "Approved"
 
     await db.flush()
-    # await db.commit()
 
     return {"message": "DSR approved successfully"}
 
@@ -3131,7 +3129,6 @@ async def reject_dsr(
     obj.status = "Draft"
 
     await db.flush()
-    # await db.commit() 
 
     return {"message": "DSR rejected and moved to draft"}
 
