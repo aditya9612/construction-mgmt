@@ -7,6 +7,9 @@ class AppError(Exception):
     status_code: int
     message: str
 
+    def __str__(self):
+        return self.message
+
 
 class NotFoundError(AppError):
     def __init__(self, message: str = "Not found"):

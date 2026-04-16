@@ -76,6 +76,7 @@ class ProjectUpdate(BaseSchema):
 
 class ProjectOut(BaseSchema):
     id: int
+    business_id: str = Field(..., description="Auto-generated project ID (PRJ001)")
     project_name: str
     owner_id: int
     description: Optional[str]
@@ -83,6 +84,12 @@ class ProjectOut(BaseSchema):
     end_date: Optional[date]
     status: str
     completion_percentage: float = 0.0
+
+    @field_validator("business_id")
+    def validate_business_id(cls, v):
+        if not v.startswith("PRJ"):
+            raise ValueError("Invalid project ID format")
+        return v
 
     class Config:
         from_attributes = True
@@ -305,6 +312,7 @@ class DSROut(DSRBase):
     updated_at: datetime
     created_by_id: Optional[int] = None
     created_by_name: Optional[str] = None
+    status: str = "Draft"
 
     latitude: Optional[float] = None
     longitude: Optional[float] = None

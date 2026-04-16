@@ -4,7 +4,7 @@ from typing import Optional
 from datetime import date
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select, extract
+from sqlalchemy import func, select, extract, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache import redis as r
 from app.core import dependencies as d
@@ -21,8 +21,9 @@ from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
 from app.core.logger import logger
 import pandas as pd
-from app.utils.common import assert_project_access , generate_business_id
+from app.utils.common import assert_project_access, generate_business_id
 from app.models.project import Project, ProjectMember
+from sqlalchemy.exc import IntegrityError
 
 
 async def get_user_project_ids(db, user):
@@ -64,13 +65,6 @@ async def create_labour(
 
     data = payload.model_dump(exclude_unset=True)
 
-    data["worker_code"] = await generate_business_id(
-        db,
-        Labour,
-        "worker_code",
-        "LAB"
-    )
-
     if payload.contractor_id:
         contractor = await db.get(Contractor, payload.contractor_id)
         if not contractor:
@@ -83,30 +77,43 @@ async def create_labour(
         current_user=current_user,
     )
 
-    obj = Labour(**data)
-    db.add(obj)
+    for _ in range(3):
+        try:
+            data["worker_code"] = await generate_business_id(
+                db, Labour, "worker_code", "LAB"
+            )
 
-    try:
-        await db.flush()
-        await db.refresh(obj)
+            obj = Labour(**data)
+            db.add(obj)
 
-        await r.bump_cache_version(redis, "dashboard_version")
+            await db.flush()
+            await db.refresh(obj)
 
-    except Exception:
-        await db.rollback()
-        logger.exception("Labour creation failed")
-        raise
+            await r.bump_cache_version(redis, "dashboard_version")
 
-    logger.info(f"Labour created id={obj.id}")
+            logger.info(f"Labour created id={obj.id}")
 
-    return s.LabourOut.model_validate(obj)
+            return s.LabourOut.model_validate(obj)
+
+        except IntegrityError as e:
+            await db.rollback()
+
+            if "uq_project_aadhaar" in str(e.orig):
+                raise ValidationError(
+                    "Labour with same Aadhaar already exists in this project"
+                )
+
+            continue
+
+    raise Exception("Failed to create labour with unique worker_code")
+
 
 @router.get("", response_model=PaginatedResponse[s.LabourOut])
 async def list_labour(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     search: Optional[str] = None,
-    status: Optional[LabourStatus] = None, 
+    status: Optional[LabourStatus] = None,
     project_id: Optional[int] = None,
     current_user: User = Depends(d.get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
@@ -121,9 +128,7 @@ async def list_labour(
 
     status_key = status.value if status else None
 
-    cache_key = (
-        f"cache:labour:list:{version}:{limit}:{offset}:{search}:{status_key}:{project_id}"
-    )
+    cache_key = f"cache:labour:list:{version}:{limit}:{offset}:{search}:{status_key}:{project_id}"
 
     cached = await r.cache_get_json(redis, cache_key)
     if cached:
@@ -132,9 +137,13 @@ async def list_labour(
     query = select(Labour)
     count_query = select(func.count()).select_from(Labour)
 
-    project_ids = await get_user_project_ids(db, current_user)
-    query = query.where(Labour.project_id.in_(project_ids))
-    count_query = count_query.where(Labour.project_id.in_(project_ids))
+    if current_user.role != UserRole.ADMIN:
+        query = query.join(
+            ProjectMember, ProjectMember.project_id == Labour.project_id
+        ).where(ProjectMember.user_id == current_user.id)
+        count_query = count_query.join(
+            ProjectMember, ProjectMember.project_id == Labour.project_id
+        ).where(ProjectMember.user_id == current_user.id)
 
     if search:
         like = f"%{search}%"
@@ -322,7 +331,6 @@ async def create_attendance(
 
     if payload.overtime_rate < 0:
         raise ValidationError("Overtime rate cannot be negative")
-
 
     if payload.working_hours + payload.overtime_hours > 24:
         raise ValidationError("Total hours cannot exceed 24")
@@ -573,14 +581,19 @@ async def generate_payroll(
         if not rows:
             return []
 
+        labour_ids = list({r.labour_id for r in rows})
+        labour_result = await db.execute(
+            select(Labour).where(Labour.id.in_(labour_ids))
+        )
+        labour_map = {l.id: l for l in labour_result.scalars().all()}
+
         payroll_map = {}
-        labour_cache = {}
 
         for r in rows:
-            if r.labour_id not in labour_cache:
-                labour_cache[r.labour_id] = await db.get(Labour, r.labour_id)
+            labour = labour_map.get(r.labour_id)
+            if not labour:
+                continue
 
-            labour = labour_cache[r.labour_id]
             hourly_rate = labour.daily_wage_rate / Decimal("8")
 
             wage = hourly_rate * r.working_hours + r.overtime_rate * r.overtime_hours
@@ -634,21 +647,16 @@ async def generate_payroll(
                 )
             )
 
-
             if existing:
                 existing.total_working_hours = data["working_hours"]
                 existing.total_overtime_hours = data["overtime_hours"]
                 existing.total_wage = total_wage
-
                 existing.paid_amount = advance
-
                 existing.remaining_amount = remaining_salary
                 existing.status = status
 
                 await db.flush()
-
                 output.append(existing)
-
                 continue
 
             obj = LabourPayroll(
@@ -666,7 +674,6 @@ async def generate_payroll(
 
             db.add(obj)
             await db.flush()
-
             output.append(obj)
 
         await r.bump_cache_version(redis, VERSION_KEY)
@@ -693,22 +700,31 @@ async def bulk_attendance(
     success = []
     errors = []
 
+    labour_ids = list({item.labour_id for item in payload.items})
+    labour_result = await db.execute(select(Labour).where(Labour.id.in_(labour_ids)))
+    labour_map = {l.id: l for l in labour_result.scalars().all()}
+
+    attendance_keys = [(item.labour_id, item.attendance_date) for item in payload.items]
+
+    existing_result = await db.execute(
+        select(LabourAttendance.labour_id, LabourAttendance.attendance_date).where(
+            tuple_(LabourAttendance.labour_id, LabourAttendance.attendance_date).in_(
+                attendance_keys
+            )
+        )
+    )
+    existing_set = set(existing_result.all())
+
     for idx, item in enumerate(payload.items):
 
         try:
             await assert_project_access(db, item.project_id, current_user)
 
-            labour = await db.get(Labour, item.labour_id)
+            labour = labour_map.get(item.labour_id)
             if not labour:
                 raise ValidationError("Labour not found")
 
-            existing = await db.scalar(
-                select(LabourAttendance).where(
-                    LabourAttendance.labour_id == item.labour_id,
-                    LabourAttendance.attendance_date == item.attendance_date,
-                )
-            )
-            if existing:
+            if (item.labour_id, item.attendance_date) in existing_set:
                 raise ValidationError("Attendance already exists")
 
             if item.attendance_date > date.today():
@@ -825,9 +841,7 @@ async def pay_salary(
     )
 
     payroll.status = (
-        PayrollStatus.PAID
-        if payroll.remaining_amount == 0
-        else PayrollStatus.PARTIAL
+        PayrollStatus.PAID if payroll.remaining_amount == 0 else PayrollStatus.PARTIAL
     )
 
     await db.flush()
@@ -927,7 +941,11 @@ async def get_labour_by_contractor(
     rows = result.scalars().all()
 
     for r in rows:
-        await assert_project_access(db, r.project_id, current_user)
+        await assert_project_access(
+            db,
+            project_id=r.project_id,
+            current_user=current_user,
+        )
 
     return [s.LabourOut.model_validate(r) for r in rows]
 

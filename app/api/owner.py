@@ -24,6 +24,8 @@ from reportlab.lib.styles import getSampleStyleSheet
 import csv
 from fastapi.responses import StreamingResponse
 from app.core.logger import logger
+from app.utils.common import generate_business_id
+from sqlalchemy.exc import IntegrityError
 
 router = APIRouter(
     prefix="/owners",
@@ -38,25 +40,29 @@ async def create_owner(
 ):
     logger.info(f"Creating owner name={payload.owner_name}")
 
-    obj = Owner(**payload.model_dump())
+    data = payload.model_dump()
 
-    try:
-        db.add(obj)
-        await db.flush()
-        await db.commit()
-        await db.refresh(obj)
-    except IntegrityError:
-        await db.rollback()
-        logger.warning("Owner creation failed - duplicate mobile")
-        raise ValidationError("Mobile number already exists")
-    except Exception:
-        await db.rollback()
-        logger.exception("Owner creation failed")
-        raise
+    for _ in range(3):
+        try:
+            data["owner_code"] = await generate_business_id(
+                db, Owner, "owner_code", "OWN"
+            )
 
-    logger.info(f"Owner created id={obj.id}")
+            obj = Owner(**data)
 
-    return OwnerOut.model_validate(obj)
+            db.add(obj)
+            await db.flush()
+            await db.refresh(obj)
+
+            logger.info(f"Owner created id={obj.id}")
+
+            return OwnerOut.model_validate(obj)
+
+        except IntegrityError:
+            await db.rollback()
+            logger.warning("Retrying owner creation due to duplicate owner_code")
+
+    raise Exception("Failed to create owner with unique owner_code")
 
 
 @router.get("", response_model=list[OwnerOut])
@@ -109,7 +115,6 @@ async def update_owner(
 
     try:
         await db.flush()
-        await db.commit()
         await db.refresh(obj)
     except IntegrityError:
         await db.rollback()
@@ -141,7 +146,6 @@ async def delete_owner(
     try:
         await db.delete(obj)
         await db.flush()
-        await db.commit()
     except Exception:
         await db.rollback()
         logger.exception(f"Owner delete failed id={owner_id}")

@@ -11,7 +11,7 @@ class Contractor(Base):
     contractor_id = Column(String(50), unique=True, nullable=False, index=True)
     name = Column(String(100), nullable=False)
     work_type = Column(String(50), nullable=False)
-    contact_number = Column(String(15), nullable=False)
+    contact_number = Column(String(15), nullable=False, unique=True, index=True)
     gst_number = Column(String(20), nullable=True)
     rate_type = Column(String(50), nullable=False)
 

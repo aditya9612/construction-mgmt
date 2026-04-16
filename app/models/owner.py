@@ -10,6 +10,8 @@ class Owner(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
+    owner_code = Column(String(20), unique=True, nullable=False, index=True)
+
     owner_name = Column(String(100), nullable=False)
     mobile = Column(String(20), nullable=False, unique=True, index=True)
     email = Column(String(100), nullable=True)

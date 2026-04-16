@@ -2,7 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from decimal import Decimal
 from datetime import date
 from app.core.dependencies import get_current_active_user, require_roles
@@ -18,6 +18,7 @@ from app.core.logger import logger
 from app.utils.common import assert_project_access, generate_business_id , validate_contractor_access
 from app.utils.helpers import NotFoundError, PermissionDeniedError
 from app.utils.pagination import PaginationParams
+from sqlalchemy.exc import IntegrityError
 
 
 CONTRACTOR_CREATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
@@ -59,23 +60,32 @@ def build_response(contractor: Contractor) -> ContractorOut:
 
 @router.post("", response_model=ContractorOut)
 async def create_contractor(
-    data: ContractorCreate, db: AsyncSession = Depends(get_db_session) , current_user: User =Depends(require_roles(CONTRACTOR_CREATE_ROLES)),
+    data: ContractorCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(CONTRACTOR_CREATE_ROLES)),
 ):
     logger.info(f"Creating contractor name={data.name}")
 
     payload = data.model_dump()
 
-    payload["contractor_id"] = await generate_business_id(
-        db, Contractor, "contractor_id", "CNT"
-    )
+    for _ in range(3):  # retry for race condition safety
+        try:
+            payload["contractor_id"] = await generate_business_id(
+                db, Contractor, "contractor_id", "CNT"
+            )
 
-    contractor = Contractor(**payload)
+            contractor = Contractor(**payload)
 
-    db.add(contractor)
-    await db.flush()
-    await db.refresh(contractor)
+            db.add(contractor)
+            await db.flush()
+            await db.refresh(contractor)
 
-    return build_response(contractor)
+            return build_response(contractor)
+
+        except IntegrityError:
+            await db.rollback()
+
+    raise Exception("Failed to create contractor with unique ID")
 
 
 @router.get("/pending-report")
@@ -87,7 +97,17 @@ async def pending_report(
 ):
     params = PaginationParams(limit=limit, offset=offset).normalized()
 
-    query = select(Contractor).limit(params.limit).offset(params.offset)
+    query = select(Contractor)
+
+    if current_user.role != UserRole.ADMIN:
+        query = (
+            query.join(ContractorProject)
+            .join(ProjectMember)
+            .where(ProjectMember.user_id == current_user.id)
+            .distinct()
+        )
+
+    query = query.limit(params.limit).offset(params.offset)
 
     result = await db.execute(query)
     contractors = result.scalars().all()
@@ -95,21 +115,16 @@ async def pending_report(
     output = []
 
     for c in contractors:
-        try:
-            await validate_contractor_access(db, c.id, current_user)
+        pending = (c.total_work_assigned or 0) - (c.payment_given or 0)
 
-            pending = (c.total_work_assigned or 0) - (c.payment_given or 0)
-
-            if pending > 0:
-                output.append(
-                    {
-                        "id": c.id,
-                        "name": c.name,
-                        "pending": pending,
-                    }
-                )
-        except:
-            continue
+        if pending > 0:
+            output.append(
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "pending": pending,
+                }
+            )
 
     return output
 
@@ -126,6 +141,14 @@ async def list_contractors(
 
     query = select(Contractor)
 
+    if current_user.role != UserRole.ADMIN:
+        query = (
+            query.join(ContractorProject)
+            .join(ProjectMember)
+            .where(ProjectMember.user_id == current_user.id)
+            .distinct()
+        )
+
     if params.search:
         query = query.where(Contractor.name.ilike(f"%{params.search}%"))
 
@@ -134,16 +157,7 @@ async def list_contractors(
     result = await db.execute(query)
     contractors = result.scalars().all()
 
-    filtered = []
-
-    for c in contractors:
-        try:
-            await validate_contractor_access(db, c.id, current_user)
-            filtered.append(c)
-        except:
-            continue
-
-    return [build_response(c) for c in filtered]
+    return [build_response(c) for c in contractors]
 
 
 @router.get("/{contractor_id}", response_model=ContractorOut)
@@ -474,7 +488,7 @@ async def contractor_ledger(
     expenses = await db.execute(
         select(Expense).where(
             Expense.category == "Contractor",
-            Expense.description.contains(f"{contractor.id}"),
+            Expense.description.contains(contractor.contractor_id),
         )
     )
 
@@ -542,20 +556,126 @@ async def contractor_dashboard(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-    if not contractor:
-        raise NotFoundError("Contractor not found")
+    from app.models.billing import RABill
+    from app.utils.common import validate_contractor_access
+    from sqlalchemy import func
 
+    #  access control
     await validate_contractor_access(db, contractor_id, current_user)
 
-    total = float(contractor.total_work_assigned or 0)
-    paid = float(contractor.payment_given or 0)
+    # ======================
+    # AMOUNTS
+    # ======================
+    total = await db.scalar(
+        select(func.sum(RABill.total_amount)).where(
+            RABill.contractor_id == contractor_id
+        )
+    ) or 0
+
+    pending = await db.scalar(
+        select(func.sum(RABill.total_amount)).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status.in_(["Draft", "Submitted"]),
+        )
+    ) or 0
+
+    approved = await db.scalar(
+        select(func.sum(RABill.total_amount)).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status == "Approved",
+        )
+    ) or 0
+
+    paid = await db.scalar(
+        select(func.sum(RABill.total_amount)).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status == "Paid",
+        )
+    ) or 0
+
+    # ======================
+    #  NUMBER OF BILLS
+    # ======================
+    total_bills = await db.scalar(
+        select(func.count()).where(
+            RABill.contractor_id == contractor_id
+        )
+    ) or 0
+
+    pending_bills = await db.scalar(
+        select(func.count()).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status.in_(["Draft", "Submitted"]),
+        )
+    ) or 0
+
+    approved_bills = await db.scalar(
+        select(func.count()).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status == "Approved",
+        )
+    ) or 0
+
+    paid_bills = await db.scalar(
+        select(func.count()).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status == "Paid",
+        )
+    ) or 0
+
+    # ======================
+    # LAST PAYMENT DATE
+    # ======================
+    last_payment_date = await db.scalar(
+        select(func.max(RABill.bill_date)).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status == "Paid",
+        )
+    )
+
+    # ======================
+    #  OVERDUE BILLS
+    # ======================
+    from datetime import date, timedelta
+
+    overdue_threshold = date.today() - timedelta(days=30)
+
+    overdue_amount = await db.scalar(
+        select(func.sum(RABill.total_amount)).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status.in_(["Submitted", "Approved"]),
+            RABill.bill_date < overdue_threshold,
+        )
+    ) or 0
+
+    overdue_count = await db.scalar(
+        select(func.count()).where(
+            RABill.contractor_id == contractor_id,
+            RABill.status.in_(["Submitted", "Approved"]),
+            RABill.bill_date < overdue_threshold,
+        )
+    ) or 0
 
     return {
-        "contractor_id": contractor.id,
-        "name": contractor.name,
-        "total_work": total,
-        "paid": paid,
-        "pending": total - paid,
-        "completion_percent": round((paid / total * 100) if total else 0, 2),
+        # 🔹 basic
+        "contractor_id": contractor_id,
+
+        # amounts
+        "total_amount": float(total),
+        "pending_amount": float(pending),
+        "approved_amount": float(approved),
+        "paid_amount": float(paid),
+
+        #  counts
+        "total_bills": total_bills,
+        "pending_bills": pending_bills,
+        "approved_bills": approved_bills,
+        "paid_bills": paid_bills,
+
+        #  last payment
+        "last_payment_date": last_payment_date,
+
+        #  overdue
+        "overdue_amount": float(overdue_amount),
+        "overdue_count": overdue_count,
     }

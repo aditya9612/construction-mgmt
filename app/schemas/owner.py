@@ -51,6 +51,7 @@ class OwnerUpdate(BaseSchema):
 # -------------------------
 class OwnerOut(BaseSchema):
     id: int
+    owner_code: str
     owner_name: str
     mobile: str
     email: Optional[EmailStr]

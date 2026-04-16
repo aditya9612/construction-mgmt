@@ -33,6 +33,10 @@ class Project(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
+    business_id: Mapped[str] = mapped_column(
+        String(20), unique=True, nullable=False, index=True
+    )
+
     project_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -284,6 +288,8 @@ class DailySiteReport(Base, TimestampMixin):
     )
 
     contractor: Mapped[Optional["Contractor"]] = relationship("Contractor")
+
+    status = Column(String(20), default="Draft", index=True)
 
     total_labour = Column(Integer, default=0)
     skilled_labour = Column(Integer, default=0)

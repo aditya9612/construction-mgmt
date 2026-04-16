@@ -12,4 +12,6 @@ from app.models.contractor import Contractor
 from app.models.expense import Expense
 from app.models.invoice import Invoice
 from app.models.final_measurement import FinalMeasurement
-from app.models.ra_bill import RABill
+from app.models.billing import RABill
+from app.models.approval import Approval
+from app.models.work_order import WorkOrder

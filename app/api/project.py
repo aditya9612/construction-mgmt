@@ -23,6 +23,7 @@ from app.core.dependencies import (
 )
 from sqlalchemy import select, func, or_
 from app.models import project as m
+from app.models.contractor import Contractor
 from app.models.user import User, UserRole
 from app.models.owner import Owner
 from app.models.expense import Expense
@@ -43,7 +44,7 @@ from app.utils.helpers import (
     ValidationError,
 )
 from app.utils.pagination import PaginationParams
-from app.utils.common import assert_project_access
+from app.utils.common import assert_project_access, generate_business_id
 
 
 def compute_project_status(project):
@@ -86,6 +87,7 @@ TASK_DELETE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
 DSR_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 DSR_READ_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 DSR_DELETE_ROLES = [UserRole.ADMIN]
+DSR_APPROVE_ROLES = [UserRole.ADMIN,UserRole.PROJECT_MANAGER,]
 ISSUE_CREATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 ISSUE_UPDATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
 ISSUE_DELETE_ROLES = [UserRole.ADMIN]
@@ -477,11 +479,25 @@ class ProjectsService:
             if payload.end_date < payload.start_date:
                 raise ValidationError("end_date cannot be before start_date")
 
-        try:
-            obj = await self.projects_repo.create_project(db, data)
-        except IntegrityError:
-            await db.rollback()
-            raise ConflictError("Project with this name already exists")
+        for _ in range(3):
+            try:
+                data["business_id"] = await generate_business_id(
+                    db, m.Project, "business_id", "PRJ"
+                )
+
+                obj = await self.projects_repo.create_project(db, data)
+                break
+
+            except IntegrityError as e:
+                await db.rollback()
+
+                # Optional: if name conflict (keep your logic)
+                if "project_name" in str(e.orig):
+                    raise ConflictError("Project with this name already exists")
+
+                continue
+        else:
+            raise Exception("Failed to generate unique project ID")
 
         completion_map = await self._compute_completion_percentage_by_project_ids(
             db, [obj.id]
@@ -489,6 +505,7 @@ class ProjectsService:
         completion = completion_map.get(obj.id, 0.0)
         return s.ProjectOut(
             id=obj.id,
+            business_id=obj.business_id,
             project_name=obj.project_name,
             owner_id=obj.owner_id,
             description=obj.description,
@@ -543,6 +560,7 @@ class ProjectsService:
         items = [
             s.ProjectOut(
                 id=p.id,
+                business_id=p.business_id,
                 project_name=p.project_name,
                 owner_id=p.owner_id,
                 description=p.description,
@@ -581,6 +599,7 @@ class ProjectsService:
 
         return s.ProjectOut(
             id=obj.id,
+            business_id=obj.business_id,
             project_name=obj.project_name,
             owner_id=obj.owner_id,
             description=obj.description,
@@ -621,6 +640,7 @@ class ProjectsService:
         completion = completion_map.get(obj.id, 0.0)
         return s.ProjectOut(
             id=obj.id,
+            business_id=obj.business_id,
             project_name=obj.project_name,
             owner_id=obj.owner_id,
             description=obj.description,
@@ -2531,7 +2551,7 @@ async def get_project_dsr(
         dsr = s.DSROut.model_validate(row)
 
         if row.contractor:
-            dsr.contractor_name = row.contractor.contractor_name
+            dsr.contractor_name = row.contractor.name
 
         if row.created_by:
             dsr.created_by_name = row.created_by.full_name
@@ -2604,6 +2624,9 @@ async def update_dsr(
     if not obj:
         raise NotFoundError("DSR not found")
 
+    if obj.status == "Approved":
+        raise ValidationError("Cannot update approved DSR")
+
     await assert_project_access(db, obj.project_id, current_user)
 
     if payload.report_date:
@@ -2636,7 +2659,7 @@ async def update_dsr(
     dsr_out = s.DSROut.model_validate(obj)
 
     if obj.contractor:
-        dsr_out.contractor_name = obj.contractor.contractor_name
+        dsr_out.contractor_name = obj.contractor.name
 
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
@@ -2752,7 +2775,7 @@ async def labour_trend(
 
     query = select(
         m.DailySiteReport.report_date,
-        func.sum(m.DailySiteReport.labour_count),
+        func.sum(m.DailySiteReport.total_labour),
     ).where(m.DailySiteReport.project_id == project_id)
 
     if start_date:
@@ -2788,10 +2811,15 @@ async def contractor_analytics(
     if start_date and end_date and end_date < start_date:
         raise BadRequestError("end_date cannot be before start_date")
 
-    query = select(
-        m.DailySiteReport.contractor_name,
-        func.count(),
-    ).where(m.DailySiteReport.project_id == project_id)
+    query = (
+        select(
+            Contractor.name,
+            func.count(),
+        )
+        .join(Contractor, Contractor.id == m.DailySiteReport.contractor_id)
+        .where(m.DailySiteReport.project_id == project_id)
+        .group_by(Contractor.name)
+    )
 
     if start_date:
         query = query.where(m.DailySiteReport.report_date >= start_date)
@@ -2799,7 +2827,7 @@ async def contractor_analytics(
     if end_date:
         query = query.where(m.DailySiteReport.report_date <= end_date)
 
-    query = query.group_by(m.DailySiteReport.contractor_name)
+    query = query.group_by(Contractor.name)
 
     result = await db.execute(query)
     rows = result.all()
@@ -2818,7 +2846,7 @@ async def delete_dsr(
     id: int,
     current_user: User = Depends(require_roles(DSR_DELETE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
-    redis = Depends(get_request_redis),   # ✅ ADD THIS
+    redis = Depends(get_request_redis), 
 ):
     logger.info(f"Deleting DSR id={id}")
 
@@ -2908,8 +2936,12 @@ async def export_dsr_excel(
 
     if contractor_name:
         contractor_name = contractor_name.strip()
-        query = query.where(
-            m.DailySiteReport.contractor_name.ilike(f"%{contractor_name}%")
+
+        query = query.join(
+            Contractor,
+            Contractor.id == m.DailySiteReport.contractor_id
+        ).where(
+            Contractor.name.ilike(f"%{contractor_name}%")
         )
 
     query = query.order_by(m.DailySiteReport.report_date.desc())
@@ -2967,6 +2999,70 @@ async def export_dsr_excel(
             "Content-Disposition": f"attachment; filename=dsr_project_{project_id}.xlsx"
         },
     )
+
+@dsr_router.put("/{id}/submit")
+async def submit_dsr(
+    id: int,
+    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.DailySiteReport, id)
+
+    if not obj:
+        raise NotFoundError("DSR not found")
+
+    await assert_project_access(db, obj.project_id, current_user)
+
+    if obj.status != "Draft":
+        raise ValidationError("Only draft DSR can be submitted")
+
+    obj.status = "Submitted"
+
+    await db.flush()
+
+    return {"message": "DSR submitted successfully"}
+
+@dsr_router.put("/{id}/approve")
+async def approve_dsr(
+    id: int,
+    current_user: User = Depends(require_roles(DSR_APPROVE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.DailySiteReport, id)
+
+    if not obj:
+        raise NotFoundError("DSR not found")
+
+    await assert_project_access(db, obj.project_id, current_user)
+
+    if obj.status != "Submitted":
+        raise ValidationError("DSR must be submitted before approval")
+
+    obj.status = "Approved"
+
+    await db.flush()
+
+    return {"message": "DSR approved successfully"}
+
+@dsr_router.put("/{id}/reject")
+async def reject_dsr(
+    id: int,
+    current_user: User = Depends(require_roles(DSR_APPROVE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.DailySiteReport, id)
+
+    if not obj:
+        raise NotFoundError("DSR not found")
+
+    if obj.status != "Submitted":
+        raise ValidationError("Only submitted DSR can be rejected")
+
+    obj.status = "Draft"
+
+    await db.flush()
+
+    return {"message": "DSR rejected and moved to draft"}
 
 
 issues_router = APIRouter(

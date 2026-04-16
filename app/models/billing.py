@@ -23,7 +23,7 @@ class RABill(Base, TimestampMixin):
         index=True,
     )
 
-    bill_number = Column(String(100), nullable=False, unique=True)
+    bill_number = Column(String(100), nullable=False, unique=True, index=True)
 
     work_description = Column(String(255), nullable=False)
 
@@ -31,9 +31,7 @@ class RABill(Base, TimestampMixin):
     rate = Column(DECIMAL(18, 2), nullable=False)
 
     gross_amount = Column(DECIMAL(18, 2), nullable=False)
-
     deductions = Column(DECIMAL(18, 2), default=0)
-
     net_amount = Column(DECIMAL(18, 2), nullable=False)
 
     gst_percent = Column(DECIMAL(5, 2), default=0)
@@ -41,7 +39,16 @@ class RABill(Base, TimestampMixin):
 
     bill_date = Column(Date, nullable=False)
 
-    status = Column(String(50), default="Submitted")
+    work_order_id = Column(
+        Integer,
+        ForeignKey("work_orders.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    status = Column(
+        String(50),
+        default="Draft"  # Draft → Submitted → Approved → Paid
+    )
 
     project = relationship("Project")
     contractor = relationship("Contractor")

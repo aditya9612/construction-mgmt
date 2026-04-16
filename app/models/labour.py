@@ -10,6 +10,7 @@ from sqlalchemy import (
     Time,
     Index,
     Enum as SAEnum,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.enums import AttendanceStatus, LabourStatus, PayrollStatus, SkillType
@@ -21,8 +22,13 @@ class Labour(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    worker_code: Mapped[str] = mapped_column(String(50), unique=True, index=True)
-    aadhaar_number: Mapped[Optional[str]] = mapped_column(String(20))
+    worker_code: Mapped[str] = mapped_column(
+        String(50), unique=True, index=True, nullable=False
+    )
+
+    aadhaar_number: Mapped[Optional[str]] = mapped_column(
+        String(20), index=True
+    )
 
     project_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True
@@ -41,6 +47,10 @@ class Labour(Base, TimestampMixin):
         SAEnum(LabourStatus), default=LabourStatus.ACTIVE
     )
     notes: Mapped[Optional[str]] = mapped_column(String(500))
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "aadhaar_number", name="uq_project_aadhaar"),
+    )
 
 
 class LabourAttendance(Base, TimestampMixin):
