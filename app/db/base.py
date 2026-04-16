@@ -15,3 +15,4 @@ from app.models.final_measurement import FinalMeasurement
 from app.models.billing import RABill
 from app.models.approval import Approval
 from app.models.work_order import WorkOrder
+from app.models.cad_conversion import CADConversion
