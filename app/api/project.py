@@ -7,6 +7,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import LabourStatus, SkillType
 from app.db.session import get_db_session
+from sqlalchemy.orm import selectinload
+import traceback
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.cache.redis import (
     bump_cache_version,
@@ -21,6 +23,7 @@ from app.core.dependencies import (
     get_request_redis,
     require_roles,
 )
+from app.models.contractor import Contractor
 from sqlalchemy import select, func, or_
 from app.models import project as m
 from app.models.contractor import Contractor
@@ -38,6 +41,7 @@ from sqlalchemy.exc import IntegrityError
 from fastapi import UploadFile, File
 from app.utils.helpers import (
     BadRequestError,
+    DataIntegrityError,
     NotFoundError,
     ConflictError,
     PermissionDeniedError,
@@ -2445,7 +2449,7 @@ async def create_dsr(
 
     # Contractor validation
     if payload.contractor_id:
-        contractor = await db.get(m.Contractor, payload.contractor_id)
+        contractor = await db.get(Contractor, payload.contractor_id)
         if not contractor:
             raise ValidationError("Invalid contractor_id")
 
@@ -2494,7 +2498,7 @@ async def create_dsr(
     dsr_out = s.DSROut.model_validate(obj)
 
     if obj.contractor:
-        dsr_out.contractor_name = obj.contractor.contractor_name
+        dsr_out.contractor_name = obj.contractor.name
 
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
@@ -2516,56 +2520,75 @@ async def get_project_dsr(
 ):
     logger.info(f"Fetching DSR for project_id={project_id}")
 
-    project = await db.get(m.Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found")
+    try:
+        project = await db.get(m.Project, project_id)
+        if not project:
+            raise NotFoundError("Project not found")
 
-    await assert_project_access(db, project_id, current_user)
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
 
-    version = await get_cache_version(redis, "cache_version:dsr")
-    cache_key = f"cache:dsr:list:{version}:{project_id}:{limit}:{offset}"
+        version = await get_cache_version(redis, "cache_version:dsr")
+        cache_key = f"cache:dsr:list:{version}:{project_id}:{limit}:{offset}"
 
-    cached = await cache_get_json(redis, cache_key)
-    if cached:
-        return PaginatedResponse[s.DSROut].model_validate(cached)
+        cached = await cache_get_json(redis, cache_key)
+        if cached:
+            return PaginatedResponse[s.DSROut].model_validate(cached)
 
-    query = (
-        select(m.DailySiteReport)
-        .where(m.DailySiteReport.project_id == project_id)
-        .order_by(m.DailySiteReport.report_date.desc())
-        .limit(limit)
-        .offset(offset)
-    )
+        query = (
+            select(m.DailySiteReport)
+            .options(
+                selectinload(m.DailySiteReport.contractor),
+                selectinload(m.DailySiteReport.created_by),
+            )
+            .where(m.DailySiteReport.project_id == project_id)
+            .order_by(m.DailySiteReport.report_date.desc())
+            .limit(limit)
+            .offset(offset)
+        )
 
-    count_query = (
-        select(func.count())
-        .select_from(m.DailySiteReport)
-        .where(m.DailySiteReport.project_id == project_id)
-    )
+        count_query = (
+            select(func.count())
+            .select_from(m.DailySiteReport)
+            .where(m.DailySiteReport.project_id == project_id)
+        )
 
-    total = await db.scalar(count_query)
-    rows = (await db.execute(query)).scalars().all()
+        total = await db.scalar(count_query)
+        rows = (await db.execute(query)).scalars().all()
 
-    items = []
-    for row in rows:
-        dsr = s.DSROut.model_validate(row)
+        items = []
+        for row in rows:
+            dsr = s.DSROut.model_validate(row, from_attributes=True)
 
-        if row.contractor:
-            dsr.contractor_name = row.contractor.name
+            if row.contractor:
+                dsr.contractor_name = row.contractor.name
 
-        if row.created_by:
-            dsr.created_by_name = row.created_by.full_name
+            if row.created_by:
+                dsr.created_by_name = row.created_by.full_name
 
-        items.append(dsr.model_dump())
+            items.append(dsr.model_dump())
 
-    meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
+        meta = PaginationMeta(
+            total=int(total or 0),
+            limit=limit,
+            offset=offset,
+        )
 
-    result = {"items": items, "meta": meta.model_dump()}
+        result = {
+            "items": items,
+            "meta": meta.model_dump(),
+        }
 
-    await cache_set_json(redis, cache_key, result)
+        await cache_set_json(redis, cache_key, result)
 
-    return PaginatedResponse[s.DSROut].model_validate(result)
+        return PaginatedResponse[s.DSROut].model_validate(result)
 
+    except Exception as e:
+        traceback.print_exc() 
+        raise DataIntegrityError("Data integrity issue")
 
 # =========================
 # GET DSR BY ID
@@ -2586,17 +2609,30 @@ async def get_dsr(
     if cached:
         return s.DSROut.model_validate(cached)
 
-    obj = await db.get(m.DailySiteReport, id)
+    result = await db.execute(
+        select(m.DailySiteReport)
+        .options(
+            selectinload(m.DailySiteReport.contractor),
+            selectinload(m.DailySiteReport.created_by),
+        )
+        .where(m.DailySiteReport.id == id)
+    )
+
+    obj = result.scalar_one_or_none()
 
     if not obj:
         raise NotFoundError("DSR not found")
 
-    await assert_project_access(db, obj.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
-    dsr_out = s.DSROut.model_validate(obj)
+    dsr_out = s.DSROut.model_validate(obj, from_attributes=True)
 
     if obj.contractor:
-        dsr_out.contractor_name = obj.contractor.contractor_name
+        dsr_out.contractor_name = obj.contractor.name
 
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
@@ -2619,7 +2655,16 @@ async def update_dsr(
 ):
     logger.info(f"Updating DSR id={id}")
 
-    obj = await db.get(m.DailySiteReport, id)
+    result = await db.execute(
+        select(m.DailySiteReport)
+        .options(
+            selectinload(m.DailySiteReport.contractor),
+            selectinload(m.DailySiteReport.created_by),
+        )
+        .where(m.DailySiteReport.id == id)
+    )
+
+    obj = result.scalar_one_or_none()
 
     if not obj:
         raise NotFoundError("DSR not found")
@@ -2627,7 +2672,11 @@ async def update_dsr(
     if obj.status == "Approved":
         raise ValidationError("Cannot update approved DSR")
 
-    await assert_project_access(db, obj.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
     if payload.report_date:
         existing = await db.scalar(
@@ -2656,7 +2705,7 @@ async def update_dsr(
     await db.refresh(obj)
     await bump_cache_version(redis, "cache_version:dsr")
 
-    dsr_out = s.DSROut.model_validate(obj)
+    dsr_out = s.DSROut.model_validate(obj, from_attributes=True)
 
     if obj.contractor:
         dsr_out.contractor_name = obj.contractor.name
@@ -2811,14 +2860,20 @@ async def contractor_analytics(
     if start_date and end_date and end_date < start_date:
         raise BadRequestError("end_date cannot be before start_date")
 
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
+
     query = (
         select(
             Contractor.name,
-            func.count(),
+            func.count(m.DailySiteReport.id),
         )
-        .join(Contractor, Contractor.id == m.DailySiteReport.contractor_id)
+        .select_from(m.DailySiteReport)
+        .join(Contractor, Contractor.id == m.DailySiteReport.contractor_id, isouter=True)
         .where(m.DailySiteReport.project_id == project_id)
-        .group_by(Contractor.name)
     )
 
     if start_date:
@@ -2839,7 +2894,6 @@ async def contractor_analytics(
         }
         for r in rows
     ]
-
 
 @dsr_router.delete("/{id}")
 async def delete_dsr(
@@ -3011,7 +3065,11 @@ async def submit_dsr(
     if not obj:
         raise NotFoundError("DSR not found")
 
-    await assert_project_access(db, obj.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
     if obj.status != "Draft":
         raise ValidationError("Only draft DSR can be submitted")
@@ -3019,6 +3077,7 @@ async def submit_dsr(
     obj.status = "Submitted"
 
     await db.flush()
+    # await db.commit() 
 
     return {"message": "DSR submitted successfully"}
 
@@ -3033,7 +3092,11 @@ async def approve_dsr(
     if not obj:
         raise NotFoundError("DSR not found")
 
-    await assert_project_access(db, obj.project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
 
     if obj.status != "Submitted":
         raise ValidationError("DSR must be submitted before approval")
@@ -3041,6 +3104,7 @@ async def approve_dsr(
     obj.status = "Approved"
 
     await db.flush()
+    # await db.commit()
 
     return {"message": "DSR approved successfully"}
 
@@ -3055,12 +3119,19 @@ async def reject_dsr(
     if not obj:
         raise NotFoundError("DSR not found")
 
+    await assert_project_access(
+        db,
+        project_id=obj.project_id,
+        current_user=current_user,
+    )
+
     if obj.status != "Submitted":
         raise ValidationError("Only submitted DSR can be rejected")
 
     obj.status = "Draft"
 
     await db.flush()
+    # await db.commit() 
 
     return {"message": "DSR rejected and moved to draft"}
 
