@@ -31,3 +31,4 @@ reportlab
 pydantic[email]>=2.1.0
 openpyxl
 pandas
+ezdxf
