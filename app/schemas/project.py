@@ -308,11 +308,12 @@ class DSRUpdate(BaseSchema):
 
 class DSROut(DSRBase):
     id: int
+    business_id: str
     created_at: datetime
     updated_at: datetime
     created_by_id: Optional[int] = None
     created_by_name: Optional[str] = None
-    status: str = "Draft"
+    status: str
 
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -385,6 +386,7 @@ class IssueUpdate(BaseSchema):
 
 class IssueOut(IssueBase):
     id: int
+    business_id: str
     status: IssueStatus
     assigned_to: Optional[int]
     resolution: Optional[str]

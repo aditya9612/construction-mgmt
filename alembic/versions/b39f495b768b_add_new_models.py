@@ -83,6 +83,17 @@ def upgrade():
     op.create_index(op.f('ix_dsr_labour_labour_id'), 'dsr_labour', ['labour_id'], unique=False)
     op.create_index(op.f('ix_contractors_contact_number'), 'contractors', ['contact_number'], unique=True)
     op.add_column('daily_site_reports', sa.Column('created_by_id', sa.Integer(), nullable=True))
+    op.add_column(
+        'daily_site_reports',
+        sa.Column('business_id', sa.String(length=20), nullable=False)
+    )
+
+    op.create_index(
+        'ix_daily_site_reports_business_id',
+        'daily_site_reports',
+        ['business_id'],
+        unique=True
+    )
     op.add_column('daily_site_reports', sa.Column('contractor_id', sa.Integer(), nullable=True))
     op.add_column('daily_site_reports', sa.Column('status', sa.String(length=20), nullable=True))
     op.add_column('daily_site_reports', sa.Column('total_labour', sa.Integer(), nullable=True))
@@ -120,6 +131,17 @@ def upgrade():
     op.create_index(op.f('ix_owners_owner_code'), 'owners', ['owner_code'], unique=True)
     op.add_column('projects', sa.Column('business_id', sa.String(length=20), nullable=False))
     op.create_index(op.f('ix_projects_business_id'), 'projects', ['business_id'], unique=True)
+    op.add_column(
+        'issues',
+        sa.Column('business_id', sa.String(length=20), nullable=False)
+    )
+
+    op.create_index(
+        'ix_issues_business_id',
+        'issues',
+        ['business_id'],
+        unique=True
+    )
     op.add_column('ra_bills', sa.Column('work_order_id', sa.Integer(), nullable=True))
     op.create_index(op.f('ix_ra_bills_bill_number'), 'ra_bills', ['bill_number'], unique=True)
     op.create_foreign_key(None, 'ra_bills', 'work_orders', ['work_order_id'], ['id'], ondelete='SET NULL')
@@ -131,6 +153,10 @@ def downgrade():
     op.drop_constraint(None, 'ra_bills', type_='foreignkey')
     op.create_index(op.f('bill_number'), 'ra_bills', ['bill_number'], unique=True)
     op.drop_column('ra_bills', 'work_order_id')
+    op.drop_index('ix_issues_business_id', table_name='issues')
+    op.drop_column('issues', 'business_id')
+    op.drop_index('ix_daily_site_reports_business_id', table_name='daily_site_reports')
+    op.drop_column('daily_site_reports', 'business_id')
     op.drop_column('projects', 'business_id')
     op.drop_column('owners', 'owner_code')
     op.alter_column('labour_payroll', 'status',

@@ -2483,11 +2483,29 @@ async def create_dsr(
     data["skilled_labour"] = skilled
     data["unskilled_labour"] = unskilled
 
-    obj = m.DailySiteReport(**data)
+    for _ in range(3):
+        try:
+            data["business_id"] = await generate_business_id(
+                db,
+                m.DailySiteReport,
+                "business_id",
+                "DSR"
+            )
+
+            obj = m.DailySiteReport(**data)
+
+            db.add(obj)
+            await db.flush()
+            break
+
+        except IntegrityError:
+            await db.rollback()
+            continue
+    else:
+        raise Exception("Failed to generate unique DSR ID")
+
 
     try:
-        db.add(obj)
-        await db.flush()
         await db.refresh(obj)
         await bump_cache_version(redis, "cache_version:dsr")
     except Exception:
@@ -2980,7 +2998,16 @@ async def export_dsr_excel(
         current_user=current_user,
     )
 
-    query = select(m.DailySiteReport).where(m.DailySiteReport.project_id == project_id)
+    query = (
+        select(
+            m.DailySiteReport,
+            Contractor.name,
+            User.full_name
+        )
+        .join(Contractor, Contractor.id == m.DailySiteReport.contractor_id, isouter=True)
+        .join(User, User.id == m.DailySiteReport.created_by_id, isouter=True)
+        .where(m.DailySiteReport.project_id == project_id)
+    )
 
     if start_date:
         query = query.where(m.DailySiteReport.report_date >= start_date)
@@ -2990,18 +3017,14 @@ async def export_dsr_excel(
 
     if contractor_name:
         contractor_name = contractor_name.strip()
-
-        query = query.join(
-            Contractor,
-            Contractor.id == m.DailySiteReport.contractor_id
-        ).where(
+        query = query.where(
             Contractor.name.ilike(f"%{contractor_name}%")
         )
 
     query = query.order_by(m.DailySiteReport.report_date.desc())
 
     result = await db.execute(query)
-    rows = result.scalars().all()
+    rows = result.all()   # ❗ NOT scalars()
 
     if not rows:
         raise NotFoundError("No DSR data found")
@@ -3025,20 +3048,22 @@ async def export_dsr_excel(
     ]
     ws.append(headers)
 
-    for r in rows:
+    for r, contractor_name, created_by_name in rows:
         ws.append(
             [
                 str(r.report_date),
                 r.project_id,
-                r.contractor_name,
+                contractor_name,
                 r.weather,
                 r.work_done,
                 r.work_planned,
-                r.labour_count,
+                r.total_labour, 
+                r.skilled_labour,
+                r.unskilled_labour, 
                 r.material_used,
                 r.issues,
                 r.remarks,
-                r.created_by.full_name if r.created_by else None,
+                created_by_name,
             ]
         )
 
@@ -3102,7 +3127,8 @@ async def approve_dsr(
 
     obj.status = "Approved"
 
-    await db.flush()
+    await db.commit()
+    await db.refresh(obj)
 
     return {"message": "DSR approved successfully"}
 
@@ -3126,9 +3152,11 @@ async def reject_dsr(
     if obj.status != "Submitted":
         raise ValidationError("Only submitted DSR can be rejected")
 
+
     obj.status = "Draft"
 
-    await db.flush()
+    await db.commit()
+    await db.refresh(obj)
 
     return {"message": "DSR rejected and moved to draft"}
 
@@ -3175,10 +3203,27 @@ async def create_issue(
         data = payload.model_dump()
         data["title"] = title
 
-        obj = m.Issue(**data)
+        for _ in range(3):
+            try:
+                data["business_id"] = await generate_business_id(
+                    db,
+                    m.Issue,
+                    "business_id",
+                    "ISS"
+                )
 
-        db.add(obj)
-        await db.flush()
+                obj = m.Issue(**data)
+
+                db.add(obj)
+                await db.flush()
+                break
+
+            except IntegrityError:
+                await db.rollback()
+                continue
+        else:
+            raise Exception("Failed to generate unique ISSUE ID")
+
         await db.refresh(obj)
 
     except IntegrityError:

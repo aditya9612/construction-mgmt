@@ -253,6 +253,10 @@ class DailySiteReport(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
+    business_id: Mapped[str] = mapped_column(
+        String(20), unique=True, nullable=False, index=True
+    )
+
     project_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("projects.id", ondelete="CASCADE"),
@@ -390,6 +394,10 @@ class Issue(Base, TimestampMixin):
     __tablename__ = "issues"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    business_id: Mapped[str] = mapped_column(
+        String(20), unique=True, nullable=False, index=True
+    )
 
     project_id: Mapped[int] = mapped_column(
         Integer,
