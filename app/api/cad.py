@@ -1,5 +1,5 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, UploadFile, File, Depends
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.session import get_db_session
@@ -10,9 +10,7 @@ import uuid
 import ezdxf
 import pandas as pd
 from datetime import datetime
-import math
-import zipfile
-from io import BytesIO
+import matplotlib.pyplot as plt
 
 from app.models.cad_conversion import CADConversion
 from app.schemas.cad_conversion import CADConversionOut
@@ -24,193 +22,172 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-# -------------------- FORMAT DETECTION --------------------
+# -------------------- FORMAT --------------------
 def detect_columns(df):
-    if {"latitude", "longitude"}.issubset(df.columns):
-        return "latlon"
-    elif {"lat", "lon"}.issubset(df.columns):
-        return "latlon"
-    elif {"easting", "northing"}.issubset(df.columns):
+    if {"easting", "northing"}.issubset(df.columns):
         return "xy"
     elif {"x", "y"}.issubset(df.columns):
         return "xy"
     else:
-        raise ValueError("Invalid CSV format")
+        raise ValueError("CSV must contain easting/northing or x/y")
 
 
+# 🔥 FIXED (SAFE PARSING)
 def get_coordinates(row, mode):
-    if mode == "latlon":
-        return float(row.get("longitude") or row.get("lon")), float(row.get("latitude") or row.get("lat"))
-    return float(row.get("easting") or row.get("x")), float(row.get("northing") or row.get("y"))
+    try:
+        x = float(row.get("easting") or row.get("x"))
+        y = float(row.get("northing") or row.get("y"))
+        return x, y
+    except Exception:
+        return None
 
 
-# -------------------- AUTO SORT --------------------
-def sort_points(points):
-    cx = sum(p[0] for p in points) / len(points)
-    cy = sum(p[1] for p in points) / len(points)
-    return sorted(points, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+# -------------------- NORMALIZE + CENTER --------------------
+def normalize_and_center(points):
+    min_x = min(p[0] for p in points)
+    min_y = min(p[1] for p in points)
+
+    shifted = [(x - min_x, y - min_y) for x, y in points]
+
+    max_x = max(p[0] for p in shifted)
+    max_y = max(p[1] for p in shifted)
+
+    cx = max_x / 2
+    cy = max_y / 2
+
+    return [(x - cx, y - cy) for x, y in shifted]
 
 
-# -------------------- AREA --------------------
-def calculate_area(points):
-    area = 0
-    for i in range(len(points)):
-        x1, y1 = points[i]
-        x2, y2 = points[(i + 1) % len(points)]
-        area += (x1 * y2 - x2 * y1)
-    return abs(area) / 2
+# -------------------- BOUNDING BOX --------------------
+def add_bounding_box(msp, points):
+    min_x = min(p[0] for p in points)
+    max_x = max(p[0] for p in points)
+    min_y = min(p[1] for p in points)
+    max_y = max(p[1] for p in points)
+
+    pad = 10
+
+    msp.add_lwpolyline([
+        (min_x - pad, min_y - pad),
+        (max_x + pad, min_y - pad),
+        (max_x + pad, max_y + pad),
+        (min_x - pad, max_y + pad),
+        (min_x - pad, min_y - pad)
+    ], dxfattribs={"color": 3})
 
 
-# -------------------- VALIDATION --------------------
-def is_valid_polygon(points):
-    return len(points) >= 3
+# -------------------- TITLE BLOCK --------------------
+def add_title_block(msp, base_x, base_y, project_name, area):
+    w, h = 80, 40
+
+    msp.add_lwpolyline([
+        (base_x, base_y),
+        (base_x + w, base_y),
+        (base_x + w, base_y + h),
+        (base_x, base_y + h),
+        (base_x, base_y)
+    ], dxfattribs={"color": 4})
+
+    rh = h / 4
+
+    for i in range(1, 4):
+        y = base_y + i * rh
+        msp.add_line((base_x, y), (base_x + w, y), dxfattribs={"color": 4})
+
+    pad_x = 4
+    pad_y = rh / 3
+
+    msp.add_text(f"Project: {project_name}", dxfattribs={"height": 3}).set_placement((base_x + pad_x, base_y + h - rh + pad_y))
+    msp.add_text(f"Date: {datetime.now().date()}", dxfattribs={"height": 3}).set_placement((base_x + pad_x, base_y + h - 2*rh + pad_y))
+    msp.add_text(f"Area: {area:.2f}", dxfattribs={"height": 3}).set_placement((base_x + pad_x, base_y + h - 3*rh + pad_y))
+    msp.add_text("Scale: 1:1", dxfattribs={"height": 3}).set_placement((base_x + pad_x, base_y + pad_y))
 
 
-# -------------------- GRID --------------------
-def add_grid(msp, base_x, base_y):
-    for i in range(0, 100, 10):
-        msp.add_line((base_x + i, base_y), (base_x + i, base_y + 100), dxfattribs={"color": 9})
-        msp.add_line((base_x, base_y + i), (base_x + 100, base_y + i), dxfattribs={"color": 9})
+# -------------------- PREVIEW --------------------
+def generate_preview(points, output_path):
+    x = [p[0] for p in points]
+    y = [p[1] for p in points]
+
+    plt.figure(figsize=(6, 6))
+    plt.scatter(x, y, s=5)
+    plt.axis('equal')
+    plt.grid(True)
+
+    path = output_path.replace(".dxf", ".png")
+    plt.savefig(path)
+    plt.close()
+
+    return path
 
 
-# -------------------- MAIN LOGIC --------------------
-async def csv_to_dxf(file_path: str, db: AsyncSession, project_name="Survey Project") -> str:
-    df = pd.read_csv(file_path)
+# -------------------- MAIN --------------------
+async def csv_to_dxf(file_path: str, db: AsyncSession):
+    # 🔥 FIXED CSV READ
+    df = pd.read_csv(file_path, skipinitialspace=True)
+    df.columns = df.columns.str.strip().str.lower()
+    df = df.dropna()
+
     mode = detect_columns(df)
+
+    raw = []
+    for _, row in df.iterrows():
+        coords = get_coordinates(row, mode)
+        if coords:
+            raw.append(coords)
+
+    if not raw:
+        raise ValueError("No valid points found")
+
+    points = normalize_and_center(raw)
 
     doc = ezdxf.new()
     msp = doc.modelspace()
 
-    doc.layers.new("POINTS", dxfattribs={"color": 1})
-    doc.layers.new("LABELS", dxfattribs={"color": 3})
-    doc.layers.new("LINES", dxfattribs={"color": 5})
-    doc.layers.new("META", dxfattribs={"color": 4})
+    doc.header["$PDMODE"] = 0
+    doc.header["$PDSIZE"] = 0
 
-    raw_points = []
-    named_points = []
+    for x, y in points:
+        msp.add_circle((x, y), radius=0.5)
 
-    for i, row in df.iterrows():
-        try:
-            x, y = get_coordinates(row, mode)
-            name = str(row.get("name") or f"P{i+1}")
-            raw_points.append((x, y))
-            named_points.append((x, y, name))
-        except:
-            continue
+    add_bounding_box(msp, points)
 
-    if not raw_points:
-        raise ValueError("No valid points found")
+    max_x = max(p[0] for p in points)
+    max_y = max(p[1] for p in points)
 
-    points = sort_points(raw_points)
+    add_title_block(msp, max_x + 20, max_y + 20, "Survey Project", 0)
 
-    if not is_valid_polygon(points):
-        raise ValueError("Need at least 3 valid points")
+    out = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.dxf").replace("\\", "/")
+    doc.saveas(out)
 
-    for x, y, name in named_points:
-        msp.add_circle((x, y), radius=2, dxfattribs={"layer": "POINTS"})
-        msp.add_line((x - 2, y), (x + 2, y), dxfattribs={"layer": "POINTS"})
-        msp.add_line((x, y - 2), (x, y + 2), dxfattribs={"layer": "POINTS"})
+    generate_preview(points, out)
 
-        msp.add_text(name, dxfattribs={"height": 4, "layer": "LABELS"}) \
-            .set_placement((x + 3, y + 3))
-
-        msp.add_text(f"{x:.2f},{y:.2f}", dxfattribs={"height": 3, "layer": "LABELS"}) \
-            .set_placement((x + 3, y - 3))
-
-    if points[0] != points[-1]:
-        points.append(points[0])
-
-    msp.add_lwpolyline(points, dxfattribs={"layer": "LINES"})
-
-    area = calculate_area(points)
-
-    add_grid(msp, points[0][0] - 50, points[0][1] - 50)
-
-    base_x, base_y = points[0]
-
-    msp.add_text(
-        f"Project: {project_name}",
-        dxfattribs={"height": 5, "layer": "META", "color": 4, "lineweight": 50}
-    ).set_placement((base_x + 80, base_y + 40))
-
-    msp.add_text(
-        f"Date: {datetime.now().date()}",
-        dxfattribs={"height": 5, "layer": "META", "color": 4, "lineweight": 50}
-    ).set_placement((base_x + 80, base_y + 32))
-
-    msp.add_text(
-        f"Area: {area:.2f} sq.units",
-        dxfattribs={"height": 5, "layer": "META", "color": 4, "lineweight": 50}
-    ).set_placement((base_x + 80, base_y + 24))
-
-    msp.add_text(
-        "Scale: 1:1",
-        dxfattribs={"height": 5, "layer": "META", "color": 4, "lineweight": 50}
-    ).set_placement((base_x + 80, base_y + 16))
-
-    output_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.dxf")
-    doc.saveas(output_path)
-
-    db_obj = CADConversion(
-        project_name=project_name,
-        file_path=output_path,
-        area=area
-    )
-    db.add(db_obj)
+    db.add(CADConversion(project_name="Survey", file_path=out, area=0))
     await db.commit()
 
-    return output_path
+    return out
 
 
-# -------------------- MULTI FILE --------------------
-@router.post("/upload-multiple")
-async def convert_multiple(files: list[UploadFile] = File(...), db: AsyncSession = Depends(get_db_session)):
-    outputs = []
-
-    for file in files:
-        temp_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4()}.csv")
-
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        try:
-            dxf_path = await csv_to_dxf(temp_path, db, project_name=file.filename)
-            outputs.append(dxf_path)
-        finally:
-            os.remove(temp_path)
-
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-        for path in outputs:
-            zip_file.write(path, os.path.basename(path))
-
-    zip_buffer.seek(0)
-
-    return StreamingResponse(
-        zip_buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=drawings.zip"}
-    )
-
-
-# -------------------- SINGLE FILE --------------------
+# -------------------- API --------------------
 @router.post("/csv-to-dxf")
 async def convert(file: UploadFile = File(...), db: AsyncSession = Depends(get_db_session)):
-    temp_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4()}.csv")
+    temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.csv")
 
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    with open(temp_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
     try:
         dxf_path = await csv_to_dxf(temp_path, db)
     finally:
         os.remove(temp_path)
 
-    return FileResponse(dxf_path, media_type="application/dxf", filename="output.dxf")
+    return FileResponse(
+        path=dxf_path,
+        media_type="application/dxf",
+        filename="output.dxf"
+    )
 
 
-# -------------------- LOGS --------------------
 @router.get("/logs", response_model=list[CADConversionOut])
-async def get_logs(db: AsyncSession = Depends(get_db_session)):
-    result = await db.execute(select(CADConversion).order_by(CADConversion.id.desc()))
-    return result.scalars().all()
+async def logs(db: AsyncSession = Depends(get_db_session)):
+    res = await db.execute(select(CADConversion))
+    return res.scalars().all()
