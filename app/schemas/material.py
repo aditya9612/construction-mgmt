@@ -1,15 +1,17 @@
 from decimal import Decimal
 from typing import Optional, List
 from datetime import datetime
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from app.core.enums import TransactionType, RateType
 import re
 
+
 # ================= BASE =================
 class BaseSchema(BaseModel):
-    class Config:
-        from_attributes = True
-        json_encoders = {Decimal: float}
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_encoders={Decimal: float},
+    )
 
 
 # ================= MATERIAL =================
@@ -20,12 +22,14 @@ class MaterialCreate(BaseSchema):
     unit: str
     supplier_id: int
     purchase_rate: Decimal
-    rate_type: RateType  # ✅ FIXED
+    rate_type: RateType
     quantity_purchased: Decimal = 0
     payment_given: Decimal = 0
     minimum_stock_level: Decimal = Decimal("0.000")
 
-    @field_validator("quantity_purchased", "payment_given", "purchase_rate", "minimum_stock_level")
+    @field_validator(
+        "quantity_purchased", "payment_given", "purchase_rate", "minimum_stock_level"
+    )
     def non_negative(cls, v):
         if v < 0:
             raise ValueError("Value cannot be negative")
@@ -38,8 +42,8 @@ class MaterialUpdate(BaseSchema):
     unit: Optional[str] = None
     supplier_id: Optional[int]
     purchase_rate: Optional[Decimal] = None
-    rate_type: Optional[RateType] = None  # ✅ FIXED
-    minimum_stock_level: Decimal = Decimal("0.000")
+    rate_type: Optional[RateType] = None
+    minimum_stock_level: Optional[Decimal] = None
 
 
 class MaterialOut(BaseSchema):
@@ -52,29 +56,36 @@ class MaterialOut(BaseSchema):
     supplier_id: int
     supplier_name: Optional[str] = None
 
-    purchase_rate: Decimal
-    rate_type: RateType  # ✅ FIXED
+    purchase_rate: float
+    rate_type: RateType
 
-    quantity_purchased: Decimal
-    quantity_used: Decimal
-    remaining_stock: Decimal
+    quantity_purchased: float
+    quantity_used: float
+    remaining_stock: float
 
-    total_amount: Decimal
-    payment_given: Decimal
-    payment_pending: Decimal
-    minimum_stock_level: Decimal = Decimal("0.000")
+    total_amount: float
+    payment_given: float
+    payment_pending: float
+    extra_paid: float
+    minimum_stock_level: float = 0.0
 
-    @field_serializer(
-        "purchase_rate",
-        "quantity_purchased",
-        "quantity_used",
-        "remaining_stock",
-        "total_amount",
-        "payment_given",
-        "payment_pending",
-    )
-    def serialize_decimal(self, v):
-        return float(v) if v is not None else 0
+
+class MaterialResponse(BaseModel):
+    id: int
+    project_id: int
+    material_name: str
+    category: str
+    unit: str
+    supplier_id: int
+    supplier_name: str
+    purchase_rate: float
+    quantity_purchased: float
+    quantity_used: float
+    remaining_stock: float
+    total_amount: float
+    payment_given: float
+    payment_pending: float
+    minimum_stock_level: float
 
 
 # ================= PURCHASE =================
@@ -205,15 +216,20 @@ class InventoryOut(BaseSchema):
 
 
 # ================= LOG =================
+
 class MaterialLogOut(BaseSchema):
     id: int
     material_id: int
     type: TransactionType
-    quantity: Decimal
-    rate: Decimal
-    total_amount: Decimal
-    amount_paid: Decimal
-    payment_pending: Decimal
+
+    quantity: float
+    rate: float          
+    avg_rate: float     
+
+    total_amount: float
+    amount_paid: float
+    payment_pending: float
+
     issue_type: Optional[str] = None
     project_id: Optional[int] = None
     created_at: Optional[datetime] = None
@@ -264,8 +280,4 @@ class LowStockResponse(BaseModel):
     unit: str
     project_id: int
 
-    model_config = {
-        "json_encoders": {
-            Decimal: lambda v: float(round(v, 2))
-        }
-    }
+    model_config = {"json_encoders": {Decimal: lambda v: float(round(v, 2))}}

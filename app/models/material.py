@@ -15,7 +15,7 @@ from sqlalchemy import (
     CheckConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.sql import func  # ✅ FIX
+from sqlalchemy.sql import func 
 
 from app.models.base import Base, TimestampMixin
 from app.core.enums import IssueType, TransactionType, RateType

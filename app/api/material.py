@@ -55,22 +55,18 @@ VERSION_KEY = "cache_version:materials"
 
 
 # ================= CENTRAL CALCULATION =================
+
 def update_material_fields(obj: Material):
-    purchase_rate = obj.purchase_rate or Decimal("0")
     qty_purchased = obj.quantity_purchased or Decimal("0")
     qty_used = obj.quantity_used or Decimal("0")
     payment_given = obj.payment_given or Decimal("0")
+    total_amount = obj.total_amount or Decimal("0")
 
-    # ✅ ONLY place where total is calculated
-    obj.total_amount = purchase_rate * qty_purchased
-
-    # ✅ allow advance (no restriction)
     obj.remaining_stock = max(qty_purchased - qty_used, Decimal("0"))
 
-    obj.payment_pending = max(obj.total_amount - payment_given, Decimal("0"))
+    obj.payment_pending = max(total_amount - payment_given, Decimal("0"))
 
-    # ✅ track advance separately
-    obj.advance_amount = max(payment_given - obj.total_amount, Decimal("0"))
+    obj.advance_amount = max(payment_given - total_amount, Decimal("0"))
 
 
 def to_transaction_type(value):
@@ -79,7 +75,7 @@ def to_transaction_type(value):
 
     if isinstance(value, str):
         try:
-            return DBTransactionType(value.upper())  # 🔥 FIX
+            return DBTransactionType(value.upper()) 
         except ValueError:
             raise HTTPException(
                 status_code=400, detail=f"Invalid transaction type: {value}"
@@ -108,6 +104,47 @@ def to_issue_type(value):
 
     return IssueType.SYSTEM
 
+
+def to_material_out(obj, supplier_name):
+    return {
+        "id": obj.id,
+        "project_id": obj.project_id,
+        "material_name": obj.material_name,
+        "category": obj.category,
+        "unit": obj.unit,
+        "supplier_id": obj.supplier_id,
+        "supplier_name": supplier_name,
+        "purchase_rate": float(obj.purchase_rate),
+        "quantity_purchased": float(obj.quantity_purchased),
+        "quantity_used": float(obj.quantity_used),
+        "remaining_stock": float(obj.remaining_stock),
+        "total_amount": float(obj.total_amount),
+        "payment_given": float(obj.payment_given),
+        "payment_pending": float(obj.payment_pending),
+        "minimum_stock_level": float(obj.minimum_stock_level),
+    }
+
+
+def calculate_fields(obj):
+    total_amount = float(obj.purchase_rate) * float(obj.quantity_purchased)
+    payment_given = float(obj.payment_given or 0)
+
+    payment_pending = max(0, total_amount - payment_given)
+    extra_paid = max(0, payment_given - total_amount)
+
+    return total_amount, payment_given, payment_pending, extra_paid
+
+
+def map_material(obj, supplier_name):
+    total_amount = float(obj.purchase_rate) * float(obj.quantity_purchased)
+    payment_given = float(obj.payment_given or 0)
+
+    payment_pending = max(0, total_amount - payment_given)
+    extra_paid = max(0, payment_given - total_amount)
+
+    return MaterialOut(
+        ...
+    )
 
 # ================= SUMMARY =================
 @router.get("/summary", response_model=SummaryOut)
@@ -172,44 +209,78 @@ async def get_supplier(id: int, db: AsyncSession = Depends(get_db_session)):
     return SupplierOut.model_validate(obj)
 
 
-@router.post("/suppliers", response_model=SupplierOut)
+@router.post("/suppliers", status_code=201)
 async def create_supplier(
-    payload: SupplierCreate,
-    db: AsyncSession = Depends(get_db_session),
+    payload: SupplierCreate, db: AsyncSession = Depends(get_db_session)
 ):
-    async with db.begin():
-        obj = Supplier(**payload.model_dump())
-        db.add(obj)
 
-    return SupplierOut.model_validate(obj)
+    # duplicate check
+    existing = await db.execute(
+        select(Supplier).where(Supplier.contact == payload.contact)
+    )
+    if existing.scalar():
+        raise HTTPException(status_code=400, detail="Supplier already exists")
+
+    supplier = Supplier(name=payload.name.strip().title(), contact=payload.contact)
+
+    db.add(supplier)
+    await db.commit()
+    await db.refresh(supplier)
+
+    return supplier
 
 
-from sqlalchemy.orm import selectinload
-
-
-@router.get("/suppliers/{supplier_id}/materials", response_model=List[MaterialOut])
+@router.get("/suppliers/{supplier_id}/materials", response_model=list[MaterialOut])
 async def get_supplier_materials(
     supplier_id: int,
+    skip: int = 0,
+    limit: int = 50,
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
         select(Material)
-        .options(selectinload(Material.supplier))  # ⚡ avoid N+1 query
         .where(Material.supplier_id == supplier_id, Material.is_deleted == False)
+        .offset(skip)
+        .limit(limit)
     )
 
     materials = result.scalars().all()
 
-    response = []
+    data = []
 
     for m in materials:
-        item = MaterialOut.model_validate(
-            m
-        )  # ✅ auto mapping (all fields incl. minimum_stock_level)
-        item.supplier_name = m.supplier.name if m.supplier else None
-        response.append(item)
+        supplier = await db.get(Supplier, m.supplier_id)
 
-    return response
+        # 🔥 CALCULATION (MANDATORY)
+        total_amount = float(m.purchase_rate) * float(m.quantity_purchased)
+        payment_given = float(m.payment_given or 0)
+
+        payment_pending = max(0, total_amount - payment_given)
+        extra_paid = max(0, payment_given - total_amount)
+
+        data.append(
+            MaterialOut(
+                id=m.id,
+                project_id=m.project_id,
+                material_name=m.material_name,
+                category=m.category,
+                unit=m.unit,
+                supplier_id=m.supplier_id,
+                supplier_name=supplier.name if supplier else None,
+                purchase_rate=float(m.purchase_rate),
+                rate_type=m.rate_type,
+                quantity_purchased=float(m.quantity_purchased),
+                quantity_used=float(m.quantity_used),
+                remaining_stock=float(m.remaining_stock),
+                total_amount=total_amount,
+                payment_given=payment_given,
+                payment_pending=payment_pending,
+                extra_paid=extra_paid, 
+                minimum_stock_level=float(m.minimum_stock_level or 0),
+            )
+        )
+
+    return data
 
 
 @router.put("/suppliers/{id}", response_model=SupplierOut)
@@ -228,8 +299,8 @@ async def update_supplier(
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
-    await db.commit()  # ✅ important
-    await db.refresh(obj)  # ✅ latest data
+    await db.commit() 
+    await db.refresh(obj) 
 
     return SupplierOut.model_validate(obj)
 
@@ -253,33 +324,51 @@ async def delete_supplier(id: int, db: AsyncSession = Depends(get_db_session)):
 # ================= material_alerts =================
 
 
-@router.get("/alerts")
-async def material_alerts(
-    threshold: Decimal | None = None,
+@router.get("/alerts", response_model=list[MaterialOut])
+async def get_material_alerts(
+    threshold: float | None = None,
     db: AsyncSession = Depends(get_db_session),
 ):
-    condition = (
-        Material.remaining_stock < threshold
-        if threshold is not None
-        else Material.remaining_stock < Material.minimum_stock_level
-    )
+    query = select(Material).where(Material.is_deleted == False)
 
-    result = await db.execute(
-        select(Material).where(Material.is_deleted == False, condition)
-    )
+    if threshold is not None:
+        query = query.where(Material.remaining_stock <= threshold)
+    else:
+        query = query.where(Material.remaining_stock <= Material.minimum_stock_level)
 
+    result = await db.execute(query)
     materials = result.scalars().all()
 
-    return [
-        {
-            "material_id": m.id,
-            "material_name": m.material_name,
-            "remaining_stock": float(m.remaining_stock or 0),
-            "minimum_stock_level": float(m.minimum_stock_level or 0),
-            "message": f"{m.material_name} is low on stock",
-        }
-        for m in materials
-    ]
+    data = []
+
+    for obj in materials:
+        supplier = await db.get(Supplier, obj.supplier_id)
+
+        total_amount, payment_given, payment_pending, extra_paid = calculate_fields(obj)
+
+        data.append(
+            MaterialOut(
+                id=obj.id,
+                project_id=obj.project_id,
+                material_name=obj.material_name,
+                category=obj.category,
+                unit=obj.unit,
+                supplier_id=obj.supplier_id,
+                supplier_name=supplier.name if supplier else None,
+                purchase_rate=float(obj.purchase_rate),
+                rate_type=obj.rate_type,
+                quantity_purchased=float(obj.quantity_purchased),
+                quantity_used=float(obj.quantity_used),
+                remaining_stock=float(obj.remaining_stock),
+                total_amount=total_amount,
+                payment_given=payment_given,
+                payment_pending=payment_pending,
+                extra_paid=extra_paid,
+                minimum_stock_level=float(obj.minimum_stock_level or 0),
+            )
+        )
+
+    return data
 
 
 # ================= PURCHASE ORDERS =================
@@ -295,21 +384,18 @@ async def create_po(
 
     async with db.begin():
 
-        # ✅ fetch material (source of truth)
         material = await db.get(Material, payload.material_id)
         if not material:
             raise HTTPException(404, "Material not found")
 
-        # ✅ fetch supplier
         supplier = await db.get(Supplier, payload.supplier_id)
         if not supplier:
             raise HTTPException(404, "Supplier not found")
 
-        # ✅ create PO with controlled data
         obj = PurchaseOrder(
             supplier_id=payload.supplier_id,
             project_id=payload.project_id,
-            material_name=material.material_name,  # 🔥 FIX
+            material_name=material.material_name, 
             quantity=payload.quantity,
             rate=payload.rate,
             total_amount=total,
@@ -330,7 +416,7 @@ async def list_po(
         (
             await db.execute(
                 select(PurchaseOrder)
-                .where(PurchaseOrder.is_deleted == False)  # ✅ fix
+                .where(PurchaseOrder.is_deleted == False) 
                 .offset(skip)
                 .limit(limit)
             )
@@ -365,17 +451,14 @@ async def update_po(
     if payload.quantity <= 0 or payload.rate <= 0:
         raise HTTPException(400, "Invalid quantity or rate")
 
-    # ✅ fetch material
     material = await db.get(Material, payload.material_id)
     if not material:
         raise HTTPException(404, "Material not found")
 
-    # ✅ fetch supplier
     supplier = await db.get(Supplier, payload.supplier_id)
     if not supplier:
         raise HTTPException(404, "Supplier not found")
 
-    # ✅ update fields manually (NO setattr loop)
     obj.supplier_id = payload.supplier_id
     obj.project_id = payload.project_id
     obj.material_name = material.material_name
@@ -397,7 +480,7 @@ async def delete_po(id: int, db: AsyncSession = Depends(get_db_session)):
         raise HTTPException(status_code=404, detail="PO not found")
 
     async with db.begin():
-        obj.is_deleted = True  # ✅ soft delete
+        obj.is_deleted = True 
 
     return {"message": "Deleted"}
 
@@ -473,7 +556,7 @@ async def create_transfer(
     if payload.from_project_id == payload.to_project_id:
         raise HTTPException(400, "Cannot transfer to same project")
 
-    async with db.begin():  # ✅ transaction safety
+    async with db.begin(): 
 
         # ===== PROJECT VALIDATION =====
         from_project = await db.get(Project, payload.from_project_id)
@@ -522,7 +605,6 @@ async def create_transfer(
 
             update_material_fields(existing_material)
 
-            # 🔥 prevent financial impact
             existing_material.payment_given = old_payment
             existing_material.total_amount = (
                 existing_material.purchase_rate * existing_material.quantity_purchased
@@ -544,7 +626,7 @@ async def create_transfer(
                 quantity_purchased=payload.quantity,
                 quantity_used=Decimal("0"),
                 payment_given=Decimal("0"),
-                minimum_stock_level=material.minimum_stock_level,  # ✅ important
+                minimum_stock_level=material.minimum_stock_level, 
             )
 
             existing_material.total_amount = Decimal("0")
@@ -627,7 +709,7 @@ async def create_transfer(
         db.add(obj)
 
     # ===== AFTER COMMIT =====
-    await db.refresh(obj)  # ✅ FIXED (no relation names)
+    await db.refresh(obj) 
 
     await bump_cache_version(redis, VERSION_KEY)
 
@@ -755,7 +837,7 @@ async def get_transfer(id: int, db: AsyncSession = Depends(get_db_session)):
             else None
         ),
         "quantity": obj.quantity,
-        "status": obj.status,  # ✅ FIX
+        "status": obj.status, 
         "created_at": getattr(obj, "created_at", None),
     }
 
@@ -823,7 +905,7 @@ async def usage(
 
         obj = await db.scalar(
             select(Material)
-            .options(selectinload(Material.supplier))  # ✅ FIX
+            .options(selectinload(Material.supplier))
             .where(Material.id == material_id, Material.is_deleted == False)
             .with_for_update()
         )
@@ -831,16 +913,27 @@ async def usage(
         if not obj:
             raise HTTPException(404, "Material not found")
 
-        qty = Decimal(data.quantity)
+        qty = Decimal(str(data.quantity))
 
         if qty <= 0:
             raise HTTPException(400, "Quantity must be > 0")
 
-        if qty > obj.remaining_stock:
+        remaining_stock = (obj.quantity_purchased or Decimal("0")) - (obj.quantity_used or Decimal("0"))
+
+        if qty > remaining_stock:
             raise HTTPException(400, "Not enough stock")
 
+        # 🔥 AVG RATE CALCULATION
+        total_amount_current = obj.total_amount or Decimal("0")
+
+        if remaining_stock > 0:
+            avg_rate = total_amount_current / remaining_stock
+        else:
+            avg_rate = Decimal("0")
+
+        used_value = qty * avg_rate
+
         reference = f"USE-{uuid.uuid4().hex[:8]}"
-        total = qty * obj.purchase_rate
 
         # ===== TRANSACTION =====
         db.add(
@@ -848,8 +941,8 @@ async def usage(
                 material_id=obj.id,
                 type=DBTransactionType.USAGE,
                 quantity=qty,
-                rate=obj.purchase_rate,
-                total_amount=total,
+                rate=avg_rate,             
+                total_amount=used_value,   
                 amount_paid=0,
                 payment_pending=0,
                 issue_type=IssueType.SITE,
@@ -865,8 +958,8 @@ async def usage(
                 material_id=obj.id,
                 type=DBTransactionType.USAGE,
                 quantity=qty,
-                rate=obj.purchase_rate,
-                total_amount=total,
+                rate=avg_rate,              
+                total_amount=used_value,   
                 amount_paid=0,
                 payment_pending=0,
                 issue_type=IssueType.SITE,
@@ -876,22 +969,51 @@ async def usage(
             )
         )
 
-        # ===== UPDATE STOCK =====
+        # ===== UPDATE STOCK + VALUE =====
         obj.quantity_used = (obj.quantity_used or Decimal("0")) + qty
+        obj.total_amount = (obj.total_amount or Decimal("0")) - used_value   
+
         update_material_fields(obj)
 
+    await db.refresh(obj)
     await bump_cache_version(redis, VERSION_KEY)
 
-    await db.refresh(obj)
+    supplier = obj.supplier
 
-    # ✅ response fix
-    response = MaterialOut.model_validate(obj)
-    response.supplier_name = obj.supplier.name if obj.supplier else None
+    # ===== RESPONSE =====
+    total_amount = float(obj.total_amount or 0)
+    payment_given = float(obj.payment_given or 0)
 
-    return response
+    payment_pending = max(0, total_amount - payment_given)
+    extra_paid = max(0, payment_given - total_amount)
 
+    return MaterialOut(
+        id=obj.id,
+        project_id=obj.project_id,
+        material_name=obj.material_name,
+        category=obj.category,
+        unit=obj.unit,
+        supplier_id=obj.supplier_id,
+        supplier_name=supplier.name if supplier else None,
+
+        purchase_rate=float(obj.purchase_rate),
+        rate_type=obj.rate_type,
+
+        quantity_purchased=float(obj.quantity_purchased),
+        quantity_used=float(obj.quantity_used),
+        remaining_stock=float(obj.remaining_stock),
+
+        total_amount=total_amount,
+        payment_given=payment_given,
+        payment_pending=payment_pending,
+        extra_paid=extra_paid,
+
+        minimum_stock_level=float(obj.minimum_stock_level or 0),
+    )
 
 # ================= PURCHASE =================
+
+
 @router.post("/{material_id}/purchase", response_model=MaterialOut)
 async def purchase(
     material_id: int,
@@ -903,7 +1025,7 @@ async def purchase(
 
         obj = await db.scalar(
             select(Material)
-            .options(selectinload(Material.supplier))  # ✅ FIX
+            .options(selectinload(Material.supplier))
             .where(Material.id == material_id, Material.is_deleted == False)
             .with_for_update()
         )
@@ -911,78 +1033,96 @@ async def purchase(
         if not obj:
             raise HTTPException(404, "Material not found")
 
-        project = await db.get(Project, data.project_id)
-        if not project:
-            raise HTTPException(404, "Project not found")
-
-        if obj.project_id != data.project_id:
-            raise HTTPException(400, "Material does not belong to this project")
-
         qty = Decimal(data.quantity)
-        paid = Decimal(data.amount_paid)
+        paid = Decimal(data.amount_paid or 0)
 
         if qty <= 0:
             raise HTTPException(400, "Quantity must be > 0")
 
-        txn_total = qty * obj.purchase_rate
-        pending = max(txn_total - paid, Decimal("0"))
+        total = qty * obj.purchase_rate
 
         reference = f"PUR-{uuid.uuid4().hex[:8]}"
 
-        # ================= UPDATE MATERIAL =================
-        obj.quantity_purchased = (obj.quantity_purchased or Decimal("0")) + qty
-        obj.payment_given = (obj.payment_given or Decimal("0")) + paid
-
-        update_material_fields(obj)
-
-        # ================= TRANSACTION =================
+        # ===== TRANSACTION =====
         db.add(
             MaterialTransaction(
                 material_id=obj.id,
                 type=DBTransactionType.PURCHASE,
                 quantity=qty,
                 rate=obj.purchase_rate,
-                total_amount=txn_total,
+                total_amount=total,
                 amount_paid=paid,
-                payment_pending=pending,
-                issue_type=(
-                    to_issue_type(data.issue_type)
-                    if data.issue_type
-                    else IssueType.VENDOR
-                ),
+                payment_pending=total - paid,
+                issue_type=IssueType.PURCHASE,
                 project_id=data.project_id,
-                remarks="Material purchase",
+                remarks="Material purchased",
                 reference_id=reference,
             )
         )
 
-        # ================= LEDGER =================
+        # ===== LEDGER =====
         db.add(
             MaterialLedger(
                 material_id=obj.id,
                 type=DBTransactionType.PURCHASE,
                 quantity=qty,
                 rate=obj.purchase_rate,
-                total_amount=txn_total,
+                total_amount=total,
                 amount_paid=paid,
-                payment_pending=pending,
+                payment_pending=total - paid,
+                issue_type=IssueType.PURCHASE,
                 project_id=data.project_id,
-                remarks="Material purchase",
+                remarks="Material purchased",
                 reference_id=reference,
             )
         )
 
-    await bump_cache_version(redis, VERSION_KEY)
+        # ===== UPDATE MATERIAL =====
+        obj.quantity_purchased = (obj.quantity_purchased or Decimal("0")) + qty
+        obj.payment_given = (obj.payment_given or Decimal("0")) + paid
+
+        obj.total_amount = (obj.total_amount or Decimal("0")) + total
+
+        update_material_fields(obj)
 
     await db.refresh(obj)
+    await bump_cache_version(redis, VERSION_KEY)
 
-    response = MaterialOut.model_validate(obj)
-    response.supplier_name = obj.supplier.name if obj.supplier else None
+    supplier = obj.supplier
 
-    return response
+    total_amount = float(obj.total_amount or 0)
+    payment_given = float(obj.payment_given or 0)
 
+    payment_pending = max(0, total_amount - payment_given)
+    extra_paid = max(0, payment_given - total_amount)
+
+    return MaterialOut(
+        id=obj.id,
+        project_id=obj.project_id,
+        material_name=obj.material_name,
+        category=obj.category,
+        unit=obj.unit,
+        supplier_id=obj.supplier_id,
+        supplier_name=supplier.name if supplier else None,
+
+        purchase_rate=float(obj.purchase_rate),
+        rate_type=obj.rate_type,
+
+        quantity_purchased=float(obj.quantity_purchased),
+        quantity_used=float(obj.quantity_used),
+        remaining_stock=float(obj.remaining_stock),
+
+        total_amount=total_amount,
+        payment_given=payment_given,
+        payment_pending=payment_pending,
+        extra_paid=extra_paid,
+
+        minimum_stock_level=float(obj.minimum_stock_level or 0),
+    )
 
 # ================= ADD INVENTORY =================
+
+
 @router.post("/inventory")
 async def adjust_inventory(
     payload: InventoryAdjustRequest,
@@ -1020,21 +1160,29 @@ async def adjust_inventory(
         if diff == 0:
             return {
                 "material_id": material_id,
-                "old_stock": old_stock,
-                "new_stock": old_stock,
+                "old_stock": float(old_stock),
+                "new_stock": float(old_stock),
                 "difference": 0,
                 "reason": reason,
             }
 
         reference = f"ADJ-{uuid.uuid4().hex[:8]}"
-        rate = material.purchase_rate or Decimal("0")
-        total_amount = abs(diff) * rate
 
-        # 🔥 FIX: adjust via purchased/used
+        qty_purchased = material.quantity_purchased or Decimal("0")
+        total_amt = material.total_amount or Decimal("0")
+
+        avg_rate = (
+            total_amt / qty_purchased if qty_purchased > 0 else Decimal("0")
+        )
+
+        adjustment_value = abs(diff) * avg_rate 
+
         if diff > 0:
             material.quantity_purchased += diff
+            material.total_amount += diff * avg_rate
         else:
             material.quantity_used += abs(diff)
+            material.total_amount -= abs(diff) * avg_rate
 
         update_material_fields(material)
 
@@ -1045,8 +1193,8 @@ async def adjust_inventory(
                 material_id=material.id,
                 type=DBTransactionType.ADJUSTMENT,
                 quantity=diff,
-                rate=rate,
-                total_amount=total_amount,
+                rate=avg_rate,  
+                total_amount=adjustment_value,
                 amount_paid=0,
                 payment_pending=0,
                 issue_type=IssueType.SYSTEM,
@@ -1061,8 +1209,8 @@ async def adjust_inventory(
                 material_id=material.id,
                 type=DBTransactionType.ADJUSTMENT,
                 quantity=diff,
-                rate=rate,
-                total_amount=total_amount,
+                rate=avg_rate, 
+                total_amount=adjustment_value,
                 amount_paid=0,
                 payment_pending=0,
                 project_id=material.project_id,
@@ -1075,31 +1223,55 @@ async def adjust_inventory(
 
     return {
         "material_id": material_id,
-        "old_stock": old_stock,
-        "new_stock": new_stock,
-        "difference": diff,
+        "old_stock": float(old_stock),
+        "new_stock": float(new_stock),
+        "difference": float(diff),
         "reason": reason,
         "reference_id": reference,
     }
 
-
 @router.get("/inventory")
 async def get_all_inventory(db: AsyncSession = Depends(get_db_session)):
-    result = await db.execute(select(Material).where(Material.is_deleted == False))
+    result = await db.execute(
+        select(
+            Material.id,
+            Material.material_name,
+            Material.remaining_stock,
+            Material.unit,
+            Material.project_id,
+            Material.total_amount,          
+            Material.quantity_purchased,  
+        ).where(Material.is_deleted == False)
+    )
 
-    materials = result.scalars().all()
+    rows = result.all()
 
-    return [
-        {
-            "material_id": m.id,
-            "material_name": m.material_name,
-            "remaining_stock": float(m.remaining_stock or 0),
-            "project_id": m.project_id,
-            "unit": m.unit,
-        }
-        for m in materials
-    ]
+    data = []
 
+    for r in rows:
+        qty_purchased = float(r.quantity_purchased or 0)
+        remaining = float(r.remaining_stock or 0)
+        total_amount = float(r.total_amount or 0)
+
+        avg_rate = total_amount / qty_purchased if qty_purchased > 0 else 0
+        total_value = remaining * avg_rate
+
+        data.append(
+            {
+                "material_id": r.id,
+                "material_name": r.material_name,
+                "remaining_stock": remaining,
+                "unit": r.unit,
+
+                # ❗ change here
+                "avg_rate": round(avg_rate, 2),
+
+                "total_value": round(total_value, 2),
+                "project_id": r.project_id,
+            }
+        )
+
+    return data
 
 @router.get("/inventory/valuation")
 async def get_inventory_valuation(
@@ -1128,27 +1300,45 @@ async def get_project_inventory(
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
-        select(Material)
-        .where(Material.project_id == project_id)
-        .where(Material.is_deleted == False)
-        .offset(skip)  # ✅ added
-        .limit(limit)  # ✅ added
+        select(
+            Material.id,
+            Material.material_name,
+            Material.remaining_stock,
+            Material.quantity_purchased,
+            Material.total_amount,
+        )
+        .where(
+            Material.project_id == project_id,
+            Material.is_deleted == False
+        )
+        .offset(skip)
+        .limit(limit)
     )
 
-    materials = result.scalars().all()
+    rows = result.all()
 
-    return [
-        {
-            "material_id": m.id,
-            "material_name": m.material_name,
-            "remaining_stock": float(m.remaining_stock or 0),
-        }
-        for m in materials
-    ]
+    data = []
+
+    for r in rows:
+        qty = float(r.quantity_purchased or 0)
+        remaining = float(r.remaining_stock or 0)
+        total_amt = float(r.total_amount or 0)
+
+        avg_rate = total_amt / qty if qty > 0 else 0
+        total_value = remaining * avg_rate
+
+        data.append({
+            "material_id": r.id,
+            "material_name": r.material_name,
+            "remaining_stock": remaining,
+            "avg_rate": round(avg_rate, 2),
+            "total_value": round(total_value, 2),
+        })
+
+    return data
 
 
 # ================= FILTERED LOGS =================
-
 
 @router.get("/logs", response_model=List[MaterialLogOut])
 async def logs(
@@ -1159,23 +1349,19 @@ async def logs(
     type: Optional[SchemaTransactionType] = None,
     db: AsyncSession = Depends(get_db_session),
 ):
-    # ✅ limit protection
     limit = min(max(limit, 1), 100)
 
     query = select(MaterialTransaction)
 
-    # ✅ filters
     if material_id is not None:
         query = query.where(MaterialTransaction.material_id == material_id)
 
     if project_id is not None:
         query = query.where(MaterialTransaction.project_id == project_id)
 
-    # ✅ enum filter (clean & safe)
     if type is not None:
         query = query.where(MaterialTransaction.type == type.value)
 
-    # ✅ sorting + pagination
     query = (
         query.order_by(MaterialTransaction.created_at.desc())
         .offset(offset)
@@ -1185,8 +1371,36 @@ async def logs(
     result = await db.execute(query)
     rows = result.scalars().all()
 
-    return [MaterialLogOut.model_validate(r) for r in rows]
+    logs = []
 
+    for r in rows:
+        quantity = float(r.quantity or 0)
+        total_amount = float(r.total_amount or 0)
+
+        # 🔥 derived avg rate
+        avg_rate = total_amount / quantity if quantity else 0
+
+        logs.append(
+            MaterialLogOut(
+                id=r.id,
+                material_id=r.material_id,
+                type=r.type,
+
+                quantity=quantity,
+                rate=float(r.rate or 0),   # stored
+                avg_rate=avg_rate,         # computed
+
+                total_amount=total_amount,
+                amount_paid=float(r.amount_paid or 0),
+                payment_pending=float(r.payment_pending or 0),
+
+                issue_type=r.issue_type,
+                project_id=r.project_id,
+                created_at=r.created_at,
+            )
+        )
+
+    return logs
 
 # ================= REPORTS =================
 
@@ -1199,15 +1413,19 @@ async def material_report(
     limit: int = 50,
     db: AsyncSession = Depends(get_db_session),
 ):
+
+    limit = min(max(limit, 1), 100)
+    skip = max(skip, 0)
+
     query = select(Material).where(Material.is_deleted == False)
 
-    if project_id:
+    if project_id is not None:
         query = query.where(Material.project_id == project_id)
 
-    if category:
+    if category is not None:
         query = query.where(Material.category == category)
 
-    query = query.offset(skip).limit(limit)  # ✅ added
+    query = query.offset(skip).limit(limit)
 
     rows = (await db.execute(query)).scalars().all()
 
@@ -1215,15 +1433,14 @@ async def material_report(
         MaterialReport(
             material_id=r.id,
             material_name=r.material_name,
-            total_purchased=r.quantity_purchased or Decimal("0"),
-            total_used=r.quantity_used or Decimal("0"),
-            remaining_stock=r.remaining_stock or Decimal("0"),
-            total_cost=r.total_amount or Decimal("0"),
-            payment_pending=r.payment_pending or Decimal("0"),
+            total_purchased=float(r.quantity_purchased or 0),
+            total_used=float(r.quantity_used or 0),
+            remaining_stock=float(r.remaining_stock or 0),
+            total_cost=float(r.total_amount or 0),  # ✅ FIXED
+            payment_pending=float(r.payment_pending or 0),
         )
         for r in rows
     ]
-
 
 @router.get("/reports/materials/pdf", response_class=FileResponse)
 async def export_pdf(db: AsyncSession = Depends(get_db_session)):
@@ -1303,7 +1520,7 @@ async def price_history(material_id: int, db: AsyncSession = Depends(get_db_sess
         select(MaterialTransaction.rate, MaterialTransaction.created_at)
         .where(
             MaterialTransaction.material_id == material_id,
-            MaterialTransaction.type == TransactionType.PURCHASE,  # ✅ FINAL FIX
+            MaterialTransaction.type == TransactionType.PURCHASE, 
         )
         .order_by(MaterialTransaction.created_at.asc())
     )
@@ -1412,27 +1629,36 @@ async def list_materials(
     result = await db.execute(query)
     materials = result.scalars().all()
 
-    return [
-        MaterialOut(
-            id=obj.id,
-            project_id=obj.project_id,
-            material_name=obj.material_name,
-            category=obj.category,
-            unit=obj.unit,
-            supplier_id=obj.supplier_id,
-            supplier_name=obj.supplier.name if obj.supplier else None,
-            purchase_rate=obj.purchase_rate,
-            rate_type=obj.rate_type,
-            quantity_purchased=obj.quantity_purchased,
-            quantity_used=obj.quantity_used,
-            remaining_stock=obj.remaining_stock,
-            total_amount=obj.total_amount,
-            payment_given=obj.payment_given,
-            payment_pending=obj.payment_pending,
-            minimum_stock_level=obj.minimum_stock_level or Decimal("0.000"),
+    data = []
+
+    for obj in materials:
+        supplier = await db.get(Supplier, obj.supplier_id)
+
+        total_amount, payment_given, payment_pending, extra_paid = calculate_fields(obj)
+
+        data.append(
+            MaterialOut(
+                id=obj.id,
+                project_id=obj.project_id,
+                material_name=obj.material_name,
+                category=obj.category,
+                unit=obj.unit,
+                supplier_id=obj.supplier_id,
+                supplier_name=supplier.name if supplier else None,
+                purchase_rate=float(obj.purchase_rate),
+                rate_type=obj.rate_type,
+                quantity_purchased=float(obj.quantity_purchased),
+                quantity_used=float(obj.quantity_used),
+                remaining_stock=float(obj.remaining_stock),
+                total_amount=total_amount,
+                payment_given=payment_given,
+                payment_pending=payment_pending,
+                extra_paid=extra_paid,
+                minimum_stock_level=float(obj.minimum_stock_level or 0),
+            )
         )
-        for obj in materials
-    ]
+
+    return data
 
 
 @router.get("/{material_id}", response_model=MaterialOut)
@@ -1447,6 +1673,10 @@ async def get_material(
     if not obj:
         raise HTTPException(status_code=404, detail="Material not found")
 
+    supplier = await db.get(Supplier, obj.supplier_id)
+
+    total_amount, payment_given, payment_pending, extra_paid = calculate_fields(obj)
+
     return MaterialOut(
         id=obj.id,
         project_id=obj.project_id,
@@ -1454,16 +1684,17 @@ async def get_material(
         category=obj.category,
         unit=obj.unit,
         supplier_id=obj.supplier_id,
-        supplier_name=obj.supplier.name if obj.supplier else None,
-        purchase_rate=obj.purchase_rate,
+        supplier_name=supplier.name if supplier else None,
+        purchase_rate=float(obj.purchase_rate),
         rate_type=obj.rate_type,
-        quantity_purchased=obj.quantity_purchased,
-        quantity_used=obj.quantity_used,
-        remaining_stock=obj.remaining_stock,
-        total_amount=obj.total_amount,
-        payment_given=obj.payment_given,
-        payment_pending=obj.payment_pending,
-        minimum_stock_level=obj.minimum_stock_level or Decimal("0.000"),
+        quantity_purchased=float(obj.quantity_purchased),
+        quantity_used=float(obj.quantity_used),
+        remaining_stock=float(obj.remaining_stock),
+        total_amount=total_amount,
+        payment_given=payment_given,
+        payment_pending=payment_pending,
+        extra_paid=extra_paid,
+        minimum_stock_level=float(obj.minimum_stock_level or 0),
     )
 
 
@@ -1487,24 +1718,43 @@ async def update_material(
 
         update_data = payload.model_dump(exclude_unset=True)
 
-        # ❌ Prevent direct payment manipulation
         if "payment_given" in update_data:
             raise HTTPException(
                 status_code=400,
-                detail="Direct payment update not allowed. Use purchase API.",
+                detail="Direct payment update not allowed. Use purchase API",
             )
 
-        # ✅ normal field updates
         for k, v in update_data.items():
             setattr(obj, k, v)
 
-        # ✅ recalculate everything
         update_material_fields(obj)
 
     await db.refresh(obj)
     await bump_cache_version(redis, VERSION_KEY)
 
-    return MaterialOut.model_validate(obj)
+    supplier = await db.get(Supplier, obj.supplier_id)
+
+    total_amount, payment_given, payment_pending, extra_paid = calculate_fields(obj)
+
+    return MaterialOut(
+        id=obj.id,
+        project_id=obj.project_id,
+        material_name=obj.material_name,
+        category=obj.category,
+        unit=obj.unit,
+        supplier_id=obj.supplier_id,
+        supplier_name=supplier.name if supplier else None,
+        purchase_rate=float(obj.purchase_rate),
+        rate_type=obj.rate_type,
+        quantity_purchased=float(obj.quantity_purchased),
+        quantity_used=float(obj.quantity_used),
+        remaining_stock=float(obj.remaining_stock),
+        total_amount=total_amount,
+        payment_given=payment_given,
+        payment_pending=payment_pending,
+        extra_paid=extra_paid,
+        minimum_stock_level=float(obj.minimum_stock_level or 0),
+    )
 
 
 @router.delete("/{material_id}")
