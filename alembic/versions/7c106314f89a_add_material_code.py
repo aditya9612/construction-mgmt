@@ -1,8 +1,8 @@
-"""init
+"""add material_code
 
-Revision ID: 9f6f09ef9ee7
+Revision ID: 7c106314f89a
 Revises: 
-Create Date: 2026-04-20 16:01:11.892110
+Create Date: 2026-04-21 17:09:36.483815
 """
 
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '9f6f09ef9ee7'
+revision = '7c106314f89a'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -339,6 +339,7 @@ def upgrade():
     sa.Column('project_id', sa.Integer(), nullable=False),
     sa.Column('is_deleted', sa.Boolean(), nullable=False),
     sa.Column('material_name', sa.String(length=255), nullable=False),
+    sa.Column('material_code', sa.String(length=20), nullable=False),
     sa.Column('category', sa.String(length=100), nullable=False),
     sa.Column('unit', sa.String(length=50), nullable=False),
     sa.Column('supplier_id', sa.Integer(), nullable=False),
@@ -364,6 +365,7 @@ def upgrade():
     op.create_index('idx_material_deleted', 'materials', ['is_deleted'], unique=False)
     op.create_index('idx_material_project', 'materials', ['project_id'], unique=False)
     op.create_index('idx_material_supplier', 'materials', ['supplier_id'], unique=False)
+    op.create_index(op.f('ix_materials_material_code'), 'materials', ['material_code'], unique=True)
     op.create_table('milestones',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
@@ -763,6 +765,7 @@ def downgrade():
     op.drop_index(op.f('ix_milestones_title'), table_name='milestones')
     op.drop_index(op.f('ix_milestones_project_id'), table_name='milestones')
     op.drop_table('milestones')
+    op.drop_index(op.f('ix_materials_material_code'), table_name='materials')
     op.drop_index('idx_material_supplier', table_name='materials')
     op.drop_index('idx_material_project', table_name='materials')
     op.drop_index('idx_material_deleted', table_name='materials')

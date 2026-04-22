@@ -2,7 +2,7 @@ from decimal import Decimal
 from typing import Optional, List
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
-from app.core.enums import TransactionType, RateType
+from app.core.enums import TransactionType, RateType, IssueType
 import re
 
 
@@ -12,7 +12,6 @@ class BaseSchema(BaseModel):
         from_attributes=True,
         json_encoders={Decimal: float},
     )
-
 
 # ================= MATERIAL =================
 class MaterialCreate(BaseSchema):
@@ -27,6 +26,12 @@ class MaterialCreate(BaseSchema):
     payment_given: Decimal = 0
     minimum_stock_level: Decimal = Decimal("0.000")
 
+    @field_validator("material_name")
+    def validate_name(cls, v):
+        if not v.strip():
+            raise ValueError("Material name required")
+        return v.strip()
+
     @field_validator(
         "quantity_purchased", "payment_given", "purchase_rate", "minimum_stock_level"
     )
@@ -34,7 +39,6 @@ class MaterialCreate(BaseSchema):
         if v < 0:
             raise ValueError("Value cannot be negative")
         return v
-
 
 class MaterialUpdate(BaseSchema):
     material_name: Optional[str] = None
@@ -48,6 +52,7 @@ class MaterialUpdate(BaseSchema):
 
 class MaterialOut(BaseSchema):
     id: int
+    material_code: str
     project_id: int
     material_name: str
     category: str
@@ -66,34 +71,16 @@ class MaterialOut(BaseSchema):
     total_amount: float
     payment_given: float
     payment_pending: float
-    extra_paid: float
+    extra_paid: float = Field(default=0.0, validation_alias="advance_amount")
     minimum_stock_level: float = 0.0
-
-
-class MaterialResponse(BaseModel):
-    id: int
-    project_id: int
-    material_name: str
-    category: str
-    unit: str
-    supplier_id: int
-    supplier_name: str
-    purchase_rate: float
-    quantity_purchased: float
-    quantity_used: float
-    remaining_stock: float
-    total_amount: float
-    payment_given: float
-    payment_pending: float
-    minimum_stock_level: float
-
+    alert_type: str
 
 # ================= PURCHASE =================
 class PurchaseMaterial(BaseSchema):
     quantity: Decimal
     amount_paid: Decimal
     project_id: int
-    issue_type: Optional[str] = None
+    issue_type: Optional[IssueType] = None   
 
     @field_validator("quantity", "amount_paid")
     def positive(cls, v):
@@ -106,14 +93,13 @@ class PurchaseMaterial(BaseSchema):
 class UsageMaterial(BaseSchema):
     quantity: Decimal
     project_id: int
-    issue_type: Optional[str] = None
+    issue_type: Optional[IssueType] = None   
 
     @field_validator("quantity")
     def positive(cls, v):
         if v <= 0:
             raise ValueError("Must be greater than 0")
         return v
-
 
 # ================= SUPPLIER =================
 class SupplierCreate(BaseSchema):
@@ -134,12 +120,10 @@ class SupplierCreate(BaseSchema):
             raise ValueError("Contact must be 10 digit number")
         return v
 
-
 class SupplierOut(BaseSchema):
     id: int
     name: str
     contact: Optional[str] = None
-
 
 # ================= PURCHASE ORDER =================
 class PurchaseOrderCreate(BaseSchema):
@@ -155,17 +139,17 @@ class PurchaseOrderCreate(BaseSchema):
             raise ValueError("Must be greater than 0")
         return v
 
-
 class PurchaseOrderOut(BaseSchema):
     id: int
+    material_id: int 
     supplier_id: int
     project_id: int
+    material_id: int  
     material_name: str
     quantity: Decimal
     rate: Decimal
     total_amount: Decimal
     status: Optional[str] = "CREATED"
-
 
 # ================= TRANSFER =================
 class TransferMaterial(BaseSchema):
@@ -207,24 +191,21 @@ class InventoryAdjustRequest(BaseSchema):
     new_stock: Decimal = Field(..., ge=0)
     reason: str = Field(..., min_length=3, max_length=255)
 
-
 class InventoryOut(BaseSchema):
     material_id: int
-    total_purchased: Decimal
-    total_used: Decimal
-    remaining_stock: Decimal
-
+    total_purchased: float
+    total_used: float
+    remaining_stock: float
 
 # ================= LOG =================
-
 class MaterialLogOut(BaseSchema):
     id: int
     material_id: int
     type: TransactionType
 
     quantity: float
-    rate: float          
-    avg_rate: float     
+    rate: float
+    avg_rate: Optional[float] = 0.0
 
     total_amount: float
     amount_paid: float
@@ -236,6 +217,7 @@ class MaterialLogOut(BaseSchema):
 
 
 # ================= SUMMARY =================
+
 class SummaryOut(BaseSchema):
     total_materials: int
     total_stock_value: Decimal
@@ -252,7 +234,6 @@ class MaterialReport(BaseSchema):
     total_cost: Decimal
     payment_pending: Decimal
 
-
 # ================= PRICE HISTORY =================
 class PriceHistoryOut(BaseSchema):
     id: int
@@ -267,7 +248,6 @@ class PriceHistoryOut(BaseSchema):
     project_id: Optional[int] = None
     created_at: Optional[datetime] = None
 
-
 # ================= LOW STOCK =================
 class LowStockResponse(BaseModel):
     material_id: int
@@ -279,5 +259,4 @@ class LowStockResponse(BaseModel):
     payment_pending: float
     unit: str
     project_id: int
-
     model_config = {"json_encoders": {Decimal: lambda v: float(round(v, 2))}}

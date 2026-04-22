@@ -1,6 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 from typing import List, Optional
+from sqlalchemy import Column
 
 from sqlalchemy import (
     Boolean,
@@ -26,7 +27,9 @@ class Material(Base, TimestampMixin):
     __tablename__ = "materials"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    material_code = Column(String(20), unique=True, index=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
@@ -58,7 +61,6 @@ class Material(Base, TimestampMixin):
     remaining_stock: Mapped[Decimal] = mapped_column(
         DECIMAL(18, 3), nullable=False, server_default=text("0.000")
     )
-
     payment_given: Mapped[Decimal] = mapped_column(
         DECIMAL(18, 2), nullable=False, server_default=text("0.00")
     )
@@ -211,6 +213,7 @@ class PurchaseOrder(Base, TimestampMixin):
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"))
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
 
+    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id")) 
     material_name: Mapped[str] = mapped_column(String(255))
 
     quantity: Mapped[Decimal] = mapped_column(DECIMAL(18, 3), nullable=False)
@@ -295,4 +298,4 @@ class MaterialLedger(Base, TimestampMixin):
     __table_args__ = (
         Index("idx_ledger_material", "material_id"),
         Index("idx_ledger_reference", "reference_id"),
-    )
+    ) 
