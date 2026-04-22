@@ -11,12 +11,39 @@ from sqlalchemy import (
     Index,
     Enum as SAEnum,
     UniqueConstraint,
+    Date,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.enums import AttendanceStatus, LabourStatus, PayrollStatus, SkillType
 from app.models.base import Base, TimestampMixin
 
 
+# ======================
+# MANY-TO-MANY MAPPING
+# ======================
+class LabourProject(Base, TimestampMixin):
+    __tablename__ = "labour_project"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    labour_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("labour.id", ondelete="CASCADE"), index=True
+    )
+
+    project_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+
+    assigned_date: Mapped[date] = mapped_column(Date, default=date.today)
+
+    __table_args__ = (
+        UniqueConstraint("labour_id", "project_id", name="uq_labour_project"),
+    )
+
+
+# ======================
+# LABOUR (GLOBAL)
+# ======================
 class Labour(Base, TimestampMixin):
     __tablename__ = "labour"
 
@@ -26,15 +53,10 @@ class Labour(Base, TimestampMixin):
         String(50), unique=True, index=True, nullable=False
     )
 
-    aadhaar_number: Mapped[Optional[str]] = mapped_column(
-        String(20), index=True
-    )
-
-    project_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True
-    )
+    aadhaar_number: Mapped[Optional[str]] = mapped_column(String(20), index=True)
 
     labour_name: Mapped[str] = mapped_column(String(255), index=True)
+
     skill_type: Mapped[SkillType] = mapped_column(SAEnum(SkillType), nullable=False)
 
     daily_wage_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
@@ -46,13 +68,16 @@ class Labour(Base, TimestampMixin):
     status: Mapped[LabourStatus] = mapped_column(
         SAEnum(LabourStatus), default=LabourStatus.ACTIVE
     )
+
     notes: Mapped[Optional[str]] = mapped_column(String(500))
 
-    __table_args__ = (
-        UniqueConstraint("project_id", "aadhaar_number", name="uq_project_aadhaar"),
-    )
+    # 🔥 NEW RELATION
+    projects = relationship("LabourProject", backref="labour", cascade="all, delete")
 
 
+# ======================
+# ATTENDANCE (NO CHANGE)
+# ======================
 class LabourAttendance(Base, TimestampMixin):
     __tablename__ = "labour_attendance"
 
@@ -76,20 +101,41 @@ class LabourAttendance(Base, TimestampMixin):
     in_time: Mapped[Optional[time]] = mapped_column(Time)
     out_time: Mapped[Optional[time]] = mapped_column(Time)
 
+    check_in_image: Mapped[Optional[str]] = mapped_column(String(500))
+    check_out_image: Mapped[Optional[str]] = mapped_column(String(500))
+
     working_hours: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), default=0)
     overtime_hours: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), default=0)
     overtime_rate: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), default=0)
+
+    check_in_latitude: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(9, 6))
+    check_in_longitude: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(9, 6))
+
+    check_out_latitude: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(9, 6))
+    check_out_longitude: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(9, 6))
+
+    check_in_address: Mapped[Optional[str]] = mapped_column(String(255))
+    check_out_address: Mapped[Optional[str]] = mapped_column(String(255))
+
+    task_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("tasks.id"), nullable=True
+    )
+
+    task = relationship("Task")
 
     task_description: Mapped[str] = mapped_column(String(255))
 
 
 Index(
-    "idx_labour_attendance_labour_date",
-    LabourAttendance.labour_id,
+    "idx_labour_attendance_project_date",
+    LabourAttendance.project_id,
     LabourAttendance.attendance_date,
 )
 
 
+# ======================
+# PAYROLL (NO CHANGE)
+# ======================
 class LabourPayroll(Base, TimestampMixin):
     __tablename__ = "labour_payroll"
 

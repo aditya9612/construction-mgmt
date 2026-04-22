@@ -6,7 +6,7 @@ from app.models.equipment import Equipment  # noqa: F401
 from app.models.labour import Labour  # noqa: F401
 from app.models.material import Material  # noqa: F401
 from app.models.project import Project  # noqa: F401
-from app.models.user import User  # noqa: F401
+from app.models.user import User # noqa: F401
 from app.models.owner import Owner
 from app.models.contractor import Contractor
 from app.models.expense import Expense
@@ -16,3 +16,10 @@ from app.models.billing import RABill
 from app.models.approval import Approval
 from app.models.work_order import WorkOrder
 from app.models.cad_conversion import CADConversion
+from app.models.user import UserAuditLog # noqa: F401
+from app.models.user import ActivityLog # noqa: F401
+from app.models.material import MaterialTransaction  # noqa: F401
+from app.models.material import Supplier  # noqa: F401
+from app.models.material import PurchaseOrder  # noqa: F401
+from app.models.material import MaterialTransfer  # noqa: F401
+from app.models.material import MaterialLedger  # noqa: F401

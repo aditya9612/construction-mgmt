@@ -6,11 +6,10 @@ from app.core import enums as e
 
 
 # ======================
-# LABOUR
+# LABOUR (GLOBAL NOW)
 # ======================
 class LabourCreate(BaseModel):
     aadhaar_number: Optional[str]
-    project_id: int
     labour_name: str
     skill_type: e.SkillType
     daily_wage_rate: Decimal
@@ -23,6 +22,7 @@ class LabourCreate(BaseModel):
         if v and (not v.isdigit() or len(v) != 12):
             raise ValueError("Aadhaar must be 12 digits")
         return v
+
 
 class LabourUpdate(BaseModel):
     labour_name: Optional[str]
@@ -37,16 +37,36 @@ class LabourOut(BaseModel):
     id: int
     worker_code: str
     aadhaar_number: Optional[str]
-    project_id: int
     labour_name: str
-    skill_type: e.SkillType 
+    skill_type: e.SkillType
     daily_wage_rate: Decimal
     contractor_id: Optional[int]
     status: e.LabourStatus
     notes: Optional[str] = None
 
+    class Config:
+        from_attributes = True
+
+
 # ======================
-# ATTENDANCE
+# 🔥 NEW: ASSIGN LABOUR TO PROJECT
+# ======================
+class LabourAssignProject(BaseModel):
+    labour_id: int
+    project_id: int
+
+
+class LabourProjectOut(BaseModel):
+    labour_id: int
+    project_id: int
+    assigned_date: date
+
+    class Config:
+        from_attributes = True
+
+
+# ======================
+# ATTENDANCE (NO CHANGE)
 # ======================
 class LabourAttendanceCreate(BaseModel):
     project_id: int
@@ -66,34 +86,28 @@ class LabourAttendanceOut(BaseModel):
     project_id: int
     attendance_date: date
     status: e.AttendanceStatus
+
+    check_in_address: Optional[str]
+    check_out_address: Optional[str]
+
     in_time: Optional[time]
     out_time: Optional[time]
+
+    task_id: Optional[int]
+
+    check_in_image: Optional[str]
+    check_out_image: Optional[str]
+
     working_hours: Decimal
     overtime_hours: Decimal
     overtime_rate: Decimal
+
     task_description: str
     total_wage: Decimal
 
     class Config:
         from_attributes = True
         json_encoders = {Decimal: float}
-
-
-class BulkAttendanceItem(BaseModel):
-    labour_id: int
-    project_id: int
-    attendance_date: date
-    status: e.AttendanceStatus = e.AttendanceStatus.PRESENT
-    in_time: Optional[time]
-    out_time: Optional[time]
-    working_hours: Decimal
-    overtime_hours: Decimal = Decimal("0")
-    overtime_rate: Decimal
-    task_description: str
-
-
-class BulkAttendanceCreate(BaseModel):
-    items: List[BulkAttendanceItem]
 
 
 # ======================
@@ -118,11 +132,14 @@ class PayrollOut(BaseModel):
     project_id: int
     month: int
     year: int
+
     total_working_hours: Decimal
     total_overtime_hours: Decimal
     total_wage: Decimal
+
     paid_amount: Decimal
     remaining_amount: Decimal
+
     status: e.PayrollStatus
 
     class Config:

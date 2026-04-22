@@ -1,7 +1,8 @@
-from datetime import date
+from datetime import date, datetime
+import re
 from typing import Any, Optional
 
-from pydantic import model_validator
+from pydantic import EmailStr, field_validator, model_validator
 
 from app.schemas.base import BaseSchema
 
@@ -35,9 +36,10 @@ class OTPVerify(BaseSchema):
     otp: str
 
 
+# -------- CREATE --------
 class UserCreatePayload(BaseSchema):
-    """Create user - provide either email+password or mobile_number."""
-    email: Optional[str] = None
+    # email: Optional[EmailStr] = None
+    email: Optional[EmailStr]
     password: Optional[str] = None
     mobile_number: Optional[str] = None
     full_name: Optional[str] = None
@@ -45,25 +47,114 @@ class UserCreatePayload(BaseSchema):
     address: Optional[str] = None
     pan_number: Optional[str] = None
     aadhaar_number: Optional[str] = None
-    profile_image: Optional[str] = None
     designation: Optional[str] = None
     joining_date: Optional[date] = None
     is_active: bool = True
 
+    @field_validator("pan_number")
+    @classmethod
+    def validate_pan(cls, v):
+        if v is None:
+            return v
 
+        v = v.strip().upper() 
+
+        if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]$", v):
+            raise ValueError("Invalid PAN format (e.g., ABCDE1234F)")
+
+        return v
+
+    @field_validator("aadhaar_number")
+    @classmethod
+    def validate_aadhaar(cls, v):
+        if v is None:
+            return v
+
+        v = v.replace(" ", "").strip() 
+
+        if not re.match(r"^[0-9]{12}$", v):
+            raise ValueError("Aadhaar must be 12 digits")
+
+        return v
+    
+    @field_validator("mobile_number")
+    @classmethod
+    def validate_mobile(cls, v):
+        if v is None:
+            return v
+
+        # normalize (same idea as your helper)
+        digits = "".join(c for c in v if c.isdigit())
+
+        # handle +91 / 91 / 0
+        if digits.startswith("91") and len(digits) == 12:
+            digits = digits[2:]
+        elif digits.startswith("0") and len(digits) == 11:
+            digits = digits[1:]
+
+        # final validation
+        if not re.match(r"^[6-9][0-9]{9}$", digits):
+            raise ValueError("Invalid Indian mobile number")
+
+        return digits
+
+
+# -------- UPDATE --------
 class UserUpdatePayload(BaseSchema):
-    """Update user - all fields optional."""
     full_name: Optional[str] = None
     mobile_number: Optional[str] = None
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None
     role: Optional[str] = None
     address: Optional[str] = None
     pan_number: Optional[str] = None
     aadhaar_number: Optional[str] = None
-    profile_image: Optional[str] = None
     designation: Optional[str] = None
     joining_date: Optional[date] = None
     is_active: Optional[bool] = None
+
+    @field_validator("pan_number")
+    @classmethod
+    def validate_pan(cls, v):
+        if v is None:
+            return v
+
+        v = v.strip().upper()  
+
+        if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]$", v):
+            raise ValueError("Invalid PAN format (e.g., ABCDE1234F)")
+
+        return v
+
+    @field_validator("aadhaar_number")
+    @classmethod
+    def validate_aadhaar(cls, v):
+        if v is None:
+            return v
+
+        v = v.replace(" ", "").strip() 
+
+        if not re.match(r"^[0-9]{12}$", v):
+            raise ValueError("Aadhaar must be 12 digits")
+
+        return v
+    
+    @field_validator("mobile_number")
+    @classmethod
+    def validate_mobile(cls, v):
+        if v is None:
+            return v
+
+        digits = "".join(c for c in v if c.isdigit())
+
+        if digits.startswith("91") and len(digits) == 12:
+            digits = digits[2:]
+        elif digits.startswith("0") and len(digits) == 11:
+            digits = digits[1:]
+
+        if not re.match(r"^[6-9][0-9]{9}$", digits):
+            raise ValueError("Invalid Indian mobile number")
+
+        return digits
 
 
 class UserOut(BaseSchema):
@@ -100,3 +191,11 @@ class UserOut(BaseSchema):
             }
         return data
 
+class UserAuditOut(BaseSchema):
+    id: int
+    user_id: int
+    field_name: str
+    old_value: Optional[str]
+    new_value: Optional[str]
+    changed_by: Optional[int]
+    changed_at: datetime

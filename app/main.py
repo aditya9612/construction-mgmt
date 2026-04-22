@@ -103,6 +103,7 @@ def create_app() -> FastAPI:
     )
 
     os.makedirs("uploads", exist_ok=True)
+    os.makedirs("uploads/profile", exist_ok=True)
 
     application.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
