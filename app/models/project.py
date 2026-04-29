@@ -28,14 +28,14 @@ if TYPE_CHECKING:
     from app.models.contractor import Contractor
 
 
+# ===================== PROJECT =====================
+
 class Project(Base, TimestampMixin):
     __tablename__ = "projects"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    business_id: Mapped[str] = mapped_column(
-        String(20), unique=True, nullable=False, index=True
-    )
+    business_id: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
 
     project_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -43,46 +43,21 @@ class Project(Base, TimestampMixin):
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
-    status: Mapped[ProjectStatus] = mapped_column(
-        SAEnum(ProjectStatus),
-        default=ProjectStatus.PLANNED
-    )
+    status: Mapped[ProjectStatus] = mapped_column(SAEnum(ProjectStatus), default=ProjectStatus.PLANNED)
 
-    owner_id: Mapped[int] = mapped_column(
-        ForeignKey("owners.id"), nullable=False, index=True
-    )
+    owner_id: Mapped[int] = mapped_column(ForeignKey("owners.id"), nullable=False, index=True)
 
     owner: Mapped["Owner"] = relationship("Owner", back_populates="projects")
 
-    members: Mapped[list["ProjectMember"]] = relationship(
-        "ProjectMember",
-        back_populates="project",
-        cascade="all, delete-orphan",
-    )
+    members = relationship("ProjectMember", back_populates="project", cascade="all, delete-orphan")
+    milestones = relationship("Milestone", back_populates="project", cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="project", cascade="all, delete-orphan")
+    dsr_entries = relationship("DailySiteReport", back_populates="project", cascade="all, delete-orphan")
+    issues = relationship("Issue", back_populates="project", cascade="all, delete-orphan")
 
-    milestones: Mapped[list["Milestone"]] = relationship(
-        "Milestone",
-        back_populates="project",
-        cascade="all, delete-orphan",
-    )
-
-    tasks: Mapped[list["Task"]] = relationship(
-        "Task",
-        back_populates="project",
-        cascade="all, delete-orphan",
-    )
-
-    dsr_entries: Mapped[list["DailySiteReport"]] = relationship(
-        "DailySiteReport",
-        back_populates="project",
-        cascade="all, delete-orphan",
-    )
-
-    issues: Mapped[list["Issue"]] = relationship(
-        "Issue",
-        back_populates="project",
-        cascade="all, delete-orphan",
-    )
+    qc_records = relationship("QCRecord", back_populates="project",cascade="all, delete-orphan")
+    safety_incidents = relationship("SafetyIncident", back_populates="project")
+    checklists = relationship("Checklist", back_populates="project")
 
     __table_args__ = (
         CheckConstraint(
@@ -90,7 +65,6 @@ class Project(Base, TimestampMixin):
             name="check_project_dates",
         ),
     )
-
 
 
 class ProjectMember(Base):
@@ -141,57 +115,40 @@ class Milestone(Base):
         UniqueConstraint("project_id", "title", name="uq_milestone_project_title"),
     )
 
+# ===================== TASK =====================
+
 class Task(Base):
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    project_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
 
-    title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
 
-    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    activity_type_id = Column(Integer, ForeignKey("activity_types.id"), nullable=True)
 
-    status: Mapped[TaskStatus] = mapped_column(
-        SAEnum(TaskStatus), default=TaskStatus.PLANNED
-    )
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[TaskStatus] = mapped_column(SAEnum(TaskStatus), default=TaskStatus.PLANNED)
 
+    start_date: Mapped[Optional[date]] = mapped_column(Date)
+    end_date: Mapped[Optional[date]] = mapped_column(Date)
 
-    start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-
-    assigned_user_id: Mapped[Optional[int]] = mapped_column(
-        Integer,
-        ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
-
+    assigned_user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"))
     completion_percentage: Mapped[float] = mapped_column(Float, default=0)
 
-    project: Mapped["Project"] = relationship("Project", back_populates="tasks")
+    project = relationship("Project", back_populates="tasks")
 
-    progress_entries: Mapped[list["TaskProgress"]] = relationship(
-        "TaskProgress",
-        back_populates="task",
-        cascade="all, delete-orphan",
-    )
+    progress_entries = relationship("TaskProgress", back_populates="task", cascade="all, delete-orphan")
+    comments = relationship("Comment", back_populates="task", cascade="all, delete-orphan")
 
-    comments: Mapped[list["Comment"]] = relationship(
-        "Comment",
-        back_populates="task",
-        cascade="all, delete-orphan",
-    )
+    qc_records = relationship("QCRecord", back_populates="task")
 
     __table_args__ = (
         UniqueConstraint("project_id", "title", name="uq_task_project_title"),
     )
+
 
 
 class TaskProgress(Base, TimestampMixin):
@@ -328,6 +285,8 @@ class DailySiteReport(Base, TimestampMixin):
         cascade="all, delete-orphan"
     )
 
+    qc_records = relationship("QCRecord", back_populates="dsr")
+
     __table_args__ = (
         UniqueConstraint("project_id", "report_date", name="uq_project_dsr_date"),
         Index("idx_dsr_lat_lng", "latitude", "longitude"),
@@ -459,3 +418,162 @@ class DSRPhoto(Base, TimestampMixin):
     file_url = mapped_column(String(500), nullable=False)
 
     dsr = relationship("DailySiteReport", back_populates="photos")
+
+# ===================== QC =====================
+
+class QCRecord(Base, TimestampMixin):
+    __tablename__ = "qc_records"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(Integer, ForeignKey("projects.id"))
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True)
+    dsr_id = Column(Integer, ForeignKey("daily_site_reports.id"), nullable=True)
+
+    inspection_type = Column(String(100))
+    test_type = Column(String(100))
+    result = Column(Float)
+    standard_value = Column(Float)
+    status = Column(String(20))
+    engineer_name = Column(String(100))
+    remarks = Column(Text)
+    report_file_url = Column(String(255))
+
+    project = relationship("Project", back_populates="qc_records")
+    task = relationship("Task", back_populates="qc_records")
+    dsr = relationship("DailySiteReport", back_populates="qc_records")
+
+    __table_args__ = (
+        Index("idx_qc_project", "project_id"),
+    )
+
+# ===================== SAFETY =====================
+
+class SafetyIncident(Base, TimestampMixin):
+    __tablename__ = "safety_incidents"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(Integer, ForeignKey("projects.id"))
+
+    date = Column(Date)
+    violation_type = Column(String(100))
+    description = Column(Text)
+    injury_details = Column(Text)
+    action_taken = Column(Text)
+    responsible_person = Column(String(100))
+
+    project = relationship("Project", back_populates="safety_incidents")
+
+    __table_args__ = (
+        Index("idx_safety_project", "project_id"),
+    )
+
+
+# ===================== CHECKLIST ====================
+
+# ======================
+# CHECKLIST
+# ======================
+
+class Checklist(Base):
+    __tablename__ = "checklists"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(Integer, ForeignKey("projects.id"))
+
+    name = Column(String(100))
+    type = Column(String(50))
+
+    project = relationship("Project", back_populates="checklists")
+    items = relationship("ChecklistItem", back_populates="checklist", cascade="all, delete-orphan")
+    logs = relationship("ChecklistLog", back_populates="checklist", cascade="all, delete-orphan")
+
+
+class ChecklistItem(Base):
+    __tablename__ = "checklist_items"
+
+    id = Column(Integer, primary_key=True)
+    checklist_id = Column(Integer, ForeignKey("checklists.id"))
+
+    item = Column(String(255))
+
+    checklist = relationship("Checklist", back_populates="items")
+
+
+class ChecklistLog(Base):
+    __tablename__ = "checklist_logs"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(Integer)
+    checklist_id = Column(Integer, ForeignKey("checklists.id"))
+
+    status = Column(String(20))
+    remarks = Column(Text)
+
+    checklist = relationship("Checklist", back_populates="logs")
+
+
+# ======================
+# SITE PHOTOS
+# ======================
+
+class SitePhoto(Base, TimestampMixin):
+    __tablename__ = "site_photos"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True)
+
+    photo_url = Column(String(500), nullable=False)
+
+    date = Column(Date)
+
+    activity_tag = Column(String(100))
+    location_tag = Column(String(100))
+    description = Column(Text)
+
+    project = relationship("Project")
+    task = relationship("Task")
+
+
+class DrawingDocument(Base, TimestampMixin):
+    __tablename__ = "drawing_documents"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+
+    drawing_name = Column(String(255))
+    version = Column(String(50))
+
+    file_url = Column(String(500))
+
+    approved_by = Column(String(100))
+    date = Column(Date)
+
+    remarks = Column(Text)
+
+    project = relationship("Project")
+
+
+class SiteRequest(Base, TimestampMixin):
+    __tablename__ = "site_requests"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+
+    request_type = Column(String(50))  # Material / Work
+    description = Column(Text)
+    quantity = Column(Float)
+
+    requested_by = Column(Integer, ForeignKey("users.id"))
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    status = Column(String(20), default="Pending")  # Pending / Approved / Rejected
+
+    project = relationship("Project")

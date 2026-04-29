@@ -21,16 +21,20 @@ from app.utils.common import (
 )
 
 from app.models.user import User, UserRole
-from app.core.dependencies import require_roles, get_current_active_user
-
+from app.core.dependencies import require_roles
 router = APIRouter(prefix="/work-orders", tags=["Work Orders"])
 
 
-WORK_ORDER_CREATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
+WORK_ORDER_CREATE_ROLES = [
+    UserRole.ADMIN.value,
+    UserRole.PROJECT_MANAGER.value,
+]
+
 WORK_ORDER_READ_ROLES = [
-    UserRole.ADMIN,
-    UserRole.PROJECT_MANAGER,
-    UserRole.SITE_ENGINEER,
+    UserRole.ADMIN.value,
+    UserRole.PROJECT_MANAGER.value,
+    UserRole.SITE_ENGINEER.value,
+    UserRole.CLIENT.value,
 ]
 
 
@@ -80,7 +84,7 @@ async def list_work_orders(
 ):
     query = select(WorkOrder)
 
-    if current_user.role != UserRole.ADMIN:
+    if str(current_user.role) != UserRole.ADMIN.value:
         query = query.join(Project).join(Project.members).where(
             Project.members.any(user_id=current_user.id)
         )
@@ -95,7 +99,7 @@ async def list_work_orders(
 async def get_work_order(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(WORK_ORDER_READ_ROLES)),
 ):
     obj = await db.get(WorkOrder, id)
 

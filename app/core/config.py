@@ -33,6 +33,15 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_PHONE_NUMBER: str = ""
 
+    # ================= EMAIL (SMTP) =================
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = ""
+
+    SHOULD_SEND_EMAIL: bool = True
+
     RATE_LIMIT_TIMES: int = 60
     RATE_LIMIT_SECONDS: int = 60
 

@@ -23,7 +23,8 @@ from app.core.dependencies import (
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.boq import BOQ
-from app.models.project import Project
+from app.models.master_data import ActivityType
+from app.models.project import Project, Task
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.boq import BOQCreate, BOQOut, BOQUpdate, BOQActualsUpdate , BOQBulkCreate
@@ -36,6 +37,21 @@ router = APIRouter(
     tags=["boq"],
     dependencies=[default_rate_limiter_dependency()],
 )
+
+
+READ_ONLY_ROLES = [r.value for r in [
+    UserRole.ADMIN,
+    UserRole.PROJECT_MANAGER,
+    UserRole.SITE_ENGINEER,
+    UserRole.ACCOUNTANT,
+    UserRole.CLIENT,
+]]
+
+WRITE_ROLES = [r.value for r in [
+    UserRole.ADMIN,
+    UserRole.PROJECT_MANAGER,
+    UserRole.ACCOUNTANT,
+]]
 
 VERSION_KEY = "cache_version:boq"
 
@@ -64,7 +80,7 @@ def validate_cost_inputs(quantity: Decimal, unit_cost: Decimal):
 async def create_boq(
     payload: BOQCreate,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.ACCOUNTANT])
+        require_roles(WRITE_ROLES)
     ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -75,6 +91,16 @@ async def create_boq(
     if not project:
         logger.warning(f"Project not found project_id={payload.project_id}")
         raise NotFoundError("Project not found")
+
+    # =========================
+    # MASTER DATA VALIDATION (ADD HERE)
+    # =========================
+    activity_type_id = getattr(payload, "activity_type_id", None)
+
+    if activity_type_id is not None:
+        activity = await db.get(ActivityType, activity_type_id)
+        if not activity:
+            raise NotFoundError("Invalid activity type")
 
     try:
         max_version = await db.scalar(
@@ -136,7 +162,7 @@ async def list_boq(
     project_id: Optional[int] = None,
     category: Optional[str] = None,
     version_no: Optional[int] = None,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -199,7 +225,7 @@ async def list_boq(
 @router.get("/{boq_id}", response_model=BOQOut)
 async def get_boq(
     boq_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
@@ -219,7 +245,7 @@ async def update_boq(
     boq_id: int,
     payload: BOQUpdate,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.ACCOUNTANT])
+        require_roles(WRITE_ROLES)
     ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -269,7 +295,7 @@ async def update_boq(
 async def delete_boq(
     boq_id: int,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])
+        require_roles(WRITE_ROLES)
     ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -302,7 +328,7 @@ async def delete_boq(
 async def update_actuals(
     boq_id: int,
     payload: BOQActualsUpdate,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Updating BOQ actuals id={boq_id}")
@@ -331,7 +357,7 @@ async def update_actuals(
 @router.get("/summary/{project_id}")
 async def boq_summary(
     project_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
@@ -355,7 +381,7 @@ async def boq_summary(
 
 @router.get("/comparison/{project_id}")
 async def boq_comparison(project_id: int,
-                         current_user: User = Depends(get_current_active_user),
+                         current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
                          db: AsyncSession = Depends(get_db_session)):
     rows = (
         (
@@ -387,7 +413,7 @@ async def boq_comparison(project_id: int,
 
 @router.get("/{boq_id}/report")
 async def boq_report(boq_id: int,
-                     current_user: User = Depends(get_current_active_user), 
+                     current_user: User = Depends(require_roles(READ_ONLY_ROLES)), 
                      db: AsyncSession = Depends(get_db_session)):
     base = await db.scalar(
         select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted")
@@ -421,7 +447,7 @@ async def boq_report(boq_id: int,
 
 @router.get("/{boq_id}/alerts")
 async def boq_alerts(boq_id: int,
-                     current_user: User = Depends(get_current_active_user),
+                     current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
                      db: AsyncSession = Depends(get_db_session)):
     rows = (
         (
@@ -444,7 +470,7 @@ async def boq_alerts(boq_id: int,
 @router.get("/{boq_id}/versions")
 async def get_versions(
     boq_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     # Get base BOQ to find project
@@ -466,7 +492,7 @@ async def get_versions(
 @router.get("/project/{project_id}", response_model=list[BOQOut])
 async def get_boq_by_project(
     project_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     rows = (
@@ -493,7 +519,7 @@ async def get_boq_by_project(
 async def add_item(
     boq_id: int,
     payload: BOQCreate,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -540,7 +566,7 @@ async def add_item(
 
 @router.get("/{boq_id}/items", response_model=list[BOQOut])
 async def get_items(boq_id: int,
-                    current_user: User = Depends(get_current_active_user),
+                    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
                     db: AsyncSession = Depends(get_db_session)):
     rows = (
         (
@@ -559,7 +585,7 @@ async def get_items(boq_id: int,
 async def update_item(
     item_id: int,
     payload: BOQUpdate,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -591,7 +617,7 @@ async def update_item(
 async def bulk_add_items(
     boq_id: int,
     payload: BOQBulkCreate,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -646,7 +672,7 @@ async def bulk_add_items(
 @router.delete("/items/{item_id}")
 async def delete_item(
     item_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -672,7 +698,7 @@ async def delete_item(
 @router.post("/{boq_id}/versions")
 async def create_version(
     boq_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -736,7 +762,7 @@ async def create_version(
 @router.get("/{boq_id}/export/json")
 async def export_boq_json(
     boq_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     rows = (
@@ -755,7 +781,7 @@ async def export_boq_json(
 @router.get("/{boq_id}/export/excel")
 async def export_boq_excel(
     boq_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     rows = (
@@ -798,7 +824,7 @@ async def export_boq_excel(
 @router.get("/{boq_id}/export/pdf")
 async def export_boq_pdf(
     boq_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     rows = (
@@ -847,7 +873,7 @@ async def export_boq_pdf(
 @router.get("/{boq_id}/optimize")
 async def boq_optimize(
     boq_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     base = await db.scalar(
@@ -885,7 +911,7 @@ async def boq_optimize(
 @router.get("/{boq_id}/logs")
 async def boq_logs(
     boq_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     rows = (
@@ -910,3 +936,30 @@ async def boq_logs(
         }
         for r in rows
     ]
+
+@router.post("/{boq_id}/generate-tasks")
+async def generate_tasks_from_boq(
+    boq_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(WRITE_ROLES))
+):
+    boq_items = await db.execute(
+        select(BOQ).where(BOQ.id == boq_id)
+    )
+
+    boq = boq_items.scalar_one_or_none()
+
+    if not boq:
+        raise NotFoundError("BOQ not found")
+
+    task = Task(
+        project_id=boq.project_id,
+        activity_type_id=boq.activity_type_id,
+        name=boq.item_name,
+        quantity=boq.quantity,
+    )
+
+    db.add(task)
+    await db.commit()
+
+    return {"message": "Task created from BOQ"}

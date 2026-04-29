@@ -6,10 +6,12 @@ from app.db.session import get_db_session
 from app.models.approval import Approval
 from app.schemas.approval import ApprovalCreate, ApprovalOut, ApprovalAction
 
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.core.dependencies import get_current_active_user, require_roles
 
 from app.utils.helpers import NotFoundError, ValidationError
+
+APPROVAL_ROLES = [role.value for role in UserRole]
 
 router = APIRouter(prefix="/approvals", tags=["Approvals"])
 
@@ -17,7 +19,7 @@ router = APIRouter(prefix="/approvals", tags=["Approvals"])
 @router.post("", response_model=ApprovalOut)
 async def create_approval(
     payload: ApprovalCreate,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(APPROVAL_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     existing = await db.scalar(
@@ -45,6 +47,7 @@ async def create_approval(
 @router.get("", response_model=list[ApprovalOut])
 async def list_approvals(
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(APPROVAL_ROLES)),
 ):
     result = await db.execute(select(Approval).order_by(Approval.id.desc()))
     rows = result.scalars().all()
@@ -56,7 +59,7 @@ async def list_approvals(
 async def approve(
     id: int,
     payload: ApprovalAction,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(APPROVAL_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     obj = await db.get(Approval, id)
@@ -86,7 +89,7 @@ async def approve(
 async def reject(
     id: int,
     payload: ApprovalAction,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(APPROVAL_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     obj = await db.get(Approval, id)

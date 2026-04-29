@@ -12,14 +12,26 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.ai import router as ai_router
 from app.api.auth import router as auth_router
-from app.api.document import router as document_router
+# from app.api.document import router as document_router
 from app.api.equipment import router as equipment_router
 from app.api.labour import router as labour_router
 from app.api.material import router as material_router
-from app.api.project import router as project_router, dsr_router, issues_router
+from app.api.project import (
+    router as project_router,
+    dsr_router,
+    issues_router,
+    qc_router,
+    safety_router,
+    checklist_router,
+    site_photo_router,
+    drawing_router,
+    site_request_router,
+    communication_router,
+)
 from app.api.boq import router as boq_router
 from app.api.user import router as user_router
 from app.api.owner import router as owner_router
+from app.api.master_data import router as master_router
 from app.api.contractor import router as contractor_router
 from app.api.expense import router as expense_router
 from app.api.invoice import router as invoice_router
@@ -28,7 +40,11 @@ from app.api.dashboard import router as dashboard_router
 from app.api.billing import router as billing_router
 from app.api.approval import router as approval_router
 from app.api.work_order import router as work_order_router
+from app.api.reports import router as reports_router
 from app.api.cad import router as cad_router
+from app.api.settings import router as settings_router
+from app.api.alert import router as alert_router
+from app.api.accountant import router as accountant_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.middlewares.rate_limiter import init_rate_limiter
@@ -37,8 +53,11 @@ from app.utils.helpers import AppError
 from app.core.logger import setup_logger
 from fastapi.staticfiles import StaticFiles
 from app.core.request_context import set_request_id
-
 from app.core.logger import logger
+from fastapi import WebSocket, WebSocketDisconnect
+from app.core.websocket_manager import manager
+from app.core.redis_pubsub import RedisPubSub
+import json
 
 SLOW_API_THRESHOLD = 500
 
@@ -51,7 +70,9 @@ async def lifespan(app: FastAPI):
     try:
         await init_rate_limiter(app, app.state.redis)
     except (RedisConnectionError, OSError) as exc:
-        logger.warning(f"Redis unavailable; continuing without Redis rate limiting. error={exc}")
+        logger.warning(
+            f"Redis unavailable; continuing without Redis rate limiting. error={exc}"
+        )
         app.state.rate_limiter = None
         app.state.redis = None
 
@@ -77,11 +98,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    application = FastAPI(
-        title=settings.APP_NAME,
-        version="0.1.0",
-        lifespan=lifespan
-    )
+    application = FastAPI(title=settings.APP_NAME, version="0.1.0", lifespan=lifespan)
 
     #  CORS CONFIG (MAIN FIX)
     origins = [
@@ -96,7 +113,7 @@ def create_app() -> FastAPI:
 
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,        # using defined list (NO override)
+        allow_origins=origins,  # using defined list (NO override)
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -104,6 +121,7 @@ def create_app() -> FastAPI:
 
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("uploads/profile", exist_ok=True)
+    os.makedirs("uploads/qc", exist_ok=True)
 
     application.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
@@ -115,9 +133,7 @@ def create_app() -> FastAPI:
 
         start_time = time.time()
 
-        logger.info(
-            f"START method={request.method} path={request.url.path}"
-        )
+        logger.info(f"START method={request.method} path={request.url.path}")
 
         try:
             response = await call_next(request)
@@ -153,8 +169,7 @@ def create_app() -> FastAPI:
             f"AppError status={exc.status_code} message={exc.message} path={request.url.path}"
         )
         return JSONResponse(
-            status_code=exc.status_code,
-            content={"detail": exc.message}
+            status_code=exc.status_code, content={"detail": exc.message}
         )
 
     @application.exception_handler(SQLAlchemyError)
@@ -166,18 +181,25 @@ def create_app() -> FastAPI:
     async def health():
         return {"status": "ok"}
 
-    api_router = APIRouter(
-        dependencies=[default_rate_limiter_dependency()]
-    )
+    api_router = APIRouter(dependencies=[default_rate_limiter_dependency()])
+    from app.api.project import qc_router, safety_router, checklist_router
 
     api_router.include_router(auth_router)
     api_router.include_router(user_router)
     api_router.include_router(project_router)
+    api_router.include_router(qc_router)
+    api_router.include_router(safety_router)
+    api_router.include_router(checklist_router)
+    api_router.include_router(site_photo_router)
+    api_router.include_router(drawing_router)
     api_router.include_router(boq_router)
     api_router.include_router(material_router)
     api_router.include_router(labour_router)
+    api_router.include_router(master_router)
     api_router.include_router(equipment_router)
-    api_router.include_router(document_router)
+    # api_router.include_router(document_router)
+    api_router.include_router(site_request_router)
+    api_router.include_router(communication_router)
     api_router.include_router(ai_router)
     api_router.include_router(owner_router)
     api_router.include_router(contractor_router)
@@ -189,8 +211,13 @@ def create_app() -> FastAPI:
     api_router.include_router(dsr_router)
     api_router.include_router(issues_router)
     api_router.include_router(approval_router)
+    api_router.include_router(accountant_router)
     api_router.include_router(work_order_router)
+    api_router.include_router(reports_router)
+    api_router.include_router(alert_router) 
     api_router.include_router(cad_router)
+    api_router.include_router(settings_router)
+
 
 
     application.include_router(api_router, prefix="/api/v1")
@@ -199,3 +226,32 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+@app.websocket("/ws/{project_id}")
+async def websocket_endpoint(websocket: WebSocket, project_id: int):
+    await manager.connect(project_id, websocket)
+
+    redis = app.state.redis
+
+    if not redis:
+        await websocket.close()
+        return
+
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(f"project:{project_id}")
+
+    try:
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                data = json.loads(message["data"])
+                await manager.broadcast(project_id, data)
+
+    except WebSocketDisconnect:
+        manager.disconnect(project_id, websocket)
+
+    except Exception:
+        manager.disconnect(project_id, websocket)
+
+    finally:
+        await pubsub.unsubscribe(f"project:{project_id}")
+        await pubsub.close()

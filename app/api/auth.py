@@ -59,7 +59,8 @@ def _normalize_mobile(mobile: str) -> str:
 
 def _build_token(user: User) -> Token:
     access_token = create_access_token(
-        {"sub": str(user.id), "role": user.role.value}
+        # {"sub": str(user.id), "role": user.role.value}
+        {"sub": str(user.id), "role": user.role}
     )
     return Token(access_token=access_token)
 
@@ -150,7 +151,7 @@ async def verify_otp(
                 hashed_password=get_password_hash(secrets.token_urlsafe(32)),
                 full_name=None,
                 mobile=mobile,
-                role=UserRole.SITE_ENGINEER,
+                role=UserRole.SITE_ENGINEER.value,
                 is_active=True,
             )
             db.add(user)

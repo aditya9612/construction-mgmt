@@ -1,14 +1,17 @@
 from __future__ import annotations
-from datetime import date
+from datetime import date, datetime
+import json
+import mimetypes
 import pathlib, re, io, os, uuid
 from openpyxl import Workbook
 from typing import Annotated, List, Optional
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import LabourStatus, SkillType
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
+from app.models.labour import LabourAttendance
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.cache.redis import (
     bump_cache_version,
@@ -16,7 +19,6 @@ from app.cache.redis import (
     cache_set_json,
     get_cache_version,
 )
-from fastapi import Request
 from PIL import Image
 from app.core.dependencies import (
     get_current_active_user,
@@ -27,6 +29,7 @@ from app.models.contractor import Contractor
 from sqlalchemy import select, func, or_
 from app.models import project as m
 from app.models.contractor import Contractor
+from app.models.messages import MessageStatus
 from app.models.user import User, UserRole
 from app.models.owner import Owner
 from app.models.expense import Expense
@@ -34,12 +37,13 @@ from app.models.invoice import Invoice
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import project as s
 from app.core.logger import logger
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 from sqlalchemy.exc import IntegrityError
 from fastapi import UploadFile, File
 from app.utils.helpers import (
+    AppError,
     BadRequestError,
     DataIntegrityError,
     NotFoundError,
@@ -83,28 +87,48 @@ router = APIRouter(
 
 VERSION_KEY = "cache_version:projects"
 
-PROJECT_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
-PROJECT_DELETE_ROLES = [UserRole.ADMIN]
+PROJECT_WRITE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
+PROJECT_DELETE_ROLES = [UserRole.ADMIN.value]
 
-TASK_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
-TASK_DELETE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
-DSR_WRITE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
-DSR_READ_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
-DSR_DELETE_ROLES = [UserRole.ADMIN]
-DSR_APPROVE_ROLES = [UserRole.ADMIN,UserRole.PROJECT_MANAGER,]
-ISSUE_CREATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
-ISSUE_UPDATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
-ISSUE_DELETE_ROLES = [UserRole.ADMIN]
-
-FINANCIAL_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.ACCOUNTANT]
-
-READ_ROLES = [
-    UserRole.ADMIN,
-    UserRole.PROJECT_MANAGER,
-    UserRole.SITE_ENGINEER,
-    UserRole.CONTRACTOR,
-    UserRole.ACCOUNTANT,
+TASK_WRITE_ROLES = [
+    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 ]
+TASK_DELETE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
+
+DSR_WRITE_ROLES = [
+    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
+]
+DSR_READ_ROLES = [
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
+        UserRole.CLIENT,
+    ]
+]
+DSR_DELETE_ROLES = [UserRole.ADMIN.value]
+DSR_APPROVE_ROLES = [
+    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.CLIENT]
+]
+
+ISSUE_CREATE_ROLES = [
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
+        UserRole.CLIENT,
+    ]
+]
+ISSUE_UPDATE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
+ISSUE_DELETE_ROLES = [UserRole.ADMIN.value]
+
+FINANCIAL_ROLES = [
+    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.ACCOUNTANT]
+]
+
+READ_ROLES = [r.value for r in UserRole]
 
 
 class ProjectsRepository:
@@ -450,7 +474,10 @@ class ProjectsService:
         self.tasks_repo = tasks_repo
 
     def _assert_project_mutation_role(self, current_user: User) -> None:
-        if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+        if current_user.role not in (
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+        ):
             raise PermissionDeniedError("Insufficient permissions")
 
     async def _compute_completion_percentage_by_project_ids(
@@ -530,7 +557,10 @@ class ProjectsService:
         status: Optional[s.ProjectStatus] = None,
     ) -> PaginatedResponse[s.ProjectOut]:
 
-        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+        if current_user.role in (
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+        ):
             base_query = select(m.Project)
         else:
             base_query = (
@@ -679,7 +709,10 @@ class ProjectMembersService:
         self.members_repo = members_repo
 
     def _assert_member_mutation_role(self, current_user: User) -> None:
-        if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+        if current_user.role not in (
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+        ):
             raise PermissionDeniedError("Insufficient permissions")
 
     async def assign_member(
@@ -715,7 +748,7 @@ class ProjectMembersService:
             await db.rollback()
             raise ConflictError("User is already assigned to this project")
 
-        role = user.role.value if hasattr(user.role, "value") else str(user.role)
+        role = user.role
 
         return s.ProjectMemberOut(
             user_id=user.id,
@@ -742,7 +775,7 @@ class ProjectMembersService:
         )
         items: list[s.ProjectMemberOut] = []
         for user in users:
-            role = user.role.value if hasattr(user.role, "value") else str(user.role)
+            role = user.role
             items.append(
                 s.ProjectMemberOut(
                     user_id=user.id,
@@ -787,7 +820,10 @@ class MilestonesService:
         self.milestones_repo = milestones_repo
 
     def _assert_milestone_mutation_role(self, current_user: User) -> None:
-        if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+        if current_user.role not in (
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+        ):
             raise PermissionDeniedError("Insufficient permissions")
 
     async def create_milestone(
@@ -966,9 +1002,9 @@ class TasksService:
 
     def _assert_task_mutation_role(self, current_user: User) -> None:
         if current_user.role not in (
-            UserRole.ADMIN,
-            UserRole.PROJECT_MANAGER,
-            UserRole.SITE_ENGINEER,
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+            UserRole.SITE_ENGINEER.value,
         ):
             raise PermissionDeniedError("Insufficient permissions")
 
@@ -987,7 +1023,10 @@ class TasksService:
         project_id: int,
         task: m.Task,
     ) -> None:
-        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+        if current_user.role in (
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+        ):
             return
 
         if current_user.id == task.assigned_user_id:
@@ -1036,6 +1075,14 @@ class TasksService:
             project_id=project_id,
             current_user=current_user,
         )
+
+        # =========================
+        # MASTER DATA VALIDATION (ADD HERE)
+        # =========================
+        if payload.activity_type_id is not None:
+            activity = await db.get(m.ActivityType, payload.activity_type_id)
+            if not activity:
+                raise NotFoundError("Invalid activity type")
 
         if payload.assigned_user_id is not None:
             assigned_user = await db.scalar(
@@ -1476,7 +1523,10 @@ class AlertsService:
     ):
         today = date.today()
 
-        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+        if current_user.role in (
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+        ):
             base_query = select(m.Project).where(
                 m.Project.end_date < today,
                 m.Project.status != s.ProjectStatus.COMPLETED,
@@ -1534,7 +1584,10 @@ class AlertsService:
     ):
         today = date.today()
 
-        if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+        if current_user.role in (
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+        ):
             base_query = select(m.Task).where(
                 m.Task.end_date < today,
                 m.Task.status != s.TaskStatus.COMPLETED,
@@ -2019,6 +2072,35 @@ async def get_project_logs(
     }
 
 
+@router.get("/projects/{project_id}/photos")
+async def get_project_photos(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    #  Access check
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    result = await db.execute(
+        select(m.SitePhoto)
+        .where(m.SitePhoto.project_id == project_id)
+        .order_by(m.SitePhoto.date.desc())
+    )
+
+    photos = result.scalars().all()
+
+    return [
+        {
+            "id": p.id,
+            "photo_url": p.photo_url,
+            "date": p.date,
+            "activity": p.activity_tag,
+            "description": p.description,
+        }
+        for p in photos
+    ]
+
+
 milestones_router = APIRouter(
     prefix="",
     tags=["project_management"],
@@ -2268,7 +2350,7 @@ async def update_task_progress(
     project_id: int,
     task_id: int,
     payload: s.TaskProgressUpdate,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
@@ -2320,7 +2402,7 @@ async def create_comment(
     project_id: int,
     task_id: int,
     payload: s.CommentCreate,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
@@ -2413,6 +2495,7 @@ dsr_router = APIRouter(
     dependencies=[default_rate_limiter_dependency()],
 )
 
+
 # =========================
 # CREATE DSR
 # =========================
@@ -2457,11 +2540,14 @@ async def create_dsr(
     labour_result = await db.execute(
         select(
             m.Labour.skill_type,
-            func.count(m.Labour.id),
-        ).where(
-            m.Labour.project_id == payload.project_id,
+            func.count(func.distinct(m.Labour.id)),
+        )
+        .join(LabourAttendance, m.Labour.id == LabourAttendance.labour_id)
+        .where(
+            LabourAttendance.project_id == payload.project_id,
             m.Labour.status == LabourStatus.ACTIVE,
-        ).group_by(m.Labour.skill_type)
+        )
+        .group_by(m.Labour.skill_type)
     )
 
     skilled = 0
@@ -2486,10 +2572,7 @@ async def create_dsr(
     for _ in range(3):
         try:
             data["business_id"] = await generate_business_id(
-                db,
-                m.DailySiteReport,
-                "business_id",
-                "DSR"
+                db, m.DailySiteReport, "business_id", "DSR"
             )
 
             obj = m.DailySiteReport(**data)
@@ -2503,7 +2586,6 @@ async def create_dsr(
             continue
     else:
         raise Exception("Failed to generate unique DSR ID")
-
 
     try:
         await db.refresh(obj)
@@ -2605,8 +2687,9 @@ async def get_project_dsr(
         return PaginatedResponse[s.DSROut].model_validate(result)
 
     except Exception as e:
-        traceback.print_exc() 
+        traceback.print_exc()
         raise DataIntegrityError("Data integrity issue")
+
 
 # =========================
 # GET DSR BY ID
@@ -2890,7 +2973,9 @@ async def contractor_analytics(
             func.count(m.DailySiteReport.id),
         )
         .select_from(m.DailySiteReport)
-        .join(Contractor, Contractor.id == m.DailySiteReport.contractor_id, isouter=True)
+        .join(
+            Contractor, Contractor.id == m.DailySiteReport.contractor_id, isouter=True
+        )
         .where(m.DailySiteReport.project_id == project_id)
     )
 
@@ -2913,12 +2998,13 @@ async def contractor_analytics(
         for r in rows
     ]
 
+
 @dsr_router.delete("/{id}")
 async def delete_dsr(
     id: int,
     current_user: User = Depends(require_roles(DSR_DELETE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
-    redis = Depends(get_request_redis), 
+    redis=Depends(get_request_redis),
 ):
     logger.info(f"Deleting DSR id={id}")
 
@@ -2999,12 +3085,10 @@ async def export_dsr_excel(
     )
 
     query = (
-        select(
-            m.DailySiteReport,
-            Contractor.name,
-            User.full_name
+        select(m.DailySiteReport, Contractor.name, User.full_name)
+        .join(
+            Contractor, Contractor.id == m.DailySiteReport.contractor_id, isouter=True
         )
-        .join(Contractor, Contractor.id == m.DailySiteReport.contractor_id, isouter=True)
         .join(User, User.id == m.DailySiteReport.created_by_id, isouter=True)
         .where(m.DailySiteReport.project_id == project_id)
     )
@@ -3017,14 +3101,12 @@ async def export_dsr_excel(
 
     if contractor_name:
         contractor_name = contractor_name.strip()
-        query = query.where(
-            Contractor.name.ilike(f"%{contractor_name}%")
-        )
+        query = query.where(Contractor.name.ilike(f"%{contractor_name}%"))
 
     query = query.order_by(m.DailySiteReport.report_date.desc())
 
     result = await db.execute(query)
-    rows = result.all()   # ❗ NOT scalars()
+    rows = result.all()  # ❗ NOT scalars()
 
     if not rows:
         raise NotFoundError("No DSR data found")
@@ -3057,9 +3139,9 @@ async def export_dsr_excel(
                 r.weather,
                 r.work_done,
                 r.work_planned,
-                r.total_labour, 
+                r.total_labour,
                 r.skilled_labour,
-                r.unskilled_labour, 
+                r.unskilled_labour,
                 r.material_used,
                 r.issues,
                 r.remarks,
@@ -3078,6 +3160,7 @@ async def export_dsr_excel(
             "Content-Disposition": f"attachment; filename=dsr_project_{project_id}.xlsx"
         },
     )
+
 
 @dsr_router.put("/{id}/submit")
 async def submit_dsr(
@@ -3104,6 +3187,7 @@ async def submit_dsr(
     await db.flush()
 
     return {"message": "DSR submitted successfully"}
+
 
 @dsr_router.put("/{id}/approve")
 async def approve_dsr(
@@ -3132,6 +3216,7 @@ async def approve_dsr(
 
     return {"message": "DSR approved successfully"}
 
+
 @dsr_router.put("/{id}/reject")
 async def reject_dsr(
     id: int,
@@ -3151,7 +3236,6 @@ async def reject_dsr(
 
     if obj.status != "Submitted":
         raise ValidationError("Only submitted DSR can be rejected")
-
 
     obj.status = "Draft"
 
@@ -3206,10 +3290,7 @@ async def create_issue(
         for _ in range(3):
             try:
                 data["business_id"] = await generate_business_id(
-                    db,
-                    m.Issue,
-                    "business_id",
-                    "ISS"
+                    db, m.Issue, "business_id", "ISS"
                 )
 
                 obj = m.Issue(**data)
@@ -3257,17 +3338,17 @@ async def list_issues(
 ):
     pagination = pagination.normalized()
 
-    if current_user.role in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+    if current_user.role in (
+        UserRole.ADMIN.value,
+        UserRole.PROJECT_MANAGER.value,
+    ):
         base_query = select(m.Issue)
     else:
-        subquery = (
-            select(m.ProjectMember.project_id)
-            .where(m.ProjectMember.user_id == current_user.id)
+        subquery = select(m.ProjectMember.project_id).where(
+            m.ProjectMember.user_id == current_user.id
         )
 
-        base_query = select(m.Issue).where(
-            m.Issue.project_id.in_(subquery)
-        )
+        base_query = select(m.Issue).where(m.Issue.project_id.in_(subquery))
 
     if status is not None:
         base_query = base_query.where(m.Issue.status == status)
@@ -3436,7 +3517,10 @@ async def delete_issue(
         logger.warning(f"Issue not found id={id}")
         raise NotFoundError("Issue not found")
 
-    if current_user.role not in (UserRole.ADMIN, UserRole.PROJECT_MANAGER):
+    if current_user.role not in (
+        UserRole.ADMIN.value,
+        UserRole.PROJECT_MANAGER.value,
+    ):
         is_member = await db.scalar(
             select(func.count())
             .select_from(m.ProjectMember)
@@ -3533,6 +3617,891 @@ async def issue_analytics(
         "total_reports": int(total or 0),
         "reports_with_issues": int(issues or 0),
     }
+
+
+# ===================== QC =====================
+
+from fastapi import Form, File, UploadFile, Depends, HTTPException
+from uuid import uuid4
+import os, shutil
+
+UPLOAD_DIR_QC = "uploads/qc"
+os.makedirs(UPLOAD_DIR_QC, exist_ok=True)
+
+
+def save_qc_file(file: UploadFile) -> str:
+    ext = file.filename.split(".")[-1].lower()
+    filename = f"{uuid4()}.{ext}"
+
+    path = os.path.join(UPLOAD_DIR_QC, filename)
+
+    with open(path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return f"/uploads/qc/{filename}"
+
+
+async def validate_and_save_qc_file(file: UploadFile) -> str:
+    if not file.content_type.startswith("image/"):
+        raise AppError(400, "Only image files allowed")
+
+    allowed_extensions = {"jpg", "jpeg", "png", "webp"}
+    ext = file.filename.split(".")[-1].lower()
+
+    if ext not in allowed_extensions:
+        raise AppError(400, "Invalid file format")
+
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise AppError(400, "File too large")
+
+    file.file.seek(0)
+
+    return save_qc_file(file)
+
+
+qc_router = APIRouter(prefix="/qc", tags=["QC"])
+
+
+@qc_router.post("", response_model=s.QCOut)
+async def create_qc(
+    payload: s.QCCreate = Depends(),
+    report_file: Optional[UploadFile] = File(None),
+    current_user: User = Depends(require_roles(ISSUE_UPDATE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    file_url = None
+
+    if report_file:
+        file_url = await validate_and_save_qc_file(report_file)
+
+    obj = m.QCRecord(**payload.model_dump(), report_file_url=file_url)
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+
+    return obj
+
+
+@qc_router.get("/{qc_id}", response_model=s.QCOut)
+async def get_qc(
+    qc_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    return await db.scalar(select(m.QCRecord).where(m.QCRecord.id == qc_id))
+
+
+@qc_router.get("", response_model=PaginatedResponse[s.QCOut])
+async def list_qc(
+    project_id: Optional[int] = None,
+    task_id: Optional[int] = None,
+    status: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(m.QCRecord)
+
+    if project_id:
+        query = query.where(m.QCRecord.project_id == project_id)
+    if task_id:
+        query = query.where(m.QCRecord.task_id == task_id)
+    if status:
+        query = query.where(m.QCRecord.status == status)
+
+    count = await db.scalar(select(func.count()).select_from(query.subquery()))
+    rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
+
+    return PaginatedResponse(
+        items=rows, meta=PaginationMeta(total=count, limit=limit, offset=offset)
+    )
+
+
+@qc_router.put("/{qc_id}", response_model=s.QCOut)
+async def update_qc(
+    qc_id: int,
+    data: s.QCCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ISSUE_UPDATE_ROLES)),
+):
+    obj = await db.get(m.QCRecord, qc_id)
+    for k, v in data.dict().items():
+        setattr(obj, k, v)
+
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+@qc_router.delete("/{qc_id}")
+async def delete_qc(
+    qc_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ISSUE_UPDATE_ROLES)),
+):
+    obj = await db.get(m.QCRecord, qc_id)
+    await db.delete(obj)
+    await db.commit()
+    return {"message": "QC deleted"}
+
+
+# ===================== SAFETY =====================
+
+safety_router = APIRouter(prefix="/safety", tags=["Safety"])
+
+
+@safety_router.post("", response_model=s.SafetyOut)
+async def create_incident(
+    data: s.SafetyCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+):
+    obj = m.SafetyIncident(**data.dict())
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+@safety_router.get("/{id}", response_model=s.SafetyOut)
+async def get_incident(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    incident = await db.scalar(
+        select(m.SafetyIncident).where(m.SafetyIncident.id == id)
+    )
+
+    if not incident:
+        raise HTTPException(status_code=404, detail="Safety incident not found")
+
+    return incident
+
+
+@safety_router.get("", response_model=PaginatedResponse[s.SafetyOut])
+async def list_incidents(
+    project_id: Optional[int] = None,
+    violation_type: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(m.SafetyIncident)
+
+    if project_id:
+        query = query.where(m.SafetyIncident.project_id == project_id)
+    if violation_type:
+        query = query.where(m.SafetyIncident.violation_type == violation_type)
+
+    count = await db.scalar(select(func.count()).select_from(query.subquery()))
+    rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
+
+    return PaginatedResponse(
+        items=rows, meta=PaginationMeta(total=count, limit=limit, offset=offset)
+    )
+
+
+@safety_router.put("/{id}", response_model=s.SafetyOut)
+async def update_incident(
+    id: int,
+    data: s.SafetyCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+):
+    obj = await db.get(m.SafetyIncident, id)
+    for k, v in data.dict().items():
+        setattr(obj, k, v)
+
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+@safety_router.delete("/{id}")
+async def delete_incident(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+):
+    obj = await db.get(m.SafetyIncident, id)
+    await db.delete(obj)
+    await db.commit()
+    return {"message": "Incident deleted"}
+
+
+# ===================== CHECKLIST =====================
+
+checklist_router = APIRouter(prefix="/checklists", tags=["Checklist"])
+
+
+@checklist_router.post("")
+async def create_checklist(
+    data: s.ChecklistCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    obj = m.Checklist(**data.dict())
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+@checklist_router.post("/items")
+async def add_item(
+    data: s.ChecklistItemCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    obj = m.ChecklistItem(**data.dict())
+    db.add(obj)
+    await db.commit()
+    return obj
+
+
+@checklist_router.get("")
+async def list_checklists(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    return (await db.execute(select(m.Checklist))).scalars().all()
+
+
+@checklist_router.post("/execute")
+async def execute_checklist(
+    data: s.ChecklistLogCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    obj = m.ChecklistLog(**data.dict())
+    db.add(obj)
+    await db.commit()
+    return obj
+
+
+@checklist_router.get("/logs", response_model=PaginatedResponse[s.ChecklistLogOut])
+async def list_logs(
+    project_id: Optional[int] = None,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(m.ChecklistLog)
+
+    if project_id:
+        query = query.where(m.ChecklistLog.project_id == project_id)
+
+    count = await db.scalar(select(func.count()).select_from(query.subquery()))
+    rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
+
+    items = [s.ChecklistLogOut.model_validate(x) for x in rows]  # ✅ FIX
+
+    return PaginatedResponse(
+        items=items, meta=PaginationMeta(total=count, limit=limit, offset=offset)
+    )
+
+
+@checklist_router.delete("/{id}")
+async def delete_checklist(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    obj = await db.get(m.Checklist, id)
+    await db.delete(obj)
+    await db.commit()
+    return {"message": "Checklist deleted"}
+
+
+# ===================== Site Photos =====================
+UPLOAD_DIR = "uploads/site_photos"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+
+
+site_photo_router = APIRouter(prefix="/site-photos", tags=["Site Photos"])
+
+
+#  Upload Photo
+@site_photo_router.post("/upload", response_model=s.SitePhotoOut)
+async def upload_photo(
+    project_id: int = Form(...),
+    file: UploadFile = File(...),
+    date: Optional[date] = Form(None),
+    activity_tag: Optional[str] = Form(None),
+    location_tag: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    #  Validate file type
+    ext = file.filename.split(".")[-1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, "Invalid file type")
+
+    #  Validate size
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(400, "File too large")
+
+    file.file.seek(0)
+
+    #  Unique filename
+    filename = f"{uuid4()}.{ext}"
+    file_path = os.path.join(UPLOAD_DIR, filename)
+
+    #  Save file
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    #  Store URL (NOT raw path)
+    file_url = f"/uploads/site_photos/{filename}"
+
+    obj = m.SitePhoto(
+        project_id=project_id,
+        photo_url=file_url,
+        date=date,
+        activity_tag=activity_tag,
+        location_tag=location_tag,
+        description=description,
+    )
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+
+    return obj
+
+
+#  Filter Photos (IMPORTANT FEATURE)
+@site_photo_router.get("", response_model=list[s.SitePhotoOut])
+async def list_photos(
+    project_id: int,
+    activity_tag: Optional[str] = None,
+    location_tag: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(m.SitePhoto).where(m.SitePhoto.project_id == project_id)
+
+    if activity_tag:
+        query = query.where(m.SitePhoto.activity_tag == activity_tag)
+
+    if location_tag:
+        query = query.where(m.SitePhoto.location_tag == location_tag)
+
+    #  Date range filter
+    if start_date:
+        query = query.where(m.SitePhoto.date >= start_date)
+
+    if end_date:
+        query = query.where(m.SitePhoto.date <= end_date)
+
+    result = (await db.execute(query)).scalars().all()
+    return result
+
+
+#  Delete
+@site_photo_router.delete("/{photo_id}")
+async def delete_photo(
+    photo_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+):
+    obj = await db.get(m.SitePhoto, photo_id)
+
+    if not obj:
+        raise HTTPException(404, "Photo not found")
+
+    #  Delete file from disk
+    if obj.photo_url:
+        file_path = obj.photo_url.replace("/uploads/", "uploads/")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    await db.delete(obj)
+    await db.commit()
+
+    return {"message": "Photo deleted"}
+
+
+# ===================== Drawings & Documents =====================
+
+drawing_router = APIRouter(prefix="/drawings", tags=["Drawings & Documents"])
+
+
+#  Upload Drawing
+@drawing_router.post("/upload", response_model=s.DrawingOut)
+async def upload_drawing(
+    data: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    #  Convert string → dict
+    parsed_data = json.loads(data)
+
+    payload = s.DrawingCreate(**parsed_data)
+
+    # Ensure folder exists
+    os.makedirs("uploads/drawings", exist_ok=True)
+
+    file_path = f"uploads/drawings/{file.filename}"
+
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    obj = m.DrawingDocument(**payload.dict(), file_url=file_path)
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+
+    return obj
+
+
+#  Version History (VERY IMPORTANT FEATURE)
+@drawing_router.get("/{project_id}/versions", response_model=list[s.DrawingOut])
+async def get_versions(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    skip: int = 0,
+    limit: int = 50,
+):
+    result = await db.execute(
+        select(m.DrawingDocument)
+        .where(m.DrawingDocument.project_id == project_id)
+        .order_by(m.DrawingDocument.id.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    return result.scalars().all()
+
+
+#  Latest Version
+@drawing_router.get("/{project_id}/latest", response_model=s.DrawingOut)
+async def get_latest(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    latest = await db.scalar(
+        select(m.DrawingDocument)
+        .where(m.DrawingDocument.project_id == project_id)
+        .order_by(m.DrawingDocument.created_at.desc())
+    )
+
+    if not latest:
+        raise HTTPException(status_code=404, detail="No drawings found")
+
+    return latest
+
+
+#  Delete
+@drawing_router.delete("/{id}")
+async def delete_drawing(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+):
+    obj = await db.get(m.DrawingDocument, id)
+
+    #  ADD HERE
+    if not obj:
+        raise NotFoundError("Drawing not found")
+
+    import os
+
+    # optional: delete file also
+    if os.path.exists(obj.file_url):
+        os.remove(obj.file_url)
+
+    await db.delete(obj)
+    await db.commit()
+
+    return {"message": "Deleted"}
+
+
+@drawing_router.get("/documents/download/{id}")
+async def download_document(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    doc = await db.get(m.DrawingDocument, id)
+
+    if not doc:
+        raise NotFoundError("Document not found")
+
+    file_path = doc.file_url
+
+    if not os.path.exists(file_path):
+        raise NotFoundError("File not found on server")
+
+    return FileResponse(
+        path=file_path,
+        filename=os.path.basename(file_path),
+        media_type="application/octet-stream",
+    )
+
+
+@router.get("/documents/view/{id}")
+async def view_document(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    doc = await db.get(m.DrawingDocument, id)
+
+    if not doc:
+        raise NotFoundError("Document not found")
+
+    file_path = doc.file_url
+
+    if not os.path.exists(file_path):
+        raise NotFoundError("File not found on server")
+
+    media_type, _ = mimetypes.guess_type(file_path)
+
+    return FileResponse(
+        path=file_path,
+        filename=os.path.basename(file_path),
+        media_type=media_type or "application/octet-stream",
+        headers={"Content-Disposition": "inline"},
+    )
+
+
+# ===================== Site Requests =====================
+
+
+site_request_router = APIRouter(prefix="/site-requests", tags=["Site Requests"])
+
+
+@site_request_router.post("", response_model=s.SiteRequestOut)
+async def create_request(
+    payload: s.SiteRequestCreate,
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = m.SiteRequest(
+        **payload.dict(),
+        requested_by=current_user.id,
+        status="Pending",
+    )
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+@site_request_router.get("", response_model=list[s.SiteRequestOut])
+async def list_requests(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    result = await db.execute(
+        select(m.SiteRequest).where(m.SiteRequest.project_id == project_id)
+    )
+    return result.scalars().all()
+
+
+@site_request_router.put("/{id}/approve")
+async def approve_request(
+    id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.SiteRequest, id)
+    obj.status = "Approved"
+    obj.approved_by = current_user.id
+
+    await db.commit()
+    return {"message": "Approved"}
+
+
+@site_request_router.put("/{id}/reject")
+async def reject_request(
+    id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.SiteRequest, id)
+    obj.status = "Rejected"
+    obj.approved_by = current_user.id
+
+    await db.commit()
+    return {"message": "Rejected"}
+
+
+# ===================== COMMUNICATION =====================
+from app.models.messages import Message
+
+communication_router = APIRouter(prefix="/communication", tags=["Communication"])
+# ===================== 1. SEND MESSAGE =====================
+
+
+@communication_router.post("/{project_id}/messages")
+async def send_message(
+    request: Request,
+    project_id: int,
+    payload: s.MessageCreate,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    obj = Message(
+        project_id=project_id,
+        message=payload.message,
+        parent_id=payload.parent_id,
+        attachment_url=payload.attachment_url,
+        created_by=current_user.id,
+        status=MessageStatus.SENT,
+    )
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+
+    redis = request.app.state.redis
+
+    if redis:
+        await redis.publish(
+            f"project:{project_id}",
+            json.dumps(
+                {
+                    "id": obj.id,
+                    "message": obj.message,
+                    "user": current_user.id,
+                    "created_at": obj.created_at.isoformat(),
+                    "status": obj.status.value,
+                    "timestamp": obj.created_at.isoformat(),
+                }
+            ),
+        )
+
+    return obj
+
+
+# ===================== 2. GET MESSAGES (PAGINATION) =====================
+
+
+@communication_router.get("/{project_id}/messages")
+async def get_messages(
+    project_id: int,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    result = await db.execute(
+        select(Message)
+        .where(Message.project_id == project_id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    return result.scalars().all()
+
+
+# ===================== 3. GET REPLIES =====================
+
+
+@communication_router.get("/messages/{message_id}/replies")
+async def get_replies(
+    message_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(Message, message_id)
+
+    if not obj:
+        raise NotFoundError("Message not found")
+
+    await assert_project_access(
+        db, project_id=obj.project_id, current_user=current_user
+    )
+
+    result = await db.execute(
+        select(Message)
+        .where(Message.parent_id == message_id)
+        .order_by(Message.created_at.asc())
+    )
+
+    return result.scalars().all()
+
+
+# ===================== 4. MARK AS READ =====================
+
+
+@communication_router.put("/messages/{id}/read")
+async def mark_read(
+    request: Request,
+    id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(Message, id)
+
+    if not obj:
+        raise NotFoundError("Message not found")
+
+    await assert_project_access(
+        db, project_id=obj.project_id, current_user=current_user
+    )
+
+    obj.status = MessageStatus.READ
+    await db.commit()
+
+    redis = request.app.state.redis
+
+    if redis:
+        await redis.publish(
+            f"project:{obj.project_id}",
+            json.dumps(
+                {
+                    "type": "read",
+                    "message_id": obj.id,
+                    "user": current_user.id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            ),
+        )
+
+    return {"message": "read"}
+
+
+# ===================== 5. MARK AS DELIVERED =====================
+
+
+@communication_router.put("/messages/{id}/delivered")
+async def mark_delivered(
+    request: Request,
+    id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.Message, id)
+
+    if not obj:
+        raise NotFoundError("Message not found")
+
+    await assert_project_access(
+        db, project_id=obj.project_id, current_user=current_user
+    )
+
+    obj.status = MessageStatus.DELIVERED
+    await db.commit()
+
+    redis = request.app.state.redis
+
+    if redis:
+        await redis.publish(
+            f"project:{obj.project_id}",
+            json.dumps(
+                {
+                    "type": "delivered",
+                    "message_id": obj.id,
+                    "user": current_user.id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            ),
+        )
+
+    return {"message": "delivered"}
+
+
+# ===================== 6. UNREAD COUNT =====================
+
+
+@communication_router.get("/{project_id}/messages/unread-count")
+async def unread_count(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    count = await db.scalar(
+        select(func.count()).where(
+            Message.project_id == project_id, Message.status != "read"
+        )
+    )
+
+    return {"unread": count}
+
+
+# ===================== 7. DELETE MESSAGE =====================
+
+
+@communication_router.delete("/messages/{id}")
+async def delete_message(
+    id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(Message, id)
+
+    if not obj:
+        raise NotFoundError("Message not found")
+
+    await assert_project_access(
+        db, project_id=obj.project_id, current_user=current_user
+    )
+
+    if obj.created_by != current_user.id:
+        raise ValidationError("Not allowed")
+
+    await db.delete(obj)
+    await db.commit()
+
+    return {"message": "deleted"}
+
+
+# ===================== 8. UPDATE MESSAGE =====================
+
+
+@communication_router.put("/messages/{id}")
+async def update_message(
+    id: int,
+    payload: s.MessageCreate,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.Message, id)
+
+    if not obj:
+        raise NotFoundError("Message not found")
+
+    await assert_project_access(
+        db, project_id=obj.project_id, current_user=current_user
+    )
+
+    if obj.created_by != current_user.id:
+        raise ValidationError("Not allowed")
+
+    obj.message = payload.message
+    obj.attachment_url = payload.attachment_url
+
+    await db.commit()
+
+    return obj
 
 
 router.include_router(milestones_router)

@@ -12,6 +12,7 @@ class BOQCreate(BaseSchema):
     unit: str = "unit"
     unit_cost: Decimal = Decimal("0")
     status: Optional[str] = "Active"
+    activity_type_id: Optional[int] = None
 
 
 class BOQUpdate(BaseSchema):

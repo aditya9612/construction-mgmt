@@ -13,14 +13,15 @@ from app.schemas.base import PaginationMeta, PaginatedResponse
 from app.schemas.user import UserAuditOut, UserOut, UserCreatePayload, UserUpdatePayload
 from app.utils.helpers import AppError, ConflictError, NotFoundError
 from app.core.logger import logger
-from fastapi import Depends, File, Request, UploadFile , Query , APIRouter
-import os , shutil
+from fastapi import Depends, File, Request, UploadFile, Query, APIRouter
+import os, shutil
 from uuid import uuid4
 
 MAX_IMAGE_SIZE = 5 * 1024 * 1024
 
 UPLOAD_DIR = "uploads/profile"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 def save_profile_image(file: UploadFile) -> str:
     ext = file.filename.split(".")[-1].lower()
@@ -33,6 +34,7 @@ def save_profile_image(file: UploadFile) -> str:
 
     #  return URL path instead of system path
     return f"/uploads/profile/{filename}"
+
 
 async def validate_and_save_image(profile_image: UploadFile) -> str:
     if not profile_image.content_type.startswith("image/"):
@@ -55,6 +57,7 @@ async def validate_and_save_image(profile_image: UploadFile) -> str:
 
     return save_profile_image(profile_image)
 
+
 async def get_current_user_optional(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
@@ -63,6 +66,7 @@ async def get_current_user_optional(
         return await get_current_active_user(request=request, db=db)
     except Exception:
         return None
+
 
 AUDIT_ALLOWED_FIELDS = {
     "full_name",
@@ -77,7 +81,10 @@ AUDIT_ALLOWED_FIELDS = {
     "profile_image",
 }
 
-async def log_user_changes(db, user, data: dict, current_user_id: int, change_group_id: str):
+
+async def log_user_changes(
+    db, user, data: dict, current_user_id: int, change_group_id: str
+):
     logs = []
 
     for field, new_value in data.items():
@@ -145,14 +152,9 @@ async def create_user(
     # ------------------------
     # VALIDATION (KEEP OLD BEHAVIOR)
     # ------------------------
-    if not payload.email and not payload.mobile_number:
-        raise AppError(422, "Provide either email or mobile_number")
-
-    if payload.email and not payload.password:
-        raise AppError(422, "Password required when creating with email")
-
     try:
-        role = UserRole(payload.role)
+        # role = UserRole(payload.role)
+        role = UserRole(payload.role).value
     except ValueError:
         raise AppError(422, f"Invalid role. Use one of: {ROLES}")
 
@@ -172,9 +174,7 @@ async def create_user(
         # ------------------------
         # NORMALIZATION (KEEP OLD LOGIC SAFE)
         # ------------------------
-        mobile_val = (
-            payload.mobile_number.strip() if payload.mobile_number else None
-        )
+        mobile_val = payload.mobile_number.strip() if payload.mobile_number else None
 
         email = payload.email.strip().lower() if payload.email else None
 
@@ -183,9 +183,7 @@ async def create_user(
         # ------------------------
         if email:
             # EMAIL UNIQUE CHECK
-            existing_email = await db.scalar(
-                select(User).where(User.email == email)
-            )
+            existing_email = await db.scalar(select(User).where(User.email == email))
             if existing_email:
                 raise ConflictError("Email already registered")
 
@@ -227,9 +225,7 @@ async def create_user(
                 raise AppError(422, "Invalid mobile number")
 
             # MOBILE UNIQUE CHECK
-            existing_mobile = await db.scalar(
-                select(User).where(User.mobile == mobile)
-            )
+            existing_mobile = await db.scalar(select(User).where(User.mobile == mobile))
             if existing_mobile:
                 raise ConflictError("Mobile already registered")
 
@@ -294,7 +290,7 @@ async def list_users(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     search: Optional[str] = None,
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
     query = select(User).where(User.is_deleted == False)
@@ -304,7 +300,9 @@ async def list_users(
         logger.info(f"User search query={search}")
         like = f"%{search}%"
         cond = or_(
-            User.email.ilike(like), User.full_name.ilike(like), User.mobile.cast(String).ilike(like)
+            User.email.ilike(like),
+            User.full_name.ilike(like),
+            User.mobile.cast(String).ilike(like),
         )
         query = query.where(cond)
         count_query = count_query.where(cond)
@@ -320,12 +318,13 @@ async def list_users(
     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
     return {"items": items, "meta": meta.model_dump()}
 
+
 @router.get("/activity-logs")
 async def get_activity_logs(
     entity_id: Optional[int] = Query(None),
     action: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
 ):
     # base query
     query = select(ActivityLog)
@@ -354,7 +353,9 @@ async def get_user(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    user = await db.scalar(select(User).where(User.id == user_id, User.is_deleted == False))
+    user = await db.scalar(
+        select(User).where(User.id == user_id, User.is_deleted == False)
+    )
 
     if user is None:
         logger.warning(f"User not found id={user_id}")
@@ -368,7 +369,7 @@ async def update_user(
     user_id: int,
     payload: UserUpdatePayload = Depends(),
     profile_image: UploadFile = File(None),
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Updating user id={user_id}")
@@ -382,32 +383,36 @@ async def update_user(
     try:
         data = payload.model_dump(exclude_unset=True)
 
-        try:
-            UserUpdatePayload(**data)
-        except ValidationError as e:
-            raise AppError(422, str(e))
+        data = {k: v for k, v in data.items() if v is not None and v != ""}
 
         old_image_path = user.profile_image
+
+        # ------------------------
         # IMAGE
+        # ------------------------
         if profile_image:
             data["profile_image"] = await validate_and_save_image(profile_image)
 
+        # ------------------------
         # MOBILE
+        # ------------------------
         if "mobile_number" in data:
             mobile_val = data.pop("mobile_number")
+
+            mobile_val = mobile_val.strip()
             data["mobile"] = mobile_val
 
-            if mobile_val:
-                existing = await db.scalar(
-                    select(User).where(
-                        and_(User.mobile == mobile_val, User.id != user_id)
-                    )
-                )
-                if existing:
-                    raise ConflictError("Mobile already registered")
+            existing = await db.scalar(
+                select(User).where(and_(User.mobile == mobile_val, User.id != user_id))
+            )
+            if existing:
+                raise ConflictError("Mobile already registered")
 
-        # EMAIL (FIX ADDED)
-        if "email" in data and data["email"]:
+        # ------------------------
+        # EMAIL
+        # ------------------------
+        if "email" in data:
+
             data["email"] = data["email"].strip().lower()
 
             existing = await db.scalar(
@@ -418,38 +423,62 @@ async def update_user(
             if existing:
                 raise ConflictError("Email already registered")
 
+        # ------------------------
         # ROLE
+        # ------------------------
         if "role" in data:
             try:
-                data["role"] = UserRole(data["role"])
+                # data["role"] = UserRole(data["role"])
+                data["role"] = UserRole(data["role"]).value
             except ValueError:
                 raise AppError(422, f"Invalid role. Use one of: {ROLES}")
 
-        change_group_id = str(uuid4())
+        # ------------------------
+        # FINAL SAFETY CHECK
+        # ------------------------
+        final_email = data.get("email", user.email)
+        final_mobile = data.get("mobile", user.mobile)
+
+        if not final_email or not final_mobile:
+            raise AppError(422, "Both email and mobile_number are required")
+
+        # ------------------------
         # AUDIT
+        # ------------------------
+        change_group_id = str(uuid4())
         await log_user_changes(db, user, data, current_user.id, change_group_id)
 
-        # APPLY
+        # ------------------------
+        # APPLY CHANGES
+        # ------------------------
+        updated_fields = []
+
         for key, value in data.items():
-            if hasattr(user, key):
+            if hasattr(user, key) and getattr(user, key) != value:
                 setattr(user, key, value)
+                updated_fields.append(key)
 
         user.updated_by = current_user.id
         await db.flush()
 
+        # ------------------------
+        # ACTIVITY LOG
+        # ------------------------
         await log_activity(
             db,
             action="UPDATE_USER",
             entity="USER",
             entity_id=user.id,
             performed_by=current_user.id,
-            details={"fields_updated": list(data.keys())},
+            details={"fields_updated": updated_fields},
         )
 
+        # ------------------------
         # CLEAN OLD IMAGE
+        # ------------------------
         if profile_image and old_image_path and old_image_path.startswith("/uploads"):
             old_path = os.path.join(".", old_image_path.lstrip("/"))
-            if os.path.exists(old_path):
+            if os.path.exists(old_path) and os.path.isfile(old_path):
                 os.remove(old_path)
 
         return UserOut.model_validate(user)
@@ -458,10 +487,11 @@ async def update_user(
         logger.exception(f"User update failed id={user_id}")
         raise
 
+
 @router.delete("/{user_id}", status_code=204)
 async def delete_user(
     user_id: int,
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Deleting user id={user_id}")
@@ -491,10 +521,11 @@ async def delete_user(
 
     return None
 
+
 @router.put("/{user_id}/restore", response_model=UserOut)
 async def restore_user(
     user_id: int,
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Restoring user id={user_id}")
@@ -524,13 +555,14 @@ async def restore_user(
 
     return UserOut.model_validate(user)
 
+
 @router.get("/{user_id}/audit-logs", response_model=list[UserAuditOut])
 async def get_user_audit_logs(
     user_id: int,
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     changed_by: Optional[int] = Query(None),
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Fetching audit logs for user id={user_id}")
@@ -552,19 +584,18 @@ async def get_user_audit_logs(
     if changed_by:
         query = query.where(UserAuditLog.changed_by == changed_by)
 
-    result = await db.execute(
-        query.order_by(UserAuditLog.changed_at.desc())
-    )
+    result = await db.execute(query.order_by(UserAuditLog.changed_at.desc()))
 
     logs = result.scalars().all()
 
     return logs
 
+
 @router.get("/{user_id}/audit-logs-grouped")
 async def get_grouped_audit_logs(
     user_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
 ):
     result = await db.execute(
         select(UserAuditLog)
@@ -584,13 +615,11 @@ async def get_grouped_audit_logs(
                 "group_id": gid,
                 "changed_by": log.changed_by,
                 "changed_at": log.changed_at,
-                "changes": []
+                "changes": [],
             }
 
-        grouped[gid]["changes"].append({
-            "field": log.field_name,
-            "old": log.old_value,
-            "new": log.new_value
-        })
+        grouped[gid]["changes"].append(
+            {"field": log.field_name, "old": log.old_value, "new": log.new_value}
+        )
 
     return list(grouped.values())

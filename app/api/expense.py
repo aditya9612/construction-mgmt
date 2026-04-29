@@ -19,12 +19,38 @@ from app.models.boq import BOQ
 from sqlalchemy import select, func
 from decimal import Decimal
 
+from app.models.user import User, UserRole
+from app.core.dependencies import require_roles
+
+
+EXPENSE_READ_ROLES = [
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
+        UserRole.ACCOUNTANT,
+        UserRole.CLIENT,
+    ]
+]
+
+EXPENSE_WRITE_ROLES = [
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.ACCOUNTANT,
+    ]
+]
+
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
 
 @router.post("", response_model=ExpenseOut)
 async def create_expense(
-    payload: ExpenseCreate, db: AsyncSession = Depends(get_db_session)
+    payload: ExpenseCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
 ):
     logger.info(
         f"Creating expense project_id={payload.project_id} amount={payload.amount}"
@@ -93,7 +119,10 @@ async def create_expense(
 
 @router.get("/date-range")
 async def get_by_date_range(
-    start: date, end: date, db: AsyncSession = Depends(get_db_session)
+    start: date,
+    end: date,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
 ):
     result = await db.execute(
         select(Expense).where(Expense.expense_date.between(start, end))
@@ -103,14 +132,21 @@ async def get_by_date_range(
 
 
 @router.get("", response_model=list[ExpenseOut])
-async def list_expenses(db: AsyncSession = Depends(get_db_session)):
+async def list_expenses(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+):
     result = await db.execute(select(Expense))
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 
 
 @router.get("/{id}", response_model=ExpenseOut)
-async def get_expense(id: int, db: AsyncSession = Depends(get_db_session)):
+async def get_expense(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+):
     obj = await db.get(Expense, id)
 
     if not obj:
@@ -121,7 +157,10 @@ async def get_expense(id: int, db: AsyncSession = Depends(get_db_session)):
 
 @router.put("/{id}", response_model=ExpenseOut)
 async def update_expense(
-    id: int, payload: ExpenseUpdate, db: AsyncSession = Depends(get_db_session)
+    id: int,
+    payload: ExpenseUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
 ):
     logger.info(f"Updating expense id={id}")
 
@@ -166,7 +205,11 @@ async def update_expense(
 
 
 @router.delete("/{id}", status_code=204)
-async def delete_expense(id: int, db: AsyncSession = Depends(get_db_session)):
+async def delete_expense(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
+):
     logger.info(f"Deleting expense id={id}")
 
     obj = await db.get(Expense, id)
@@ -189,28 +232,44 @@ async def delete_expense(id: int, db: AsyncSession = Depends(get_db_session)):
 
 
 @router.get("/project/{project_id}")
-async def get_by_project(project_id: int, db: AsyncSession = Depends(get_db_session)):
+async def get_by_project(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+):
     result = await db.execute(select(Expense).where(Expense.project_id == project_id))
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 
 
 @router.get("/category/{category}")
-async def get_by_category(category: str, db: AsyncSession = Depends(get_db_session)):
+async def get_by_category(
+    category: str,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+):
     result = await db.execute(select(Expense).where(Expense.category == category))
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 
 
 @router.get("/payment-mode/{mode}")
-async def get_by_payment_mode(mode: str, db: AsyncSession = Depends(get_db_session)):
+async def get_by_payment_mode(
+    mode: str,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+):
     result = await db.execute(select(Expense).where(Expense.payment_mode == mode))
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 
 
 @router.get("/summary/{project_id}")
-async def summary(project_id: int, db: AsyncSession = Depends(get_db_session)):
+async def summary(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+):
     total = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
@@ -219,7 +278,11 @@ async def summary(project_id: int, db: AsyncSession = Depends(get_db_session)):
 
 
 @router.get("/boq-comparison/{project_id}")
-async def boq_comparison(project_id: int, db: AsyncSession = Depends(get_db_session)):
+async def boq_comparison(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+):
     total_expense = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )

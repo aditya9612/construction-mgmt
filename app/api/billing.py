@@ -20,6 +20,28 @@ from app.models.approval import Approval
 from app.models.user import User
 from app.core.dependencies import get_current_active_user, require_roles
 
+from app.models.user import UserRole
+
+BILLING_READ_ROLES = [
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.ACCOUNTANT,
+        UserRole.SITE_ENGINEER,
+    ]
+]
+
+BILLING_WRITE_ROLES = [
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.ACCOUNTANT,
+    ]
+]
+
+
 router = APIRouter(prefix="/billing", tags=["Billing"])
 
 
@@ -30,7 +52,7 @@ router = APIRouter(prefix="/billing", tags=["Billing"])
 async def create_ra_bill(
     payload: RABillCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
 ):
     from app.models.work_order import WorkOrder
 
@@ -138,14 +160,11 @@ async def create_ra_bill(
         if work_order.total_quantity:
             progress = float((obj.quantity / work_order.total_quantity) * 100)
 
-        total_billed_qty = (
-            await db.scalar(
-                select(func.sum(RABill.quantity)).where(
-                    RABill.work_order_id == obj.work_order_id
-                )
+        total_billed_qty = await db.scalar(
+            select(func.sum(RABill.quantity)).where(
+                RABill.work_order_id == obj.work_order_id
             )
-            or Decimal("0")
-        )
+        ) or Decimal("0")
 
         remaining_qty = work_order.total_quantity - total_billed_qty
         available_qty = work_order.completed_quantity - total_billed_qty
@@ -153,14 +172,16 @@ async def create_ra_bill(
         total_billed_qty = float(total_billed_qty)
         remaining_qty = float(remaining_qty)
         available_qty = float(available_qty)
-        
-    return RABillOut.model_validate({
-        **obj.__dict__,
-        "progress_percent": round(progress, 2) if progress else None,
-        "total_billed_quantity": total_billed_qty,
-        "remaining_quantity": remaining_qty,
-        "available_to_bill": available_qty,
-    })
+
+    return RABillOut.model_validate(
+        {
+            **obj.__dict__,
+            "progress_percent": round(progress, 2) if progress else None,
+            "total_billed_quantity": total_billed_qty,
+            "remaining_quantity": remaining_qty,
+            "available_to_bill": available_qty,
+        }
+    )
 
 
 # ======================
@@ -170,6 +191,7 @@ async def create_ra_bill(
 async def list_ra_bills(
     pagination: PaginationParams = Depends(),
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(BILLING_READ_ROLES)),
 ):
     from app.models.work_order import WorkOrder
 
@@ -199,18 +221,13 @@ async def list_ra_bills(
 
             if work_order:
                 if work_order.total_quantity:
-                    progress = float(
-                        (r.quantity / work_order.total_quantity) * 100
-                    )
+                    progress = float((r.quantity / work_order.total_quantity) * 100)
 
-                total_billed_qty = (
-                    await db.scalar(
-                        select(func.sum(RABill.quantity)).where(
-                            RABill.work_order_id == r.work_order_id
-                        )
+                total_billed_qty = await db.scalar(
+                    select(func.sum(RABill.quantity)).where(
+                        RABill.work_order_id == r.work_order_id
                     )
-                    or Decimal("0")
-                )
+                ) or Decimal("0")
 
                 remaining_qty = work_order.total_quantity - total_billed_qty
                 available_qty = work_order.completed_quantity - total_billed_qty
@@ -220,13 +237,15 @@ async def list_ra_bills(
                 available_qty = float(available_qty)
 
         items.append(
-            RABillOut.model_validate({
-                **r.__dict__,
-                "progress_percent": round(progress, 2) if progress else None,
-                "total_billed_quantity": total_billed_qty,
-                "remaining_quantity": remaining_qty,
-                "available_to_bill": available_qty,
-            })
+            RABillOut.model_validate(
+                {
+                    **r.__dict__,
+                    "progress_percent": round(progress, 2) if progress else None,
+                    "total_billed_quantity": total_billed_qty,
+                    "remaining_quantity": remaining_qty,
+                    "available_to_bill": available_qty,
+                }
+            )
         )
 
     return PaginatedResponse(
@@ -238,6 +257,7 @@ async def list_ra_bills(
         ),
     )
 
+
 # ======================
 # GET
 # ======================
@@ -245,7 +265,7 @@ async def list_ra_bills(
 async def get_ra_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(BILLING_READ_ROLES)),
 ):
     from app.models.work_order import WorkOrder
 
@@ -269,18 +289,13 @@ async def get_ra_bill(
 
         if work_order:
             if work_order.total_quantity:
-                progress = float(
-                    (obj.quantity / work_order.total_quantity) * 100
-                )
+                progress = float((obj.quantity / work_order.total_quantity) * 100)
 
-            total_billed_qty = (
-                await db.scalar(
-                    select(func.sum(RABill.quantity)).where(
-                        RABill.work_order_id == obj.work_order_id
-                    )
+            total_billed_qty = await db.scalar(
+                select(func.sum(RABill.quantity)).where(
+                    RABill.work_order_id == obj.work_order_id
                 )
-                or Decimal("0")
-            )
+            ) or Decimal("0")
 
             remaining_qty = work_order.total_quantity - total_billed_qty
             available_qty = work_order.completed_quantity - total_billed_qty
@@ -289,13 +304,16 @@ async def get_ra_bill(
             remaining_qty = float(remaining_qty)
             available_qty = float(available_qty)
 
-    return RABillOut.model_validate({
-        **obj.__dict__,
-        "progress_percent": round(progress, 2) if progress else None,
-        "total_billed_quantity": total_billed_qty,
-        "remaining_quantity": remaining_qty,
-        "available_to_bill": available_qty,
-    })
+    return RABillOut.model_validate(
+        {
+            **obj.__dict__,
+            "progress_percent": round(progress, 2) if progress else None,
+            "total_billed_quantity": total_billed_qty,
+            "remaining_quantity": remaining_qty,
+            "available_to_bill": available_qty,
+        }
+    )
+
 
 # ======================
 # UPDATE
@@ -305,7 +323,7 @@ async def update_ra_bill(
     id: int,
     payload: RABillUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
 ):
     obj = await db.get(RABill, id)
     if not obj:
@@ -341,7 +359,7 @@ async def update_ra_bill(
 async def delete_ra_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
 ):
     obj = await db.get(RABill, id)
     if not obj:
@@ -365,7 +383,11 @@ async def delete_ra_bill(
 
 
 @router.put("/{id}/submit")
-async def submit_bill(id: int, db: AsyncSession = Depends(get_db_session)):
+async def submit_bill(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+):
     obj = await db.get(RABill, id)
     if not obj:
         raise NotFoundError("Bill not found")
@@ -381,7 +403,11 @@ async def submit_bill(id: int, db: AsyncSession = Depends(get_db_session)):
 
 
 @router.put("/{id}/approve")
-async def approve_bill(id: int, db: AsyncSession = Depends(get_db_session)):
+async def approve_bill(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+):
     obj = await db.get(RABill, id)
     if not obj:
         raise NotFoundError("Bill not found")
@@ -407,7 +433,11 @@ async def approve_bill(id: int, db: AsyncSession = Depends(get_db_session)):
 
 
 @router.put("/{id}/pay")
-async def pay_bill(id: int, db: AsyncSession = Depends(get_db_session)):
+async def pay_bill(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+):
     obj = await db.get(RABill, id)
     if not obj:
         raise NotFoundError("Bill not found")

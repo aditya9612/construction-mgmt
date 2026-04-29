@@ -14,6 +14,16 @@ from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.document import DocumentCreate, DocumentOut, DocumentUpdate
 from app.utils.helpers import NotFoundError
 
+DOCUMENT_WRITE_ROLES = [r.value for r in [
+    UserRole.ADMIN,
+    UserRole.PROJECT_MANAGER,
+    UserRole.SITE_ENGINEER,
+]]
+
+DOCUMENT_DELETE_ROLES = [r.value for r in [
+    UserRole.ADMIN,
+    UserRole.PROJECT_MANAGER,
+]]
 
 router = APIRouter(prefix="/documents", tags=["documents"], dependencies=[default_rate_limiter_dependency()])
 
@@ -23,9 +33,7 @@ VERSION_KEY = "cache_version:documents"
 @router.post("", response_model=DocumentOut)
 async def create_document(
     payload: DocumentCreate,
-    current_user: User = Depends(
-        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER])
-    ),
+    current_user: User = Depends(require_roles(DOCUMENT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -107,9 +115,7 @@ async def get_document(
 async def update_document(
     document_id: int,
     payload: DocumentUpdate,
-    current_user: User = Depends(
-        require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER])
-    ),
+    current_user: User = Depends(require_roles(DOCUMENT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -129,7 +135,7 @@ async def update_document(
 @router.delete("/{document_id}", status_code=204)
 async def delete_document(
     document_id: int,
-    current_user: User = Depends(require_roles([UserRole.ADMIN, UserRole.PROJECT_MANAGER])),
+    current_user: User = Depends(require_roles(DOCUMENT_DELETE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):

@@ -20,6 +20,7 @@ ROLES = [
     "SiteEngineer",
     "Contractor",
     "Accountant",
+    "Client",
 ]
 
 
@@ -29,6 +30,7 @@ class UserRole(str, enum.Enum):
     SITE_ENGINEER = "SiteEngineer"
     CONTRACTOR = "Contractor"
     ACCOUNTANT = "Accountant"
+    CLIENT = "Client"
 
 
 class User(Base, TimestampMixin):
@@ -46,10 +48,16 @@ class User(Base, TimestampMixin):
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     mobile: Mapped[Optional[str]] = mapped_column(String(20), unique=True, nullable=True, index=True)
 
-    role: Mapped[UserRole] = mapped_column(
-        Enum(UserRole, name="user_role", values_callable=lambda x: [e.value for e in x]),
+    # role: Mapped[UserRole] = mapped_column(
+    #     Enum(UserRole, name="user_role", values_callable=lambda x: [e.value for e in x]),
+    #     nullable=False,
+    #     default=UserRole.SITE_ENGINEER,
+    # )
+
+    role: Mapped[str] = mapped_column(
+        String(50),
         nullable=False,
-        default=UserRole.SITE_ENGINEER,
+        default=UserRole.SITE_ENGINEER.value,
     )
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

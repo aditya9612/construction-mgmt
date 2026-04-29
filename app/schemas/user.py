@@ -39,9 +39,9 @@ class OTPVerify(BaseSchema):
 # -------- CREATE --------
 class UserCreatePayload(BaseSchema):
     # email: Optional[EmailStr] = None
-    email: Optional[EmailStr]
+    email: EmailStr
     password: Optional[str] = None
-    mobile_number: Optional[str] = None
+    mobile_number: str
     full_name: Optional[str] = None
     role: str
     address: Optional[str] = None

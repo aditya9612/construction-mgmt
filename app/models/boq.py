@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import DECIMAL, ForeignKey, Integer, String, Text, Index, Boolean, JSON
+from sqlalchemy import DECIMAL, Column, ForeignKey, Integer, String, Text, Index, Boolean, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.request_context import get_current_user_id
 from app.models.base import Base, TimestampMixin
@@ -23,6 +23,9 @@ class BOQ(Base, TimestampMixin):
     version_no: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
+
+    # ADD THIS (do not remove anything)
+    activity_type_id = Column(Integer, ForeignKey("activity_types.id"), nullable=True)
 
     is_latest: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="1", index=True

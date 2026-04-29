@@ -2,50 +2,12 @@ from datetime import date, datetime
 from typing import Optional
 from enum import Enum
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing_extensions import Annotated
+from app.core.enums import IssueCategory, IssuePriority, IssueStatus, ProjectStatus, QCStatus, SiteRequestStatus, SiteRequestType, TaskStatus, WeatherType
 from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
-
-
-# ===================== ENUMS =====================
-
-class ProjectStatus(str, Enum):
-    PLANNED = "Planned"
-    ONGOING = "Ongoing"
-    COMPLETED = "Completed"
-    ON_HOLD = "On Hold"
-
-
-class IssuePriority(str, Enum):
-    LOW = "Low"
-    MEDIUM = "Medium"
-    HIGH = "High"
-    CRITICAL = "Critical"
-
-
-class IssueStatus(str, Enum):
-    OPEN = "Open"
-    CLOSED = "Closed"
-
-
-class TaskStatus(str, Enum):
-    PLANNED = "Planned"
-    IN_PROGRESS = "In Progress"
-    COMPLETED = "Completed"
-
-
-class WeatherType(str, Enum):
-    SUNNY = "Sunny"
-    RAINY = "Rainy"
-    CLOUDY = "Cloudy"
-    WINDY = "Windy"
-
-
-class IssueCategory(str, Enum):
-    MATERIAL = "Material"
-    SAFETY = "Safety"
-    DELAY = "Delay"
+from datetime import date as dt_date
 
 
 # ===================== PROJECT =====================
@@ -141,6 +103,7 @@ class TaskCreate(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     assigned_user_id: Optional[int] = None
+    activity_type_id: Optional[int] = None
 
 
 class TaskUpdate(BaseSchema):
@@ -393,3 +356,187 @@ class IssueOut(IssueBase):
 
     class Config:
         from_attributes = True
+
+
+# ===================== QC =====================
+
+class QCCreate(BaseSchema):
+    project_id: int
+    task_id: Optional[int] = None
+    dsr_id: Optional[int] = None
+    inspection_type: str
+    test_type: str
+    result: float
+    standard_value: float
+    status: QCStatus
+    engineer_name: str
+    remarks: Optional[str] = None
+
+
+    @field_validator("inspection_type", "test_type", "engineer_name")
+    def validate_text_fields(cls, v):
+        if not v.strip():
+            raise ValueError("Field cannot be empty")
+        return v
+
+
+class QCOut(QCCreate):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+
+# ===================== SAFETY =====================
+
+class SafetyCreate(BaseSchema):
+    project_id: int
+    date: date
+    violation_type: str
+    description: str
+    injury_details: Optional[str] = None
+    action_taken: Optional[str] = None
+    responsible_person: str
+
+    @field_validator("description", "violation_type", "responsible_person")
+    def validate_required_text(cls, v):
+        if not v.strip():
+            raise ValueError("Field cannot be empty")
+        return v
+
+
+class SafetyOut(SafetyCreate):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+
+# ===================== CHECKLIST =====================
+
+class ChecklistCreate(BaseSchema):
+    project_id: int
+    name: str
+    type: str
+
+    @field_validator("name", "type")
+    def validate_checklist_fields(cls, v):
+        if not v.strip():
+            raise ValueError("Field cannot be empty")
+        return v
+
+
+class ChecklistItemCreate(BaseSchema):
+    checklist_id: int
+    item: str
+
+    @field_validator("item")
+    def validate_item(cls, v):
+        if not v.strip():
+            raise ValueError("Checklist item cannot be empty")
+        return v
+
+
+class ChecklistLogCreate(BaseSchema):
+    project_id: int
+    checklist_id: int
+    status: str
+    remarks: Optional[str] = None
+
+    @field_validator("status")
+    def validate_status(cls, v):
+        if v not in ["Done", "Pending"]:
+            raise ValueError("Status must be Done or Pending")
+        return v
+    
+class ChecklistLogOut(BaseModel):
+    id: int
+    project_id: Optional[int]
+    checklist_id: Optional[int]
+    status: Optional[str]
+    remarks: Optional[str]
+
+    model_config = {
+        "from_attributes": True   #  VERY IMPORTANT
+    }
+    
+class SitePhotoCreate(BaseSchema):
+    project_id: int
+    task_id: Optional[int] = None
+    date: Optional[dt_date] = None
+    activity_tag: Optional[str] = None
+    location_tag: Optional[str] = None
+    description: Optional[str] = None
+    
+
+class SitePhotoOut(SitePhotoCreate):
+    id: int
+    photo_url: str
+
+    class Config:
+        from_attributes = True
+
+
+class DrawingCreate(BaseSchema):
+    project_id: int
+    drawing_name: str
+    version: str
+    approved_by: Optional[str]
+    date: Optional[date]
+    remarks: Optional[str]
+
+
+class DrawingOut(DrawingCreate):
+    id: int
+    file_url: str
+
+    class Config:
+        from_attributes = True
+
+
+# ===================== CREATE =====================
+
+class SiteRequestCreate(BaseSchema):
+    project_id: int
+    request_type: SiteRequestType
+    description: str
+    quantity: float
+
+    @field_validator("description")
+    def validate_description(cls, v):
+        if not v.strip():
+            raise ValueError("Description cannot be empty")
+        return v
+
+
+# ===================== ACTION =====================
+
+class SiteRequestAction(BaseSchema):
+    remarks: Optional[str] = None
+
+
+# ===================== OUTPUT =====================
+
+class SiteRequestOut(BaseSchema):
+    id: int
+    project_id: int
+    request_type: SiteRequestType
+    description: str
+    quantity: float
+    requested_by: int
+    approved_by: Optional[int]
+    status: SiteRequestStatus
+
+    class Config:
+        from_attributes = True
+
+class MessageCreate(BaseSchema):
+    message: str
+    parent_id: Optional[int] = None
+    attachment_url: Optional[str] = None
+
+    @field_validator("message")
+    def validate_message(cls, v):
+        if not v.strip():
+            raise ValueError("Message cannot be empty")
+        return v

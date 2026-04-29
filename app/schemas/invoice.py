@@ -1,16 +1,14 @@
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import date, datetime
 
 
 class InvoiceBase(BaseModel):
     project_id: int
-    owner_id: int
     type: str
     reference_id: Optional[int] = None
 
     amount: float
-
     gst_percent: float = 0
     tax_percent: float = 0
 
@@ -25,9 +23,7 @@ class InvoiceUpdate(BaseModel):
     amount: Optional[float] = None
     gst_percent: Optional[float] = None
     tax_percent: Optional[float] = None
-    status: Optional[str] = None
     description: Optional[str] = None
-
 
 class InvoiceOut(BaseModel):
     id: int
@@ -42,6 +38,8 @@ class InvoiceOut(BaseModel):
     tax_percent: float
     tax_amount: float
     total_amount: float
+    paid_amount: float
+    pending_amount: float
 
     status: str
     description: Optional[str]
@@ -49,3 +47,15 @@ class InvoiceOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+class LabourInvoiceCreate(BaseModel):
+    project_id: int
+    start_date: date
+    end_date: date
+
+
+class AnalyticsSummaryOut(BaseModel):
+    progress_percent: float
+    financial_progress_percent: float
+    total_expense: float
+    total_revenue: float

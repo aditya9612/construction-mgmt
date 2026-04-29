@@ -1,10 +1,23 @@
 from enum import Enum
 
+class InvoiceStatus(str, Enum):
+    PENDING = "pending"
+    PARTIAL = "partial"
+    PAID = "paid"
 
-class AttendanceStatus(str, Enum):
-    PRESENT = "Present"
-    ABSENT = "Absent"
-    HALF = "Half"
+class AccountType(str, Enum):
+    ASSET = "asset"
+    LIABILITY = "liability"
+    INCOME = "income"
+    EXPENSE = "expense"
+    EQUITY = "equity"
+
+
+class PaymentMode(str, Enum):
+    CASH = "Cash"
+    BANK_TRANSFER = "BankTransfer"
+    CHEQUE = "Cheque"
+    UPI = "UPI"
 
 
 class PayrollStatus(str, Enum):
@@ -65,3 +78,72 @@ class AttendanceStatus(str, Enum):
     PRESENT = "present"
     ABSENT = "absent"
     HALF_DAY = "half_day"
+
+class ProjectStatus(str, Enum):
+    PLANNED = "PLANNED"
+    ONGOING = "ONGOING"
+    COMPLETED = "COMPLETED"
+    ON_HOLD = "ON_HOLD"
+
+
+class IssuePriority(str, Enum):
+    LOW = "Low"
+    MEDIUM = "Medium"
+    HIGH = "High"
+    CRITICAL = "Critical"
+
+
+class IssueStatus(str, Enum):
+    OPEN = "Open"
+    CLOSED = "Closed"
+
+
+class TaskStatus(str, Enum):
+    PLANNED = "Planned"
+    IN_PROGRESS = "In Progress"
+    COMPLETED = "Completed"
+
+
+class WeatherType(str, Enum):
+    SUNNY = "Sunny"
+    RAINY = "Rainy"
+    CLOUDY = "Cloudy"
+    WINDY = "Windy"
+
+
+class IssueCategory(str, Enum):
+    MATERIAL = "Material"
+    SAFETY = "Safety"
+    DELAY = "Delay"
+
+
+class SiteRequestStatus(str, Enum):
+    PENDING = "Pending"
+    APPROVED = "Approved"
+    REJECTED = "Rejected"
+
+
+class SiteRequestType(str, Enum):
+    MATERIAL = "Material"
+    LABOUR = "Labour"
+    EQUIPMENT = "Equipment"
+    WORK = "Work"   # optional: keep only if you have generic work requests
+
+class QCStatus(str, Enum):
+    PASS = "Pass"
+    FAIL = "Fail"
+
+
+class EquipmentCondition(str, Enum):
+    GOOD = "GOOD"
+    REPAIR = "REPAIR"
+    DAMAGED = "DAMAGED"
+    MAINTENANCE = "MAINTENANCE"
+
+
+class EquipmentStatus(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    IN_PROJECT = "IN_PROJECT"
+    IDLE = "IDLE"
+    RENTED = "RENTED"
+    MAINTENANCE = "MAINTENANCE"

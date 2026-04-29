@@ -1,15 +1,17 @@
 from decimal import Decimal
 from typing import Optional, List
 from datetime import datetime
-from pydantic import BaseModel, Field, field_serializer, field_validator
-from app.core.enums import TransactionType, RateType
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from app.core.enums import TransactionType, RateType, IssueType
 import re
+
 
 # ================= BASE =================
 class BaseSchema(BaseModel):
-    class Config:
-        from_attributes = True
-        json_encoders = {Decimal: float}
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_encoders={Decimal: lambda v: round(float(v), 2)},  
+    )
 
 
 # ================= MATERIAL =================
@@ -20,12 +22,20 @@ class MaterialCreate(BaseSchema):
     unit: str
     supplier_id: int
     purchase_rate: Decimal
-    rate_type: RateType  
-    quantity_purchased: Decimal = 0
-    payment_given: Decimal = 0
-    minimum_stock_level: Decimal = Decimal("0.000")
+    rate_type: RateType
+    quantity_purchased: Decimal = Decimal("0")
+    payment_given: Decimal = Decimal("0")
+    minimum_stock_level: Decimal = Decimal("0")
 
-    @field_validator("quantity_purchased", "payment_given", "purchase_rate", "minimum_stock_level")
+    @field_validator("material_name")
+    def validate_name(cls, v):
+        if not v.strip():
+            raise ValueError("Material name required")
+        return v.strip()
+
+    @field_validator(
+        "quantity_purchased", "payment_given", "purchase_rate", "minimum_stock_level"
+    )
     def non_negative(cls, v):
         if v < 0:
             raise ValueError("Value cannot be negative")
@@ -36,14 +46,15 @@ class MaterialUpdate(BaseSchema):
     material_name: Optional[str] = None
     category: Optional[str] = None
     unit: Optional[str] = None
-    supplier_id: Optional[int]
+    supplier_id: Optional[int] = None
     purchase_rate: Optional[Decimal] = None
-    rate_type: Optional[RateType] = None  
-    minimum_stock_level: Decimal = Decimal("0.000")
+    rate_type: Optional[RateType] = None
+    minimum_stock_level: Optional[Decimal] = None
 
 
 class MaterialOut(BaseSchema):
     id: int
+    material_code: str
     project_id: int
     material_name: str
     category: str
@@ -52,29 +63,19 @@ class MaterialOut(BaseSchema):
     supplier_id: int
     supplier_name: Optional[str] = None
 
-    purchase_rate: Decimal
-    rate_type: RateType  
+    purchase_rate: float
+    rate_type: RateType
 
-    quantity_purchased: Decimal
-    quantity_used: Decimal
-    remaining_stock: Decimal
+    quantity_purchased: float
+    quantity_used: float
+    remaining_stock: float
 
-    total_amount: Decimal
-    payment_given: Decimal
-    payment_pending: Decimal
-    minimum_stock_level: Decimal = Decimal("0.000")
-
-    @field_serializer(
-        "purchase_rate",
-        "quantity_purchased",
-        "quantity_used",
-        "remaining_stock",
-        "total_amount",
-        "payment_given",
-        "payment_pending",
-    )
-    def serialize_decimal(self, v):
-        return float(v) if v is not None else 0
+    total_amount: float
+    payment_given: float
+    payment_pending: float
+    extra_paid: float = Field(default=0.0, validation_alias="advance_amount")
+    minimum_stock_level: float = 0.0
+    alert_type: str
 
 
 # ================= PURCHASE =================
@@ -82,7 +83,7 @@ class PurchaseMaterial(BaseSchema):
     quantity: Decimal
     amount_paid: Decimal
     project_id: int
-    issue_type: Optional[str] = None
+    issue_type: Optional[IssueType] = None
 
     @field_validator("quantity", "amount_paid")
     def positive(cls, v):
@@ -95,7 +96,7 @@ class PurchaseMaterial(BaseSchema):
 class UsageMaterial(BaseSchema):
     quantity: Decimal
     project_id: int
-    issue_type: Optional[str] = None
+    issue_type: Optional[IssueType] = None
 
     @field_validator("quantity")
     def positive(cls, v):
@@ -113,7 +114,7 @@ class SupplierCreate(BaseSchema):
     def validate_name(cls, v):
         if not v or len(v.strip()) < 3:
             raise ValueError("Supplier name must be at least 3 characters")
-        return v.strip()
+        return v.strip().title()  
 
     @field_validator("contact")
     def validate_contact(cls, v):
@@ -147,12 +148,13 @@ class PurchaseOrderCreate(BaseSchema):
 
 class PurchaseOrderOut(BaseSchema):
     id: int
+    material_id: int
     supplier_id: int
     project_id: int
     material_name: str
-    quantity: Decimal
-    rate: Decimal
-    total_amount: Decimal
+    quantity: float
+    rate: float            
+    total_amount: float    
     status: Optional[str] = "CREATED"
 
 
@@ -185,7 +187,7 @@ class TransferOut(BaseSchema):
     material: Optional[TransferMaterial] = None
     from_project: Optional[TransferProject] = None
     to_project: Optional[TransferProject] = None
-    quantity: Decimal
+    quantity: float   # ✅ FIX
     status: str
     created_at: Optional[datetime] = None
 
@@ -199,9 +201,9 @@ class InventoryAdjustRequest(BaseSchema):
 
 class InventoryOut(BaseSchema):
     material_id: int
-    total_purchased: Decimal
-    total_used: Decimal
-    remaining_stock: Decimal
+    total_purchased: float
+    total_used: float
+    remaining_stock: float
 
 
 # ================= LOG =================
@@ -209,11 +211,15 @@ class MaterialLogOut(BaseSchema):
     id: int
     material_id: int
     type: TransactionType
-    quantity: Decimal
-    rate: Decimal
-    total_amount: Decimal
-    amount_paid: Decimal
-    payment_pending: Decimal
+
+    quantity: float
+    rate: float
+    avg_rate: Optional[float] = 0.0
+
+    total_amount: float
+    amount_paid: float
+    payment_pending: float
+
     issue_type: Optional[str] = None
     project_id: Optional[int] = None
     created_at: Optional[datetime] = None
@@ -222,38 +228,29 @@ class MaterialLogOut(BaseSchema):
 # ================= SUMMARY =================
 class SummaryOut(BaseSchema):
     total_materials: int
-    total_stock_value: Decimal
-    total_pending_payments: Decimal
+    total_stock_value: float
+    total_pending_payments: float
 
 
 # ================= REPORT =================
 class MaterialReport(BaseSchema):
     material_id: int
     material_name: str
-    total_purchased: Decimal
-    total_used: Decimal
-    remaining_stock: Decimal
-    total_cost: Decimal
-    payment_pending: Decimal
+    total_purchased: float      
+    total_used: float           
+    remaining_stock: float      
+    total_cost: float           
+    payment_pending: float      
 
 
 # ================= PRICE HISTORY =================
 class PriceHistoryOut(BaseSchema):
-    id: int
-    material_id: int
-    type: TransactionType
-    quantity: Decimal
-    rate: Decimal
-    total_amount: Decimal
-    amount_paid: Decimal
-    payment_pending: Decimal
-    issue_type: Optional[str] = None
-    project_id: Optional[int] = None
-    created_at: Optional[datetime] = None
+    rate: float
+    date: datetime
 
 
 # ================= LOW STOCK =================
-class LowStockResponse(BaseModel):
+class LowStockResponse(BaseSchema):
     material_id: int
     material_name: str
     total_purchased: float
@@ -263,9 +260,3 @@ class LowStockResponse(BaseModel):
     payment_pending: float
     unit: str
     project_id: int
-
-    model_config = {
-        "json_encoders": {
-            Decimal: lambda v: float(round(v, 2))
-        }
-    }

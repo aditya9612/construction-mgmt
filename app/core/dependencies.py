@@ -56,8 +56,25 @@ async def get_current_active_user(
     return current_user
 
 
-def require_roles(allowed_roles: Iterable[UserRole]) -> Callable[[User], User]:
-    allowed: List[UserRole] = list(allowed_roles)
+# def require_roles(allowed_roles: Iterable[UserRole]) -> Callable[[User], User]:
+#     allowed: List[UserRole] = list(allowed_roles)
+
+#     async def _dependency(
+#         current_user: User = Depends(get_current_active_user),
+#     ) -> User:
+#         if current_user.role not in allowed:
+#             raise HTTPException(
+#                 status_code=status.HTTP_403_FORBIDDEN,
+#                 detail=f"Insufficient permissions. Required: {[r.value for r in allowed]}",
+#             )
+#         return current_user
+
+#     return _dependency
+
+from fastapi import Depends
+
+def require_roles(allowed_roles: Iterable[str]):
+    allowed = list(allowed_roles)
 
     async def _dependency(
         current_user: User = Depends(get_current_active_user),
@@ -65,10 +82,11 @@ def require_roles(allowed_roles: Iterable[UserRole]) -> Callable[[User], User]:
         if current_user.role not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Insufficient permissions. Required: {[r.value for r in allowed]}",
+                detail=f"Insufficient permissions. Required: {allowed}",
             )
         return current_user
 
+    _dependency.__name__ = "role_dependency"
     return _dependency
 
 
