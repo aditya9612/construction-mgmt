@@ -1,10 +1,10 @@
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, Union
 from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator
 from typing_extensions import Annotated
-from app.core.enums import IssueCategory, IssuePriority, IssueStatus, ProjectStatus, QCStatus, SiteRequestStatus, SiteRequestType, TaskStatus, WeatherType
+from app.core.enums import IssueCategory, IssuePriority, IssueStatus, MilestoneStatus, ProjectStatus, QCStatus, SiteRequestStatus, SiteRequestType, TaskPriority, TaskStatus, WeatherType
 from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
 from datetime import date as dt_date
@@ -75,13 +75,14 @@ class MilestoneCreate(BaseSchema):
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-
+    status: Optional[MilestoneStatus] = MilestoneStatus.PLANNED
 
 class MilestoneUpdate(BaseSchema):
     title: Optional[str] = None
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    status: Optional[MilestoneStatus] = None
 
 
 class MilestoneOut(BaseSchema):
@@ -91,6 +92,7 @@ class MilestoneOut(BaseSchema):
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    status: MilestoneStatus
 
 
 # ===================== TASK =====================
@@ -98,19 +100,18 @@ class MilestoneOut(BaseSchema):
 class TaskCreate(BaseSchema):
     title: str
     description: Optional[str] = None
-    priority: Annotated[int, Field(ge=0, le=5)]
+    priority: Union[int, TaskPriority]
     status: TaskStatus = TaskStatus.PLANNED
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    assigned_user_id: Optional[int] = None
+    assigned_user_ids: Optional[list[int]] = None
     activity_type_id: Optional[int] = None
 
 
 class TaskUpdate(BaseSchema):
     title: Optional[str] = None
     description: Optional[str] = None
-    priority: Optional[int] = None
-    status: Optional[TaskStatus] = None
+    priority: Optional[Union[int, TaskPriority]] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     assigned_user_id: Optional[int] = None
@@ -121,10 +122,11 @@ class TaskOut(BaseSchema):
     project_id: int
     title: str
     description: Optional[str] = None
-    priority: int
+    priority: TaskPriority
     status: TaskStatus
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    created_by_user_id: int
     assigned_user_id: Optional[int]
     completion_percentage: float
     is_delayed: bool
@@ -141,6 +143,14 @@ class TaskProgressOut(BaseSchema):
     percentage: int
     remarks: Optional[str] = None
     created_at: datetime
+
+class TaskPass(BaseSchema):
+    new_user_id: int
+    remark: Optional[str] = None
+
+
+class TaskStatusUpdate(BaseSchema):
+    status: TaskStatus
 
 
 # ===================== COMMENTS =====================

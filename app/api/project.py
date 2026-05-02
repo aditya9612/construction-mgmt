@@ -4,10 +4,10 @@ import json
 import mimetypes
 import pathlib, re, io, os, uuid
 from openpyxl import Workbook
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Union
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.enums import LabourStatus, SkillType
+from app.core.enums import PRIORITY_MAP, REVERSE_PRIORITY_MAP, LabourStatus, MilestoneStatus, SkillType, TaskPriority
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
@@ -19,6 +19,7 @@ from app.cache.redis import (
     cache_set_json,
     get_cache_version,
 )
+from sqlalchemy.orm import aliased
 from PIL import Image
 from app.core.dependencies import (
     get_current_active_user,
@@ -28,7 +29,6 @@ from app.core.dependencies import (
 from app.models.contractor import Contractor
 from sqlalchemy import select, func, or_
 from app.models import project as m
-from app.models.contractor import Contractor
 from app.models.messages import MessageStatus
 from app.models.user import User, UserRole
 from app.models.owner import Owner
@@ -69,6 +69,19 @@ def compute_project_status(project):
 
     return "Active"
 
+def compute_milestone_status(milestone):
+    today = date.today()
+
+    if milestone.status == MilestoneStatus.COMPLETED:
+        return "Completed"
+
+    if milestone.start_date and today < milestone.start_date:
+        return "Planned"
+
+    if milestone.end_date and today > milestone.end_date:
+        return "Delayed"
+
+    return "In Progress"
 
 def get_pagination(
     limit: int = Query(20, ge=1, le=100),
@@ -841,6 +854,9 @@ class MilestonesService:
 
         data = payload.model_dump(exclude_unset=True)
 
+        if "status" not in data:
+            data["status"] = MilestoneStatus.PLANNED
+
         try:
             obj = await self.milestones_repo.create_milestone(
                 db, project_id=project_id, data=data
@@ -862,6 +878,7 @@ class MilestonesService:
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
+            status=compute_milestone_status(obj),  # IMPORTANT
         )
 
     async def list_milestones(
@@ -891,6 +908,7 @@ class MilestonesService:
                 description=m.description,
                 start_date=m.start_date,
                 end_date=m.end_date,
+                status=compute_milestone_status(m),
             )
             for m in rows
         ]
@@ -916,6 +934,7 @@ class MilestonesService:
             id=obj.id,
             project_id=obj.project_id,
             title=obj.title,
+            status=compute_milestone_status(obj),
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
@@ -958,6 +977,7 @@ class MilestonesService:
             id=obj.id,
             project_id=obj.project_id,
             title=obj.title,
+            status=compute_milestone_status(obj),
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
@@ -1047,14 +1067,16 @@ class TasksService:
             project_id=task.project_id,
             title=task.title,
             description=task.description,
-            priority=task.priority,
+            priority=PRIORITY_MAP.get(task.priority, TaskPriority.MEDIUM),
             status=task.status,
             start_date=task.start_date,
             end_date=task.end_date,
+            created_by_user_id=task.created_by_user_id,
             assigned_user_id=task.assigned_user_id,
             completion_percentage=task.completion_percentage,
             is_delayed=is_delayed,
         )
+
 
     async def create_task(
         self,
@@ -1063,7 +1085,8 @@ class TasksService:
         *,
         project_id: int,
         payload: s.TaskCreate,
-    ) -> s.TaskOut:
+    ) -> s.TaskOut | list[s.TaskOut]:
+
         self._assert_task_mutation_role(current_user)
 
         project = await self.projects_repo.get_project(db, project_id=project_id)
@@ -1077,43 +1100,122 @@ class TasksService:
         )
 
         # =========================
-        # MASTER DATA VALIDATION (ADD HERE)
+        # MASTER DATA VALIDATION
         # =========================
         if payload.activity_type_id is not None:
             activity = await db.get(m.ActivityType, payload.activity_type_id)
             if not activity:
                 raise NotFoundError("Invalid activity type")
 
-        if payload.assigned_user_id is not None:
-            assigned_user = await db.scalar(
-                select(User).where(User.id == payload.assigned_user_id)
-            )
-            if assigned_user is None:
-                raise NotFoundError("User not found")
-
-            is_member = await db.scalar(
-                select(m.ProjectMember).where(
-                    m.ProjectMember.project_id == project_id,
-                    m.ProjectMember.user_id == payload.assigned_user_id,
-                )
-            )
-            if not is_member:
-                raise ValidationError("User not part of project")
-
         data = payload.model_dump(exclude_unset=True)
 
-        try:
-            obj = await self.tasks_repo.create_task(
-                db,
-                project_id=project_id,
-                data=data,
-            )
-        except IntegrityError:
-            await db.rollback()
-            raise ConflictError("Task with this title already exists in this project")
+        if "priority" in data:
+            if isinstance(data["priority"], TaskPriority):
+                data["priority"] = REVERSE_PRIORITY_MAP[data["priority"]]
+            elif isinstance(data["priority"], str):
+                try:
+                    enum_val = TaskPriority(data["priority"])
+                    data["priority"] = REVERSE_PRIORITY_MAP[enum_val]
+                except ValueError:
+                    raise ValidationError("Invalid priority value")
 
-        is_delayed = self._is_delayed(task=obj, current_date=date.today())
-        return self._task_to_out(task=obj, is_delayed=is_delayed)
+        # =========================
+        # MULTI-ASSIGN LOGIC (FIXED)
+        # =========================
+        assigned_ids = payload.assigned_user_ids
+
+        data.pop("assigned_user_ids", None)
+
+        if assigned_ids == []:
+            raise ValidationError("assigned_user_ids cannot be empty")
+
+        #  CASE 1: SINGLE / OLD FLOW
+        if assigned_ids is None:
+
+            user_id = data.get("assigned_user_id")
+
+            if user_id is not None:
+                assigned_user = await db.scalar(
+                    select(User).where(User.id == user_id)
+                )
+                if assigned_user is None:
+                    raise NotFoundError("User not found")
+
+                is_member = await db.scalar(
+                    select(m.ProjectMember).where(
+                        m.ProjectMember.project_id == project_id,
+                        m.ProjectMember.user_id == user_id,
+                    )
+                )
+                if not is_member:
+                    raise ValidationError("User not part of project")
+
+            data["created_by_user_id"] = current_user.id
+
+            try:
+                obj = await self.tasks_repo.create_task(
+                    db,
+                    project_id=project_id,
+                    data=data,
+                )
+            except IntegrityError:
+                await db.rollback()
+                raise ConflictError("Task with this title already exists in this project")
+
+            return self._task_to_out(
+                task=obj,
+                is_delayed=self._is_delayed(task=obj, current_date=date.today()),
+            )
+
+        # =========================
+        # CASE 2: MULTI-ASSIGN
+        # =========================
+        tasks = []
+
+        for user_id in assigned_ids:
+
+            if user_id is not None:
+                assigned_user = await db.scalar(
+                    select(User).where(User.id == user_id)
+                )
+                if assigned_user is None:
+                    raise NotFoundError("User not found")
+
+                is_member = await db.scalar(
+                    select(m.ProjectMember).where(
+                        m.ProjectMember.project_id == project_id,
+                        m.ProjectMember.user_id == user_id,
+                    )
+                )
+                if not is_member:
+                    raise ValidationError("User not part of project")
+
+            new_data = data.copy()
+            new_data["assigned_user_id"] = user_id
+            new_data["created_by_user_id"] = current_user.id
+
+            try:
+                obj = await self.tasks_repo.create_task(
+                    db,
+                    project_id=project_id,
+                    data=new_data,
+                )
+            except IntegrityError:
+                await db.rollback()
+                raise ConflictError("Task with this title already exists in this project")
+
+            tasks.append(
+                self._task_to_out(
+                    task=obj,
+                    is_delayed=self._is_delayed(task=obj, current_date=date.today()),
+                )
+            )
+
+        #  AFTER LOOP (correct place)
+        if len(tasks) == 1:
+            return tasks[0]
+
+        return tasks
 
     async def list_tasks(
         self,
@@ -1125,7 +1227,10 @@ class TasksService:
         assigned_user_id: Optional[int],
         limit: int,
         offset: int,
+        search: Optional[str] = None,
+        view: Optional[str] = None,
     ) -> PaginatedResponse[s.TaskOut]:
+
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
@@ -1136,22 +1241,59 @@ class TasksService:
             current_user=current_user,
         )
 
-        rows, total = await self.tasks_repo.list_tasks(
-            db,
-            project_id=project_id,
-            status=status,
-            assigned_user_id=assigned_user_id,
-            limit=limit,
-            offset=offset,
-        )
+        #  base query
+        query = select(m.Task)
+        count_query = select(func.count()).select_from(m.Task)
+
+        #  mandatory filter
+        query = query.where(m.Task.project_id == project_id)
+        count_query = count_query.where(m.Task.project_id == project_id)
+
+        #  optional filters
+
+        if status:
+            query = query.where(m.Task.status == status)
+            count_query = count_query.where(m.Task.status == status)
+
+        if assigned_user_id is not None:
+            query = query.where(m.Task.assigned_user_id == assigned_user_id)
+            count_query = count_query.where(m.Task.assigned_user_id == assigned_user_id)
+
+        if search:
+            query = query.where(m.Task.title.ilike(f"%{search}%"))
+            count_query = count_query.where(m.Task.title.ilike(f"%{search}%"))
+
+        if view == "created":
+            query = query.where(m.Task.created_by_user_id == current_user.id)
+            count_query = count_query.where(m.Task.created_by_user_id == current_user.id)
+
+        elif view == "received":
+            query = query.where(m.Task.assigned_user_id == current_user.id)
+            count_query = count_query.where(m.Task.assigned_user_id == current_user.id)
+
+        #  ordering + pagination
+        query = query.order_by(m.Task.id.desc()).limit(limit).offset(offset)
+
+        #  execute
+        rows = (await db.execute(query)).scalars().all()
+        total = await db.scalar(count_query)
+
         current_date = date.today()
+
         items = [
             self._task_to_out(
-                task=t, is_delayed=self._is_delayed(task=t, current_date=current_date)
+                task=t,
+                is_delayed=self._is_delayed(task=t, current_date=current_date),
             )
             for t in rows
         ]
-        meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
+
+        meta = PaginationMeta(
+            total=int(total or 0),
+            limit=limit,
+            offset=offset,
+        )
+
         return PaginatedResponse[s.TaskOut](items=items, meta=meta)
 
     async def get_task(
@@ -1208,6 +1350,17 @@ class TasksService:
 
         data = payload.model_dump(exclude_unset=True)
 
+        if "priority" in data:
+            if isinstance(data["priority"], TaskPriority):
+                data["priority"] = REVERSE_PRIORITY_MAP[data["priority"]]
+            elif isinstance(data["priority"], str):
+                try:
+                    enum_val = TaskPriority(data["priority"])
+                    data["priority"] = REVERSE_PRIORITY_MAP[enum_val]
+                except ValueError:
+                    raise ValidationError("Invalid priority value")
+
+
         if "title" in data and data["title"] is None:
             raise ValidationError("title cannot be null")
 
@@ -1252,6 +1405,85 @@ class TasksService:
         is_delayed = self._is_delayed(task=obj, current_date=date.today())
 
         return self._task_to_out(task=obj, is_delayed=is_delayed)
+
+    async def pass_task(
+        self,
+        db: AsyncSession,
+        current_user: User,
+        *,
+        project_id: int,
+        task_id: int,
+        new_user_id: int,
+    ):
+        obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
+        if not obj:
+            raise NotFoundError("Task not found")
+
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+
+        new_user = await db.scalar(select(User).where(User.id == new_user_id))
+        if not new_user:
+            raise NotFoundError("User not found")
+
+        #  FIX: ensure user belongs to project
+        is_member = await db.scalar(
+            select(m.ProjectMember).where(
+                m.ProjectMember.project_id == project_id,
+                m.ProjectMember.user_id == new_user_id,
+            )
+        )
+        if not is_member:
+            raise ValidationError("User not part of project")
+
+        await self.tasks_repo.update_task(
+            db,
+            obj=obj,
+            data={"assigned_user_id": new_user_id},
+        )
+
+        await db.refresh(obj)
+
+        return self._task_to_out(
+            task=obj,
+            is_delayed=self._is_delayed(task=obj, current_date=date.today()),
+        )
+    
+    async def update_task_status(
+        self,
+        db: AsyncSession,
+        current_user: User,
+        *,
+        project_id: int,
+        task_id: int,
+        status: s.TaskStatus,
+    ):
+        obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
+        if not obj:
+            raise NotFoundError("Task not found")
+
+        #  FIX: access check
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+
+        await self.tasks_repo.update_task(
+            db,
+            obj=obj,
+            data={"status": status},
+        )
+
+        await db.refresh(obj)
+
+        return self._task_to_out(
+            task=obj,
+            is_delayed=self._is_delayed(task=obj, current_date=date.today()),
+        )
 
     async def delete_task(
         self,
@@ -2231,7 +2463,7 @@ async def delete_milestone(
     }
 
 
-@tasks_router.post("/{project_id}/tasks", response_model=s.TaskOut)
+@tasks_router.post("/{project_id}/tasks", response_model=Union[s.TaskOut, List[s.TaskOut]])
 async def create_task(
     project_id: int,
     payload: s.TaskCreate,
@@ -2251,7 +2483,10 @@ async def create_task(
         logger.exception(f"Task creation failed project_id={project_id}")
         raise
 
-    logger.info(f"Task created id={out.id}")
+    if isinstance(out, list):
+        logger.info(f"Tasks created count={len(out)}")
+    else:
+        logger.info(f"Task created id={out.id}")
 
     return out
 
@@ -2259,8 +2494,10 @@ async def create_task(
 @tasks_router.get("/{project_id}/tasks", response_model=PaginatedResponse[s.TaskOut])
 async def list_tasks(
     project_id: int,
-    status: Optional[s.TaskStatus] = Query(default=None),
-    assigned_user_id: Optional[int] = Query(default=None),
+    status: Optional[s.TaskStatus] = Query(None),
+    assigned_user_id: Optional[int] = Query(None),
+    search: Optional[str] = Query(None),
+    view: Optional[str] = Query(None),           
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
@@ -2275,10 +2512,12 @@ async def list_tasks(
         assigned_user_id=assigned_user_id,
         limit=limit,
         offset=offset,
+        search=search,    
+        view=view,
     )
 
 
-@tasks_router.get("/{project_id}/tasks/{task_id}", response_model=s.TaskOut)
+@tasks_router.get("/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]])
 async def get_task(
     project_id: int,
     task_id: int,
@@ -2292,7 +2531,7 @@ async def get_task(
     )
 
 
-@tasks_router.put("/{project_id}/tasks/{task_id}", response_model=s.TaskOut)
+@tasks_router.put("/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]])
 async def update_task(
     project_id: int,
     task_id: int,
@@ -2317,6 +2556,40 @@ async def update_task(
 
     return out
 
+@tasks_router.patch("/{project_id}/tasks/{task_id}/status")
+async def update_status(
+    project_id: int,
+    task_id: int,
+    payload: s.TaskStatusUpdate,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    service: TasksService = Depends(get_tasks_service),
+):
+    return await service.update_task_status(
+        db,
+        current_user,
+        project_id=project_id,
+        task_id=task_id,
+        status=payload.status,
+    )
+
+
+@tasks_router.post("/{project_id}/tasks/{task_id}/pass")
+async def pass_task(
+    project_id: int,
+    task_id: int,
+    payload: s.TaskPass,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    service: TasksService = Depends(get_tasks_service),
+):
+    return await service.pass_task(
+        db,
+        current_user,
+        project_id=project_id,
+        task_id=task_id,
+        new_user_id=payload.new_user_id,
+    )
 
 @tasks_router.delete("/{project_id}/tasks/{task_id}")
 async def delete_task(

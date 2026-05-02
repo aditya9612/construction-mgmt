@@ -2,7 +2,7 @@ from sqlalchemy import Column, Date, Index, Integer, String, ForeignKey, Enum, D
 from sqlalchemy.orm import relationship
 from datetime import datetime
 import enum
-
+from sqlalchemy import Text
 from app.core.enums import AccountType
 from app.models.base import Base
 
@@ -76,3 +76,23 @@ class FixedAsset(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class RedevelopmentOffer(Base):
+    __tablename__ = "redevelopment_offers"
+
+    id = Column(Integer, primary_key=True)
+
+    project_name = Column(String(150), nullable=False)
+    society_name = Column(String(150), nullable=False)
+    address = Column(String(255), nullable=False)
+    pdf_path = Column(String(255), nullable=True)
+    developer_name = Column(String(150), nullable=False)
+    contact_email = Column(String(150))
+    contact_phone = Column(String(20))
+
+    extra_carpet_percent = Column(Integer, default=0)
+
+    note = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)

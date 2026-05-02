@@ -1,6 +1,6 @@
 from datetime import date
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from decimal import Decimal
 
@@ -118,3 +118,27 @@ class AssetCreate(BaseModel):
     purchase_date: Optional[date] = None
     depreciation_rate: Optional[Decimal] = 10
     project_id: Optional[int] = None
+
+
+class OfferCreate(BaseModel):
+    project_name: str
+    society_name: str
+    address: str
+
+    developer_name: str
+    contact_email: Optional[str]
+    contact_phone: Optional[str]
+
+    extra_carpet_percent: int = Field(..., gt=0, lt=100)
+    note: Optional[str]
+
+
+class OfferOut(BaseModel):
+    id: int
+    project_name: str
+    society_name: str
+    address: str
+    extra_carpet_percent: int
+
+    class Config:
+        from_attributes = True

@@ -1,7 +1,10 @@
 from decimal import Decimal
-from datetime import date
+from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi.responses import FileResponse
+from app.models.accountant import RedevelopmentOffer
+from app.schemas.accountant import OfferCreate, OfferOut
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from app.core.enums import PaymentMode
@@ -18,11 +21,18 @@ from app.db.session import get_db_session
 from app.models.billing import RABill
 from app.models.invoice import Invoice, Transaction
 from app.models.user import User
-from app.core.dependencies import get_current_active_user, require_roles
+from app.core.dependencies import require_roles
 
 from app.utils.helpers import NotFoundError, ValidationError
 
 from app.models.user import UserRole
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+import os
+
 
 ACCOUNTANT_READ_ROLES = [
     r.value
@@ -40,6 +50,211 @@ ACCOUNTANT_WRITE_ROLES = [
         UserRole.ACCOUNTANT,
     ]
 ]
+
+
+def generate_offer_pdf(offer):
+    import os
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+    logo_path = os.path.join(BASE_DIR, "static", "logo.png")
+    stamp_path = os.path.join(BASE_DIR, "static", "stamp.png")
+
+    file_path = f"media/offers/offer_{offer.id}.pdf"
+    os.makedirs("media/offers", exist_ok=True)
+
+    doc = SimpleDocTemplate(file_path, pagesize=A4)
+
+    styles = getSampleStyleSheet()
+
+    #  FIX 1: Better spacing styles (ONLY CHANGE)
+    normal = ParagraphStyle(name='NormalSmall', fontSize=10, leading=16, spaceAfter=6)
+    bold = ParagraphStyle(name='Bold', fontSize=10, leading=16, spaceAfter=8, spaceBefore=6)
+    title = ParagraphStyle(name='Title', alignment=1, fontSize=14, spaceAfter=18)
+
+    content = []
+
+    date_val = offer.created_at.strftime("%d-%m-%Y") if offer.created_at else "-"
+
+    # ================= HEADER =================
+    header = Table([
+        [
+            Image(logo_path, width=130, height=60) if os.path.exists(logo_path) else "",
+            Paragraph("<para align=right><b>Date :</b></para>", normal)
+        ]
+    ], colWidths=[300, 200])
+
+    content.append(header)
+
+    #  FIX 2: Bigger space after header
+    content.append(Spacer(1, 8))
+
+    # ================= TITLE =================
+    content.append(Paragraph("<b>OFFER LETTER</b>", title))
+
+    #  FIX 3: More gap like image
+    content.append(Spacer(1, 8))
+
+    # ================= SECOND DATE =================
+    content.append(
+        Paragraph(f"<para align=right>Date: {date_val}</para>", normal)
+    )
+    content.append(Spacer(1, 12))
+
+    # ================= ADDRESS =================
+    content.append(Paragraph("<b>To,</b>", bold))
+    content.append(Paragraph(offer.society_name or "-", normal))
+    content.append(Paragraph(offer.address or "-", normal))
+
+    #  FIX 5: spacing before subject
+    content.append(Spacer(1, 14))
+
+    # ================= SUBJECT =================
+    content.append(Paragraph("<b>Subject:- REDEVELOPMENT OFFER LETTER</b>", bold))
+
+    # ================= BODY =================
+    content.append(Paragraph("Dear Sir/Madam,", normal))
+
+    content.append(Paragraph(
+        "It is my pleasure to write this letter and express my intent of re-developing your society/property.",
+        normal
+    ))
+
+    content.append(Paragraph(
+        f"To brief you about my company, <b>{offer.developer_name}</b> is a well-established name in business. "
+        "Its presence in central suburbs like Sinhagad Road, Pune. Since more than a decade, "
+        f"<b>{offer.developer_name}</b> has successfully ventured into real estate development.",
+        normal
+    ))
+
+    content.append(Paragraph(
+        f"<b>{offer.developer_name}</b>, a well-crafted initiative by visionary leadership.",
+        normal
+    ))
+
+    content.append(Paragraph(
+        "We have proudly made more than 1000+ families happy with commercial and residential spaces. "
+        "The purpose of this offer letter is to set forth our offers which are described below:",
+        normal
+    ))
+
+    content.append(Paragraph(
+        "If there is any query in any of the offer terms, amenities, requests, demands etc., "
+        "feel free to reach out to us and we will definitely resolve it.",
+        normal
+    ))
+
+    content.append(Paragraph("<b>Our Re-Development offer includes:</b>", bold))
+
+    #  FIX 6: space before table
+    content.append(Spacer(1, 12))
+
+    # ================= TABLE =================
+    table = Table([
+        ["CARPET AREA", f"EXISTING FLAT OWNER WILL GET {offer.extra_carpet_percent}% EXTRA CARPET AREA."]
+    ], colWidths=[180, 300])
+
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 1, colors.black),
+        ("BACKGROUND", (0, 0), (0, 0), colors.lightgrey),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+    ]))
+
+    content.append(table)
+
+    #  FIX 7: more breathing space after table
+    content.append(Spacer(1, 16))
+
+    # ================= NOTE =================
+    content.append(Paragraph(
+        "<b>Note:</b> Corpus fund, rent, shifting charges, and other expenses shall be mutually finalized.",
+        normal
+    ))
+
+    content.append(Spacer(1, 20))
+
+    # ================= FOOTER =================
+    content.append(Spacer(1, 12))  # small gap
+
+    footer = Table([
+        [
+            Image(stamp_path, width=90, height=90) if os.path.exists(stamp_path) else "",
+            Paragraph(
+                f"<para align=right>"
+                f"{offer.contact_phone or '-'}<br/>"
+                f"{offer.contact_email or '-'}<br/>"
+                f"SITE ADD: S.No.57/6B, Plot No.03, Abhiruchi Mall, Pune"
+                f"</para>",
+                normal
+            )
+        ]
+    ], colWidths=[180, 320])
+
+    content.append(footer)
+
+    # ================= BACKGROUND (UNCHANGED) =================
+    def draw_background(canvas, doc):
+        from reportlab.lib import colors
+
+        W, H = doc.pagesize
+
+        # ================= TOP RIGHT =================
+        canvas.saveState()
+
+        # DARK BAND (outer)
+        canvas.setFillColor(colors.HexColor("#d4a017"))
+        p = canvas.beginPath()
+        p.moveTo(W - 160, H)
+        p.lineTo(W, H)
+        p.lineTo(W, H - 90)
+        p.lineTo(W - 110, H - 45)
+        p.close()
+        canvas.drawPath(p, fill=1, stroke=0)
+
+        # LIGHT BAND (inner parallel)
+        canvas.setFillColor(colors.HexColor("#f4c542"))
+        p = canvas.beginPath()
+        p.moveTo(W - 130, H)
+        p.lineTo(W, H)
+        p.lineTo(W, H - 60)
+        p.lineTo(W - 90, H - 30)
+        p.close()
+        canvas.drawPath(p, fill=1, stroke=0)
+
+        canvas.restoreState()
+
+        # ================= BOTTOM LEFT =================
+        canvas.saveState()
+
+        # DARK BAND
+        canvas.setFillColor(colors.HexColor("#d4a017"))
+        p = canvas.beginPath()
+        p.moveTo(0, 0)
+        p.lineTo(0, 140)
+        p.lineTo(140, 50)
+        p.lineTo(90, 0)
+        p.close()
+        canvas.drawPath(p, fill=1, stroke=0)
+
+        # LIGHT BAND (parallel)
+        canvas.setFillColor(colors.HexColor("#f4c542"))
+        p = canvas.beginPath()
+        p.moveTo(0, 0)
+        p.lineTo(0, 100)
+        p.lineTo(105, 35)
+        p.lineTo(65, 0)
+        p.close()
+        canvas.drawPath(p, fill=1, stroke=0)
+
+        canvas.restoreState()
+
+    doc.build(content, onFirstPage=draw_background)
+
+    return file_path
+
 
 router = APIRouter(prefix="/accountant", tags=["Accountant"])
 
@@ -97,10 +312,6 @@ async def receipt_summary(
 
     return {"total_receipts": float(total or 0)}
 
-
-# ============================
-#  PAYABLE VIEW (FROM RA BILL)
-# ============================
 @router.get("/payables")
 async def list_payables(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
@@ -149,11 +360,6 @@ async def list_payables(
     return result
 
 
-# ============================
-#  PAY CONTRACTOR (PARTIAL SUPPORTED)
-# ============================
-
-
 @router.post("/payables/{ra_id}/pay")
 async def pay_contractor(
     ra_id: int,
@@ -193,9 +399,6 @@ async def pay_contractor(
     if not contractor_acc or not bank_acc:
         raise ValidationError("Required accounts not configured")
 
-    # =====================
-    # 1. CREATE PAYMENT TXN
-    # =====================
     txn = Transaction(
         project_id=ra.project_id,
         type="payment",
@@ -207,9 +410,6 @@ async def pay_contractor(
     )
     db.add(txn)
 
-    # =====================
-    # 2. JOURNAL ENTRY
-    # =====================
     entry = JournalEntry(description=f"Payment for RA {ra.id}")
     db.add(entry)
     await db.flush()  # get entry.id
@@ -228,9 +428,6 @@ async def pay_contractor(
         ]
     )
 
-    # =====================
-    # 3. UPDATE RA STATUS
-    # =====================
     new_paid = paid + payload.amount
     new_pending = Decimal(ra.total_amount) - new_paid
 
@@ -247,9 +444,6 @@ async def pay_contractor(
     }
 
 
-# ============================
-#  TRANSACTIONS (ALL)
-# ============================
 @router.get("/transactions")
 async def list_transactions(
     db: AsyncSession = Depends(get_db_session),
@@ -259,9 +453,6 @@ async def list_transactions(
     return rows
 
 
-# ============================
-#  PAYABLE SUMMARY
-# ============================
 @router.get("/payables/summary")
 async def payable_summary(
     db: AsyncSession = Depends(get_db_session),
@@ -302,10 +493,6 @@ async def payable_summary(
     }
 
 
-# ============================
-#  CASH FLOW
-# ============================
-@router.get("/cashflow")
 async def cashflow(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
@@ -325,9 +512,7 @@ async def cashflow(
     }
 
 
-# ============================
-#  FILTER PAYABLES BY DATE
-# ============================
+
 @router.get("/payables/date-range")
 async def payables_by_date(
     start: date,
@@ -548,9 +733,7 @@ async def balance_sheet(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    # =========================
-    # ACCOUNT BALANCES
-    # =========================
+
     result = await db.execute(
         select(
             Account.id,
@@ -589,9 +772,7 @@ async def balance_sheet(
             equity.append(item)
             total_equity += balance
 
-    # =========================
-    # PROFIT CALCULATION
-    # =========================
+
     income = await db.scalar(
         select(func.sum(JournalLine.credit - JournalLine.debit))
         .join(Account, Account.id == JournalLine.account_id)
@@ -609,16 +790,12 @@ async def balance_sheet(
 
     profit = income - expense
 
-    # =========================
-    # ADD PROFIT TO EQUITY
-    # =========================
+
     total_equity += profit
 
     equity.append({"account_name": "Retained Earnings", "balance": profit})
 
-    # =========================
-    # FINAL OUTPUT
-    # =========================
+
     return {
         "assets": {"items": assets, "total": total_assets},
         "liabilities": {"items": liabilities, "total": total_liabilities},
@@ -627,3 +804,93 @@ async def balance_sheet(
         "is_balanced": round(total_assets, 2)
         == round(total_liabilities + total_equity, 2),
     }
+
+
+@router.post("/offers", response_model=OfferOut)
+async def create_offer(
+    payload: OfferCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+):
+    obj = RedevelopmentOffer(**payload.dict())
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+
+    return obj
+
+@router.get("/offers/{offer_id}/generate")
+async def generate_offer_letter(
+    offer_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+):
+    offer = await db.get(RedevelopmentOffer, offer_id)
+
+    if not offer:
+        raise NotFoundError("Offer not found")
+
+    date_val = offer.created_at.date() if offer.created_at else "-"
+
+    letter = f"""
+RAJVEER CONSTRUCTION
+
+Date: {date_val}
+
+To,
+{offer.society_name}
+{offer.address}
+
+Subject: Redevelopment Offer Letter
+
+Dear Sir/Madam,
+
+We are pleased to express our intent to redevelop your property.
+
+{offer.developer_name} is a well-established name in real estate development.
+
+We have successfully delivered multiple residential and commercial projects.
+
+Our Offer Includes:
+- Existing flat owners will get {offer.extra_carpet_percent}% extra carpet area
+
+Note:
+{offer.note or "Details will be finalized mutually."}
+
+Contact:
+{offer.contact_phone or '-'}
+{offer.contact_email or '-'}
+"""
+
+    return {
+        "offer_id": offer.id,
+        "letter": letter
+    }
+
+
+@router.get("/offers/{offer_id}/pdf")
+async def download_offer_pdf(
+    offer_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+):
+    offer = await db.get(RedevelopmentOffer, offer_id)
+
+    if not offer:
+        raise NotFoundError("Offer not found")
+
+    #  Generate only once (but still works locally)
+    if not getattr(offer, "pdf_path", None):
+        file_path = generate_offer_pdf(offer)
+        offer.pdf_path = file_path
+        await db.commit()
+        await db.refresh(offer)
+    else:
+        file_path = offer.pdf_path
+
+    return FileResponse(
+        path=file_path,
+        filename=os.path.basename(file_path),
+        media_type="application/pdf"
+    )

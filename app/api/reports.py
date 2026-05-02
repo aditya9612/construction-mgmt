@@ -21,6 +21,9 @@ from app.models import project as m
 from app.models.accountant import FixedAsset
 from app.models.expense import Expense
 from app.models.user import User, UserRole
+from fastapi import BackgroundTasks
+from app.utils.helpers import NotFoundError
+from app.utils.whatsapp import send_report_template
 
 REPORT_READ_ROLES = [role.value for role in UserRole]
 
@@ -336,13 +339,12 @@ async def export_issue_excel(
 #     project_id: int,
 #     report_date: date,
 #     email: str,
+#     background_tasks: BackgroundTasks,
 #     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
 #     db: AsyncSession = Depends(get_db_session),
 # ):
-#     #  ACCESS CONTROL
 #     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
-#     # 1. Get data
 #     dsr = await db.scalar(
 #         select(m.DailySiteReport).where(
 #             m.DailySiteReport.project_id == project_id,
@@ -350,7 +352,7 @@ async def export_issue_excel(
 #         )
 #     )
 
-#     # 2. Generate PDF
+#     # PDF generation (same as yours)
 #     import io
 #     from reportlab.platypus import SimpleDocTemplate, Paragraph
 #     from reportlab.lib.styles import getSampleStyleSheet
@@ -371,91 +373,36 @@ async def export_issue_excel(
 #     doc.build(content)
 #     buffer.seek(0)
 
-#     # 3. Send Email
-#     result = await send_email(
+#     #  Background email (NON-BLOCKING)
+#     body = f"""
+#     <html>
+#     <body style="font-family: Arial, sans-serif;">
+#         <h2> Daily Site Report</h2>
+
+#         <p><b>Date:</b> {report_date}</p>
+
+#         <p>Please find the attached report.</p>
+
+#         <br>
+
+#         <hr>
+#         <p style="font-size:12px;color:gray;">
+#         Construction Management System
+#         </p>
+#     </body>
+#     </html>
+#     """
+
+#     background_tasks.add_task(
+#         send_email,
 #         to_email=email,
 #         subject="Daily Report",
-#         body=f"Daily report for {report_date}. See attachment.",
+#         body=body,
 #         attachment=buffer.read(),
 #         filename="daily_report.pdf",
 #     )
 
-#     if not result:
-#         raise Exception("Failed to send email")
-
-#     return {"message": "Email sent successfully"}
-
-from fastapi import BackgroundTasks
-
-@router.post("/daily/share/email")
-async def share_daily_email(
-    project_id: int,
-    report_date: date,
-    email: str,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    dsr = await db.scalar(
-        select(m.DailySiteReport).where(
-            m.DailySiteReport.project_id == project_id,
-            m.DailySiteReport.report_date == report_date,
-        )
-    )
-
-    # PDF generation (same as yours)
-    import io
-    from reportlab.platypus import SimpleDocTemplate, Paragraph
-    from reportlab.lib.styles import getSampleStyleSheet
-
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    styles = getSampleStyleSheet()
-
-    content = []
-    content.append(Paragraph(f"Daily Report - {report_date}", styles["Title"]))
-
-    if dsr:
-        content.append(Paragraph(f"Work Done: {dsr.work_done}", styles["Normal"]))
-        content.append(Paragraph(f"Weather: {dsr.weather}", styles["Normal"]))
-    else:
-        content.append(Paragraph("No data available", styles["Normal"]))
-
-    doc.build(content)
-    buffer.seek(0)
-
-    #  Background email (NON-BLOCKING)
-    body = f"""
-    <html>
-    <body style="font-family: Arial, sans-serif;">
-        <h2> Daily Site Report</h2>
-
-        <p><b>Date:</b> {report_date}</p>
-
-        <p>Please find the attached report.</p>
-
-        <br>
-
-        <hr>
-        <p style="font-size:12px;color:gray;">
-        Construction Management System
-        </p>
-    </body>
-    </html>
-    """
-
-    background_tasks.add_task(
-        send_email,
-        to_email=email,
-        subject="Daily Report",
-        body=body,
-        attachment=buffer.read(),
-        filename="daily_report.pdf",
-    )
-
-    return {"message": "Email queued successfully"}
+#     return {"message": "Email queued successfully"}
 
 
 # ===================== FILTERED REPORT DOWNLOAD =====================
@@ -725,112 +672,108 @@ async def asset_report(db: AsyncSession = Depends(get_db_session),current_user: 
 
     return assets
 
-@router.post("/combined/share/email")
-async def share_combined_report_email(
-    project_id: int,
-    start_date: date,
-    end_date: date,
-    email: str,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+# @router.post("/combined/share/email")
+# async def share_combined_report_email(
+#     project_id: int,
+#     start_date: date,
+#     end_date: date,
+#     email: str,
+#     background_tasks: BackgroundTasks,
+#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+#     db: AsyncSession = Depends(get_db_session),
+# ):
+#     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
-    # ===== DATA =====
-    progress = await db.scalar(
-        select(func.avg(m.Task.completion_percentage)).where(
-            m.Task.project_id == project_id
-        )
-    )
+#     # ===== DATA =====
+#     progress = await db.scalar(
+#         select(func.avg(m.Task.completion_percentage)).where(
+#             m.Task.project_id == project_id
+#         )
+#     )
 
-    total_paid = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.status == InvoiceStatus.PAID
-        )
-    )
+#     total_paid = await db.scalar(
+#         select(func.sum(Invoice.total_amount)).where(
+#             Invoice.project_id == project_id,
+#             Invoice.status == InvoiceStatus.PAID
+#         )
+#     )
 
-    total_pending = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.status == InvoiceStatus.PENDING
-        )
-    )
+#     total_pending = await db.scalar(
+#         select(func.sum(Invoice.total_amount)).where(
+#             Invoice.project_id == project_id,
+#             Invoice.status == InvoiceStatus.PENDING
+#         )
+#     )
 
-    reports = await db.execute(
-        select(m.DailySiteReport).where(
-            m.DailySiteReport.project_id == project_id,
-            m.DailySiteReport.report_date >= start_date,
-            m.DailySiteReport.report_date <= end_date,
-        )
-    )
-    dsr_list = reports.scalars().all()
+#     reports = await db.execute(
+#         select(m.DailySiteReport).where(
+#             m.DailySiteReport.project_id == project_id,
+#             m.DailySiteReport.report_date >= start_date,
+#             m.DailySiteReport.report_date <= end_date,
+#         )
+#     )
+#     dsr_list = reports.scalars().all()
 
-    # ===== PDF =====
-    import io
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
+#     # ===== PDF =====
+#     import io
+#     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+#     from reportlab.lib.styles import getSampleStyleSheet
 
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    styles = getSampleStyleSheet()
+#     buffer = io.BytesIO()
+#     doc = SimpleDocTemplate(buffer)
+#     styles = getSampleStyleSheet()
 
-    content = []
-    content.append(Paragraph("Combined Project Report", styles["Title"]))
-    content.append(Spacer(1, 10))
+#     content = []
+#     content.append(Paragraph("Combined Project Report", styles["Title"]))
+#     content.append(Spacer(1, 10))
 
-    content.append(Paragraph(f"{start_date} to {end_date}", styles["Normal"]))
-    content.append(Spacer(1, 10))
+#     content.append(Paragraph(f"{start_date} to {end_date}", styles["Normal"]))
+#     content.append(Spacer(1, 10))
 
-    content.append(Paragraph(f"Progress: {round(progress or 0, 2)}%", styles["Normal"]))
-    content.append(Paragraph(f"Paid: {float(total_paid or 0)}", styles["Normal"]))
-    content.append(Paragraph(f"Pending: {float(total_pending or 0)}", styles["Normal"]))
-    content.append(Spacer(1, 10))
+#     content.append(Paragraph(f"Progress: {round(progress or 0, 2)}%", styles["Normal"]))
+#     content.append(Paragraph(f"Paid: {float(total_paid or 0)}", styles["Normal"]))
+#     content.append(Paragraph(f"Pending: {float(total_pending or 0)}", styles["Normal"]))
+#     content.append(Spacer(1, 10))
 
-    for r in dsr_list:
-        content.append(Paragraph(f"{r.report_date} - {r.work_done}", styles["Normal"]))
+#     for r in dsr_list:
+#         content.append(Paragraph(f"{r.report_date} - {r.work_done}", styles["Normal"]))
 
-    doc.build(content)
-    buffer.seek(0)
+#     doc.build(content)
+#     buffer.seek(0)
 
-    background_tasks.add_task(
-        send_email,
-        to_email=email,
-        subject="Combined Project Report",
-        body=f"Report from {start_date} to {end_date}",
-        attachment=buffer.read(),
-        filename="combined_report.pdf",
-    )
+#     background_tasks.add_task(
+#         send_email,
+#         to_email=email,
+#         subject="Combined Project Report",
+#         body=f"Report from {start_date} to {end_date}",
+#         attachment=buffer.read(),
+#         filename="combined_report.pdf",
+#     )
 
-    return {"message": "Email queued successfully"}
-
-
-from app.utils.helpers import NotFoundError
-from app.utils.whatsapp import send_report_template
+#     return {"message": "Email queued successfully"}
 
 
-@router.post("/combined/share/whatsapp")
-async def share_combined_whatsapp(
-    project_id: int,
-    start_date: date,
-    end_date: date,
-    phone: str,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+# @router.post("/combined/share/whatsapp")
+# async def share_combined_whatsapp(
+#     project_id: int,
+#     start_date: date,
+#     end_date: date,
+#     phone: str,
+#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+#     db: AsyncSession = Depends(get_db_session),
+# ):
+#     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
-    #  Generate report URL (IMPORTANT)
-    report_url = f"http://localhost:8000/reports/combined?project_id={project_id}&start_date={start_date}&end_date={end_date}"
+#     #  Generate report URL (IMPORTANT)
+#     report_url = f"http://localhost:8000/reports/combined?project_id={project_id}&start_date={start_date}&end_date={end_date}"
 
-    result = await send_report_template(
-        to=phone,
-        name="Client",
-        report_url=report_url
-    )
+#     result = await send_report_template(
+#         to=phone,
+#         name="Client",
+#         report_url=report_url
+#     )
 
-    return {
-        "message": "WhatsApp message sent",
-        "response": result
-    }
+#     return {
+#         "message": "WhatsApp message sent",
+#         "response": result
+#     }

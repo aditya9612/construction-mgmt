@@ -102,7 +102,33 @@ class TaskStatus(str, Enum):
     PLANNED = "Planned"
     IN_PROGRESS = "In Progress"
     COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
 
+
+# reuse existing enum
+TaskPriority = IssuePriority
+
+
+PRIORITY_MAP = {
+    1: TaskPriority.LOW,
+    2: TaskPriority.MEDIUM,
+    3: TaskPriority.HIGH,
+    4: TaskPriority.CRITICAL
+}
+
+REVERSE_PRIORITY_MAP = {
+    TaskPriority.LOW: 1,
+    TaskPriority.MEDIUM: 2,
+    TaskPriority.HIGH: 3,
+    TaskPriority.CRITICAL: 4
+}
+
+
+class MilestoneStatus(str, Enum):
+    PLANNED = "Planned"
+    IN_PROGRESS = "In Progress"
+    COMPLETED = "Completed"
+    DELAYED = "Delayed"
 
 class WeatherType(str, Enum):
     SUNNY = "Sunny"
