@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, ForeignKey, DECIMAL
+from sqlalchemy import Column, Integer, ForeignKey, DECIMAL, text
 from sqlalchemy.orm import relationship
 
 from app.models.base import Base
@@ -19,8 +19,8 @@ class FinalMeasurement(Base):
     final_area = Column(DECIMAL(18, 2), nullable=False)
     approved_rate = Column(DECIMAL(18, 2), nullable=False)
 
-    extra_area = Column(DECIMAL(18, 2), default=0)
-    extra_rate = Column(DECIMAL(18, 2), default=0)
+    extra_area = Column( DECIMAL(18, 2), nullable=False, default=0, server_default=text("0") )
+    extra_rate = Column( DECIMAL(18, 2), nullable=False, default=0, server_default=text("0") )
 
     total_area = Column(DECIMAL(18, 2), nullable=False)
     total_amount = Column(DECIMAL(18, 2), nullable=False)

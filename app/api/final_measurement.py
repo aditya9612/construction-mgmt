@@ -147,9 +147,10 @@ async def update_measurement(
     data = payload.model_dump(exclude_unset=True)
 
     for k, v in data.items():
-        setattr(obj, k, v)
+        if v is not None:
+            setattr(obj, k, v)
 
-    final_area = Decimal(obj.final_area or 0)
+    final_area = Decimal(str(obj.final_area or 0))
     extra_area = Decimal(obj.extra_area or 0)
     approved_rate = Decimal(obj.approved_rate or 0)
     extra_rate = Decimal(obj.extra_rate or 0)

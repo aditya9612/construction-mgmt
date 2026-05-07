@@ -3940,7 +3940,7 @@ qc_router = APIRouter(prefix="/qc", tags=["QC"])
 async def create_qc(
     payload: s.QCCreate = Depends(),
     report_file: Optional[UploadFile] = File(None),
-    current_user: User = Depends(require_roles(ISSUE_UPDATE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     file_url = None
@@ -3998,7 +3998,7 @@ async def update_qc(
     qc_id: int,
     data: s.QCCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ISSUE_UPDATE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
     obj = await db.get(m.QCRecord, qc_id)
     for k, v in data.dict().items():
@@ -4013,7 +4013,7 @@ async def update_qc(
 async def delete_qc(
     qc_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ISSUE_UPDATE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
     obj = await db.get(m.QCRecord, qc_id)
     await db.delete(obj)
@@ -4030,7 +4030,7 @@ safety_router = APIRouter(prefix="/safety", tags=["Safety"])
 async def create_incident(
     data: s.SafetyCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
     obj = m.SafetyIncident(**data.dict())
     db.add(obj)
@@ -4084,7 +4084,7 @@ async def update_incident(
     id: int,
     data: s.SafetyCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
     obj = await db.get(m.SafetyIncident, id)
     for k, v in data.dict().items():
@@ -4099,7 +4099,7 @@ async def update_incident(
 async def delete_incident(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
     obj = await db.get(m.SafetyIncident, id)
     await db.delete(obj)
@@ -4212,7 +4212,7 @@ async def upload_photo(
     activity_tag: Optional[str] = Form(None),
     location_tag: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     #  Validate file type
@@ -4289,7 +4289,7 @@ async def list_photos(
 async def delete_photo(
     photo_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
     obj = await db.get(m.SitePhoto, photo_id)
 
@@ -4314,37 +4314,59 @@ drawing_router = APIRouter(prefix="/drawings", tags=["Drawings & Documents"])
 
 
 #  Upload Drawing
-@drawing_router.post("/upload", response_model=s.DrawingOut)
+@drawing_router.post(
+    "/upload",
+    response_model=s.DrawingOut
+)
 async def upload_drawing(
-    data: str = Form(...),
+    project_id: int = Form(...),
+    drawing_name: str = Form(...),
+    version: str = Form(...),
+    approved_by: Optional[str] = Form(None),
+    date: Optional[date] = Form(None),
+    remarks: Optional[str] = Form(None),
+
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+
+    current_user: User = Depends(
+        require_roles(TASK_WRITE_ROLES)
+    ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    #  Convert string → dict
-    parsed_data = json.loads(data)
-
-    payload = s.DrawingCreate(**parsed_data)
-
-    # Ensure folder exists
+    
+    # ensure folder exists
     os.makedirs("uploads/drawings", exist_ok=True)
 
+    # unique filename recommended
     file_path = f"uploads/drawings/{file.filename}"
 
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
-    obj = m.DrawingDocument(**payload.dict(), file_url=file_path)
+    obj = m.DrawingDocument(
+        project_id=project_id,
+        drawing_name=drawing_name,
+        version=version,
+        approved_by=approved_by,
+        date=date,
+        remarks=remarks,
+        file_url=file_path,
+    )
 
     db.add(obj)
+
     await db.commit()
     await db.refresh(obj)
 
     return obj
 
 
-#  Version History (VERY IMPORTANT FEATURE)
-@drawing_router.get("/{project_id}/versions", response_model=list[s.DrawingOut])
+# ===================== Version History =====================
+
+@drawing_router.get(
+    "/{project_id}/versions",
+    response_model=list[s.DrawingOut]
+)
 async def get_versions(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -4354,16 +4376,23 @@ async def get_versions(
 ):
     result = await db.execute(
         select(m.DrawingDocument)
-        .where(m.DrawingDocument.project_id == project_id)
+        .where(
+            m.DrawingDocument.project_id == project_id
+        )
         .order_by(m.DrawingDocument.id.desc())
         .offset(skip)
         .limit(limit)
     )
+
     return result.scalars().all()
 
 
-#  Latest Version
-@drawing_router.get("/{project_id}/latest", response_model=s.DrawingOut)
+# ===================== Latest Version =====================
+
+@drawing_router.get(
+    "/{project_id}/latest",
+    response_model=s.DrawingOut
+)
 async def get_latest(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -4371,32 +4400,39 @@ async def get_latest(
 ):
     latest = await db.scalar(
         select(m.DrawingDocument)
-        .where(m.DrawingDocument.project_id == project_id)
-        .order_by(m.DrawingDocument.created_at.desc())
+        .where(
+            m.DrawingDocument.project_id == project_id
+        )
+        .order_by(
+            m.DrawingDocument.created_at.desc()
+        )
     )
 
     if not latest:
-        raise HTTPException(status_code=404, detail="No drawings found")
+        raise HTTPException(
+            status_code=404,
+            detail="No drawings found"
+        )
 
     return latest
 
 
-#  Delete
+# ===================== Delete =====================
+
 @drawing_router.delete("/{id}")
 async def delete_drawing(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(
+        require_roles(TASK_WRITE_ROLES)
+    ),
 ):
     obj = await db.get(m.DrawingDocument, id)
 
-    #  ADD HERE
     if not obj:
         raise NotFoundError("Drawing not found")
 
-    import os
-
-    # optional: delete file also
+    # optional file delete
     if os.path.exists(obj.file_url):
         os.remove(obj.file_url)
 
@@ -4405,6 +4441,8 @@ async def delete_drawing(
 
     return {"message": "Deleted"}
 
+
+# ===================== Download =====================
 
 @drawing_router.get("/documents/download/{id}")
 async def download_document(
@@ -4429,7 +4467,9 @@ async def download_document(
     )
 
 
-@router.get("/documents/view/{id}")
+# ===================== View =====================
+
+@drawing_router.get("/documents/view/{id}")
 async def view_document(
     id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -4451,7 +4491,9 @@ async def view_document(
         path=file_path,
         filename=os.path.basename(file_path),
         media_type=media_type or "application/octet-stream",
-        headers={"Content-Disposition": "inline"},
+        headers={
+            "Content-Disposition": "inline"
+        },
     )
 
 
@@ -4523,8 +4565,8 @@ async def reject_request(
 from app.models.messages import Message
 
 communication_router = APIRouter(prefix="/communication", tags=["Communication"])
-# ===================== 1. SEND MESSAGE =====================
 
+# ===================== 1. SEND MESSAGE =====================
 
 @communication_router.post("/{project_id}/messages")
 async def send_message(
@@ -4536,17 +4578,27 @@ async def send_message(
 ):
     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
+    #  FIX: validate parent_id
+    parent = None
+    if payload.parent_id:
+        parent = await db.get(Message, payload.parent_id)
+        if not parent:
+            raise HTTPException(
+                status_code=400,
+                detail="Parent message not found"
+            )
+
     obj = Message(
         project_id=project_id,
         message=payload.message,
-        parent_id=payload.parent_id,
+        parent_id=parent.id if parent else None,   #  FIXED
         attachment_url=payload.attachment_url,
         created_by=current_user.id,
         status=MessageStatus.SENT,
     )
 
     db.add(obj)
-    await db.commit()
+    await db.flush()
     await db.refresh(obj)
 
     redis = request.app.state.redis
@@ -4558,6 +4610,7 @@ async def send_message(
                 {
                     "id": obj.id,
                     "message": obj.message,
+                    "parent_id": obj.parent_id,   # added (helpful)
                     "user": current_user.id,
                     "created_at": obj.created_at.isoformat(),
                     "status": obj.status.value,
@@ -4569,8 +4622,7 @@ async def send_message(
     return obj
 
 
-# ===================== 2. GET MESSAGES (PAGINATION) =====================
-
+# ===================== 2. GET MESSAGES =====================
 
 @communication_router.get("/{project_id}/messages")
 async def get_messages(
@@ -4594,7 +4646,6 @@ async def get_messages(
 
 
 # ===================== 3. GET REPLIES =====================
-
 
 @communication_router.get("/messages/{message_id}/replies")
 async def get_replies(
@@ -4622,7 +4673,6 @@ async def get_replies(
 
 # ===================== 4. MARK AS READ =====================
 
-
 @communication_router.put("/messages/{id}/read")
 async def mark_read(
     request: Request,
@@ -4640,7 +4690,7 @@ async def mark_read(
     )
 
     obj.status = MessageStatus.READ
-    await db.commit()
+    await db.flush()
 
     redis = request.app.state.redis
 
@@ -4662,7 +4712,6 @@ async def mark_read(
 
 # ===================== 5. MARK AS DELIVERED =====================
 
-
 @communication_router.put("/messages/{id}/delivered")
 async def mark_delivered(
     request: Request,
@@ -4670,7 +4719,7 @@ async def mark_delivered(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.Message, id)
+    obj = await db.get(Message, id)   # ✅ FIXED (removed m.)
 
     if not obj:
         raise NotFoundError("Message not found")
@@ -4680,7 +4729,7 @@ async def mark_delivered(
     )
 
     obj.status = MessageStatus.DELIVERED
-    await db.commit()
+    await db.flush()
 
     redis = request.app.state.redis
 
@@ -4702,7 +4751,6 @@ async def mark_delivered(
 
 # ===================== 6. UNREAD COUNT =====================
 
-
 @communication_router.get("/{project_id}/messages/unread-count")
 async def unread_count(
     project_id: int,
@@ -4722,7 +4770,6 @@ async def unread_count(
 
 # ===================== 7. DELETE MESSAGE =====================
 
-
 @communication_router.delete("/messages/{id}")
 async def delete_message(
     id: int,
@@ -4741,14 +4788,22 @@ async def delete_message(
     if obj.created_by != current_user.id:
         raise ValidationError("Not allowed")
 
+    # ✅ FIX: prevent delete if replies exist
+    result = await db.execute(
+        select(Message).where(Message.parent_id == id)
+    )
+    child = result.scalars().first()
+
+    if child:
+        raise ValidationError("Cannot delete message with replies")
+
     await db.delete(obj)
-    await db.commit()
+    await db.flush()
 
     return {"message": "deleted"}
 
 
 # ===================== 8. UPDATE MESSAGE =====================
-
 
 @communication_router.put("/messages/{id}")
 async def update_message(
@@ -4757,7 +4812,7 @@ async def update_message(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.Message, id)
+    obj = await db.get(Message, id)   # ✅ FIXED (removed m.)
 
     if not obj:
         raise NotFoundError("Message not found")
@@ -4772,10 +4827,9 @@ async def update_message(
     obj.message = payload.message
     obj.attachment_url = payload.attachment_url
 
-    await db.commit()
+    await db.flush()
 
     return obj
-
 
 router.include_router(milestones_router)
 router.include_router(tasks_router)

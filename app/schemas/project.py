@@ -4,13 +4,26 @@ from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator
 from typing_extensions import Annotated
-from app.core.enums import IssueCategory, IssuePriority, IssueStatus, MilestoneStatus, ProjectStatus, QCStatus, SiteRequestStatus, SiteRequestType, TaskPriority, TaskStatus, WeatherType
+from app.core.enums import (
+    IssueCategory,
+    IssuePriority,
+    IssueStatus,
+    MilestoneStatus,
+    ProjectStatus,
+    QCStatus,
+    SafetyChecklistStatus,
+    SiteRequestStatus,
+    SiteRequestType,
+    TaskPriority,
+    TaskStatus,
+    WeatherType,
+)
 from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
 from datetime import date as dt_date
 
-
 # ===================== PROJECT =====================
+
 
 class ProjectCreate(BaseSchema):
     project_name: str
@@ -70,12 +83,14 @@ class ProjectMemberOut(BaseSchema):
 
 # ===================== MILESTONE =====================
 
+
 class MilestoneCreate(BaseSchema):
     title: str
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[MilestoneStatus] = MilestoneStatus.PLANNED
+
 
 class MilestoneUpdate(BaseSchema):
     title: Optional[str] = None
@@ -96,6 +111,7 @@ class MilestoneOut(BaseSchema):
 
 
 # ===================== TASK =====================
+
 
 class TaskCreate(BaseSchema):
     title: str
@@ -144,6 +160,7 @@ class TaskProgressOut(BaseSchema):
     remarks: Optional[str] = None
     created_at: datetime
 
+
 class TaskPass(BaseSchema):
     new_user_id: int
     remark: Optional[str] = None
@@ -155,6 +172,7 @@ class TaskStatusUpdate(BaseSchema):
 
 # ===================== COMMENTS =====================
 
+
 class CommentCreate(BaseSchema):
     content: str
 
@@ -165,7 +183,9 @@ class CommentOut(BaseSchema):
     author_user_id: int
     content: str
 
+
 # ===================== DSR BASE =====================
+
 
 class DSRBase(BaseSchema):
     project_id: int
@@ -173,7 +193,7 @@ class DSRBase(BaseSchema):
 
     site_location: Optional[str] = None
 
-    contractor_id: Optional[int] = None 
+    contractor_id: Optional[int] = None
 
     weather: Optional[WeatherType] = None
 
@@ -200,7 +220,7 @@ class DSRBase(BaseSchema):
         if v > date.today():
             raise ValueError("Future report date not allowed")
         return v
-    
+
     @field_validator("contractor_id")
     def validate_contractor_id(cls, v):
         if v is not None and v <= 0:
@@ -209,6 +229,7 @@ class DSRBase(BaseSchema):
 
 
 # ===================== CREATE =====================
+
 
 class DSRCreate(DSRBase):
     latitude: Optional[float] = None
@@ -219,7 +240,7 @@ class DSRCreate(DSRBase):
         if v is not None and not (-90 <= v <= 90):
             raise ValueError("Invalid latitude")
         return v
-    
+
     @field_validator("longitude")
     def validate_lng(cls, v):
         if v is not None and not (-180 <= v <= 180):
@@ -228,6 +249,7 @@ class DSRCreate(DSRBase):
 
 
 # ===================== UPDATE =====================
+
 
 class DSRUpdate(BaseSchema):
     report_date: Optional[date] = None
@@ -279,6 +301,7 @@ class DSRUpdate(BaseSchema):
 
 # ===================== OUTPUT =====================
 
+
 class DSROut(DSRBase):
     id: int
     business_id: str
@@ -299,7 +322,9 @@ class DSROut(DSRBase):
     class Config:
         from_attributes = True
 
+
 # ===================== PAGINATION META =====================
+
 
 class PaginationMeta(BaseSchema):
     total: int
@@ -308,6 +333,7 @@ class PaginationMeta(BaseSchema):
 
 
 # ===================== ISSUES =====================
+
 
 class IssueBase(BaseSchema):
     project_id: int
@@ -370,6 +396,7 @@ class IssueOut(IssueBase):
 
 # ===================== QC =====================
 
+
 class QCCreate(BaseSchema):
     project_id: int
     task_id: Optional[int] = None
@@ -381,7 +408,6 @@ class QCCreate(BaseSchema):
     status: QCStatus
     engineer_name: str
     remarks: Optional[str] = None
-
 
     @field_validator("inspection_type", "test_type", "engineer_name")
     def validate_text_fields(cls, v):
@@ -399,9 +425,12 @@ class QCOut(QCCreate):
 
 # ===================== SAFETY =====================
 
+
 class SafetyCreate(BaseSchema):
     project_id: int
     date: date
+    safety_checklist_status: SafetyChecklistStatus
+    ppe_compliance: bool = True
     violation_type: str
     description: str
     injury_details: Optional[str] = None
@@ -423,6 +452,7 @@ class SafetyOut(SafetyCreate):
 
 
 # ===================== CHECKLIST =====================
+
 
 class ChecklistCreate(BaseSchema):
     project_id: int
@@ -458,7 +488,8 @@ class ChecklistLogCreate(BaseSchema):
         if v not in ["Done", "Pending"]:
             raise ValueError("Status must be Done or Pending")
         return v
-    
+
+
 class ChecklistLogOut(BaseModel):
     id: int
     project_id: Optional[int]
@@ -466,10 +497,9 @@ class ChecklistLogOut(BaseModel):
     status: Optional[str]
     remarks: Optional[str]
 
-    model_config = {
-        "from_attributes": True   #  VERY IMPORTANT
-    }
-    
+    model_config = {"from_attributes": True}  #  VERY IMPORTANT
+
+
 class SitePhotoCreate(BaseSchema):
     project_id: int
     task_id: Optional[int] = None
@@ -477,7 +507,7 @@ class SitePhotoCreate(BaseSchema):
     activity_tag: Optional[str] = None
     location_tag: Optional[str] = None
     description: Optional[str] = None
-    
+
 
 class SitePhotoOut(SitePhotoCreate):
     id: int
@@ -506,6 +536,7 @@ class DrawingOut(DrawingCreate):
 
 # ===================== CREATE =====================
 
+
 class SiteRequestCreate(BaseSchema):
     project_id: int
     request_type: SiteRequestType
@@ -521,11 +552,13 @@ class SiteRequestCreate(BaseSchema):
 
 # ===================== ACTION =====================
 
+
 class SiteRequestAction(BaseSchema):
     remarks: Optional[str] = None
 
 
 # ===================== OUTPUT =====================
+
 
 class SiteRequestOut(BaseSchema):
     id: int
@@ -539,6 +572,7 @@ class SiteRequestOut(BaseSchema):
 
     class Config:
         from_attributes = True
+
 
 class MessageCreate(BaseSchema):
     message: str

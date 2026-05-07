@@ -71,6 +71,7 @@ LABOUR_DELETE_ROLES = [
     for r in [
         UserRole.ADMIN,
         UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
     ]
 ]
 

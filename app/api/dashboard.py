@@ -333,6 +333,155 @@ async def export_dashboard(
     )
 
 
+@router.get("/client")
+async def client_dashboard(
+    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(d.get_request_redis),
+):
+    if current_user.role not in [
+        UserRole.CLIENT.value,
+        UserRole.ADMIN.value,
+    ]:
+        return {"error": "Access denied"}
+
+    async def logic():
+        project_ids = await get_user_project_ids(db, current_user)
+
+        # ========================
+        # PROJECT
+        # ========================
+        project = await db.execute(
+            select(
+                m.Project.id,
+                m.Project.status,
+                m.Project.start_date,
+                m.Project.end_date,
+            )
+            .where(m.Project.id.in_(project_ids))
+            .limit(1)
+        )
+
+        project = project.first()
+
+        if not project:
+            return {"error": "No project found"}
+
+        project_id, status, start_date, end_date = project
+
+        # ========================
+        # PROGRESS
+        # ========================
+        progress = await db.scalar(
+            select(func.avg(m.Task.completion_percentage)).where(
+                m.Task.project_id == project_id
+            )
+        )
+
+        # ========================
+        # BUDGET
+        # ========================
+        budget_total = await db.scalar(
+            select(func.sum(BOQ.total_cost)).where(
+                BOQ.project_id == project_id,
+                BOQ.is_latest == True,
+            )
+        )
+
+        # ========================
+        # EXPENSE
+        # ========================
+        total_expense = await db.scalar(
+            select(func.sum(Expense.amount)).where(
+                Expense.project_id == project_id
+            )
+        )
+
+        budget_val = float(budget_total or 0)
+        expense_val = float(total_expense or 0)
+
+        budget_used_percent = (
+            (expense_val / budget_val) * 100
+            if budget_val
+            else 0
+        )
+
+        remaining_budget = budget_val - expense_val
+
+        # ========================
+        # MILESTONES
+        # ========================
+        milestones_total = await db.scalar(
+            select(func.count(m.Milestone.id)).where(
+                m.Milestone.project_id == project_id
+            )
+        )
+
+        milestones_completed = await db.scalar(
+            select(func.count(m.Milestone.id)).where(
+                m.Milestone.project_id == project_id,
+                m.Milestone.status == "Completed",
+            )
+        )
+
+        # ========================
+        # TASKS
+        # ========================
+        tasks_total = await db.scalar(
+            select(func.count(m.Task.id)).where(
+                m.Task.project_id == project_id
+            )
+        )
+
+        tasks_completed = await db.scalar(
+            select(func.count(m.Task.id)).where(
+                m.Task.project_id == project_id,
+                m.Task.status == "Completed",
+            )
+        )
+
+        # ========================
+        # DAYS REMAINING
+        # ========================
+        days_remaining = 0
+
+        if end_date:
+            days_remaining = (end_date - date.today()).days
+
+        # ========================
+        # RESPONSE
+        # ========================
+        return {
+            "project_id": project_id,
+            "status": status,
+            "progress_percent": round(progress or 0, 2),
+
+            "budget_total": budget_val,
+            "total_expense": expense_val,
+            "budget_used_percent": round(budget_used_percent, 2),
+            "remaining_budget": round(remaining_budget, 2),
+
+            "milestones_total": milestones_total or 0,
+            "milestones_completed": milestones_completed or 0,
+
+            "tasks_total": tasks_total or 0,
+            "tasks_completed": tasks_completed or 0,
+
+            "start_date": start_date,
+            "end_date": end_date,
+            "days_remaining": max(days_remaining, 0),
+        }
+
+    version = await r.get_cache_version(redis, VERSION_KEY)
+
+    return await cache_get_set(
+        redis,
+        f"client_dashboard:{current_user.id}",
+        version,
+        logic,
+    )
+
+
 # =========================================
 # GRAPH APIs
 # =========================================

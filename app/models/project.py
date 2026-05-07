@@ -2,6 +2,7 @@ from datetime import date
 from typing import Optional, TYPE_CHECKING
 from sqlalchemy import (
     DECIMAL,
+    Boolean,
     CheckConstraint,
     Column,
     Date,
@@ -16,7 +17,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from decimal import Decimal
-from app.core.enums import AttendanceStatus, MilestoneStatus
+from app.core.enums import AttendanceStatus, MilestoneStatus, SafetyChecklistStatus
 from app.models.base import Base, TimestampMixin
 from app.models.labour import Labour
 from app.schemas.project import (
@@ -483,6 +484,24 @@ class QCRecord(Base, TimestampMixin):
 # ===================== SAFETY =====================
 
 
+# class SafetyIncident(Base, TimestampMixin):
+#     __tablename__ = "safety_incidents"
+
+#     id = Column(Integer, primary_key=True)
+
+#     project_id = Column(Integer, ForeignKey("projects.id"))
+
+#     date = Column(Date)
+#     violation_type = Column(String(100))
+#     description = Column(Text)
+#     injury_details = Column(Text)
+#     action_taken = Column(Text)
+#     responsible_person = Column(String(100))
+
+#     project = relationship("Project", back_populates="safety_incidents")
+
+#     __table_args__ = (Index("idx_safety_project", "project_id"),)
+
 class SafetyIncident(Base, TimestampMixin):
     __tablename__ = "safety_incidents"
 
@@ -491,6 +510,14 @@ class SafetyIncident(Base, TimestampMixin):
     project_id = Column(Integer, ForeignKey("projects.id"))
 
     date = Column(Date)
+
+   
+    safety_checklist_status = Column(
+        SAEnum(SafetyChecklistStatus),
+        nullable=False
+    )
+    ppe_compliance = Column(Boolean, default=True)
+
     violation_type = Column(String(100))
     description = Column(Text)
     injury_details = Column(Text)

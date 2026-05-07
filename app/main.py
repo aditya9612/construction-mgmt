@@ -1,3 +1,4 @@
+from datetime import datetime
 import logging
 import time
 import uuid
@@ -9,6 +10,13 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import json
+from fastapi import WebSocket, WebSocketDisconnect
+
+from jose import jwt, JWTError
+from app.core.config import settings
+from app.models.chat import ChatMessage, MessageStatus
 
 from app.api.ai import router as ai_router
 from app.api.auth import router as auth_router
@@ -45,8 +53,10 @@ from app.api.cad import router as cad_router
 from app.api.settings import router as settings_router
 from app.api.alert import router as alert_router
 from app.api.accountant import router as accountant_router
+from app.api.chat import router as chats_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
+from app.core.db import AsyncSessionLocal
 from app.middlewares.rate_limiter import init_rate_limiter
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.utils.helpers import AppError
@@ -163,6 +173,51 @@ def create_app() -> FastAPI:
             )
             raise
 
+    
+    @application.middleware("http")
+    async def track_user_activity(request: Request, call_next):
+        response = await call_next(request)
+
+        try:
+            redis = request.app.state.redis
+
+            # decode user from JWT manually
+            auth = request.headers.get("Authorization")
+
+            if auth and auth.startswith("Bearer "):
+                token = auth.split(" ")[1]
+
+                try:
+                    payload = jwt.decode(
+                        token,
+                        settings.SECRET_KEY,
+                        algorithms=["HS256"]
+                    )
+
+                    user_id = int(payload.get("sub"))
+
+                    if user_id and redis:
+                        await redis.set(
+                            f"user:{user_id}:online",
+                            1,
+                            ex=60
+                        )
+
+                        await redis.set(
+                            f"user:{user_id}:last_seen",
+                            datetime.utcnow().isoformat()
+                        )
+
+                except JWTError:
+                    pass
+
+        except Exception:
+            pass
+
+        return response
+
+
+
     @application.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):
         logger.warning(
@@ -200,6 +255,7 @@ def create_app() -> FastAPI:
     # api_router.include_router(document_router)
     api_router.include_router(site_request_router)
     api_router.include_router(communication_router)
+    api_router.include_router(chats_router)
     api_router.include_router(ai_router)
     api_router.include_router(owner_router)
     api_router.include_router(contractor_router)
@@ -227,9 +283,24 @@ def create_app() -> FastAPI:
 
 app = create_app()
 
-@app.websocket("/ws/{project_id}")
-async def websocket_endpoint(websocket: WebSocket, project_id: int):
-    await manager.connect(project_id, websocket)
+
+@app.websocket("/ws/{chat_id}")
+async def websocket_endpoint(websocket: WebSocket, chat_id: int):
+
+    token = websocket.query_params.get("token")
+
+    if not token:
+        await websocket.close()
+        return
+
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        user_id = int(payload.get("sub"))
+    except JWTError:
+        await websocket.close()
+        return
+
+    await manager.connect(chat_id, websocket)
 
     redis = app.state.redis
 
@@ -237,21 +308,115 @@ async def websocket_endpoint(websocket: WebSocket, project_id: int):
         await websocket.close()
         return
 
+    #  add to active users
+    await redis.sadd(f"chat:{chat_id}:online_users", user_id)
+
+    #  send full active users list on connect
+    users = await redis.smembers(f"chat:{chat_id}:online_users")
+    await websocket.send_json({
+        "type": "active_users",
+        "users": [int(u) for u in users]
+    })
+
+    #  mark online + last seen
+    await redis.set(f"user:{user_id}:online", 1, ex=60)
+    await redis.set(f"user:{user_id}:last_seen", datetime.utcnow().isoformat())
+
+    #  broadcast presence (online)
+    await redis.publish(
+        f"chat:{chat_id}",
+        json.dumps({
+            "type": "presence",
+            "user_id": user_id,
+            "status": "online"
+        })
+    )
+
+    #  heartbeat
+    async def heartbeat():
+        while True:
+            await redis.set(f"user:{user_id}:online", 1, ex=60)
+            await redis.set(f"user:{user_id}:last_seen", datetime.utcnow().isoformat())
+            await asyncio.sleep(30)
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+
+    #  subscribe
     pubsub = redis.pubsub()
-    await pubsub.subscribe(f"project:{project_id}")
+    await pubsub.subscribe(
+        f"chat:{chat_id}",
+        f"project:{chat_id}"
+    )
 
     try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
+        # =========================
+        #  DB SESSION (ADDED)
+        # =========================
+        async with AsyncSessionLocal() as db:
+
+            async for message in pubsub.listen():
+
+                if message["type"] != "message":
+                    continue
+
                 data = json.loads(message["data"])
-                await manager.broadcast(project_id, data)
+
+                # =========================
+                #  MARK DELIVERED (ADDED)
+                # =========================
+                if data.get("type") == "message":
+                    msg_id = data.get("message_id")
+
+                    if msg_id:
+                        msg = await db.get(ChatMessage, msg_id)
+
+                        if msg and msg.status == MessageStatus.SENT:
+                            msg.status = MessageStatus.DELIVERED
+                            await db.commit()
+
+                        #  broadcast delivered event (NEW)
+                        await redis.publish(
+                            f"chat:{chat_id}",
+                            json.dumps({
+                                "type": "delivered",
+                                "chat_id": chat_id,
+                                "message_id": msg_id
+                            })
+                        )
+
+                #  broadcast ALL event types
+                await manager.broadcast(chat_id, data)
 
     except WebSocketDisconnect:
-        manager.disconnect(project_id, websocket)
+        manager.disconnect(chat_id, websocket)
 
     except Exception:
-        manager.disconnect(project_id, websocket)
+        manager.disconnect(chat_id, websocket)
 
     finally:
-        await pubsub.unsubscribe(f"project:{project_id}")
+        # stop heartbeat safely
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except:
+            pass
+
+        # remove from active users
+        await redis.srem(f"chat:{chat_id}:online_users", user_id)
+
+        # mark offline
+        await redis.delete(f"user:{user_id}:online")
+
+        # broadcast offline presence
+        await redis.publish(
+            f"chat:{chat_id}",
+            json.dumps({
+                "type": "presence",
+                "user_id": user_id,
+                "status": "offline"
+            })
+        )
+
+        # cleanup
+        await pubsub.unsubscribe(f"chat:{chat_id}")
         await pubsub.close()

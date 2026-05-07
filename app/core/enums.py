@@ -159,6 +159,10 @@ class QCStatus(str, Enum):
     PASS = "Pass"
     FAIL = "Fail"
 
+class SafetyChecklistStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 class EquipmentCondition(str, Enum):
     GOOD = "GOOD"
