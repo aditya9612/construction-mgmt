@@ -28,7 +28,6 @@ class EquipmentCreate(BaseSchema):
             return EquipmentCondition(v.value.upper())
         return v
 
-
 class EquipmentUpdate(BaseSchema):
     project_id: Optional[int] = None
     equipment_name: Optional[str] = Field(None, max_length=255)
@@ -69,6 +68,7 @@ class EquipmentUsageCreate(BaseSchema):
     fuel_used: Decimal = Field(..., ge=0)
     usage_date: date
     notes: Optional[str] = Field(None, max_length=500)
+
 
 class EquipmentUsageOut(BaseSchema):
     id: int

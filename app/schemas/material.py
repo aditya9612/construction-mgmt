@@ -13,7 +13,6 @@ class BaseSchema(BaseModel):
         json_encoders={Decimal: lambda v: round(float(v), 2)},
     )
 
-
 # ================= MATERIAL =================
 class MaterialCreate(BaseSchema):
     project_id: int

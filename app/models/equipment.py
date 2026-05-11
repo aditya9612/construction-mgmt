@@ -122,7 +122,6 @@ class Equipment(Base, TimestampMixin):
             f"<Equipment id={self.id} code={self.equipment_code} status={self.status}>"
         )
 
-
 class EquipmentUsage(Base, TimestampMixin):
     __tablename__ = "equipment_usage"
 

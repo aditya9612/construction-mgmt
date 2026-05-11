@@ -23,7 +23,6 @@ from app.core.enums import IssueType, TransactionType, RateType
 
 # ================= MATERIAL =================
 
-
 class Material(Base, TimestampMixin):
     __tablename__ = "materials"
 
