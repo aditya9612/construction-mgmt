@@ -1228,7 +1228,6 @@ async def usage(
                 type=DBTransactionType.USAGE,
                 quantity=-qty,  # ✅ FIX: negative for usage
                 rate=avg_rate,
-                avg_rate=avg_rate,  # ✅ consistency
                 total_amount=used_value,
                 amount_paid=0,
                 payment_pending=0,
@@ -1246,7 +1245,6 @@ async def usage(
                 type=DBTransactionType.USAGE,
                 quantity=-qty,  # ✅ FIX
                 rate=avg_rate,
-                avg_rate=avg_rate,
                 total_amount=used_value,
                 amount_paid=0,
                 payment_pending=0,

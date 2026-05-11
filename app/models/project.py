@@ -172,6 +172,8 @@ class Task(Base):
         Integer, ForeignKey("users.id")
     )
     completion_percentage: Mapped[float] = mapped_column(Float, default=0)
+    discipline: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
 
     # in Task model
 
@@ -657,7 +659,9 @@ class WorkActivity(Base, TimestampMixin):
     work_order_id = Column( Integer, ForeignKey("work_orders.id", ondelete="CASCADE"), nullable=False, index=True, )
     total_completed = Column(DECIMAL(18, 2), default=0)
     remaining_quantity = Column(DECIMAL(18, 2), default=0)
-    completion_percentage = Column(DECIMAL(5, 2), default=0)
+    completion_percentage: Column = Column(DECIMAL(5, 2), default=0)
+    discipline: Column = Column(String(100), nullable=True)
+
 
     status = Column(
         SAEnum(WorkActivityStatus),
