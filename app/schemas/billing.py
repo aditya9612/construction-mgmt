@@ -55,7 +55,11 @@ class RABillOut(BaseModel):
     project_id: int
     contractor_id: int
     work_order_id: Optional[int]
-    quotation_id: Optional[int]
+
+    # Make optional with default None so validation succeeds
+    # even if the SQLAlchemy model does not have this attribute.
+    quotation_id: Optional[int] = None
+
     bill_number: str
     work_description: str
     quantity: Decimal
@@ -67,6 +71,7 @@ class RABillOut(BaseModel):
     total_amount: Decimal
     bill_date: date
     status: str
+
     progress_percent: Optional[float] = None
     total_billed_quantity: Optional[float] = None
     remaining_quantity: Optional[float] = None

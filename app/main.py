@@ -56,6 +56,8 @@ from app.api.alert import router as alert_router
 from app.api.accountant import router as accountant_router
 from app.api.chat import router as chats_router
 from app.api.quotation import router as quotation_router
+from app.api.agreement import router as agreement_router
+from app.api.project_visualization import router as visualization_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal
@@ -277,6 +279,8 @@ def create_app() -> FastAPI:
     api_router.include_router(alert_router) 
     api_router.include_router(cad_router)
     api_router.include_router(settings_router)
+    api_router.include_router(agreement_router)
+    api_router.include_router(visualization_router)
 
 
 

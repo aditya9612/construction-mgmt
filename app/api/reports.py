@@ -32,17 +32,6 @@ router = APIRouter(prefix="/reports", tags=["Reports"])
 
 # ===================== DAILY REPORT =====================
 
-@router.get("/test-email")
-async def test_email():
-    result = await send_email(
-        to_email="your_email@gmail.com",
-        subject="Test SMTP",
-        body="SMTP is working "
-    )
-
-    return {"success": result}
-
-
 @router.get("/daily")
 async def daily_report(
     project_id: int,

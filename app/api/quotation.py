@@ -3,13 +3,16 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
+from app.models.billing import RABill
+from app.models.contractor import Contractor
 from app.models.equipment import Equipment
 from app.models.labour import Labour
-from datetime import datetime
+from datetime import date, datetime
 from num2words import num2words
 from app.db.session import get_db_session
 
 from app.models.material import Material
+from app.models.project import Project
 from app.models.quotation import (
     QuotationExtraCharge,
     QuotationMaster,
@@ -1522,16 +1525,15 @@ async def reject_quotation(
 # CONVERT TO BILL
 # =========================================================
 
-
 @router.post("/{quotation_id}/convert-to-bill")
 async def convert_to_bill(
     quotation_id: int,
+    project_id: int,      # Required query parameter
+    contractor_id: int,   # Required query parameter
     db: AsyncSession = Depends(get_db_session)
 ):
-    from datetime import date
-    from decimal import Decimal
 
-    from app.models.billing import RABill
+    # GET QUOTATION
 
     quotation = await get_quotation_or_404(
         quotation_id,
@@ -1554,22 +1556,51 @@ async def convert_to_bill(
             "Already converted to bill"
         )
 
-    # REAL RA BILL CREATION
+    # VALIDATE PROJECT
 
-    grand_total = Decimal(str(quotation.grand_total or 0))
-    gst_percent = Decimal(str(quotation.gst_percent or 0))
+    project = await db.get(
+        Project,
+        project_id
+    )
+
+    if not project:
+        raise HTTPException(
+            404,
+            "Project not found"
+        )
+
+    # VALIDATE CONTRACTOR
+
+    contractor = await db.get(
+        Contractor,
+        contractor_id
+    )
+
+    if not contractor:
+        raise HTTPException(
+            404,
+            "Contractor not found"
+        )
+
+    # PREPARE AMOUNTS
+
+    grand_total = Decimal(
+        str(quotation.grand_total or 0)
+    )
+
+    gst_percent = Decimal(
+        str(quotation.gst_percent or 0)
+    )
+
+    # CREATE RA BILL
 
     bill = RABill(
         # Link back to quotation
         quotation_id=quotation.id,
 
-        # Required project details
-        project_id=quotation.project_id,
-
-        # Use actual contractor if available in your quotation model.
-        # If your quotation does not store contractor_id yet,
-        # replace this with a valid contractor ID.
-        contractor_id=quotation.contractor_id,
+        # Required references selected by user
+        project_id=project.id,
+        contractor_id=contractor.id,
 
         # Optional work order linkage
         work_order_id=None,
@@ -1580,33 +1611,33 @@ async def convert_to_bill(
         # Description
         work_description=quotation.project_name,
 
-        # Quantity/Rate pattern to preserve exact quotation total
+        # Preserve quotation total
         quantity=Decimal("1"),
         rate=grand_total,
 
-        # Financials
+        # Financial values
         gross_amount=grand_total,
         deductions=Decimal("0"),
         net_amount=grand_total,
         gst_percent=gst_percent,
         total_amount=grand_total,
 
-        # Bill date
+        # Bill metadata
         bill_date=date.today(),
-
-        # Initial status
         status="Draft",
     )
 
     db.add(bill)
 
-    # Ensure bill.id is generated before commit
+    # Generate bill.id before commit
     await db.flush()
 
-    # UPDATE QUOTATION STATUS
+    # UPDATE QUOTATION
+
+    # Save selected project for future reference
+    quotation.project_id = project.id
 
     quotation.converted_to_bill = True
-
     quotation.status = QuotationStatus.CONVERTED
 
     await db.commit()
@@ -1614,7 +1645,11 @@ async def convert_to_bill(
     return {
         "message": "Converted to bill successfully",
         "bill_id": bill.id,
-        "bill_number": bill.bill_number
+        "bill_number": bill.bill_number,
+        "project_id": project.id,
+        "project_name": project.project_name,
+        "contractor_id": contractor.id,
+        "contractor_name": contractor.name
     }
 
 
@@ -1669,16 +1704,23 @@ async def convert_to_invoice(
 # CONVERT TO WORK ORDER
 # =========================================================
 
-
 @router.post("/{quotation_id}/convert-to-work-order")
 async def convert_to_work_order(
     quotation_id: int,
+    project_id: int,      # Required query parameter
+    contractor_id: int,   # Required query parameter
     db: AsyncSession = Depends(get_db_session)
 ):
     from decimal import Decimal
 
     from app.models.work_order import WorkOrder
+    from app.models.contractor import Contractor
+    from app.models.project import Project
     from app.utils.common import generate_business_id
+
+    # =====================================================
+    # GET QUOTATION
+    # =====================================================
 
     quotation = await get_quotation_or_404(
         quotation_id,
@@ -1706,19 +1748,33 @@ async def convert_to_work_order(
         )
 
     # =====================================================
-    # REQUIRED FIELD VALIDATIONS
+    # VALIDATE PROJECT
     # =====================================================
 
-    if not quotation.project_id:
+    project = await db.get(
+        Project,
+        project_id
+    )
+
+    if not project:
         raise HTTPException(
-            400,
-            "Quotation is not linked to any project"
+            404,
+            "Project not found"
         )
 
-    if not quotation.contractor_id:
+    # =====================================================
+    # VALIDATE CONTRACTOR
+    # =====================================================
+
+    contractor = await db.get(
+        Contractor,
+        contractor_id
+    )
+
+    if not contractor:
         raise HTTPException(
-            400,
-            "Quotation is not linked to any contractor"
+            404,
+            "Contractor not found"
         )
 
     # =====================================================
@@ -1733,46 +1789,40 @@ async def convert_to_work_order(
     )
 
     # =====================================================
-    # CREATE REAL WORK ORDER
+    # CREATE WORK ORDER
     # =====================================================
 
-    grand_total = Decimal(str(quotation.grand_total or 0))
+    grand_total = Decimal(
+        str(quotation.grand_total or 0)
+    )
 
     work_order = WorkOrder(
-        # Link back to quotation
         quotation_id=quotation.id,
-
-        # Required references
-        project_id=quotation.project_id,
-        contractor_id=quotation.contractor_id,
-
-        # Auto-generated number
+        project_id=project.id,
+        contractor_id=contractor.id,
         work_order_number=work_order_number,
-
-        # Description
         work_description=(
             f"{quotation.project_name} "
             f"(From Quotation {quotation.quotation_no})"
         ),
-
-        # Preserve exact approved quotation value
         total_quantity=Decimal("1"),
         completed_quantity=Decimal("0"),
         rate=grand_total,
         total_amount=grand_total,
-
-        # Initial status
         status="Assigned",
     )
 
     db.add(work_order)
 
-    # Generate work_order.id before commit
+    # Generate ID
     await db.flush()
 
     # =====================================================
-    # UPDATE QUOTATION STATUS
+    # UPDATE QUOTATION
     # =====================================================
+
+    # Save selected project to quotation for future reference
+    quotation.project_id = project.id
 
     quotation.converted_to_work_order = True
     quotation.status = QuotationStatus.CONVERTED
@@ -1782,8 +1832,14 @@ async def convert_to_work_order(
     return {
         "message": "Converted to work order successfully",
         "work_order_id": work_order.id,
-        "work_order_number": work_order.work_order_number
+        "work_order_number": work_order.work_order_number,
+        "project_id": project.id,
+        "project_name": project.project_name,
+        "contractor_id": contractor.id,
+        "contractor_name": contractor.name
     }
+
+
 
 
 # =========================================================
@@ -2203,26 +2259,50 @@ async def list_extra_charges(
 # PDF GENERATION
 # =========================================================
 
-@router.get("/{quotation_id}/pdf")
+# =========================================================
+# PDF GENERATION
+# =========================================================
+
+@router.get(
+    "/{quotation_id}/pdf",
+    responses={
+        200: {
+            "content": {
+                "application/pdf": {}
+            },
+            "description": "PDF file"
+        }
+    }
+)
 async def generate_pdf(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session)
 ):
-
+    # Get quotation
     quotation = await get_quotation_or_404(
         quotation_id,
         db
     )
 
+    # Generate PDF buffer
     pdf_buffer = generate_quotation_pdf(
         quotation
     )
 
+    # Safe filename:
+    # QT/2026/0001 -> QT-2026-0001
+    safe_filename = (
+        quotation.quotation_no
+        .replace("/", "-")
+        .replace("\\", "-")
+    )
+
+    # Return PDF stream
     return StreamingResponse(
         pdf_buffer,
         media_type="application/pdf",
         headers={
-            "Content-Disposition":
-            f'inline; filename="{quotation.quotation_no}.pdf"'
-        },
+            "Content-Disposition": f'attachment; filename="{safe_filename}.pdf"',
+            "Content-Type": "application/pdf"
+        }
     )

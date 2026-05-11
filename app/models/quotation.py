@@ -61,6 +61,11 @@ class QuotationMaster(Base):
     gst_number: Mapped[str | None] = mapped_column(String(50))
 
     # ================= PROJECT =================
+    project_id: Mapped[int | None] = mapped_column(
+        ForeignKey("projects.id"), nullable=True, index=True
+    )
+
+    project = relationship("Project", lazy="selectin")
 
     project_name: Mapped[str] = mapped_column(String(150))
 
@@ -313,7 +318,9 @@ class QuotationMaterial(Base):
         ForeignKey("quotation_master.id", ondelete="CASCADE")
     )
 
-    quotation = relationship( "QuotationMaster", back_populates="material_items", lazy="selectin" )
+    quotation = relationship(
+        "QuotationMaster", back_populates="material_items", lazy="selectin"
+    )
 
     # OPTIONAL LINK
     material_id: Mapped[Optional[int]] = mapped_column(

@@ -1995,6 +1995,107 @@ def get_reports_service():
     return ReportsService(ProjectsRepository())
 
 
+@router.get("/module-summary", response_model=s.ProjectsModuleResponse)
+async def projects_module_summary(
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    today = date.today()
+
+    # 1. Summary
+    total = await db.scalar(select(func.count(m.Project.id)))
+    ongoing = await db.scalar(select(func.count(m.Project.id)).where(m.Project.status == "ONGOING"))
+    completed = await db.scalar(select(func.count(m.Project.id)).where(m.Project.status == "COMPLETED"))
+    delayed = await db.scalar(
+        select(func.count(m.Project.id))
+        .where(m.Project.status == "ONGOING", m.Project.end_date < today)
+    )
+
+    summary = s.ProjectsModuleSummary(
+        total_projects=total or 0,
+        ongoing_sites=ongoing or 0,
+        completed_projects=completed or 0,
+        delayed_projects=delayed or 0
+    )
+
+    # 2. Activities (Aggregated Feed)
+    activities = []
+
+    # a. Task Progress
+    task_p = await db.execute(
+        select(m.TaskProgress, m.Task.title, m.Project.project_name, User.full_name)
+        .join(m.Task, m.TaskProgress.task_id == m.Task.id)
+        .join(m.Project, m.Task.project_id == m.Project.id)
+        .join(User, m.TaskProgress.created_by_user_id == User.id)
+        .order_by(m.TaskProgress.created_at.desc())
+        .limit(5)
+    )
+    for row in task_p.all():
+        activities.append(s.ProjectActivityItem(
+            type="task_completion",
+            user_name=row[3],
+            description=f"updated progress on {row[1]} to {row[0].percentage}%",
+            project_name=row[2],
+            timestamp=row[0].created_at
+        ))
+
+    # b. Invoices
+    invoices = await db.execute(
+        select(Invoice, m.Project.project_name)
+        .join(m.Project, Invoice.project_id == m.Project.id)
+        .order_by(Invoice.created_at.desc())
+        .limit(5)
+    )
+    for row in invoices.all():
+        activities.append(s.ProjectActivityItem(
+            type="invoice",
+            user_name="Financial Team",
+            description=f"submitted Invoice #{row[0].id} for {row[0].total_amount}",
+            project_name=row[1],
+            timestamp=row[0].created_at
+        ))
+
+    # c. Site Photos
+    photos = await db.execute(
+        select(m.SitePhoto, m.Project.project_name)
+        .join(m.Project, m.SitePhoto.project_id == m.Project.id)
+        .order_by(m.SitePhoto.created_at.desc())
+        .limit(5)
+    )
+    for row in photos.all():
+        activities.append(s.ProjectActivityItem(
+            type="photo",
+            user_name="Site Bot",
+            description="uploaded a new site photo",
+            project_name=row[1],
+            timestamp=row[0].created_at
+        ))
+
+    # d. Issues
+    issues = await db.execute(
+        select(m.Issue, m.Project.project_name)
+        .join(m.Project, m.Issue.project_id == m.Project.id)
+        .order_by(m.Issue.created_at.desc())
+        .limit(5)
+    )
+    for row in issues.all():
+        activities.append(s.ProjectActivityItem(
+            type="issue",
+            user_name="Site Manager",
+            description=f"reported {row[0].priority} issue: {row[0].title}",
+            project_name=row[1],
+            timestamp=row[0].created_at
+        ))
+
+    # Sort and return
+    activities.sort(key=lambda x: x.timestamp, reverse=True)
+    
+    return s.ProjectsModuleResponse(
+        summary=summary,
+        activities=activities[:15]
+    )
+
+
 @router.post("", response_model=s.ProjectOut)
 async def create_project(
     payload: s.ProjectCreate,
@@ -2331,107 +2432,6 @@ async def get_project_photos(
         }
         for p in photos
     ]
-
-
-@router.get("/module-summary", response_model=s.ProjectsModuleResponse)
-async def projects_module_summary(
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    today = date.today()
-
-    # 1. Summary
-    total = await db.scalar(select(func.count(m.Project.id)))
-    ongoing = await db.scalar(select(func.count(m.Project.id)).where(m.Project.status == "ONGOING"))
-    completed = await db.scalar(select(func.count(m.Project.id)).where(m.Project.status == "COMPLETED"))
-    delayed = await db.scalar(
-        select(func.count(m.Project.id))
-        .where(m.Project.status == "ONGOING", m.Project.end_date < today)
-    )
-
-    summary = s.ProjectsModuleSummary(
-        total_projects=total or 0,
-        ongoing_sites=ongoing or 0,
-        completed_projects=completed or 0,
-        delayed_projects=delayed or 0
-    )
-
-    # 2. Activities (Aggregated Feed)
-    activities = []
-
-    # a. Task Progress
-    task_p = await db.execute(
-        select(m.TaskProgress, m.Task.title, m.Project.project_name, User.full_name)
-        .join(m.Task, m.TaskProgress.task_id == m.Task.id)
-        .join(m.Project, m.Task.project_id == m.Project.id)
-        .join(User, m.TaskProgress.created_by_user_id == User.id)
-        .order_by(m.TaskProgress.created_at.desc())
-        .limit(5)
-    )
-    for row in task_p.all():
-        activities.append(s.ProjectActivityItem(
-            type="task_completion",
-            user_name=row[3],
-            description=f"updated progress on {row[1]} to {row[0].percentage}%",
-            project_name=row[2],
-            timestamp=row[0].created_at
-        ))
-
-    # b. Invoices
-    invoices = await db.execute(
-        select(Invoice, m.Project.project_name)
-        .join(m.Project, Invoice.project_id == m.Project.id)
-        .order_by(Invoice.created_at.desc())
-        .limit(5)
-    )
-    for row in invoices.all():
-        activities.append(s.ProjectActivityItem(
-            type="invoice",
-            user_name="Financial Team",
-            description=f"submitted Invoice #{row[0].id} for {row[0].total_amount}",
-            project_name=row[1],
-            timestamp=row[0].created_at
-        ))
-
-    # c. Site Photos
-    photos = await db.execute(
-        select(m.SitePhoto, m.Project.project_name)
-        .join(m.Project, m.SitePhoto.project_id == m.Project.id)
-        .order_by(m.SitePhoto.created_at.desc())
-        .limit(5)
-    )
-    for row in photos.all():
-        activities.append(s.ProjectActivityItem(
-            type="photo",
-            user_name="Site Bot",
-            description="uploaded a new site photo",
-            project_name=row[1],
-            timestamp=row[0].created_at
-        ))
-
-    # d. Issues
-    issues = await db.execute(
-        select(m.Issue, m.Project.project_name)
-        .join(m.Project, m.Issue.project_id == m.Project.id)
-        .order_by(m.Issue.created_at.desc())
-        .limit(5)
-    )
-    for row in issues.all():
-        activities.append(s.ProjectActivityItem(
-            type="issue",
-            user_name="Site Manager",
-            description=f"reported {row[0].priority} issue: {row[0].title}",
-            project_name=row[1],
-            timestamp=row[0].created_at
-        ))
-
-    # Sort and return
-    activities.sort(key=lambda x: x.timestamp, reverse=True)
-    
-    return s.ProjectsModuleResponse(
-        summary=summary,
-        activities=activities[:15]
-    )
 
 
 milestones_router = APIRouter(

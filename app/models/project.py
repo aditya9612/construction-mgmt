@@ -19,7 +19,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from decimal import Decimal
-from app.core.enums import AttendanceStatus, MilestoneStatus, SafetyChecklistStatus, WorkActivityStatus
+from app.core.enums import (
+    AttendanceStatus,
+    MilestoneStatus,
+    SafetyChecklistStatus,
+    WorkActivityStatus,
+)
 from app.models.base import Base, TimestampMixin
 from app.models.labour import Labour
 from app.schemas.project import (
@@ -135,7 +140,7 @@ class Milestone(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    status = mapped_column( SAEnum(MilestoneStatus), default=MilestoneStatus.PLANNED )
+    status = mapped_column(SAEnum(MilestoneStatus), default=MilestoneStatus.PLANNED)
     project: Mapped["Project"] = relationship("Project", back_populates="milestones")
 
     __table_args__ = (
@@ -174,10 +179,9 @@ class Task(Base):
     completion_percentage: Mapped[float] = mapped_column(Float, default=0)
     discipline: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
-
     # in Task model
 
-    created_by_user_id = mapped_column( Integer, ForeignKey("users.id"), nullable=False )
+    created_by_user_id = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
 
     project = relationship("Project", back_populates="tasks")
 
@@ -192,7 +196,6 @@ class Task(Base):
 
     __table_args__ = (
         UniqueConstraint("project_id", "title", name="uq_task_project_title"),
-
         #  ONLY KEEP THIS (high value composite index)
         Index(
             "idx_task_project_status_assigned",
@@ -320,7 +323,7 @@ class DailySiteReport(Base, TimestampMixin):
     longitude: Mapped[Optional[float]] = mapped_column(Float, index=True, nullable=True)
 
     photos = relationship(
-        "DSRPhoto", back_populates="dsr", cascade="all, delete-orphan"
+        "DSRPhoto", back_populates="dsr", cascade="all, delete-orphan", lazy="selectin"
     )
 
     project: Mapped["Project"] = relationship("Project", back_populates="dsr_entries")
@@ -506,6 +509,7 @@ class QCRecord(Base, TimestampMixin):
 
 #     __table_args__ = (Index("idx_safety_project", "project_id"),)
 
+
 class SafetyIncident(Base, TimestampMixin):
     __tablename__ = "safety_incidents"
 
@@ -515,11 +519,7 @@ class SafetyIncident(Base, TimestampMixin):
 
     date = Column(Date)
 
-   
-    safety_checklist_status = Column(
-        SAEnum(SafetyChecklistStatus),
-        nullable=False
-    )
+    safety_checklist_status = Column(SAEnum(SafetyChecklistStatus), nullable=False)
     ppe_compliance = Column(Boolean, default=True)
 
     violation_type = Column(String(100))
@@ -534,6 +534,7 @@ class SafetyIncident(Base, TimestampMixin):
 
 
 # ===================== CHECKLIST ====================
+
 
 class Checklist(Base):
     __tablename__ = "checklists"
@@ -656,12 +657,16 @@ class WorkActivity(Base, TimestampMixin):
     planned_quantity = Column(DECIMAL(18, 2), default=0)
     unit = Column(String(50))
     engineer_id = Column(Integer)
-    work_order_id = Column( Integer, ForeignKey("work_orders.id", ondelete="CASCADE"), nullable=False, index=True, )
+    work_order_id = Column(
+        Integer,
+        ForeignKey("work_orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     total_completed = Column(DECIMAL(18, 2), default=0)
     remaining_quantity = Column(DECIMAL(18, 2), default=0)
     completion_percentage: Column = Column(DECIMAL(5, 2), default=0)
     discipline: Column = Column(String(100), nullable=True)
-
 
     status = Column(
         SAEnum(WorkActivityStatus),
@@ -674,7 +679,7 @@ class WorkActivity(Base, TimestampMixin):
     created_at = Column(TIMESTAMP, server_default=func.now())
 
 
-class DailyProgressEntry(Base ,TimestampMixin):
+class DailyProgressEntry(Base, TimestampMixin):
 
     __tablename__ = "daily_progress_entries"
 
