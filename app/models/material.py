@@ -16,20 +16,20 @@ from sqlalchemy import (
     CheckConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.sql import func 
+from sqlalchemy.sql import func
 
 from app.models.base import Base, TimestampMixin
 from app.core.enums import IssueType, TransactionType, RateType
 
-
 # ================= MATERIAL =================
+
+
 class Material(Base, TimestampMixin):
     __tablename__ = "materials"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     material_code = Column(String(20), unique=True, index=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
-
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
@@ -61,15 +61,19 @@ class Material(Base, TimestampMixin):
     remaining_stock: Mapped[Decimal] = mapped_column(
         DECIMAL(18, 3), nullable=False, server_default=text("0.000")
     )
+
     payment_given: Mapped[Decimal] = mapped_column(
         DECIMAL(18, 2), nullable=False, server_default=text("0.00")
     )
     payment_pending: Mapped[Decimal] = mapped_column(
         DECIMAL(18, 2), nullable=False, server_default=text("0.00")
     )
+
+    # IMPORTANT: This is TOTAL PURCHASE COST (do NOT reduce it anywhere)
     total_amount: Mapped[Decimal] = mapped_column(
         DECIMAL(18, 2), nullable=False, server_default=text("0.00")
     )
+
     advance_amount: Mapped[Decimal] = mapped_column(
         DECIMAL(18, 2), nullable=False, server_default=text("0.00")
     )
@@ -92,6 +96,13 @@ class Material(Base, TimestampMixin):
         "MaterialLedger", back_populates="material", cascade="all, delete"
     )
 
+    # NEW: Correct avg_rate calculation
+    @property
+    def avg_rate(self):
+        if self.quantity_purchased and self.quantity_purchased > 0:
+            return self.total_amount / self.quantity_purchased
+        return Decimal("0.00")
+
     __table_args__ = (
         Index("idx_material_project", "project_id"),
         Index("idx_material_deleted", "is_deleted"),
@@ -103,7 +114,9 @@ class Material(Base, TimestampMixin):
             name="unique_material_per_project_supplier",
         ),
         CheckConstraint("remaining_stock >= 0", name="check_stock_not_negative"),
-        CheckConstraint("minimum_stock_level >= 0", name="check_min_stock_not_negative"),
+        CheckConstraint(
+            "minimum_stock_level >= 0", name="check_min_stock_not_negative"
+        ),
     )
 
 
@@ -155,9 +168,7 @@ class MaterialTransaction(Base, TimestampMixin):
 
     quantity: Mapped[Decimal] = mapped_column(DECIMAL(18, 3), nullable=False)
 
-    rate: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 2), server_default=text("0.00")
-    )
+    rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), server_default=text("0.00"))
 
     total_amount: Mapped[Decimal] = mapped_column(
         DECIMAL(18, 2), server_default=text("0.00")
@@ -192,16 +203,21 @@ class MaterialTransaction(Base, TimestampMixin):
 
 
 # ================= SUPPLIER =================
+
+
 class Supplier(Base, TimestampMixin):
     __tablename__ = "suppliers"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(255))
-    contact: Mapped[Optional[str]] = mapped_column(String(50))
+
+    supplier_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    contact_person: Mapped[Optional[str]] = mapped_column(String(255))
+    phone_email: Mapped[Optional[str]] = mapped_column(String(100))
+
+    gst_number: Mapped[Optional[str]] = mapped_column(String(20))
+    address: Mapped[Optional[str]] = mapped_column(String(255))
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    __table_args__ = (Index("idx_supplier_deleted", "is_deleted"),)
 
 
 # ================= PURCHASE ORDER =================
@@ -213,7 +229,7 @@ class PurchaseOrder(Base, TimestampMixin):
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"))
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
 
-    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id")) 
+    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"))
     material_name: Mapped[str] = mapped_column(String(255))
 
     quantity: Mapped[Decimal] = mapped_column(DECIMAL(18, 3), nullable=False)
@@ -298,4 +314,4 @@ class MaterialLedger(Base, TimestampMixin):
     __table_args__ = (
         Index("idx_ledger_material", "material_id"),
         Index("idx_ledger_reference", "reference_id"),
-    ) 
+    )

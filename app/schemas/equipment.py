@@ -70,7 +70,6 @@ class EquipmentUsageCreate(BaseSchema):
     usage_date: date
     notes: Optional[str] = Field(None, max_length=500)
 
-
 class EquipmentUsageOut(BaseSchema):
     id: int
     equipment_id: int

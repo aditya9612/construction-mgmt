@@ -4,7 +4,7 @@ from decimal import Decimal
 import uuid
 import os
 from sqlalchemy.exc import IntegrityError
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from reportlab.platypus import SimpleDocTemplate, Table
@@ -16,14 +16,11 @@ from app.core.dependencies import get_request_redis, require_roles
 from app.db.session import get_db_session
 from app.schemas.material import MaterialReport
 from app.schemas.material import PriceHistoryOut
-import tempfile
 from app.core.enums import IssueType, TransactionType, TransferStatus
 from app.utils.common import generate_business_id
 from sqlalchemy.orm import selectinload
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
-import tempfile
-from openpyxl import Workbook
 import os
 from app.models.material import (
     Material,
@@ -33,14 +30,41 @@ from app.models.material import (
     PurchaseOrder,
     MaterialTransfer,
 )
+from reportlab.platypus import Image
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics.charts.barcharts import VerticalBarChart
+from reportlab.graphics import renderPM
+from reportlab.lib.units import inch
 from starlette.background import BackgroundTask
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-import tempfile
 from app.models.material import MaterialUsage
 from app.schemas.material import InventoryAdjustRequest
 from app.models.project import Project
 from sqlalchemy.orm import aliased
+import re
+from sqlalchemy import case
+from decimal import Decimal
+import tempfile, os, uuid
+from datetime import datetime
+
+from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
+    PageTemplate,
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    Spacer,
+    Image,
+)
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib.styles import ParagraphStyle
+
 from app.core.enums import TransactionType as DBTransactionType
 from app.schemas.material import TransactionType as SchemaTransactionType
 from app.schemas.material import (
@@ -59,22 +83,29 @@ from app.schemas.material import (
     TransferOut,
 )
 
-MATERIAL_READ_ROLES = [r.value for r in [
-    UserRole.ADMIN,
-    UserRole.PROJECT_MANAGER,
-    UserRole.SITE_ENGINEER,
-    UserRole.ACCOUNTANT,
-    UserRole.CLIENT,
-]]
+MATERIAL_READ_ROLES = [
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
+        UserRole.ACCOUNTANT,
+        UserRole.CLIENT,
+    ]
+]
 
-MATERIAL_WRITE_ROLES = [r.value for r in [
-    UserRole.ADMIN,
-    UserRole.PROJECT_MANAGER,
-    UserRole.SITE_ENGINEER,
-]]
+MATERIAL_WRITE_ROLES = [
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
+    ]
+]
 
 router = APIRouter(prefix="/materials", tags=["materials"])
 VERSION_KEY = "cache_version:materials"
+
 
 def safe_delete(file_path: str):
     try:
@@ -82,7 +113,9 @@ def safe_delete(file_path: str):
     except OSError:
         pass
 
+
 # ================= CENTRAL CALCULATION =================
+
 
 def build_material_response(obj, supplier_name: str | None):
     total_amount = float(obj.total_amount or 0)
@@ -109,26 +142,21 @@ def build_material_response(obj, supplier_name: str | None):
         material_name=(obj.material_name or "").strip().title(),
         category=obj.category,
         unit=obj.unit,
-
         supplier_id=obj.supplier_id,
         supplier_name=supplier_name or "N/A",
-
         purchase_rate=round(float(obj.purchase_rate or 0), 2),
         rate_type=obj.rate_type,
-
         quantity_purchased=round(float(obj.quantity_purchased or 0), 2),
         quantity_used=round(float(obj.quantity_used or 0), 2),
-
         remaining_stock=round(remaining, 2),
-
         total_amount=round(total_amount, 2),
         payment_given=round(payment_given, 2),
         payment_pending=round(payment_pending, 2),
         extra_paid=round(extra_paid, 2),
-
         minimum_stock_level=round(min_level, 2),
         alert_type=alert,
     )
+
 
 def update_material_fields(obj: Material):
     qty_purchased = obj.quantity_purchased or Decimal("0")
@@ -139,6 +167,7 @@ def update_material_fields(obj: Material):
     obj.remaining_stock = max(qty_purchased - qty_used, Decimal("0"))
     obj.payment_pending = max(total_amount - payment_given, Decimal("0"))
     obj.advance_amount = max(payment_given - total_amount, Decimal("0"))
+
 
 def build_po_response(po: PurchaseOrder) -> PurchaseOrderOut:
     return PurchaseOrderOut(
@@ -153,30 +182,28 @@ def build_po_response(po: PurchaseOrder) -> PurchaseOrderOut:
         status=po.status,
     )
 
+
 def get_signed_quantity(tx: MaterialTransaction) -> float:
     if tx.type in {DBTransactionType.USAGE, DBTransactionType.TRANSFER_OUT}:
         return -abs(float(tx.quantity or 0))
     return abs(float(tx.quantity or 0))
 
+
 def build_transfer_response(obj, material, from_project, to_project):
     return TransferOut(
         id=obj.id,
         material=TransferMaterial(
-            id=material.id, 
-            name=(material.material_name or "").title()
+            id=material.id, name=(material.material_name or "").title()
         ),
         from_project=TransferProject(
-            id=from_project.id, 
-            name=from_project.project_name
+            id=from_project.id, name=from_project.project_name
         ),
-        to_project=TransferProject(
-            id=to_project.id, 
-            name=to_project.project_name
-        ),
+        to_project=TransferProject(id=to_project.id, name=to_project.project_name),
         quantity=obj.quantity,
         status=obj.status,
         created_at=obj.created_at,
     )
+
 
 def get_alert_type(obj):
     from decimal import Decimal
@@ -190,6 +217,7 @@ def get_alert_type(obj):
         return "LOW_STOCK"
     else:
         return "IN_STOCK"
+
 
 def calculate_fields(obj):
     from decimal import Decimal
@@ -206,22 +234,80 @@ def calculate_fields(obj):
         float(payment_pending),
         float(extra_paid),
     )
-    
+
+
+def calculate_payment(total, paid):
+    return (
+        float(total),
+        float(paid),
+        float(max(total - paid, 0)),
+        float(max(paid - total, 0)),
+    )
+
+
+def calculate_avg_rate(material):
+    qty = material.quantity_purchased or Decimal("0")
+    total = material.total_amount or Decimal("0")
+
+    return total / qty if qty > 0 else Decimal("0")
+
+
+def calculate_wac(material):
+    qty = material.quantity_purchased or Decimal("0")
+    total = material.total_amount or Decimal("0")
+
+    return total / qty if qty > 0 else Decimal("0")
+
+
+def generate_chart(rows, path):
+    import matplotlib.pyplot as plt
+
+    names = []
+    stock = []
+
+    for m, _ in rows[:10]:
+        names.append((m.material_name or "")[:8])
+        stock.append(float(m.remaining_stock or 0))
+
+    plt.figure(figsize=(6, 3))
+    plt.bar(names, stock)
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
 # ================= SUMMARY =================
-
 @router.get("/summary", response_model=SummaryOut)
-async def material_summary(db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES))):
+async def material_summary(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+):
 
+    # ✅ total materials (same)
     total_materials = await db.scalar(
         select(func.count(Material.id)).where(Material.is_deleted == False)
     )
 
-    total_stock = await db.scalar(
-        select(func.sum(Material.remaining_stock * Material.purchase_rate)).where(
-            Material.is_deleted == False
-        )
+    # 🔥 FIX: use WAC instead of purchase_rate
+    rows = (
+        (await db.execute(select(Material).where(Material.is_deleted == False)))
+        .scalars()
+        .all()
     )
 
+    total_stock = Decimal("0")
+
+    for m in rows:
+        purchased = m.quantity_purchased or Decimal("0")
+        total_amt = m.total_amount or Decimal("0")
+        remaining = m.remaining_stock or Decimal("0")
+
+        avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
+
+        total_stock += remaining * avg_rate
+
+    # ✅ pending (same)
     total_pending = await db.scalar(
         select(func.sum(Material.payment_pending)).where(Material.is_deleted == False)
     )
@@ -231,6 +317,7 @@ async def material_summary(db: AsyncSession = Depends(get_db_session),current_us
         "total_stock_value": round(float(total_stock or 0), 2),
         "total_pending_payments": round(float(total_pending or 0), 2),
     }
+
 
 # ================= SUPPLIERS =================
 
@@ -261,7 +348,11 @@ async def list_suppliers(
 
 
 @router.get("/suppliers/{id}", response_model=SupplierOut)
-async def get_supplier(id: int, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES))):
+async def get_supplier(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+):
 
     obj = await db.scalar(
         select(Supplier).where(Supplier.id == id, Supplier.is_deleted == False)
@@ -279,26 +370,74 @@ async def create_supplier(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    name = payload.name.strip()
-    contact = payload.contact.strip() if payload.contact else None
-
     import re
 
-    if contact and not re.match(r"^[6-9]\d{9}$", contact):
-        raise HTTPException(400, "Invalid contact number")
+    # 🔹 Name validation
+    supplier_name = payload.supplier_name.strip().title()
+    if len(supplier_name) < 3:
+        raise HTTPException(400, "Supplier name must be at least 3 characters")
 
+    # 🔹 Contact person validation
+    contact_person = (
+        payload.contact_person.strip().title() if payload.contact_person else None
+    )
+    if contact_person and not re.fullmatch(r"[A-Za-z ]{3,}", contact_person):
+        raise HTTPException(400, "Invalid contact person name")
+
+    # 🔹 Phone / Email validation (PERFECT)
+    phone_email = payload.phone_email.strip() if payload.phone_email else None
+
+    if phone_email:
+        cleaned = re.sub(r"[^\d]", "", phone_email)
+
+        # handle +91 / 91
+        if cleaned.startswith("91") and len(cleaned) == 12:
+            cleaned = cleaned[2:]
+
+        if cleaned.isdigit():
+            if not re.fullmatch(r"[6-9]\d{9}", cleaned):
+                raise HTTPException(400, "Invalid Indian mobile number")
+            phone_email = cleaned  # store clean number
+        elif "@" in phone_email:
+            if not re.fullmatch(r"[^@]+@[^@]+\.[^@]+", phone_email):
+                raise HTTPException(400, "Invalid email format")
+        else:
+            raise HTTPException(400, "Enter valid phone number or email")
+
+    # 🔹 GST validation
+    gst_number = payload.gst_number.strip().upper() if payload.gst_number else None
+    if gst_number and not re.fullmatch(
+        r"\d{2}[A-Z]{5}\d{4}[A-Z]\d[Z][A-Z\d]", gst_number
+    ):
+        raise HTTPException(400, "Invalid GST number format")
+
+    # 🔹 Address validation
+    address = payload.address.strip() if payload.address else None
+    if address and len(address) < 3:
+        raise HTTPException(400, "Address too short")
+
+    # 🔹 Duplicate check
     existing = await db.scalar(
         select(Supplier).where(
-            func.lower(Supplier.name) == name.lower(),
-            Supplier.contact == contact,
             Supplier.is_deleted == False,
+            (
+                (Supplier.gst_number == gst_number if gst_number else False)
+                | (Supplier.phone_email == phone_email if phone_email else False)
+            ),
         )
     )
 
     if existing:
-        raise HTTPException(400, "Supplier already exists")
+        raise HTTPException(400, "Supplier with same GST or phone/email already exists")
 
-    supplier = Supplier(name=name, contact=contact)
+    # 🔹 Create supplier
+    supplier = Supplier(
+        supplier_name=supplier_name,
+        contact_person=contact_person,
+        phone_email=phone_email,
+        gst_number=gst_number,
+        address=address,
+    )
 
     try:
         db.add(supplier)
@@ -306,7 +445,7 @@ async def create_supplier(
         await db.refresh(supplier)
     except IntegrityError:
         await db.rollback()
-        raise HTTPException(400, "Supplier already exists")
+        raise HTTPException(400, "Duplicate supplier")
 
     return SupplierOut.model_validate(supplier)
 
@@ -323,30 +462,60 @@ async def update_supplier(
     if not supplier or supplier.is_deleted:
         raise HTTPException(404, "Supplier not found")
 
-    new_name = payload.name.strip().title()
-    new_contact = payload.contact.strip() if payload.contact else None
+    new_name = payload.supplier_name.strip().title()
+    new_contact_person = (
+        payload.contact_person.strip() if payload.contact_person else None
+    )
+    new_phone_email = payload.phone_email.strip() if payload.phone_email else None
+    new_gst = payload.gst_number.strip().upper() if payload.gst_number else None
+    new_address = payload.address.strip() if payload.address else None
 
-    if new_contact and (not new_contact.isdigit() or len(new_contact) != 10):
-        raise HTTPException(400, "Invalid contact number")
+    import re
 
-    # no-op
-    if supplier.name == new_name and supplier.contact == new_contact:
+    # ✅ Phone validation
+    if new_phone_email and new_phone_email.isdigit():
+        if not re.match(r"^[6-9]\d{9}$", new_phone_email):
+            raise HTTPException(400, "Invalid phone number")
+
+    # ✅ GST validation
+    if new_gst and not re.match(r"\d{2}[A-Z]{5}\d{4}[A-Z]\d[Z][A-Z\d]", new_gst):
+        raise HTTPException(400, "Invalid GST number")
+
+    # ✅ No change
+    if (
+        supplier.supplier_name == new_name
+        and supplier.contact_person == new_contact_person
+        and supplier.phone_email == new_phone_email
+        and supplier.gst_number == new_gst
+        and supplier.address == new_address
+    ):
         return SupplierOut.model_validate(supplier)
 
+    # ✅ Duplicate check
     existing = await db.scalar(
         select(Supplier).where(
-            Supplier.contact == new_contact,
             Supplier.id != supplier_id,
             Supplier.is_deleted == False,
+            (
+                (Supplier.gst_number == new_gst if new_gst else False)
+                | (
+                    Supplier.phone_email == new_phone_email
+                    if new_phone_email
+                    else False
+                )
+            ),
         )
     )
 
     if existing:
-        raise HTTPException(400, "Contact already used")
+        raise HTTPException(400, "GST or phone/email already used")
 
     try:
-        supplier.name = new_name
-        supplier.contact = new_contact
+        supplier.supplier_name = new_name
+        supplier.contact_person = new_contact_person
+        supplier.phone_email = new_phone_email
+        supplier.gst_number = new_gst
+        supplier.address = new_address
 
         await db.commit()
         await db.refresh(supplier)
@@ -359,14 +528,21 @@ async def update_supplier(
 
 
 @router.delete("/suppliers/{id}")
-async def delete_supplier(id: int, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),):
+async def delete_supplier(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
+):
     obj = await db.get(Supplier, id)
 
     if not obj or obj.is_deleted:
         raise HTTPException(404, "Supplier not found")
 
+    # ✅ FIX: ignore deleted materials
     in_use = await db.scalar(
-        select(func.count()).where(Material.supplier_id == id)
+        select(func.count()).where(
+            Material.supplier_id == id, Material.is_deleted == False  # 🔥 important fix
+        )
     )
 
     if in_use > 0:
@@ -388,7 +564,7 @@ async def get_supplier_materials(
     db: AsyncSession = Depends(get_db_session),
 ):
     query = (
-        select(Material, Supplier.name)
+        select(Material, Supplier.supplier_name)
         .join(Supplier, Supplier.id == Material.supplier_id, isouter=True)
         .where(Material.supplier_id == supplier_id, Material.is_deleted == False)
         .offset(skip)
@@ -397,13 +573,11 @@ async def get_supplier_materials(
 
     rows = (await db.execute(query)).all()
 
-    return [
-        build_material_response(m, supplier_name)
-        for m, supplier_name in rows
-    ]
+    return [build_material_response(m, supplier_name) for m, supplier_name in rows]
 
 
 # ================= material_alerts =================
+
 
 @router.get("/alerts", response_model=list[MaterialOut])
 async def get_material_alerts(
@@ -412,7 +586,7 @@ async def get_material_alerts(
     db: AsyncSession = Depends(get_db_session),
 ):
     query = (
-        select(Material, Supplier.name)
+        select(Material, Supplier.supplier_name)
         .join(Supplier, Supplier.id == Material.supplier_id, isouter=True)
         .where(Material.is_deleted == False)
     )
@@ -447,8 +621,13 @@ async def get_material_alerts(
 
 # ================= PURCHASE ORDERS =================
 
+
 @router.post("/purchase-orders", response_model=PurchaseOrderOut, status_code=201)
-async def create_po(payload: PurchaseOrderCreate, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES))):
+async def create_po(
+    payload: PurchaseOrderCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
+):
 
     if payload.quantity <= 0 or payload.rate <= 0:
         raise HTTPException(400, "Quantity and rate must be greater than 0")
@@ -484,7 +663,11 @@ async def create_po(payload: PurchaseOrderCreate, db: AsyncSession = Depends(get
 
 
 @router.get("/purchase-orders/{id}", response_model=PurchaseOrderOut)
-async def get_po(id: int, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES))):
+async def get_po(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+):
 
     po = await db.get(PurchaseOrder, id)
 
@@ -495,19 +678,28 @@ async def get_po(id: int, db: AsyncSession = Depends(get_db_session),current_use
 
 
 @router.get("/purchase-orders", response_model=List[PurchaseOrderOut])
-async def list_po(skip: int = 0, limit: int = 50, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES))):
+async def list_po(
+    skip: int = 0,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+):
 
     limit = min(max(limit, 1), 100)
 
     rows = (
-        await db.execute(
-            select(PurchaseOrder)
-            .where(PurchaseOrder.is_deleted == False)
-            .order_by(PurchaseOrder.id.desc())
-            .offset(skip)
-            .limit(limit)
+        (
+            await db.execute(
+                select(PurchaseOrder)
+                .where(PurchaseOrder.is_deleted == False)
+                .order_by(PurchaseOrder.id.desc())
+                .offset(skip)
+                .limit(limit)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     return [build_po_response(r) for r in rows]
 
@@ -552,7 +744,11 @@ async def update_po(
 
 
 @router.delete("/purchase-orders/{id}")
-async def delete_po(id: int, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),):
+async def delete_po(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
+):
 
     obj = await db.get(PurchaseOrder, id)
 
@@ -565,7 +761,9 @@ async def delete_po(id: int, db: AsyncSession = Depends(get_db_session),current_
 
     return {"message": "Purchase order deleted successfully"}
 
+
 # =========================project_transactions=============================
+
 
 @router.get("/projects/{project_id}/transactions")
 async def project_transactions(
@@ -577,14 +775,13 @@ async def project_transactions(
 ):
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
-    if (
-        current_user.role != UserRole.ADMIN.value
-        and project_id not in (current_user.allowed_projects or [])
+    if current_user.role != UserRole.ADMIN.value and project_id not in (
+        current_user.allowed_projects or []
     ):
         raise HTTPException(403, "Access denied")
 
     query = (
-        select(MaterialTransaction, Material.material_name, Supplier.name)
+        select(MaterialTransaction, Material.material_name, Supplier.supplier_name)
         .join(Material, Material.id == MaterialTransaction.material_id)
         .join(Supplier, Supplier.id == Material.supplier_id, isouter=True)
         .where(MaterialTransaction.project_id == project_id)
@@ -670,6 +867,7 @@ async def get_material_transactions(
 
 # ================= TRANSFERS =================
 
+
 @router.post("/transfers", response_model=TransferOut)
 async def create_transfer(
     payload: TransferCreate,
@@ -677,6 +875,9 @@ async def create_transfer(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     redis=Depends(get_request_redis),
 ):
+    import uuid
+    from decimal import Decimal
+
     try:
         if payload.quantity <= 0:
             raise HTTPException(400, "Quantity must be > 0")
@@ -692,7 +893,7 @@ async def create_transfer(
 
         reference = f"TRF-{uuid.uuid4().hex[:8]}"
 
-        #  LOCK SOURCE
+        # ===== LOCK SOURCE =====
         material = await db.scalar(
             select(Material)
             .where(Material.id == payload.material_id, Material.is_deleted == False)
@@ -705,16 +906,24 @@ async def create_transfer(
         if payload.quantity > material.remaining_stock:
             raise HTTPException(400, "Not enough stock")
 
-        # UPDATE SOURCE
+        # ===== WAC CALCULATION =====
+        qty_purchased = material.quantity_purchased or Decimal("0")
+        total_amt = material.total_amount or Decimal("0")
+
+        avg_rate = total_amt / qty_purchased if qty_purchased > 0 else Decimal("0")
+        total = payload.quantity * avg_rate
+
+        # ===== UPDATE SOURCE =====
         material.quantity_used += payload.quantity
         update_material_fields(material)
 
-        #  LOCK DESTINATION
+        # ===== LOCK DESTINATION =====
         existing_material = await db.scalar(
             select(Material)
             .where(
                 Material.project_id == payload.to_project_id,
-                func.lower(Material.material_name) == material.material_name.lower(),
+                func.lower(Material.material_name)
+                == material.material_name.strip().lower(),
                 Material.is_deleted == False,
             )
             .with_for_update()
@@ -722,7 +931,9 @@ async def create_transfer(
 
         if existing_material:
             existing_material.quantity_purchased += payload.quantity
+            existing_material.total_amount += total
             update_material_fields(existing_material)
+
         else:
             material_code = await generate_business_id(
                 db=db,
@@ -738,43 +949,59 @@ async def create_transfer(
                 category=material.category,
                 unit=material.unit,
                 supplier_id=material.supplier_id,
-                purchase_rate=material.purchase_rate,
+                purchase_rate=avg_rate,
                 rate_type=material.rate_type,
                 quantity_purchased=payload.quantity,
                 quantity_used=Decimal("0"),
                 payment_given=Decimal("0"),
+                total_amount=total,
                 minimum_stock_level=material.minimum_stock_level,
             )
 
             db.add(existing_material)
             await db.flush()
 
-        total = payload.quantity * material.purchase_rate
+        # ===== TRANSACTION + LEDGER =====
+        def create_entry(mat_id, type_, project_id, qty):
+            db.add(
+                MaterialTransaction(
+                    material_id=mat_id,
+                    type=type_,
+                    project_id=project_id,
+                    quantity=qty,  # ✅ FIXED SIGN HERE
+                    rate=avg_rate,
+                    total_amount=total,
+                    issue_type=IssueType.TRANSFER,
+                    reference_id=reference,
+                )
+            )
 
-        def create_entry(mat_id, type_, project_id):
-            db.add(MaterialTransaction(
-                material_id=mat_id,
-                type=type_,
-                project_id=project_id,
-                quantity=payload.quantity,
-                rate=material.purchase_rate,
-                total_amount=total,
-                issue_type=IssueType.TRANSFER,
-                reference_id=reference,
-            ))
+            db.add(
+                MaterialLedger(
+                    material_id=mat_id,
+                    type=type_,
+                    project_id=project_id,
+                    quantity=qty,  # ✅ FIXED SIGN HERE
+                    rate=avg_rate,
+                    total_amount=total,
+                    reference_id=reference,
+                )
+            )
 
-            db.add(MaterialLedger(
-                material_id=mat_id,
-                type=type_,
-                project_id=project_id,
-                quantity=payload.quantity,
-                rate=material.purchase_rate,
-                total_amount=total,
-                reference_id=reference,
-            ))
+        # ✅ CORRECT SIGN USAGE
+        create_entry(
+            material.id,
+            DBTransactionType.TRANSFER_OUT,
+            payload.from_project_id,
+            -payload.quantity,  # 🔴 OUT = NEGATIVE
+        )
 
-        create_entry(material.id, DBTransactionType.TRANSFER_OUT, payload.from_project_id)
-        create_entry(existing_material.id, DBTransactionType.TRANSFER_IN, payload.to_project_id)
+        create_entry(
+            existing_material.id,
+            DBTransactionType.TRANSFER_IN,
+            payload.to_project_id,
+            payload.quantity,  # 🟢 IN = POSITIVE
+        )
 
         obj = MaterialTransfer(
             **payload.model_dump(),
@@ -784,7 +1011,6 @@ async def create_transfer(
 
         db.add(obj)
 
-        #  COMMIT HERE
         await db.commit()
         await db.refresh(obj)
 
@@ -799,8 +1025,14 @@ async def create_transfer(
 
 # ================= LIST TRANSFERS =================
 
+
 @router.get("/transfers")
-async def list_transfers(skip: int = 0, limit: int = 50, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES))):
+async def list_transfers(
+    skip: int = 0,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+):
 
     skip = max(skip, 0)
     limit = min(max(limit, 1), 100)
@@ -818,7 +1050,7 @@ async def list_transfers(skip: int = 0, limit: int = 50, db: AsyncSession = Depe
                 FromProject.project_name,
                 ToProject.project_name,
             )
-            .select_from(MaterialTransfer)   
+            .select_from(MaterialTransfer)
             .join(Material)
             .join(FromProject, FromProject.id == MaterialTransfer.from_project_id)
             .join(ToProject, ToProject.id == MaterialTransfer.to_project_id)
@@ -842,10 +1074,16 @@ async def list_transfers(skip: int = 0, limit: int = 50, db: AsyncSession = Depe
 
     return {"total": total or 0, "skip": skip, "limit": limit, "data": data}
 
+
 # ================= GET SINGLE TRANSFER =================
 
+
 @router.get("/transfers/{id}", response_model=TransferOut)
-async def get_transfer(id: int, db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES))):
+async def get_transfer(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+):
 
     FromProject = aliased(Project)
     ToProject = aliased(Project)
@@ -872,10 +1110,12 @@ async def get_transfer(id: int, db: AsyncSession = Depends(get_db_session),curre
 
     return build_transfer_response(obj, material, from_project, to_project)
 
-#=================update_transfer_status=========
+
+# =================update_transfer_status=========
 
 
 VALID_STATUS = {"PENDING", "COMPLETED", "CANCELLED"}
+
 
 @router.put("/transfers/{id}", response_model=TransferOut)
 async def update_transfer_status(
@@ -908,21 +1148,21 @@ async def update_transfer_status(
 
     return TransferOut(
         id=obj.id,
-        material=TransferMaterial(
-            id=material.id, 
-            name=material.material_name
-        ) if material else None,
-
-        from_project=TransferProject(
-            id=from_project.id, 
-            name=from_project.project_name
-        ) if from_project else None,
-
-        to_project=TransferProject(
-            id=to_project.id, 
-            name=to_project.project_name
-        ) if to_project else None,
-
+        material=(
+            TransferMaterial(id=material.id, name=material.material_name)
+            if material
+            else None
+        ),
+        from_project=(
+            TransferProject(id=from_project.id, name=from_project.project_name)
+            if from_project
+            else None
+        ),
+        to_project=(
+            TransferProject(id=to_project.id, name=to_project.project_name)
+            if to_project
+            else None
+        ),
         quantity=obj.quantity,
         status=obj.status,
         created_at=obj.created_at,
@@ -971,10 +1211,9 @@ async def usage(
 
     total_amount_current = obj.total_amount or Decimal("0")
 
-    # ===== WAC CALC =====
-    avg_rate = (
-        total_amount_current / purchased if purchased > 0 else Decimal("0")
-    )
+    # ===== FIXED AVG RATE =====
+    # ✅ Based ONLY on purchases (your design)
+    avg_rate = total_amount_current / purchased if purchased > 0 else Decimal("0")
 
     used_value = qty * avg_rate
 
@@ -987,8 +1226,9 @@ async def usage(
             MaterialTransaction(
                 material_id=obj.id,
                 type=DBTransactionType.USAGE,
-                quantity=qty,
+                quantity=-qty,  # ✅ FIX: negative for usage
                 rate=avg_rate,
+                avg_rate=avg_rate,  # ✅ consistency
                 total_amount=used_value,
                 amount_paid=0,
                 payment_pending=0,
@@ -1004,8 +1244,9 @@ async def usage(
             MaterialLedger(
                 material_id=obj.id,
                 type=DBTransactionType.USAGE,
-                quantity=qty,
+                quantity=-qty,  # ✅ FIX
                 rate=avg_rate,
+                avg_rate=avg_rate,
                 total_amount=used_value,
                 amount_paid=0,
                 payment_pending=0,
@@ -1016,7 +1257,7 @@ async def usage(
             )
         )
 
-        # ===== ✅ FIX: USAGE TABLE INSERT =====
+        # ===== USAGE TABLE =====
         db.add(
             MaterialUsage(
                 material_id=obj.id,
@@ -1028,6 +1269,8 @@ async def usage(
 
         # ===== UPDATE MATERIAL =====
         obj.quantity_used = used + qty
+
+        # ❌ DO NOT TOUCH total_amount (as per your design)
 
         update_material_fields(obj)
 
@@ -1065,7 +1308,7 @@ async def usage(
         category=obj.category,
         unit=obj.unit,
         supplier_id=obj.supplier_id,
-        supplier_name=supplier.name if supplier else None,
+        supplier_name=supplier.supplier_name if supplier else None,
         purchase_rate=float(obj.purchase_rate),
         rate_type=obj.rate_type,
         quantity_purchased=float(obj.quantity_purchased),
@@ -1079,8 +1322,8 @@ async def usage(
         alert_type=alert_type,
     )
 
-# ================= PURCHASE =================
 
+# ================= PURCHASE =================
 @router.post("/{material_id}/purchase", response_model=MaterialOut)
 async def purchase(
     material_id: int,
@@ -1090,7 +1333,7 @@ async def purchase(
     redis=Depends(get_request_redis),
 ):
     import uuid
-    from decimal import Decimal
+    from decimal import Decimal, ROUND_HALF_UP
 
     try:
         obj = await db.scalar(
@@ -1103,20 +1346,37 @@ async def purchase(
         if not obj:
             raise HTTPException(404, "Material not found")
 
+        # ===== SAFE INPUT =====
         qty = Decimal(str(data.quantity))
+        rate = Decimal(str(data.rate))
         paid = Decimal(str(data.amount_paid or 0))
 
         if qty <= 0:
             raise HTTPException(400, "Quantity must be > 0")
 
+        if rate <= 0:
+            raise HTTPException(400, "Rate must be > 0")
+
         if paid < 0:
             raise HTTPException(400, "Payment cannot be negative")
 
-        total = qty * obj.purchase_rate
+        # ===== EXISTING DATA =====
+        old_qty = obj.quantity_purchased or Decimal("0")
+        old_rate = obj.purchase_rate or Decimal("0")
 
-        # ✅ SAFE PAYMENT CALC
-        payment_pending = max(0, total - paid)
-        extra_paid = max(0, paid - total)
+        # ===== SAME LOGIC =====
+        if old_qty > 0:
+            new_rate = ((old_qty * old_rate) + (qty * rate)) / (old_qty + qty)
+        else:
+            new_rate = rate
+
+        obj.purchase_rate = new_rate
+
+        # ===== TOTAL =====
+        total = (qty * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        # ===== PAYMENT =====
+        payment_pending = max(Decimal("0"), total - paid)
 
         reference = f"PUR-{uuid.uuid4().hex[:8]}"
 
@@ -1126,7 +1386,7 @@ async def purchase(
                 material_id=obj.id,
                 type=DBTransactionType.PURCHASE,
                 quantity=qty,
-                rate=obj.purchase_rate,
+                rate=rate,
                 total_amount=total,
                 amount_paid=paid,
                 payment_pending=payment_pending,
@@ -1143,7 +1403,7 @@ async def purchase(
                 material_id=obj.id,
                 type=DBTransactionType.PURCHASE,
                 quantity=qty,
-                rate=obj.purchase_rate,
+                rate=rate,
                 total_amount=total,
                 amount_paid=paid,
                 payment_pending=payment_pending,
@@ -1156,16 +1416,21 @@ async def purchase(
 
         # ===== UPDATE MATERIAL =====
         obj.quantity_purchased = (obj.quantity_purchased or Decimal("0")) + qty
+        obj.remaining_stock = (obj.remaining_stock or Decimal("0")) + qty
         obj.payment_given = (obj.payment_given or Decimal("0")) + paid
         obj.total_amount = (obj.total_amount or Decimal("0")) + total
 
+        # 🔥 IMPORTANT FIX (DB consistency)
+        obj.payment_pending = max(Decimal("0"), obj.total_amount - obj.payment_given)
+
+        # ⚠️ must not override total/stock
         update_material_fields(obj)
 
         await db.commit()
 
-    except Exception:
+    except Exception as e:
         await db.rollback()
-        raise
+        raise e
 
     await db.refresh(obj)
     await bump_cache_version(redis, VERSION_KEY)
@@ -1178,7 +1443,7 @@ async def purchase(
     payment_pending = max(0, total_amount - payment_given)
     extra_paid = max(0, payment_given - total_amount)
 
-    # ✅ FIXED ALERT
+    # ===== ALERT =====
     if obj.remaining_stock == 0:
         alert_type = "OUT_OF_STOCK"
     elif obj.remaining_stock <= obj.minimum_stock_level:
@@ -1190,17 +1455,17 @@ async def purchase(
         id=obj.id,
         material_code=obj.material_code,
         project_id=obj.project_id,
-        material_name=obj.material_name.strip().title(),  # ✅ normalize
+        material_name=obj.material_name.strip().title(),
         category=obj.category,
         unit=obj.unit,
         supplier_id=obj.supplier_id,
-        supplier_name=supplier.name if supplier else None,
+        supplier_name=supplier.supplier_name if supplier else None,
         purchase_rate=float(obj.purchase_rate),
         rate_type=obj.rate_type,
         quantity_purchased=float(obj.quantity_purchased),
         quantity_used=float(obj.quantity_used),
         remaining_stock=float(obj.remaining_stock),
-        total_amount=round(total_amount, 2),           # ✅ rounding
+        total_amount=round(total_amount, 2),
         payment_given=round(payment_given, 2),
         payment_pending=round(payment_pending, 2),
         extra_paid=round(extra_paid, 2),
@@ -1208,8 +1473,8 @@ async def purchase(
         alert_type=alert_type,
     )
 
-# ================= ADD INVENTORY =================
 
+# ================= ADD INVENTORY =================
 @router.post("/inventory")
 async def adjust_inventory(
     payload: InventoryAdjustRequest,
@@ -1217,6 +1482,9 @@ async def adjust_inventory(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     redis=Depends(get_request_redis),
 ):
+    import uuid
+    from decimal import Decimal
+
     material_id = payload.material_id
     reason = (payload.reason or "").strip()
 
@@ -1258,27 +1526,47 @@ async def adjust_inventory(
         qty_purchased = material.quantity_purchased or Decimal("0")
         total_amt = material.total_amount or Decimal("0")
 
-        avg_rate = total_amt / qty_purchased if qty_purchased > 0 else Decimal("0")
+        # ✅ SAFE avg_rate
+        avg_rate = (
+            total_amt / qty_purchased
+            if qty_purchased and qty_purchased > 0
+            else (material.purchase_rate or Decimal("0"))
+        )
 
-        adjustment_value = abs(diff) * avg_rate
-
-        # ONLY STOCK CHANGE (NO COST CHANGE)
+        # ===== STOCK + COST UPDATE =====
         if diff > 0:
+            # Stock increase
             material.quantity_purchased += diff
-        else:
-            material.quantity_used += abs(diff)
 
+            # Cost increase (OK)
+            material.total_amount += diff * avg_rate
+
+        else:
+            # Stock decrease
+            decrease_qty = abs(diff)
+            material.quantity_used += decrease_qty
+
+            # ⚠️ IMPORTANT FIX:
+            # DO NOT reduce total_amount (this was breaking avg_rate)
+            cost_reduction = decrease_qty * avg_rate  # kept for logging/debug only
+
+            # Keep structure but skip deduction
+            if material.total_amount <= 0:
+                material.total_amount = Decimal("0")
+
+        # ✅ Recalculate derived fields
         update_material_fields(material)
 
         audit_remark = f"Stock adjusted: {old_stock} → {new_stock} | {reason}"
 
+        # ===== TRANSACTION =====
         db.add(
             MaterialTransaction(
                 material_id=material.id,
                 type=DBTransactionType.ADJUSTMENT,
                 quantity=diff,
                 rate=avg_rate,
-                total_amount=adjustment_value,
+                total_amount=abs(diff) * avg_rate if diff > 0 else 0,
                 amount_paid=0,
                 payment_pending=0,
                 issue_type=IssueType.SYSTEM,
@@ -1288,13 +1576,14 @@ async def adjust_inventory(
             )
         )
 
+        # ===== LEDGER =====
         db.add(
             MaterialLedger(
                 material_id=material.id,
                 type=DBTransactionType.ADJUSTMENT,
                 quantity=diff,
                 rate=avg_rate,
-                total_amount=adjustment_value,
+                total_amount=abs(diff) * avg_rate if diff > 0 else 0,
                 amount_paid=0,
                 payment_pending=0,
                 project_id=material.project_id,
@@ -1320,10 +1609,15 @@ async def adjust_inventory(
         "reference_id": reference,
     }
 
-#===============get_all_inventory===========================
+
+# ===============get_all_inventory===========================
+
 
 @router.get("/inventory")
-async def get_all_inventory(db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES))):
+async def get_all_inventory(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+):
     result = await db.execute(
         select(
             Material.id,
@@ -1345,10 +1639,7 @@ async def get_all_inventory(db: AsyncSession = Depends(get_db_session),current_u
         remaining = r.remaining_stock or Decimal("0")
         total_amount = r.total_amount or Decimal("0")
 
-        avg_rate = (
-            total_amount / qty_purchased
-            if qty_purchased > 0 else Decimal("0")
-        )
+        avg_rate = total_amount / qty_purchased if qty_purchased > 0 else Decimal("0")
 
         total_value = remaining * avg_rate
 
@@ -1370,7 +1661,9 @@ async def get_all_inventory(db: AsyncSession = Depends(get_db_session),current_u
 
     return data
 
-#==================get_inventory_valuation=======================
+
+# ==================get_inventory_valuation=======================
+
 
 @router.get("/inventory/valuation")
 async def get_inventory_valuation(
@@ -1394,18 +1687,16 @@ async def get_inventory_valuation(
         remaining = r.remaining_stock or Decimal("0")
         total_amount = r.total_amount or Decimal("0")
 
-        avg_rate = (
-            total_amount / purchased
-            if purchased > 0 else Decimal("0")
-        )
+        avg_rate = total_amount / purchased if purchased > 0 else Decimal("0")
 
         total_value += remaining * avg_rate
 
-    return {
-        "total_value": float(total_value.quantize(Decimal("0.01")))
-    }
+    return {"total_value": float(total_value.quantize(Decimal("0.01")))}
 
-#======================================================
+
+# ======================================================
+
+
 @router.get("/inventory/{project_id}")
 async def get_project_inventory(
     project_id: int,
@@ -1436,10 +1727,7 @@ async def get_project_inventory(
         remaining = r.remaining_stock or Decimal("0")
         total_amt = r.total_amount or Decimal("0")
 
-        avg_rate = (
-            total_amt / purchased
-            if purchased > 0 else Decimal("0")
-        )
+        avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
 
         total_value = remaining * avg_rate
 
@@ -1457,6 +1745,7 @@ async def get_project_inventory(
 
 
 # ================= FILTERED LOGS =================
+
 
 @router.get("/logs", response_model=List[MaterialLogOut])
 async def logs(
@@ -1519,6 +1808,7 @@ async def logs(
 
 # ================= REPORTS =================
 
+
 @router.get("/reports", response_model=List[MaterialReport])
 async def material_report(
     project_id: Optional[int] = None,
@@ -1551,10 +1841,9 @@ async def material_report(
         remaining = r.remaining_stock or Decimal("0")
         total_amt = r.total_amount or Decimal("0")
 
-        avg_rate = (
-            total_amt / purchased
-            if purchased > 0 else Decimal("0")
-        ).quantize(Decimal("0.01"))
+        avg_rate = (total_amt / purchased if purchased > 0 else Decimal("0")).quantize(
+            Decimal("0.01")
+        )
 
         total_cost = (remaining * avg_rate).quantize(Decimal("0.01"))
 
@@ -1577,275 +1866,878 @@ async def material_report(
 
 # ======================PDF REPORT=============================================
 
-from starlette.background import BackgroundTask
+NAVY = colors.HexColor("#163A6B")
+ORANGE = colors.HexColor("#F57C00")
+BG_LIGHT = colors.HexColor("#F4F7FC")
+BORDER_CLR = colors.HexColor("#D0D5DD")
+TEXT_DARK = colors.HexColor("#1A1A2E")
+TEXT_GREY = colors.HexColor("#667085")
+RED_ALERT = colors.HexColor("#D92D20")
+RED_BG = colors.HexColor("#FFF1F0")
+GREEN_OK = colors.HexColor("#027A48")
+AMBER_LOW = colors.HexColor("#B54708")
+AMBER_BG = colors.HexColor("#FFFAEB")
+WHITE = colors.white
+FOOTER_BG = colors.HexColor("#EEF2F7")
 
-@router.get("/reports/materials/pdf", response_class=FileResponse)
-async def export_pdf(db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),):
 
-    from decimal import Decimal
-    import tempfile, os, uuid
-    from datetime import datetime
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+def fmt(val: Decimal, dec: int = 2) -> str:
+    try:
+        return f"{float(val):,.{dec}f}"
+    except Exception:
+        return str(val)
 
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib.pagesizes import A4
 
-    # ===== FETCH MATERIAL =====
-    rows = (
-        await db.execute(
-            select(Material).where(Material.is_deleted == False)
+def rs(val: Decimal, dec: int = 2) -> str:
+    return f"Rs. {fmt(val, dec)}"
+
+
+# ─── CANVAS: PAGE HEADER + FOOTER ─────────────────────────────────────────────
+def _draw_page(canvas_obj, doc):
+    canvas_obj.saveState()
+    w, h = A4
+
+    # top orange bar
+    canvas_obj.setFillColor(ORANGE)
+    canvas_obj.rect(0, h - 6, w, 6, fill=1, stroke=0)
+
+    # navy header band
+    canvas_obj.setFillColor(NAVY)
+    canvas_obj.rect(0, h - 70, w, 64, fill=1, stroke=0)
+
+    # INFRA (white) + PILOT (orange)
+    canvas_obj.setFillColor(WHITE)
+    canvas_obj.setFont("Helvetica-Bold", 20)
+    canvas_obj.drawString(25 * mm, h - 38, "INFRA")
+    canvas_obj.setFillColor(ORANGE)
+    canvas_obj.drawString(25 * mm + 60, h - 38, "PILOT")
+
+    # tagline
+    canvas_obj.setFillColor(colors.HexColor("#AECBF5"))
+    canvas_obj.setFont("Helvetica", 8)
+    canvas_obj.drawString(25 * mm, h - 51, "Construction Billing Software")
+
+    # REPORT badge (top-right)
+    bx, by = w - 55 * mm, h - 57
+    canvas_obj.setFillColor(ORANGE)
+    canvas_obj.roundRect(bx, by, 48 * mm, 23, radius=4, fill=1, stroke=0)
+    canvas_obj.setFillColor(WHITE)
+    canvas_obj.setFont("Helvetica-Bold", 13)
+    canvas_obj.drawCentredString(bx + 24 * mm, by + 6, "REPORT")
+
+    # generated timestamp
+    canvas_obj.setFillColor(colors.HexColor("#AECBF5"))
+    canvas_obj.setFont("Helvetica", 7.5)
+    ts = datetime.utcnow().strftime("%d/%m/%Y  %H:%M UTC")
+    canvas_obj.drawRightString(w - 15 * mm, h - 67, f"Generated: {ts}")
+
+    # page-1 title block — canvas-drawn for pixel-perfect centering
+    if doc.page == 1:
+        canvas_obj.setFillColor(NAVY)
+        canvas_obj.setFont("Helvetica-Bold", 16)
+        canvas_obj.drawCentredString(w / 2, h - 96, "Material Inventory Report")
+
+        canvas_obj.setFillColor(TEXT_GREY)
+        canvas_obj.setFont("Helvetica", 9)
+        date_str = datetime.utcnow().strftime("%d %B %Y")
+        canvas_obj.drawCentredString(
+            w / 2, h - 111, f"Pune, Maharashtra   |   {date_str}"
         )
-    ).scalars().all()
 
-    file_path = os.path.join(tempfile.gettempdir(), f"material_{uuid.uuid4()}.pdf")
+        canvas_obj.setStrokeColor(ORANGE)
+        canvas_obj.setLineWidth(2)
+        canvas_obj.line(15 * mm, h - 119, w - 15 * mm, h - 119)
 
-    doc = SimpleDocTemplate(file_path, pagesize=A4)
-    styles = getSampleStyleSheet()
+    # bottom orange bar
+    canvas_obj.setFillColor(ORANGE)
+    canvas_obj.rect(0, 0, w, 5, fill=1, stroke=0)
+
+    # footer text + page number
+    canvas_obj.setFillColor(TEXT_GREY)
+    canvas_obj.setFont("Helvetica", 7.5)
+    canvas_obj.drawCentredString(
+        w / 2, 10, "Generated by Infra Pilot System  \u2022  Confidential"
+    )
+    canvas_obj.drawRightString(w - 15 * mm, 10, f"Page {doc.page}")
+
+    canvas_obj.restoreState()
+
+
+# ─── PDF BUILDER ────────────────────────────────────────────────────
+def _build_pdf(file_path: str, rows: list) -> None:
+    doc = BaseDocTemplate(
+        file_path,
+        pagesize=A4,
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=130,
+        bottomMargin=22,
+    )
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
+    doc.addPageTemplates([PageTemplate(id="main", frames=frame, onPage=_draw_page)])
+
     elements = []
 
-    # ===== HEADER =====
-    elements.append(Paragraph("<b>Material Inventory Report</b>", styles["Title"]))
-    elements.append(
-        Paragraph(
-            f"Generated on: {datetime.utcnow().strftime('%d-%m-%Y %H:%M')}",
-            styles["Normal"],
+    # ── styles ───────────────────────────────────────────────────
+    sec_s = ParagraphStyle(
+        "sec",
+        fontName="Helvetica-Bold",
+        fontSize=10,
+        textColor=NAVY,
+        spaceBefore=2,
+        spaceAfter=2,
+    )
+    hdr_s = ParagraphStyle(
+        "hdr", fontName="Helvetica-Bold", fontSize=8, textColor=WHITE, leading=11
+    )
+    cell_s = ParagraphStyle(
+        "cell", fontName="Helvetica", fontSize=8, textColor=TEXT_DARK, leading=11
+    )
+    foot_s = ParagraphStyle(
+        "foot", fontName="Helvetica-Bold", fontSize=8, textColor=NAVY, leading=11
+    )
+
+    # ── spacer for canvas title ───────────────────────────────────
+    elements.append(Spacer(1, 18))
+
+    # ── contact info row ─────────────────────────────────────────
+    ci_s = ParagraphStyle("ci", fontName="Helvetica-Bold", fontSize=8, textColor=NAVY)
+    ci_table = Table(
+        [
+            [
+                Paragraph("Pune, Maharashtra", ci_s),
+                Paragraph("+91 9999999999", ci_s),
+                Paragraph("info@infrapilot.com", ci_s),
+                Paragraph("www.infrapilot.com", ci_s),
+            ]
+        ],
+        colWidths=[doc.width / 4] * 4,
+    )
+    ci_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), BG_LIGHT),
+                ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("INNERGRID", (0, 0), (-1, -1), 0.3, BORDER_CLR),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]
         )
     )
-    elements.append(Spacer(1, 20))
+    elements.append(ci_table)
+    elements.append(Spacer(1, 16))
 
-    # ===== TABLE HEADER =====
-    data = [[
-        "ID",
-        "Material",
-        "Purchased",
-        "Used",
-        "Remaining",
-        "Transfer In",
-        "Transfer Out",
-        "Cost",
-        "Paid",
-        "Pending"
-    ]]
+    # ── compute summary + processed rows ─────────────────────────
+    total_purchased = Decimal("0")
+    total_used = Decimal("0")
+    total_remaining = Decimal("0")
+    total_value = Decimal("0")
+    total_pending = Decimal("0")
+    alerts_out: list[str] = []
+    alerts_low: list[str] = []
+    processed = []
 
-    grand_total = Decimal("0")
-
-    for m in rows:
-
+    for m, sup in rows:
         purchased = m.quantity_purchased or Decimal("0")
         used = m.quantity_used or Decimal("0")
         remaining = m.remaining_stock or Decimal("0")
         total_amt = m.total_amount or Decimal("0")
-        paid = m.payment_given or Decimal("0")
-        pending = m.payment_pending or Decimal("0")
+        pend = m.payment_pending or Decimal("0")
+        min_lvl = Decimal(str(m.minimum_stock_level or 0))
 
-        # ===== WAC =====
         avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
-        cost = (remaining * avg_rate).quantize(Decimal("0.01"))
+        value = remaining * avg_rate
 
-        # ===== TRANSFER CALC =====
-        transfer_in = await db.scalar(
-            select(func.sum(MaterialTransaction.quantity)).where(
-                MaterialTransaction.material_id == m.id,
-                MaterialTransaction.type == DBTransactionType.TRANSFER_IN
+        total_purchased += purchased
+        total_used += used
+        total_remaining += remaining
+        total_value += value
+        total_pending += pend
+
+        if remaining == 0:
+            status = "OUT"
+            alerts_out.append(m.material_name.title())
+        elif remaining <= min_lvl:
+            status = "LOW"
+            alerts_low.append(m.material_name.title())
+        else:
+            status = "OK"
+
+        processed.append((m, sup, purchased, used, remaining, avg_rate, value, status))
+
+    # ── summary cards ────────────────────────────────────────────
+    elements.append(Paragraph("SUMMARY", sec_s))
+    elements.append(Spacer(1, 6))
+
+    card_w = doc.width / 5 - 2
+
+    def _card(label: str, value: str) -> Table:
+        lbl_s = ParagraphStyle(
+            "lbl", fontName="Helvetica", fontSize=7.5, textColor=TEXT_GREY
+        )
+        val_s = ParagraphStyle(
+            "val", fontName="Helvetica-Bold", fontSize=12, textColor=NAVY, leading=15
+        )
+        return Table(
+            [[Paragraph(label, lbl_s)], [Paragraph(f"<b>{value}</b>", val_s)]],
+            colWidths=[card_w],
+        )
+
+    cards = Table(
+        [
+            [
+                _card("Total Materials", str(len(rows))),
+                _card("Total Purchased", fmt(total_purchased, 0) + " units"),
+                _card("Total Used", fmt(total_used, 0) + " units"),
+                _card("Stock Value", rs(total_value, 0)),
+                _card("Pending", rs(total_pending, 0)),
+            ]
+        ],
+        colWidths=[card_w + 3] * 5,
+    )
+
+    cards.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), BG_LIGHT),
+                ("BOX", (0, 0), (-1, -1), 1, BORDER_CLR),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 10),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("LINEABOVE", (0, 0), (-1, 0), 3, ORANGE),
+            ]
+        )
+    )
+    elements.append(cards)
+    elements.append(Spacer(1, 20))
+
+    # ── material details table ────────────────────────────────────
+    elements.append(Paragraph("MATERIAL DETAILS", sec_s))
+    elements.append(Spacer(1, 6))
+
+    col_widths = [
+        10 * mm,
+        35 * mm,
+        35 * mm,
+        20 * mm,
+        16 * mm,
+        20 * mm,
+        20 * mm,
+        28 * mm,
+        16 * mm,
+    ]
+    col_labels = [
+        "#",
+        "Material Name",
+        "Supplier",
+        "Purchased",
+        "Used",
+        "Remaining",
+        "Avg Rate",
+        "Value (Rs.)",
+        "Status",
+    ]
+
+    tdata = [[Paragraph(c, hdr_s) for c in col_labels]]
+    out_rows: list[int] = []
+    low_rows: list[int] = []
+
+    for i, (m, sup, purchased, used, remaining, avg_rate, value, status) in enumerate(
+        processed
+    ):
+        ridx = i + 1
+        if status == "OUT":
+            st = Paragraph(
+                "<b>OUT</b>",
+                ParagraphStyle(
+                    "s", fontName="Helvetica-Bold", fontSize=8, textColor=RED_ALERT
+                ),
             )
-        ) or Decimal("0")
-
-        transfer_out = await db.scalar(
-            select(func.sum(MaterialTransaction.quantity)).where(
-                MaterialTransaction.material_id == m.id,
-                MaterialTransaction.type == DBTransactionType.TRANSFER_OUT
+            out_rows.append(ridx)
+        elif status == "LOW":
+            st = Paragraph(
+                "<b>LOW</b>",
+                ParagraphStyle(
+                    "s", fontName="Helvetica-Bold", fontSize=8, textColor=AMBER_LOW
+                ),
             )
-        ) or Decimal("0")
+            low_rows.append(ridx)
+        else:
+            st = Paragraph(
+                "<b>OK</b>",
+                ParagraphStyle(
+                    "s", fontName="Helvetica-Bold", fontSize=8, textColor=GREEN_OK
+                ),
+            )
 
-        grand_total += cost
+        tdata.append(
+            [
+                Paragraph(str(i + 1), cell_s),
+                Paragraph((m.material_name or "").title(), cell_s),
+                Paragraph(sup or "N/A", cell_s),
+                Paragraph(fmt(purchased, 1), cell_s),
+                Paragraph(fmt(used, 1), cell_s),
+                Paragraph(fmt(remaining, 1), cell_s),
+                Paragraph(fmt(avg_rate, 2), cell_s),
+                Paragraph(fmt(value, 2), cell_s),
+                st,
+            ]
+        )
 
-        data.append([
-            m.id,
-            (m.material_name or "").title(),
-            float(purchased),
-            float(used),
-            float(remaining),
-            float(transfer_in),
-            float(transfer_out),
-            float(cost),
-            float(paid),
-            float(pending),
-        ])
+    # totals footer row
+    tdata.append(
+        [
+            Paragraph("", foot_s),
+            Paragraph("<b>TOTAL</b>", foot_s),
+            Paragraph("", foot_s),
+            Paragraph(f"<b>{fmt(total_purchased, 1)}</b>", foot_s),
+            Paragraph(f"<b>{fmt(total_used, 1)}</b>", foot_s),
+            Paragraph(f"<b>{fmt(total_remaining, 1)}</b>", foot_s),
+            Paragraph("", foot_s),
+            Paragraph(f"<b>{fmt(total_value, 2)}</b>", foot_s),
+            Paragraph("", foot_s),
+        ]
+    )
+    frow = len(tdata) - 1
 
-    # ===== TOTAL ROW =====
-    data.append(["", "", "", "", "", "", "TOTAL", float(grand_total), "", ""])
+    detail = Table(tdata, colWidths=col_widths, repeatRows=1)
+    ts = TableStyle(
+        [
+            # header
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("LINEBELOW", (0, 0), (-1, 0), 2, ORANGE),
+            ("TOPPADDING", (0, 0), (-1, 0), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+            # data rows
+            ("ROWBACKGROUNDS", (0, 1), (-1, frow - 1), [WHITE, BG_LIGHT]),
+            ("TOPPADDING", (0, 1), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
+            # totals footer
+            ("BACKGROUND", (0, frow), (-1, frow), FOOTER_BG),
+            ("LINEABOVE", (0, frow), (-1, frow), 1.5, NAVY),
+            ("LINEBELOW", (0, frow), (-1, frow), 1.5, NAVY),
+            # grid
+            ("GRID", (0, 0), (-1, -1), 0.3, BORDER_CLR),
+            ("BOX", (0, 0), (-1, -1), 1, BORDER_CLR),
+            # alignment
+            ("ALIGN", (0, 0), (0, -1), "CENTER"),
+            ("ALIGN", (3, 0), (7, -1), "RIGHT"),
+            ("ALIGN", (8, 0), (8, -1), "CENTER"),
+            # padding
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]
+    )
+    for r in out_rows:
+        ts.add("BACKGROUND", (0, r), (-1, r), RED_BG)
+    for r in low_rows:
+        ts.add("BACKGROUND", (0, r), (-1, r), AMBER_BG)
 
-    # ===== TABLE =====
-    table = Table(data, repeatRows=1)
+    detail.setStyle(ts)
+    elements.append(detail)
 
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2E86C1")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+    # ── alerts ───────────────────────────────────────────────────
+    all_alerts = [(a, "OUT OF STOCK", RED_ALERT, RED_BG) for a in alerts_out] + [
+        (a, "LOW STOCK", AMBER_LOW, AMBER_BG) for a in alerts_low
+    ]
+    if all_alerts:
+        elements.append(Spacer(1, 18))
+        # section header with left orange accent bar
+        alert_hdr = Table([[Paragraph("ALERTS", sec_s)]], colWidths=[doc.width])
+        alert_hdr.setStyle(
+            TableStyle(
+                [
+                    ("LINEBEFORE", (0, 0), (0, -1), 4, ORANGE),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ]
+            )
+        )
+        elements.append(alert_hdr)
+        elements.append(Spacer(1, 8))
 
-        ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        a_rows = []
+        for name, label, txt_clr, _ in all_alerts:
+            badge_s = ParagraphStyle(
+                "badge", fontName="Helvetica-Bold", fontSize=7.5, textColor=txt_clr
+            )
+            name_s = ParagraphStyle(
+                "aname", fontName="Helvetica-Bold", fontSize=8.5, textColor=TEXT_DARK
+            )
+            a_rows.append(
+                [Paragraph(f"<b>{label}</b>", badge_s), Paragraph(name, name_s)]
+            )
 
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-         [colors.whitesmoke, colors.lightgrey]),
-
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-
-        # TOTAL highlight
-        ("BACKGROUND", (0, -1), (-1, -1), colors.lightblue),
-        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
-    ]))
-
-    elements.append(table)
+        a_table = Table(a_rows, colWidths=[32 * mm, doc.width - 32 * mm])
+        a_ts = TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 1, BORDER_CLR),
+                ("INNERGRID", (0, 0), (-1, -1), 0.3, BORDER_CLR),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LINEBEFORE", (0, 0), (0, -1), 4, RED_ALERT),
+            ]
+        )
+        for i, (_, _, _, bg_clr) in enumerate(all_alerts):
+            a_ts.add("BACKGROUND", (0, i), (-1, i), bg_clr)
+        a_table.setStyle(a_ts)
+        elements.append(a_table)
 
     doc.build(elements)
+
+
+# ─── FASTAPI ENDPOINT ─────────────────────────────────────────────────────────
+@router.get("/reports/materials/pdf", response_class=FileResponse)
+async def export_pdf(
+    supplier_id: int | None = Query(None),
+    db: AsyncSession = Depends(get_db_session),
+    current_user=Depends(require_roles(MATERIAL_READ_ROLES)),
+):
+    query = (
+        select(Material, Supplier.supplier_name)
+        .join(Supplier, Supplier.id == Material.supplier_id, isouter=True)
+        .where(Material.is_deleted == False)
+    )
+    if supplier_id:
+        query = query.where(Material.supplier_id == supplier_id)
+
+    rows = (await db.execute(query)).all()
+    if not rows:
+        raise HTTPException(404, "No data found")
+
+    file_path = os.path.join(tempfile.gettempdir(), f"mat_report_{uuid.uuid4()}.pdf")
+    _build_pdf(file_path, rows)
 
     return FileResponse(
         file_path,
         media_type="application/pdf",
-        filename="material_full_report.pdf",
+        filename="material_report.pdf",
         background=BackgroundTask(safe_delete, file_path),
     )
+
+
 # ==================excel report=====================
 
+
 @router.get("/reports/materials/excel", response_class=FileResponse)
-async def export_excel(db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),):
-
+async def export_excel(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+):
     from decimal import Decimal
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, GradientFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.formatting.rule import ColorScaleRule, CellIsRule
+    from openpyxl.styles.numbers import FORMAT_NUMBER_COMMA_SEPARATED1
 
+    # ── Fetch data ─────────────────────────────────────────────────────────────
     materials = (
-        await db.execute(
-            select(Material).where(Material.is_deleted == False)
+        (await db.execute(select(Material).where(Material.is_deleted == False)))
+        .scalars()
+        .all()
+    )
+
+    transfer_data = await db.execute(
+        select(
+            MaterialTransaction.material_id,
+            func.sum(
+                case(
+                    (
+                        MaterialTransaction.type == DBTransactionType.TRANSFER_IN,
+                        MaterialTransaction.quantity,
+                    ),
+                    else_=0,
+                )
+            ).label("transfer_in"),
+            func.sum(
+                case(
+                    (
+                        MaterialTransaction.type == DBTransactionType.TRANSFER_OUT,
+                        MaterialTransaction.quantity,
+                    ),
+                    else_=0,
+                )
+            ).label("transfer_out"),
+        ).group_by(MaterialTransaction.material_id)
+    )
+
+    transfer_map = {
+        row.material_id: {
+            "in": row.transfer_in or Decimal("0"),
+            "out": row.transfer_out or Decimal("0"),
+        }
+        for row in transfer_data
+    }
+
+    # ── Colors ─────────────────────────────────────────────────────────────────
+    C_NAVY = "1A2B4A"
+    C_ORANGE = "F5A623"
+    C_WHITE = "FFFFFF"
+    C_LIGHT_GREY = "F5F5F5"
+    C_ALT_ROW = "EFF3FB"
+    C_GREEN_BG = "E8F5E9"
+    C_GREEN_FG = "2E7D32"
+    C_RED_BG = "FFEBEE"
+    C_RED_FG = "C62828"
+    C_AMBER_BG = "FFF8E1"
+    C_AMBER_FG = "E65100"
+    C_BORDER = "CCCCCC"
+    C_TOTAL_BG = "1A2B4A"
+
+    # ── Style helpers ──────────────────────────────────────────────────────────
+    def fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    def font(bold=False, color=C_NAVY, size=10, italic=False):
+        return Font(name="Arial", bold=bold, color=color, size=size, italic=italic)
+
+    def align(h="left", v="center", wrap=False):
+        return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+    def thin_border(left=True, right=True, top=True, bottom=True):
+        s = Side(style="thin", color=C_BORDER)
+        n = Side(style=None)
+        return Border(
+            left=s if left else n,
+            right=s if right else n,
+            top=s if top else n,
+            bottom=s if bottom else n,
         )
-    ).scalars().all()
 
-    file_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
+    def thick_bottom():
+        return Border(bottom=Side(style="medium", color=C_NAVY))
 
+    NUM_FMT_INT = "#,##0"
+    NUM_FMT_DEC = "#,##0.00"
+    NUM_FMT_MONEY = "₹ #,##0.00"
+
+    # ── Workbook setup ─────────────────────────────────────────────────────────
     wb = Workbook()
     ws = wb.active
     ws.title = "Material Report"
 
-    # ===== STYLES =====
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="2E86C1", end_color="2E86C1", fill_type="solid")
-    center_align = Alignment(horizontal="center", vertical="center")
-    right_align = Alignment(horizontal="right")
-    border = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin"),
-    )
+    # ── Row 1: Title banner ────────────────────────────────────────────────────
+    ws.merge_cells("A1:J1")
+    ws["A1"] = "INFRAPILOT — Material Inventory Report"
+    ws["A1"].font = font(bold=True, color=C_WHITE, size=14)
+    ws["A1"].fill = fill(C_NAVY)
+    ws["A1"].alignment = align("center")
+    ws.row_dimensions[1].height = 32
 
-    # ===== HEADER =====
-    headers = [
-        "ID", "Material", "Purchased", "Used", "Remaining",
-        "Transfer In", "Transfer Out",
-        "Cost", "Paid", "Pending"
+    # ── Row 2: Generated date ──────────────────────────────────────────────────
+    from datetime import datetime
+
+    ws.merge_cells("A2:J2")
+    ws["A2"] = f"Generated: {datetime.now().strftime('%d %b %Y  %I:%M %p')}"
+    ws["A2"].font = font(color=C_WHITE, size=9, italic=True)
+    ws["A2"].fill = fill(C_ORANGE)
+    ws["A2"].alignment = align("right")
+    ws.row_dimensions[2].height = 18
+
+    # ── Row 3: blank spacer ────────────────────────────────────────────────────
+    ws.row_dimensions[3].height = 8
+
+    # ── Rows 4-6: Summary KPI block ────────────────────────────────────────────
+    #  Labels row
+    kpi_labels = [
+        "Total Materials",
+        "Total Purchased",
+        "Total Used",
+        "Remaining Stock",
+        "Total Cost (Rs.)",
+        "Total Pending (Rs.)",
     ]
-    ws.append(headers)
+    kpi_cols = [
+        "A",
+        "B",
+        "C",
+        "D",
+        "G",
+        "J",
+    ]  # approximate columns for 2-col merged groups
 
-    for col_num, col_name in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_num)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = center_align
-        cell.border = border
+    # We'll use a 3-wide merge per KPI across 6 KPIs → cols A-R would be too wide
+    # Instead: use cols A:B, C:D, E:F, G:H, I:J split across 5 pairs in 10 cols
+    kpi_pairs = [("A", "B"), ("C", "D"), ("E", "F"), ("G", "H"), ("I", "J")]
 
-    ws.freeze_panes = "A2"
+    total_purchased = sum(float(m.quantity_purchased or 0) for m in materials)
+    total_used = sum(float(m.quantity_used or 0) for m in materials)
+    total_remaining = sum(float(m.remaining_stock or 0) for m in materials)
 
     total_cost = Decimal("0")
-
-    row_idx = 2
-
     for m in materials:
+        purchased = m.quantity_purchased or Decimal("0")
+        total_amt = m.total_amount or Decimal("0")
+        remaining = m.remaining_stock or Decimal("0")
+        avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
+        total_cost += remaining * avg_rate
 
+    total_pending = sum(float(m.payment_pending or 0) for m in materials)
+
+    kpi_data = [
+        ("Total Materials", len(materials), None),
+        ("Total Purchased", total_purchased, "units"),
+        ("Total Used", total_used, "units"),
+        ("Remaining Stock", total_remaining, "units"),
+        ("Total Cost", float(round(total_cost, 2)), "Rs."),
+        ("Pending Payment", total_pending, "Rs."),
+    ]
+
+    for row in [4, 5]:
+        ws.row_dimensions[row].height = 20
+
+    for idx, ((start_col, end_col), (label, val, unit)) in enumerate(
+        zip(kpi_pairs, kpi_data)
+    ):
+        # Label cell (row 4)
+        lbl_cell = f"{start_col}4"
+        ws.merge_cells(f"{start_col}4:{end_col}4")
+        ws[lbl_cell] = label
+        ws[lbl_cell].font = font(bold=False, color="777777", size=8)
+        ws[lbl_cell].fill = fill(C_LIGHT_GREY)
+        ws[lbl_cell].alignment = align("center")
+
+        # Value cell (row 5)
+        val_cell = f"{start_col}5"
+        ws.merge_cells(f"{start_col}5:{end_col}5")
+        display = (
+            f"Rs. {val:,.0f}"
+            if unit == "Rs."
+            else (f"{val:,.0f} {unit}" if unit else str(val))
+        )
+        ws[val_cell] = display
+        ws[val_cell].font = font(bold=True, color=C_NAVY, size=11)
+        ws[val_cell].fill = fill(C_WHITE)
+        ws[val_cell].alignment = align("center")
+
+        for r in [4, 5]:
+            ws[f"{start_col}{r}"].border = thin_border()
+
+    ws.row_dimensions[6].height = 10  # spacer
+
+    # ── Row 7: Section label ───────────────────────────────────────────────────
+    ws.merge_cells("A7:J7")
+    ws["A7"] = "MATERIAL DETAILS"
+    ws["A7"].font = font(bold=True, color=C_NAVY, size=10)
+    ws["A7"].fill = fill(C_LIGHT_GREY)
+    ws["A7"].alignment = align("left")
+    ws["A7"].border = thick_bottom()
+    ws.row_dimensions[7].height = 22
+
+    # ── Row 8: Column headers ──────────────────────────────────────────────────
+    headers = [
+        "#",
+        "Material Name",
+        "Supplier",
+        "Purchased\n(units)",
+        "Used\n(units)",
+        "Remaining\n(units)",
+        "Transfer In",
+        "Transfer Out",
+        "Avg Rate\n(Rs.)",
+        "Stock Value\n(Rs.)",
+        "Paid\n(Rs.)",
+        "Pending\n(Rs.)",
+        "Status",
+    ]
+
+    # Expand to 13 columns — add Supplier & Status
+    ws.merge_cells("A8:A8")  # no-op but keeps it consistent
+
+    for col_idx, hdr in enumerate(headers, start=1):
+        cell = ws.cell(row=8, column=col_idx, value=hdr)
+        cell.font = font(bold=True, color=C_WHITE, size=9)
+        cell.fill = fill(C_NAVY)
+        cell.alignment = align("center", wrap=True)
+        cell.border = thin_border()
+
+    ws.row_dimensions[8].height = 30
+
+    # ── Column widths ──────────────────────────────────────────────────────────
+    col_widths = [5, 22, 18, 12, 12, 12, 12, 12, 12, 14, 12, 12, 10]
+    for i, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ── Data rows ──────────────────────────────────────────────────────────────
+    DATA_START = 9
+    row_idx = DATA_START
+
+    for i, m in enumerate(materials, start=1):
         purchased = m.quantity_purchased or Decimal("0")
         used = m.quantity_used or Decimal("0")
         remaining = m.remaining_stock or Decimal("0")
         total_amt = m.total_amount or Decimal("0")
         paid = m.payment_given or Decimal("0")
         pending = m.payment_pending or Decimal("0")
-
-        # ===== WAC =====
         avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
-        cost = remaining * avg_rate
+        stock_val = remaining * avg_rate
+        t_in = transfer_map.get(m.id, {}).get("in", Decimal("0"))
+        t_out = transfer_map.get(m.id, {}).get("out", Decimal("0"))
 
-        # ===== TRANSFER =====
-        transfer_in = await db.scalar(
-            select(func.sum(MaterialTransaction.quantity)).where(
-                MaterialTransaction.material_id == m.id,
-                MaterialTransaction.type == DBTransactionType.TRANSFER_IN
-            )
-        ) or Decimal("0")
+        # Status logic
+        if float(remaining) == 0:
+            status, s_fg, s_bg = "OUT", C_RED_FG, C_RED_BG
+        elif float(remaining) < float(purchased) * 0.15:
+            status, s_fg, s_bg = "LOW", C_AMBER_FG, C_AMBER_BG
+        else:
+            status, s_fg, s_bg = "OK", C_GREEN_FG, C_GREEN_BG
 
-        transfer_out = await db.scalar(
-            select(func.sum(MaterialTransaction.quantity)).where(
-                MaterialTransaction.material_id == m.id,
-                MaterialTransaction.type == DBTransactionType.TRANSFER_OUT
-            )
-        ) or Decimal("0")
+        bg = C_WHITE if i % 2 == 1 else C_ALT_ROW
 
-        total_cost += cost
-
-        row = [
-            m.id,
+        row_vals = [
+            i,
             (m.material_name or "").title(),
+            getattr(m, "supplier_name", None) or "-",
             float(purchased),
             float(used),
             float(remaining),
-            float(transfer_in),
-            float(transfer_out),
-            float(round(cost, 2)),
+            float(t_in),
+            float(t_out),
+            float(round(avg_rate, 2)),
+            float(round(stock_val, 2)),
             float(paid),
             float(pending),
+            status,
         ]
 
-        ws.append(row)
+        for col_idx, val in enumerate(row_vals, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.font = font(size=9, color="333333")
+            cell.fill = fill(bg)
+            cell.alignment = align("center")
+            cell.border = thin_border()
 
-        # ===== STYLE ROW =====
-        for col in range(1, len(headers) + 1):
-            cell = ws.cell(row=row_idx, column=col)
-            cell.border = border
+            # Number formatting
+            if col_idx in (4, 5, 6, 7, 8):
+                cell.number_format = NUM_FMT_INT
+            elif col_idx in (9, 10, 11, 12):
+                cell.number_format = NUM_FMT_DEC
+                cell.alignment = align("right")
 
-            if col >= 3:  # numeric columns
-                cell.alignment = right_align
-            else:
-                cell.alignment = center_align
+            # Status column styling
+            if col_idx == 13:
+                cell.fill = fill(s_bg)
+                cell.font = font(bold=True, color=s_fg, size=9)
+                cell.alignment = align("center")
 
+        ws.row_dimensions[row_idx].height = 18
         row_idx += 1
 
-    # ===== TOTAL ROW =====
-    ws.append([])
-    ws.append(["", "", "", "", "", "", "TOTAL", float(round(total_cost, 2)), "", ""])
+    # ── Total row ─────────────────────────────────────────────────────────────
+    data_end = row_idx - 1
+    ws.row_dimensions[row_idx].height = 22
 
-    total_row = ws.max_row
-    for col in range(1, len(headers) + 1):
-        cell = ws.cell(row=total_row, column=col)
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(start_color="D6EAF8", end_color="D6EAF8", fill_type="solid")
+    total_labels = {
+        1: "TOTAL",
+        4: f"=SUM(D{DATA_START}:D{data_end})",
+        5: f"=SUM(E{DATA_START}:E{data_end})",
+        6: f"=SUM(F{DATA_START}:F{data_end})",
+        7: f"=SUM(G{DATA_START}:G{data_end})",
+        8: f"=SUM(H{DATA_START}:H{data_end})",
+        10: f"=SUM(J{DATA_START}:J{data_end})",
+        11: f"=SUM(K{DATA_START}:K{data_end})",
+        12: f"=SUM(L{DATA_START}:L{data_end})",
+    }
 
-    # ===== AUTO FILTER =====
-    ws.auto_filter.ref = f"A1:J{ws.max_row}"
+    for col_idx in range(1, 14):
+        val = total_labels.get(col_idx, "")
+        cell = ws.cell(row=row_idx, column=col_idx, value=val)
+        cell.font = font(bold=True, color=C_WHITE, size=9)
+        cell.fill = fill(C_TOTAL_BG)
+        cell.alignment = align("center")
+        cell.border = thin_border()
+        if col_idx in (10, 11, 12):
+            cell.number_format = NUM_FMT_DEC
+            cell.alignment = align("right")
+        elif col_idx in (4, 5, 6, 7, 8):
+            cell.number_format = NUM_FMT_INT
 
-    # ===== AUTO WIDTH =====
-    for col in ws.columns:
-        max_length = 0
-        col_letter = col[0].column_letter
-        for cell in col:
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = max_length + 3
+    # ── Freeze panes (header rows + col A) ────────────────────────────────────
+    ws.freeze_panes = "B9"
 
+    # ── Auto-filter on header row ──────────────────────────────────────────────
+    ws.auto_filter.ref = f"A8:{get_column_letter(13)}{data_end}"
+
+    # ── Conditional formatting: Pending column (red if > 0) ───────────────────
+    pending_col = f"L{DATA_START}:L{data_end}"
+    ws.conditional_formatting.add(
+        pending_col,
+        CellIsRule(
+            operator="greaterThan",
+            formula=["0"],
+            fill=PatternFill("solid", fgColor=C_RED_BG),
+            font=Font(color=C_RED_FG, bold=True, name="Arial", size=9),
+        ),
+    )
+
+    # ── ALERTS sheet ───────────────────────────────────────────────────────────
+    alerts = [
+        (m, "OUT OF STOCK", C_RED_FG, C_RED_BG)
+        for m in materials
+        if float(m.remaining_stock or 0) == 0
+    ]
+    alerts += [
+        (m, "LOW STOCK", C_AMBER_FG, C_AMBER_BG)
+        for m in materials
+        if 0 < float(m.remaining_stock or 0) < float(m.quantity_purchased or 0) * 0.15
+    ]
+
+    if alerts:
+        ws_alert = wb.create_sheet("Alerts")
+        ws_alert.merge_cells("A1:D1")
+        ws_alert["A1"] = "ALERTS — Materials Needing Attention"
+        ws_alert["A1"].font = font(bold=True, color=C_WHITE, size=12)
+        ws_alert["A1"].fill = fill(C_NAVY)
+        ws_alert["A1"].alignment = align("center")
+        ws_alert.row_dimensions[1].height = 28
+
+        for col_i, hdr in enumerate(
+            ["Status", "Material Name", "Remaining", "Purchased"], 1
+        ):
+            c = ws_alert.cell(row=2, column=col_i, value=hdr)
+            c.font = font(bold=True, color=C_WHITE, size=9)
+            c.fill = fill(C_ORANGE)
+            c.alignment = align("center")
+
+        for r_i, (m, label, fg, bg) in enumerate(alerts, start=3):
+            row_data = [
+                label,
+                (m.material_name or "").title(),
+                float(m.remaining_stock or 0),
+                float(m.quantity_purchased or 0),
+            ]
+            for c_i, v in enumerate(row_data, 1):
+                c = ws_alert.cell(row=r_i, column=c_i, value=v)
+                c.font = font(bold=(c_i == 1), color=fg, size=9)
+                c.fill = fill(bg)
+                c.alignment = align("center")
+                c.border = thin_border()
+
+        for col_i, w in zip([1, 2, 3, 4], [16, 28, 14, 14]):
+            ws_alert.column_dimensions[get_column_letter(col_i)].width = w
+
+    # ── Save ───────────────────────────────────────────────────────────────────
+    file_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
     wb.save(file_path)
 
     return FileResponse(
         file_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="material_advanced_report.xlsx",
+        filename=f"material_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
         background=BackgroundTask(safe_delete, file_path),
     )
+
 
 # ===============price-history==========================
 @router.get("/price-history/{material_id}")
@@ -1857,10 +2749,7 @@ async def price_history(
     from decimal import Decimal
 
     result = await db.execute(
-        select(
-            MaterialTransaction.rate,
-            MaterialTransaction.created_at
-        )
+        select(MaterialTransaction.rate, MaterialTransaction.created_at)
         .where(
             MaterialTransaction.material_id == material_id,
             MaterialTransaction.type == DBTransactionType.PURCHASE,  # ✅ FIX
@@ -1891,6 +2780,7 @@ async def price_history(
 
     return history
 
+
 # ================= MATERIALS - DYNAMIC ROUTES =================
 @router.post("", response_model=MaterialOut)
 async def create_material(
@@ -1906,8 +2796,8 @@ async def create_material(
 
     # ===== NORMALIZE NAME =====
     raw_name = payload.material_name.strip()
-    normalized_name = raw_name.lower()
-    data["material_name"] = raw_name  # store clean name
+    normalized_name = raw_name.strip().lower()
+    data["material_name"] = normalized_name  # ✅ store normalized
 
     # ===== VALIDATE SUPPLIER =====
     supplier = await db.get(Supplier, payload.supplier_id)
@@ -1953,7 +2843,9 @@ async def create_material(
         raise HTTPException(400, "Material already exists")
 
     # ===== CALCULATIONS =====
-    obj.total_amount = (obj.quantity_purchased * obj.purchase_rate).quantize(Decimal("0.01"))
+    obj.total_amount = (obj.quantity_purchased * obj.purchase_rate).quantize(
+        Decimal("0.01")
+    )
 
     # 👉 use centralized logic
     update_material_fields(obj)
@@ -2006,12 +2898,14 @@ async def create_material(
     # ===== RESPONSE =====
     response = MaterialOut.model_validate({**obj.__dict__, "alert_type": alert_type})
 
-    response.supplier_name = supplier.name
+    response.supplier_name = supplier.supplier_name
     response.material_name = obj.material_name.title()
 
     return response
 
-#=================list_materials=========================
+
+# =================list_materials=========================
+
 
 @router.get("", response_model=list[MaterialOut])
 async def list_materials(
@@ -2023,7 +2917,7 @@ async def list_materials(
 ):
     # 🔹 JOIN for supplier (N+1 fix)
     query = (
-        select(Material, Supplier.name)
+        select(Material, Supplier.supplier_name)
         .join(Supplier, Supplier.id == Material.supplier_id, isouter=True)
         .where(Material.is_deleted == False)
     )
@@ -2076,7 +2970,9 @@ async def list_materials(
 
     return data
 
-#==============get_material=================
+
+# ==============get_material=================
+
 
 @router.get("/{material_id}", response_model=MaterialOut)
 async def get_material(
@@ -2109,7 +3005,7 @@ async def get_material(
         category=obj.category,
         unit=obj.unit,
         supplier_id=obj.supplier_id,
-        supplier_name=supplier.name if supplier else None,
+        supplier_name=supplier.supplier_name if supplier else None,
         purchase_rate=float(obj.purchase_rate),
         rate_type=obj.rate_type,
         quantity_purchased=float(obj.quantity_purchased),
@@ -2123,7 +3019,10 @@ async def get_material(
         alert_type=alert_type,
     )
 
-#=============update_material==================
+
+# =============update_material==================
+
+
 @router.put("/{material_id}", response_model=MaterialOut)
 async def update_material(
     material_id: int,
@@ -2143,20 +3042,20 @@ async def update_material(
 
     update_data = payload.model_dump(exclude_unset=True)
 
-    # ❌ direct payment block
+    # direct payment block
     if "payment_given" in update_data:
         raise HTTPException(
             status_code=400,
             detail="Direct payment update not allowed. Use purchase API",
         )
 
-    # ✅ NORMALIZE NAME
+    # NORMALIZE NAME
     if "material_name" in update_data:
         new_name = update_data["material_name"].strip()
         normalized_name = new_name.lower()
         update_data["material_name"] = new_name
 
-        # ✅ DUPLICATE CHECK (IMPORTANT FIX 🔥)
+        # DUPLICATE CHECK (IMPORTANT FIX )
         existing = await db.scalar(
             select(Material).where(
                 Material.project_id == obj.project_id,
@@ -2174,11 +3073,11 @@ async def update_material(
             )
 
     try:
-        # ✅ apply updates
+        # apply updates
         for k, v in update_data.items():
             setattr(obj, k, v)
 
-        # ✅ recalc
+        # recalc
         update_material_fields(obj)
 
         await db.commit()
@@ -2194,7 +3093,7 @@ async def update_material(
 
     total_amount, payment_given, payment_pending, extra_paid = calculate_fields(obj)
 
-    # ✅ alert fix (<= important)
+    #  alert fix (<= important)
     if obj.remaining_stock == 0:
         alert_type = "OUT_OF_STOCK"
     elif obj.remaining_stock <= obj.minimum_stock_level:
@@ -2210,7 +3109,7 @@ async def update_material(
         category=obj.category,
         unit=obj.unit,
         supplier_id=obj.supplier_id,
-        supplier_name=supplier.name if supplier else None,
+        supplier_name=supplier.supplier_name if supplier else None,
         purchase_rate=float(obj.purchase_rate or 0),
         rate_type=obj.rate_type,
         quantity_purchased=float(obj.quantity_purchased or 0),
@@ -2224,7 +3123,9 @@ async def update_material(
         alert_type=alert_type,
     )
 
-#============delete_material===========
+
+# ============delete_material===========
+
 
 @router.delete("/{material_id}")
 async def delete_material(

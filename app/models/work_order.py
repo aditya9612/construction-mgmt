@@ -39,5 +39,8 @@ class WorkOrder(Base, TimestampMixin):
         default="Assigned"  # Assigned / In Progress / Completed
     )
 
+    quotation_id = Column( Integer, ForeignKey("quotation_master.id", ondelete="SET NULL"), nullable=True, unique=True, index=True, )
+
     project = relationship("Project")
     contractor = relationship("Contractor")
+    quotation = relationship( "QuotationMaster", lazy="selectin" )

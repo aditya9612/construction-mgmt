@@ -2,6 +2,7 @@ from datetime import date
 from typing import Optional, TYPE_CHECKING
 from sqlalchemy import (
     DECIMAL,
+    TIMESTAMP,
     Boolean,
     CheckConstraint,
     Column,
@@ -14,10 +15,11 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
     Enum as SAEnum,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from decimal import Decimal
-from app.core.enums import AttendanceStatus, MilestoneStatus, SafetyChecklistStatus
+from app.core.enums import AttendanceStatus, MilestoneStatus, SafetyChecklistStatus, WorkActivityStatus
 from app.models.base import Base, TimestampMixin
 from app.models.labour import Labour
 from app.schemas.project import (
@@ -637,3 +639,44 @@ class SiteRequest(Base, TimestampMixin):
     status = Column(String(20), default="Pending")  # Pending / Approved / Rejected
 
     project = relationship("Project")
+
+
+# =================work progress===========================
+
+
+class WorkActivity(Base, TimestampMixin):
+    __tablename__ = "work_activities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, nullable=False)
+    boq_code = Column(Integer)
+    activity_name = Column(String(255), nullable=False)
+    planned_quantity = Column(DECIMAL(18, 2), default=0)
+    unit = Column(String(50))
+    engineer_id = Column(Integer)
+    total_completed = Column(DECIMAL(18, 2), default=0)
+    remaining_quantity = Column(DECIMAL(18, 2), default=0)
+    completion_percentage = Column(DECIMAL(5, 2), default=0)
+
+    status = Column(
+        SAEnum(WorkActivityStatus),
+        default=WorkActivityStatus.NOT_STARTED,
+        nullable=False,
+    )
+
+    start_date = Column(Date)
+    end_date = Column(Date)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+
+
+class DailyProgressEntry(Base ,TimestampMixin):
+
+    __tablename__ = "daily_progress_entries"
+
+    id = Column(Integer, primary_key=True)
+    activity_id = Column(Integer, ForeignKey("work_activities.id"))
+    entry_date = Column(Date)
+    today_progress = Column(DECIMAL(18, 2), default=0)
+    remarks = Column(Text)
+    created_by = Column(Integer)
+    created_at = Column(TIMESTAMP, server_default=func.now())

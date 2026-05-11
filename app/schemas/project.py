@@ -17,6 +17,7 @@ from app.core.enums import (
     TaskPriority,
     TaskStatus,
     WeatherType,
+    WorkActivityStatus,
 )
 from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
@@ -318,6 +319,7 @@ class DSROut(DSRBase):
     total_labour: int = 0
     skilled_labour: int = 0
     unskilled_labour: int = 0
+    photos: list[str] = []
 
     class Config:
         from_attributes = True
@@ -584,3 +586,73 @@ class MessageCreate(BaseSchema):
         if not v.strip():
             raise ValueError("Message cannot be empty")
         return v
+
+
+class WorkActivityCreate(BaseModel):
+    project_id: int
+    boq_code: int
+    activity_name: str
+    planned_quantity: float
+    unit: str
+    start_date: date
+    end_date: date
+
+    # Use enum instead of str
+    status: WorkActivityStatus = WorkActivityStatus.NOT_STARTED
+
+    engineer_id: int
+
+
+class WorkActivityUpdate(BaseModel):
+    activity_name: Optional[str] = None
+    planned_quantity: Optional[float] = None
+    unit: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+    # Optional enum for partial updates
+    status: Optional[WorkActivityStatus] = None
+
+
+class WorkActivityResponse(BaseModel):
+    id: int
+    project_id: int
+    boq_code: int
+    activity_name: str
+    planned_quantity: float
+    unit: str
+    start_date: date
+    end_date: date
+
+    # Response will return enum values such as "On Track"
+    status: WorkActivityStatus
+
+    engineer_id: int
+
+    class Config:
+        from_attributes = True
+
+
+class DailyProgressCreate(BaseModel):
+    activity_id: int
+    entry_date: date
+    today_progress: float
+    remarks: Optional[str] = None
+    created_by: int
+
+
+class DailyProgressUpdate(BaseModel):
+    today_progress: Optional[float] = None
+    remarks: Optional[str] = None
+
+
+class DailyProgressResponse(BaseModel):
+    id: int
+    activity_id: int
+    entry_date: date
+    today_progress: float
+    remarks: Optional[str] = None
+    created_by: int
+
+    class Config:
+        from_attributes = True

@@ -1,10 +1,13 @@
-from fastapi import APIRouter, Depends
+import os
+import shutil
+
+from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
-from app.models.settings import UserSettings
-from app.schemas.settings import UserSettingsUpdate, UserSettingsOut
+from app.models.settings import CompanySettings, UserSettings
+from app.schemas.settings import CompanySettingsOut, CompanySettingsUpdate, UserSettingsUpdate, UserSettingsOut
 
 from app.models.user import User
 from app.core.dependencies import get_current_active_user
@@ -85,3 +88,165 @@ async def get_profile(
     current_user: User = Depends(get_current_active_user),
 ):
     return current_user
+
+
+UPLOAD_DIR = "uploads/company"
+
+os.makedirs(
+    UPLOAD_DIR,
+    exist_ok=True
+)
+
+
+# =========================================================
+# GET SETTINGS
+# =========================================================
+
+@router.get(
+    "/company",
+    response_model=CompanySettingsOut
+)
+async def get_company_settings(
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(CompanySettings)
+    )
+
+    settings = result.scalars().first()
+
+    if not settings:
+
+        settings = CompanySettings()
+
+        db.add(settings)
+
+        await db.commit()
+
+        await db.refresh(settings)
+
+    return settings
+
+
+# =========================================================
+# UPDATE SETTINGS
+# =========================================================
+
+@router.put(
+    "/company",
+    response_model=CompanySettingsOut
+)
+async def update_company_settings(
+    payload: CompanySettingsUpdate,
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(CompanySettings)
+    )
+
+    settings = result.scalars().first()
+
+    if not settings:
+
+        settings = CompanySettings()
+
+        db.add(settings)
+
+    update_data = payload.model_dump(
+        exclude_unset=True
+    )
+
+    for key, value in update_data.items():
+        setattr(settings, key, value)
+
+    await db.commit()
+
+    await db.refresh(settings)
+
+    return settings
+
+
+# =========================================================
+# UPLOAD LOGO
+# =========================================================
+
+@router.post("/upload-logo")
+async def upload_logo(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(CompanySettings)
+    )
+
+    settings = result.scalars().first()
+
+    if not settings:
+
+        settings = CompanySettings()
+
+        db.add(settings)
+
+    file_path = (
+        f"{UPLOAD_DIR}/logo_{file.filename}"
+    )
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(
+            file.file,
+            buffer
+        )
+
+    settings.company_logo = file_path
+
+    await db.commit()
+
+    return {
+        "message": "Logo uploaded successfully",
+        "file_path": file_path
+    }
+
+
+# =========================================================
+# UPLOAD SIGNATURE
+# =========================================================
+
+@router.post("/upload-signature")
+async def upload_signature(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(CompanySettings)
+    )
+
+    settings = result.scalars().first()
+
+    if not settings:
+
+        settings = CompanySettings()
+
+        db.add(settings)
+
+    file_path = (
+        f"{UPLOAD_DIR}/signature_{file.filename}"
+    )
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(
+            file.file,
+            buffer
+        )
+
+    settings.signature_image = file_path
+
+    await db.commit()
+
+    return {
+        "message": "Signature uploaded successfully",
+        "file_path": file_path
+    }

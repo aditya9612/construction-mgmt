@@ -31,6 +31,7 @@ class InvoiceOut(BaseModel):
     owner_id: int
     type: str
     reference_id: Optional[int]
+    quotation_id: Optional[int]
 
     amount: float
     gst_percent: float

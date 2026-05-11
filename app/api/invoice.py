@@ -25,8 +25,7 @@ from decimal import Decimal
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 from app.core.logger import logger
-
-
+from app.models.quotation import QuotationMaster, QuotationStatus
 from app.models.user import UserRole
 
 INVOICE_READ_ROLES = [
@@ -53,10 +52,9 @@ router = APIRouter(prefix="/invoices", tags=["invoices"])
 
 from sqlalchemy import and_
 
-
 # @router.post("/{type}", response_model=InvoiceOut)
 # async def create_invoice(
-#     type: str,
+# type: str,
 #     payload: InvoiceCreate,
 #     db: AsyncSession = Depends(get_db_session),
 # ):
@@ -154,6 +152,120 @@ from sqlalchemy import and_
 #     logger.info(f"Invoice created id={obj.id}")
 
 #     return InvoiceOut.model_validate(obj)
+
+
+@router.post("/from-quotation/{quotation_id}", response_model=InvoiceOut)
+async def create_invoice_from_quotation(
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+):
+    # 1. Get quotation
+    quotation = await db.get(QuotationMaster, quotation_id)
+
+    if not quotation:
+        raise NotFoundError("Quotation not found")
+
+    # 2. Must be approved
+    if not quotation.is_approved:
+        raise ValidationError("Quotation must be approved first")
+
+    # 3. Prevent duplicate conversion
+    if quotation.converted_to_invoice:
+        raise ValidationError("Quotation already converted to invoice")
+
+    # 4. Project is required for invoice linkage
+    if not getattr(quotation, "project_id", None):
+        raise ValidationError("Quotation is not linked to any project")
+
+    # 5. Get project
+    project = await db.get(Project, quotation.project_id)
+
+    if not project:
+        raise NotFoundError("Project not found")
+
+    # 6. Additional safety check
+    existing_invoice = await db.scalar(
+        select(Invoice).where(Invoice.quotation_id == quotation.id)
+    )
+
+    if existing_invoice:
+        raise ValidationError("Invoice already exists for this quotation")
+
+    # 7. Calculate GST % (combine CGST + SGST)
+    gst_percent = Decimal(
+        (quotation.cgst_percent or 0) +
+        (quotation.sgst_percent or 0)
+    )
+
+    # 8. Create invoice
+    invoice = Invoice(
+        project_id=quotation.project_id,
+        owner_id=project.owner_id,
+
+        quotation_id=quotation.id,
+
+        type="owner",
+        reference_id=quotation.id,
+
+        amount=Decimal(quotation.subtotal or 0),
+
+        gst_percent=gst_percent,
+        gst_amount=Decimal(quotation.gst_amount or 0),
+
+        tax_percent=Decimal(quotation.tds_percent or 0),
+        tax_amount=Decimal(quotation.tds_amount or 0),
+
+        total_amount=Decimal(quotation.grand_total or 0),
+
+        paid_amount=Decimal(0),
+        pending_amount=Decimal(quotation.grand_total or 0),
+
+        status="pending",
+
+        description=(
+            f"Invoice generated from quotation "
+            f"{quotation.quotation_no}"
+        ),
+    )
+
+    try:
+        db.add(invoice)
+        await db.flush()
+
+        # 9. Owner ledger entry
+        owner_txn = OwnerTransaction(
+            owner_id=project.owner_id,
+            project_id=quotation.project_id,
+            type="credit",
+            amount=Decimal(quotation.grand_total or 0),
+            reference_type="invoice",
+            reference_id=invoice.id,
+            description=f"Invoice generated from quotation {quotation.quotation_no}",
+        )
+
+        db.add(owner_txn)
+
+        # 10. Update quotation
+        quotation.converted_to_invoice = True
+        quotation.status = QuotationStatus.CONVERTED
+
+        await db.commit()
+
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            f"Failed to create invoice from quotation_id={quotation_id}"
+        )
+        raise
+
+    await db.refresh(invoice)
+
+    logger.info(
+        f"Invoice created from quotation_id={quotation_id}, invoice_id={invoice.id}"
+    )
+
+    return InvoiceOut.model_validate(invoice)
 
 
 @router.get("", response_model=list[InvoiceOut])

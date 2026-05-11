@@ -5,9 +5,9 @@ import mimetypes
 import pathlib, re, io, os, uuid
 from openpyxl import Workbook
 from typing import Annotated, List, Optional, Union
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Form
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.enums import PRIORITY_MAP, REVERSE_PRIORITY_MAP, LabourStatus, MilestoneStatus, SkillType, TaskPriority
+from app.core.enums import PRIORITY_MAP, REVERSE_PRIORITY_MAP, LabourStatus, MilestoneStatus, SkillType, TaskPriority, WorkActivityStatus
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
@@ -2774,7 +2774,9 @@ dsr_router = APIRouter(
 # =========================
 @dsr_router.post("", response_model=s.DSROut)
 async def create_dsr(
-    payload: s.DSRCreate,
+    request: Request,
+    payload: s.DSRCreate = Depends(),
+    photos: Optional[UploadFile] = File(None),
     current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -2860,7 +2862,37 @@ async def create_dsr(
     else:
         raise Exception("Failed to generate unique DSR ID")
 
+    # Handle Photos
+    if photos:
+        upload_dir = "uploads/dsr"
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        file = photos
+        if file.content_type and file.content_type.startswith("image/"):
+            content = await file.read()
+            if len(content) <= 5 * 1024 * 1024:
+                try:
+                    img = Image.open(io.BytesIO(content))
+                    img.verify()
+                    
+                    safe_name = pathlib.Path(file.filename or "file").name
+                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_name)
+                    
+                    ext = pathlib.Path(safe_name).suffix.lower().replace(".", "")
+                    if ext in {"jpg", "jpeg", "png"}:
+                        filename = f"{uuid.uuid4()}_{safe_name}"
+                        path = os.path.join(upload_dir, filename).replace("\\", "/")
+                        
+                        with open(path, "wb") as f:
+                            f.write(content)
+                        
+                        photo = m.DSRPhoto(dsr_id=obj.id, file_url=path)
+                        db.add(photo)
+                except Exception:
+                    pass
+
     try:
+        await db.flush()
         await db.refresh(obj)
         await bump_cache_version(redis, "cache_version:dsr")
     except Exception:
@@ -2875,6 +2907,11 @@ async def create_dsr(
 
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
+
+    # Add photo URLs to output
+    base_url = str(request.base_url).rstrip("/")
+    result_photos = await db.execute(select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == obj.id))
+    dsr_out.photos = [f"{base_url}/{p.file_url}" for p in result_photos.scalars().all()]
 
     return dsr_out
 
@@ -3090,69 +3127,6 @@ async def update_dsr(
     return dsr_out
 
 
-@dsr_router.post("/{dsr_id}/photos")
-async def upload_dsr_photos(
-    dsr_id: int,
-    request: Request,
-    file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    dsr = await db.get(m.DailySiteReport, dsr_id)
-    if not dsr:
-        raise NotFoundError("DSR not found")
-
-    await assert_project_access(
-        db,
-        project_id=dsr.project_id,
-        current_user=current_user,
-    )
-
-    upload_dir = "uploads/dsr"
-    os.makedirs(upload_dir, exist_ok=True)
-
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise BadRequestError("Only image files are allowed")
-
-    content = await file.read()
-
-    if len(content) > 5 * 1024 * 1024:
-        raise BadRequestError("File too large (max 5MB)")
-
-    try:
-        img = Image.open(io.BytesIO(content))
-        img.verify()
-    except Exception:
-        raise BadRequestError("Invalid image file")
-
-    safe_name = pathlib.Path(file.filename or "file").name
-    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_name)
-
-    allowed_extensions = {"jpg", "jpeg", "png"}
-    ext = pathlib.Path(safe_name).suffix.lower().replace(".", "")
-
-    if ext not in allowed_extensions:
-        raise BadRequestError("Only JPG, JPEG, PNG allowed")
-
-    filename = f"{uuid.uuid4()}_{safe_name}"
-
-    path = os.path.join(upload_dir, filename).replace("\\", "/")
-
-    with open(path, "wb") as f:
-        f.write(content)
-
-    photo = m.DSRPhoto(dsr_id=dsr_id, file_url=path)
-    db.add(photo)
-
-    await db.flush()
-
-    base_url = str(request.base_url).rstrip("/")
-    file_url = f"{base_url}/{path}"
-
-    return {
-        "status": "success",
-        "uploaded": [file_url],
-    }
 
 
 @dsr_router.get("/project/{project_id}/map")
@@ -3889,6 +3863,394 @@ async def issue_analytics(
     return {
         "total_reports": int(total or 0),
         "reports_with_issues": int(issues or 0),
+    }
+
+
+
+work_progress_router = APIRouter(
+    prefix="/work-progress",
+    tags=["Work Progress"],
+    dependencies=[default_rate_limiter_dependency()],
+)
+
+# =========================================================
+# 1. CREATE ACTIVITY
+
+@work_progress_router.post("/activities")
+async def create_activity(
+    data: s.WorkActivityCreate,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    activity = m.WorkActivity(**data.dict())
+
+    db.add(activity)
+
+    await db.commit()
+
+    await db.refresh(activity)
+
+    return {
+        "message": "Activity Created",
+        "data": activity
+    }
+
+
+# =========================================================
+# 2. LIST ACTIVITIES
+
+@work_progress_router.get("/activities")
+async def list_activities(
+    project_id: int | None = None,
+    status: WorkActivityStatus | None = None,   # changed from str
+    engineer_id: int | None = None,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    stmt = select(m.WorkActivity)
+
+    if project_id:
+        stmt = stmt.where(m.WorkActivity.project_id == project_id)
+
+    if status:
+        stmt = stmt.where(m.WorkActivity.status == status)
+
+    if engineer_id:
+        stmt = stmt.where(m.WorkActivity.engineer_id == engineer_id)
+
+    result = await db.execute(stmt)
+    activities = result.scalars().all()
+
+    return activities
+
+
+
+# =========================================================
+# 3. GET SINGLE ACTIVITY
+
+@work_progress_router.get("/activities/{id}")
+async def get_activity(
+    id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(m.WorkActivity).where(m.WorkActivity.id == id)
+    )
+
+    activity = result.scalars().first()
+
+    return activity
+
+
+# =========================================================
+# 4. UPDATE ACTIVITY
+
+@work_progress_router.put("/activities/{id}")
+async def update_activity(
+    id: int,
+    data: s.WorkActivityUpdate,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(m.WorkActivity).where(m.WorkActivity.id == id)
+    )
+
+    activity = result.scalars().first()
+
+    if not activity:
+        return {"message": "Activity Not Found"}
+
+    for key, value in data.dict(exclude_unset=True).items():
+
+        setattr(activity, key, value)
+
+    await db.commit()
+
+    await db.refresh(activity)
+
+    return {
+        "message": "Activity Updated",
+        "data": activity
+    }
+
+
+# =========================================================
+# 5. DELETE ACTIVITY
+
+@work_progress_router.delete("/activities/{id}")
+async def delete_activity(
+    id: int,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(m.WorkActivity).where(m.WorkActivity.id == id)
+    )
+
+    activity = result.scalars().first()
+
+    if not activity:
+        return {"message": "Activity Not Found"}
+
+    await db.delete(activity)
+
+    await db.commit()
+
+    return {"message": "Activity Deleted"}
+
+
+# =========================================================
+# 6. ADD DAILY PROGRESS
+
+@work_progress_router.post("/daily-entry")
+async def add_daily_progress(
+    data: s.DailyProgressCreate,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    entry = m.DailyProgressEntry(**data.dict())
+    db.add(entry)
+
+    result = await db.execute(
+        select(m.WorkActivity).where(
+            m.WorkActivity.id == data.activity_id
+        )
+    )
+
+    activity = result.scalars().first()
+
+    if not activity:
+        return {"message": "Activity Not Found"}
+
+    current_completed = float(activity.total_completed or 0)
+    new_completed = current_completed + data.today_progress
+
+    activity.total_completed = new_completed
+
+    activity.remaining_quantity = (
+        float(activity.planned_quantity) - new_completed
+    )
+
+    activity.completion_percentage = round(
+        (new_completed / float(activity.planned_quantity)) * 100,
+        2
+    )
+
+    if activity.completion_percentage >= 100:
+        activity.status = WorkActivityStatus.COMPLETED
+
+    elif activity.completion_percentage > 0:
+        activity.status = WorkActivityStatus.ON_TRACK
+
+    await db.commit()
+    await db.refresh(entry)
+    await db.refresh(activity)
+
+    return {
+        "message": "Progress Added",
+        "progress": entry,
+        "activity": activity
+    }
+
+
+
+# =========================================================
+# 7. LIST DAILY ENTRIES
+
+@work_progress_router.get("/daily-entry")
+async def list_daily_entries(
+    activity_id: int | None = None,
+    entry_date: str | None = None,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    stmt = select(m.DailyProgressEntry)
+
+    if activity_id:
+        stmt = stmt.where(
+            m.DailyProgressEntry.activity_id == activity_id
+        )
+
+    if entry_date:
+        stmt = stmt.where(
+            m.DailyProgressEntry.entry_date == entry_date
+        )
+
+    result = await db.execute(stmt)
+
+    entries = result.scalars().all()
+
+    return entries
+
+
+# =========================================================
+# 8. UPDATE DAILY ENTRY
+
+@work_progress_router.put("/daily-entry/{id}")
+async def update_daily_entry(
+    id: int,
+    data: s.DailyProgressUpdate,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(m.DailyProgressEntry).where(
+            m.DailyProgressEntry.id == id
+        )
+    )
+
+    entry = result.scalars().first()
+
+    if not entry:
+        return {"message": "Daily Entry Not Found"}
+
+    for key, value in data.dict(exclude_unset=True).items():
+
+        setattr(entry, key, value)
+
+    await db.commit()
+
+    await db.refresh(entry)
+
+    return {
+        "message": "Daily Entry Updated",
+        "data": entry
+    }
+
+
+# =========================================================
+# 9. DELETE DAILY ENTRY
+
+@work_progress_router.delete("/daily-entry/{id}")
+async def delete_daily_entry(
+    id: int,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(m.DailyProgressEntry).where(
+            m.DailyProgressEntry.id == id
+        )
+    )
+
+    entry = result.scalars().first()
+
+    if not entry:
+        return {"message": "Daily Entry Not Found"}
+
+    await db.delete(entry)
+
+    await db.commit()
+
+    return {"message": "Daily Entry Deleted"}
+
+
+# =========================================================
+# 10. PROJECT SUMMARY
+
+@work_progress_router.get("/project-summary/{project_id}")
+async def project_summary(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    result = await db.execute(
+        select(m.WorkActivity).where(
+            m.WorkActivity.project_id == project_id
+        )
+    )
+
+    activities = result.scalars().all()
+
+    total_activities = len(activities)
+
+    completed = len([
+        a for a in activities
+        if a.status == WorkActivityStatus.COMPLETED
+    ])
+
+    delayed = len([
+        a for a in activities
+        if a.status == WorkActivityStatus.DELAY
+    ])
+
+    return {
+        "total_activities": total_activities,
+        "completed_activities": completed,
+        "delayed_activities": delayed,
+    }
+
+
+# =========================================================
+# 11. DELAY REPORT
+
+@work_progress_router.get("/delay-report")
+async def delay_report(
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    result = await db.execute(
+        select(m.WorkActivity).where(
+            m.WorkActivity.status == WorkActivityStatus.DELAY
+        )
+    )
+
+    activities = result.scalars().all()
+
+    return activities
+
+
+# =========================================================
+# 12. SITE ENGINEER TODAY PROGRESS
+
+@work_progress_router.get("/site-engineer/today-progress")
+async def today_progress(
+    engineer_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    result = await db.execute(
+        select(m.WorkActivity).where(
+            m.WorkActivity.engineer_id == engineer_id
+        )
+    )
+
+    activities = result.scalars().all()
+
+    return activities
+
+
+# =========================================================
+# 13. SITE ENGINEER SUBMIT WORK
+
+@work_progress_router.post("/site-engineer/progress-entry")
+async def site_engineer_progress(
+    data: s.DailyProgressCreate,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+
+    entry = m.DailyProgressEntry(**data.dict())
+
+    db.add(entry)
+
+    await db.commit()
+
+    await db.refresh(entry)
+
+    return {
+        "message": "Today's Work Submitted",
+        "data": entry
     }
 
 

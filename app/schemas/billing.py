@@ -55,6 +55,7 @@ class RABillOut(BaseModel):
     project_id: int
     contractor_id: int
     work_order_id: Optional[int]
+    quotation_id: Optional[int]
     bill_number: str
     work_description: str
     quantity: Decimal

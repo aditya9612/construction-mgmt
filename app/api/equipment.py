@@ -59,6 +59,7 @@ from app.models.user import User, UserRole
 
 # Internal - Enums
 from app.core.enums import EquipmentCondition
+from openpyxl.cell.cell import MergedCell
 
 # Internal - Schemas
 from app.schemas.base import PaginatedResponse, PaginationMeta
@@ -1427,219 +1428,474 @@ async def equipment_full_pdf_report(
         TableStyle,
         Paragraph,
         Spacer,
+        HRFlowable,
     )
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
     from fastapi.responses import StreamingResponse
 
+    # ── Colors matching Material Inventory design ──────────────────────────────
+    DARK_NAVY = colors.HexColor("#1A2B4A")  # header bar bg
+    ORANGE = colors.HexColor("#F5A623")  # accent / highlight
+    TABLE_HDR = colors.HexColor("#1A2B4A")  # table header bg
+    ROW_ALT = colors.HexColor("#F5F5F5")  # alternate row
+    ROW_WHITE = colors.white
+    BORDER_CLR = colors.HexColor("#DDDDDD")
+    TEXT_DARK = colors.HexColor("#222222")
+    TEXT_LIGHT = colors.white
+    LABEL_GREY = colors.HexColor("#555555")
+    GREEN_HDR = colors.HexColor("#2E7D32")  # Maintenance table header
+    RED_HDR = colors.HexColor("#C62828")  # Rental table header
+    ORANGE_LIGHT = colors.HexColor("#FFF3E0")  # alert bg
+    RED_LIGHT = colors.HexColor("#FFEBEE")  # out-of-stock alert bg
+
+    PAGE_W, PAGE_H = letter
+    MARGIN = 36
+
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        leftMargin=MARGIN,
+        rightMargin=MARGIN,
+        topMargin=90,  # space for fixed header band
+        bottomMargin=40,
+    )
 
-    styles = getSampleStyleSheet()
-    story = []
-
-    # FONT SAFE LOAD (IMPORTANT FIX)
+    # ── Font ──────────────────────────────────────────────────────────────────
     font_path = os.path.join("fonts", "DejaVuSans.ttf")
-
+    font_path_bold = os.path.join("fonts", "DejaVuSans-Bold.ttf")
     try:
         pdfmetrics.registerFont(TTFont("DejaVu", font_path))
+        pdfmetrics.registerFont(TTFont("DejaVu-Bold", font_path_bold))
         FONT = "DejaVu"
-    except:
-        FONT = "Helvetica"  # fallback (no crash)
+        FONT_BOLD = "DejaVu-Bold"
+    except Exception:
+        FONT = "Helvetica"
+        FONT_BOLD = "Helvetica-Bold"
 
-    # TITLE + DATE
-    story.append(Paragraph("Equipment Management Report", styles["Title"]))
-    story.append(Spacer(1, 10))
+    # ── Styles ────────────────────────────────────────────────────────────────
+    styles = getSampleStyleSheet()
 
-    story.append(
-        Paragraph(f"Date: {datetime.now().strftime('%d %b %Y')}", styles["Normal"])
+    def S(name, **kw):
+        return ParagraphStyle(name, **kw)
+
+    title_style = S(
+        "RPT_Title",
+        fontSize=16,
+        textColor=TEXT_DARK,
+        alignment=TA_CENTER,
+        fontName=FONT_BOLD,
+        spaceAfter=2,
     )
-    story.append(Spacer(1, 25))
+    sub_style = S(
+        "RPT_Sub", fontSize=9, textColor=LABEL_GREY, alignment=TA_CENTER, spaceAfter=4
+    )
+    section_style = S(
+        "RPT_Section",
+        fontSize=11,
+        textColor=DARK_NAVY,
+        fontName=FONT_BOLD,
+        spaceBefore=10,
+        spaceAfter=4,
+    )
+    normal_style = S("RPT_Normal", fontSize=9, textColor=TEXT_DARK)
+    bold_style = S("RPT_Bold", fontSize=9, textColor=TEXT_DARK, fontName=FONT_BOLD)
+    info_label = S("RPT_InfoLbl", fontSize=8, textColor=LABEL_GREY)
+    info_value = S("RPT_InfoVal", fontSize=9, textColor=TEXT_DARK, fontName=FONT_BOLD)
+    total_style = S("RPT_Total", fontSize=10, textColor=TEXT_DARK, fontName=FONT_BOLD)
 
-    # 1. EQUIPMENT LIST
-    story.append(Paragraph("Equipment List", styles["Heading2"]))
-    story.append(Spacer(1, 10))
-
+    # ── Fetch data ────────────────────────────────────────────────────────────
     eq_stmt = select(Equipment).where(Equipment.is_deleted == False)
     eq_result = await db.execute(eq_stmt)
     equipments = eq_result.scalars().all()
-
-    eq_data = [["#", "ID", "Code", "Name", "Condition", "Project"]]
-
-    for i, e in enumerate(equipments, start=1):
-        eq_data.append(
-            [
-                str(i),
-                str(e.id),
-                e.equipment_code,
-                e.equipment_name,
-                e.condition.value if e.condition else "-",
-                str(e.project_id) if e.project_id else "-",
-            ]
-        )
-
-    eq_table = Table(eq_data, colWidths=[30, 40, 90, 140, 70, 70], repeatRows=1)
-    eq_table.setStyle(
-        TableStyle(
-            [
-                ("FONTNAME", (0, 0), (-1, -1), FONT),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkblue),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                (
-                    "ROWBACKGROUNDS",
-                    (0, 1),
-                    (-1, -1),
-                    [colors.whitesmoke, colors.lightgrey],
-                ),
-            ]
-        )
-    )
-
-    story.append(eq_table)
-    story.append(Spacer(1, 25))
-
-    # MAINTENANCE
-    story.append(Paragraph("Maintenance History", styles["Heading2"]))
-    story.append(Spacer(1, 10))
 
     m_stmt = select(EquipmentMaintenance)
     m_result = await db.execute(m_stmt)
     maint = m_result.scalars().all()
 
-    m_data = [["Equip ID", "Description", "Date", "Cost"]]
-    total_maint_cost = 0
-
-    for m in maint:
-        cost = float(m.cost or 0)
-        total_maint_cost += cost
-
-        m_data.append(
-            [
-                str(m.equipment_id),
-                m.description,
-                str(m.maintenance_date),
-                f"₹ {cost:,.2f}" if FONT == "DejaVu" else f"{cost:,.2f}",
-            ]
-        )
-
-    m_table = Table(m_data, colWidths=[60, 150, 100, 90], repeatRows=1)
-    m_table.setStyle(
-        TableStyle(
-            [
-                ("FONTNAME", (0, 0), (-1, -1), FONT),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkgreen),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ("ALIGN", (0, 0), (-2, -1), "CENTER"),
-                ("ALIGN", (-1, 1), (-1, -1), "RIGHT"),
-                (
-                    "ROWBACKGROUNDS",
-                    (0, 1),
-                    (-1, -1),
-                    [colors.whitesmoke, colors.lightgrey],
-                ),
-            ]
-        )
-    )
-
-    story.append(m_table)
-    story.append(Spacer(1, 10))
-
-    story.append(
-        Paragraph(
-            f"Total Maintenance Cost: ₹ {total_maint_cost:,.2f}", styles["Normal"]
-        )
-    )
-
-    story.append(Spacer(1, 25))
-
-    # 3. RENTAL
-    story.append(Paragraph("Rental History", styles["Heading2"]))
-    story.append(Spacer(1, 10))
-
     r_stmt = select(EquipmentRental)
     r_result = await db.execute(r_stmt)
     rentals = r_result.scalars().all()
 
-    r_data = [["Equip ID", "Client", "Start", "End", "Cost"]]
-    total_rental_cost = 0
+    total_maint_cost = sum(float(m.cost or 0) for m in maint)
+    total_rental_cost = sum(float(r.rental_cost or 0) for r in rentals)
+    grand_total = total_maint_cost + total_rental_cost
 
+    now_str = datetime.now().strftime("%d %b %Y")
+    now_ts = datetime.now().strftime("%d/%m/%Y  %I:%M %p UTC")
+
+    # ── Common table style helper ─────────────────────────────────────────────
+    def base_table_style(hdr_color):
+        return TableStyle(
+            [
+                # Header row
+                ("BACKGROUND", (0, 0), (-1, 0), hdr_color),
+                ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
+                ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
+                ("FONTSIZE", (0, 0), (-1, 0), 8),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("TOPPADDING", (0, 0), (-1, 0), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                # Data rows
+                ("FONTNAME", (0, 1), (-1, -1), FONT),
+                ("FONTSIZE", (0, 1), (-1, -1), 8),
+                ("TEXTCOLOR", (0, 1), (-1, -1), TEXT_DARK),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
+                ("TOPPADDING", (0, 1), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
+                # Grid
+                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("LINEBELOW", (0, 0), (-1, 0), 1.5, hdr_color),
+                ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+            ]
+        )
+
+    # ── Story ─────────────────────────────────────────────────────────────────
+    story = []
+
+    # Title block
+    story.append(Paragraph("Equipment Management Report", title_style))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(f"Pune, Maharashtra &nbsp;|&nbsp; {now_str}", sub_style))
+    story.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=12))
+
+    # ── Info band (location / phone / email / website) ────────────────────────
+    info_data = [
+        [
+            Paragraph("Pune, Maharashtra", info_value),
+            Paragraph("+91 9999999999", info_value),
+            Paragraph("info@infrapilot.com", info_value),
+            Paragraph("www.infrapilot.com", info_value),
+        ]
+    ]
+    info_table = Table(info_data, colWidths=[130, 110, 150, 130])
+    info_table.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FAFAFA")),
+            ]
+        )
+    )
+    story.append(info_table)
+    story.append(Spacer(1, 14))
+
+    # ── SUMMARY box ───────────────────────────────────────────────────────────
+    story.append(
+        Paragraph(
+            "SUMMARY",
+            S(
+                "SumHdr",
+                fontSize=10,
+                textColor=DARK_NAVY,
+                fontName=FONT_BOLD,
+                spaceBefore=4,
+                spaceAfter=6,
+            ),
+        )
+    )
+
+    good_count = sum(
+        1 for e in equipments if e.condition and e.condition.value == "GOOD"
+    )
+    poor_count = sum(
+        1 for e in equipments if e.condition and e.condition.value != "GOOD"
+    )
+
+    summary_data = [
+        [
+            Paragraph("Total Equipment", info_label),
+            Paragraph("Good Condition", info_label),
+            Paragraph("Maintenance Cost", info_label),
+            Paragraph("Rental Cost", info_label),
+            Paragraph("Grand Total", info_label),
+        ],
+        [
+            Paragraph(str(len(equipments)), bold_style),
+            Paragraph(str(good_count), bold_style),
+            Paragraph(f"Rs. {total_maint_cost:,.0f}", bold_style),
+            Paragraph(f"Rs. {total_rental_cost:,.0f}", bold_style),
+            Paragraph(f"Rs. {grand_total:,.0f}", bold_style),
+        ],
+    ]
+    sum_table = Table(summary_data, colWidths=[95, 95, 110, 110, 110])
+    sum_table.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+                # Highlight last column (Grand Total)
+                ("BACKGROUND", (4, 0), (4, -1), colors.HexColor("#FFF8E1")),
+            ]
+        )
+    )
+    story.append(sum_table)
+    story.append(Spacer(1, 18))
+
+    # ── EQUIPMENT DETAILS ─────────────────────────────────────────────────────
+    story.append(
+        Paragraph(
+            "EQUIPMENT DETAILS",
+            S(
+                "SH2",
+                fontSize=10,
+                textColor=DARK_NAVY,
+                fontName=FONT_BOLD,
+                spaceAfter=6,
+            ),
+        )
+    )
+
+    eq_data = [["#", "ID", "Code", "Name", "Condition", "Project"]]
+    for i, e in enumerate(equipments, 1):
+        cond = e.condition.value if e.condition else "-"
+        eq_data.append(
+            [
+                str(i),
+                str(e.id),
+                e.equipment_code or "-",
+                e.equipment_name or "-",
+                cond,
+                str(e.project_id) if e.project_id else "-",
+            ]
+        )
+
+    # Status coloring for condition column (index 4)
+    eq_style = base_table_style(TABLE_HDR)
+    for row_i, e in enumerate(equipments, 1):
+        cond = e.condition.value if e.condition else ""
+        if cond == "GOOD":
+            clr = colors.HexColor("#E8F5E9")
+            txt = colors.HexColor("#2E7D32")
+        elif cond in ("POOR", "DAMAGED"):
+            clr = colors.HexColor("#FFEBEE")
+            txt = colors.HexColor("#C62828")
+        else:
+            clr = ROW_WHITE
+            txt = TEXT_DARK
+        eq_style.add("BACKGROUND", (4, row_i), (4, row_i), clr)
+        eq_style.add("TEXTCOLOR", (4, row_i), (4, row_i), txt)
+        eq_style.add("FONTNAME", (4, row_i), (4, row_i), FONT_BOLD)
+
+    eq_table = Table(eq_data, colWidths=[25, 35, 95, 160, 80, 65], repeatRows=1)
+    eq_table.setStyle(eq_style)
+    story.append(eq_table)
+    story.append(Spacer(1, 20))
+
+    # ── MAINTENANCE HISTORY ───────────────────────────────────────────────────
+    story.append(
+        Paragraph(
+            "MAINTENANCE HISTORY",
+            S(
+                "SH3",
+                fontSize=10,
+                textColor=DARK_NAVY,
+                fontName=FONT_BOLD,
+                spaceAfter=6,
+            ),
+        )
+    )
+
+    m_data = [["Equip ID", "Description", "Date", "Cost (Rs.)"]]
+    for m in maint:
+        cost = float(m.cost or 0)
+        m_data.append(
+            [
+                str(m.equipment_id),
+                m.description or "-",
+                str(m.maintenance_date),
+                f"{cost:,.2f}",
+            ]
+        )
+
+    # Total row
+    m_data.append(["", "TOTAL", "", f"{total_maint_cost:,.2f}"])
+
+    m_style = base_table_style(GREEN_HDR)
+    last = len(m_data) - 1
+    m_style.add("BACKGROUND", (0, last), (-1, last), colors.HexColor("#E8F5E9"))
+    m_style.add("FONTNAME", (0, last), (-1, last), FONT_BOLD)
+    m_style.add("ALIGN", (-1, 1), (-1, last), "RIGHT")
+
+    m_table = Table(m_data, colWidths=[65, 220, 110, 100], repeatRows=1)
+    m_table.setStyle(m_style)
+    story.append(m_table)
+    story.append(Spacer(1, 20))
+
+    # ── RENTAL HISTORY ────────────────────────────────────────────────────────
+    story.append(
+        Paragraph(
+            "RENTAL HISTORY",
+            S(
+                "SH4",
+                fontSize=10,
+                textColor=DARK_NAVY,
+                fontName=FONT_BOLD,
+                spaceAfter=6,
+            ),
+        )
+    )
+
+    r_data = [["Equip ID", "Client", "Start", "End", "Cost (Rs.)"]]
     for r in rentals:
         cost = float(r.rental_cost or 0)
-        total_rental_cost += cost
-
         r_data.append(
             [
                 str(r.equipment_id),
-                r.client_name,
+                r.client_name or "-",
                 str(r.start_date),
                 str(r.end_date),
-                f"₹ {cost:,.2f}" if FONT == "DejaVu" else f"{cost:,.2f}",
+                f"{cost:,.2f}",
             ]
         )
 
-    r_table = Table(r_data, colWidths=[60, 150, 90, 90, 90], repeatRows=1)
-    r_table.setStyle(
-        TableStyle(
+    r_data.append(["", "", "TOTAL", "", f"{total_rental_cost:,.2f}"])
+
+    r_style = base_table_style(RED_HDR)
+    last_r = len(r_data) - 1
+    r_style.add("BACKGROUND", (0, last_r), (-1, last_r), colors.HexColor("#FFEBEE"))
+    r_style.add("FONTNAME", (0, last_r), (-1, last_r), FONT_BOLD)
+    r_style.add("ALIGN", (-1, 1), (-1, last_r), "RIGHT")
+
+    r_table = Table(r_data, colWidths=[65, 180, 80, 80, 95], repeatRows=1)
+    r_table.setStyle(r_style)
+    story.append(r_table)
+    story.append(Spacer(1, 20))
+
+    # ── ALERTS (low-stock / out-of-stock style for poor-condition equipment) ──
+    poor_equip = [
+        e
+        for e in equipments
+        if e.condition and e.condition.value in ("POOR", "DAMAGED", "OUT_OF_SERVICE")
+    ]
+
+    if poor_equip:
+        story.append(
+            Paragraph(
+                "ALERTS",
+                S(
+                    "AlertHdr",
+                    fontSize=10,
+                    textColor=DARK_NAVY,
+                    fontName=FONT_BOLD,
+                    spaceAfter=6,
+                ),
+            )
+        )
+
+        alert_data = []
+        for e in poor_equip:
+            cond = e.condition.value if e.condition else "-"
+            bg = RED_LIGHT if cond in ("DAMAGED", "OUT_OF_SERVICE") else ORANGE_LIGHT
+            lbl = Paragraph(
+                cond.replace("_", " "),
+                S(
+                    f"AL_{e.id}",
+                    fontSize=8,
+                    textColor=colors.HexColor("#C62828"),
+                    fontName=FONT_BOLD,
+                ),
+            )
+            name = Paragraph(
+                e.equipment_name or "-",
+                S(f"AN_{e.id}", fontSize=8, textColor=TEXT_DARK),
+            )
+            alert_data.append([lbl, name])
+
+        alert_table = Table(alert_data, colWidths=[110, 300])
+        a_style = TableStyle(
             [
                 ("FONTNAME", (0, 0), (-1, -1), FONT),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkred),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ("ALIGN", (0, 0), (-2, -1), "CENTER"),
-                ("ALIGN", (-1, 1), (-1, -1), "RIGHT"),
-                (
-                    "ROWBACKGROUNDS",
-                    (0, 1),
-                    (-1, -1),
-                    [colors.whitesmoke, colors.lightgrey],
-                ),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("ALIGN", (0, 0), (0, -1), "LEFT"),
+                ("ALIGN", (1, 0), (1, -1), "LEFT"),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
             ]
         )
-    )
+        for row_i, e in enumerate(poor_equip):
+            cond = e.condition.value if e.condition else ""
+            bg = RED_LIGHT if cond in ("DAMAGED", "OUT_OF_SERVICE") else ORANGE_LIGHT
+            a_style.add("BACKGROUND", (0, row_i), (-1, row_i), bg)
+        alert_table.setStyle(a_style)
+        story.append(alert_table)
+        story.append(Spacer(1, 20))
 
-    story.append(r_table)
-    story.append(Spacer(1, 10))
+    # ── HEADER & FOOTER drawn on every page ───────────────────────────────────
+    def draw_header_footer(canvas, doc):
+        canvas.saveState()
+        w, h = letter
 
-    story.append(
-        Paragraph(f"Total Rental Cost: ₹ {total_rental_cost:,.2f}", styles["Normal"])
-    )
+        # ── Top header band ──────────────────────────────────────────────────
+        band_h = 52
+        canvas.setFillColor(DARK_NAVY)
+        canvas.rect(0, h - band_h, w, band_h, fill=1, stroke=0)
 
-    story.append(Spacer(1, 25))
+        # Logo text: "INFRA" white + "PILOT" orange
+        canvas.setFont(FONT_BOLD, 18)
+        canvas.setFillColor(colors.white)
+        canvas.drawString(36, h - 30, "INFRA")
+        canvas.setFillColor(ORANGE)
+        canvas.drawString(98, h - 30, "PILOT")
 
-    # SUMMARY
-    story.append(Paragraph("Summary", styles["Heading2"]))
-    story.append(Spacer(1, 10))
+        # Tagline
+        canvas.setFont(FONT, 7)
+        canvas.setFillColor(colors.HexColor("#AAAACC"))
+        canvas.drawString(36, h - 44, "Construction Equipment Management")
 
-    story.append(Paragraph(f"Total Equipment: {len(equipments)}", styles["Normal"]))
-    story.append(
-        Paragraph(
-            f"Grand Total Cost: ₹ {(total_rental_cost + total_maint_cost):,.2f}",
-            styles["Normal"],
+        # REPORT button (orange pill)
+        btn_x, btn_y, btn_w, btn_h2 = w - 120, h - 46, 84, 22
+        canvas.setFillColor(ORANGE)
+        canvas.roundRect(btn_x, btn_y, btn_w, btn_h2, 4, fill=1, stroke=0)
+        canvas.setFont(FONT_BOLD, 9)
+        canvas.setFillColor(colors.white)
+        canvas.drawCentredString(btn_x + btn_w / 2, btn_y + 6, "REPORT")
+
+        # Generated timestamp (top-right under button)
+        canvas.setFont(FONT, 7)
+        canvas.setFillColor(colors.HexColor("#AAAACC"))
+        canvas.drawRightString(w - 36, h - 58, f"Generated: {now_ts}")
+
+        # ── Footer ───────────────────────────────────────────────────────────
+        canvas.setFillColor(colors.HexColor("#EEEEEE"))
+        canvas.rect(0, 0, w, 28, fill=1, stroke=0)
+        canvas.setFont(FONT, 8)
+        canvas.setFillColor(LABEL_GREY)
+        canvas.drawCentredString(
+            w / 2, 10, "Generated by Infra Pilot System  •  Confidential"
         )
-    )
+        canvas.drawRightString(w - 36, 10, f"Page {doc.page}")
 
-    # FOOTER
-    def add_footer(canvas, doc):
-        canvas.setFont("Helvetica", 9)
-        canvas.drawString(180, 20, "Generated by Equipment Management System")
+        canvas.restoreState()
 
-    # BUILD PDF
-    doc.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
-
+    # ── Build ─────────────────────────────────────────────────────────────────
+    doc.build(story, onFirstPage=draw_header_footer, onLaterPages=draw_header_footer)
     buffer.seek(0)
 
+    fname = f"equipment_report_{datetime.now().strftime('%Y%m%d')}.pdf"
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"attachment; filename=equipment_report_{datetime.now().strftime('%Y%m%d')}.pdf"
-        },
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
     )
 
 
@@ -1654,197 +1910,549 @@ async def equipment_excel_report(
     import io
     from datetime import datetime
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.formatting.rule import CellIsRule
     from fastapi.responses import StreamingResponse
 
+    # ── Fetch data ─────────────────────────────────────────────────────────────
+    stmt = select(Equipment).where(Equipment.is_deleted == False)
+    equipments = (await db.execute(stmt)).scalars().all()
+
+    m_result = await db.execute(select(EquipmentMaintenance))
+    maint = m_result.scalars().all()
+
+    r_result = await db.execute(select(EquipmentRental))
+    rentals = r_result.scalars().all()
+
+    total_maint_cost = sum(float(m.cost or 0) for m in maint)
+    total_rental_cost = sum(float(r.rental_cost or 0) for r in rentals)
+    grand_total = total_maint_cost + total_rental_cost
+
+    now_str = datetime.now().strftime("%d %b %Y  %I:%M %p")
+
+    # ── Colors ─────────────────────────────────────────────────────────────────
+    C_NAVY = "1A2B4A"
+    C_ORANGE = "F5A623"
+    C_WHITE = "FFFFFF"
+    C_LIGHT = "F5F5F5"
+    C_ALT = "EFF3FB"
+    C_GREEN_BG = "E8F5E9"
+    C_GREEN_FG = "2E7D32"
+    C_GREEN_HDR = "2E7D32"
+    C_RED_BG = "FFEBEE"
+    C_RED_FG = "C62828"
+    C_RED_HDR = "C62828"
+    C_AMBER_BG = "FFF8E1"
+    C_AMBER_FG = "E65100"
+    C_BORDER = "CCCCCC"
+
+    CURRENCY_FMT = '"Rs." #,##0.00'
+    INT_FMT = "#,##0"
+    DEC_FMT = "#,##0.00"
+
+    # ── Style helpers ──────────────────────────────────────────────────────────
+    def fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    def font(bold=False, color="333333", size=10, italic=False):
+        return Font(name="Arial", bold=bold, color=color, size=size, italic=italic)
+
+    def align(h="center", v="center", wrap=False):
+        return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+    def border():
+        s = Side(style="thin", color=C_BORDER)
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def thick_bottom_border():
+        return Border(bottom=Side(style="medium", color=C_NAVY))
+
+    def style_header_row(ws, row_num, num_cols, bg_color):
+        for col in range(1, num_cols + 1):
+            cell = ws.cell(row=row_num, column=col)
+            cell.font = font(bold=True, color=C_WHITE, size=9)
+            cell.fill = fill(bg_color)
+            cell.alignment = align("center", wrap=True)
+            cell.border = border()
+        ws.row_dimensions[row_num].height = 28
+
+    def add_title_banner(ws, num_cols, title_text):
+        """Rows 1-3: title banner, generated date, spacer."""
+        ws.merge_cells(f"A1:{get_column_letter(num_cols)}1")
+        ws["A1"] = f"INFRAPILOT — {title_text}"
+        ws["A1"].font = font(bold=True, color=C_WHITE, size=13)
+        ws["A1"].fill = fill(C_NAVY)
+        ws["A1"].alignment = align("center")
+        ws.row_dimensions[1].height = 30
+
+        ws.merge_cells(f"A2:{get_column_letter(num_cols)}2")
+        ws["A2"] = f"Generated: {now_str}"
+        ws["A2"].font = font(color=C_WHITE, size=9, italic=True)
+        ws["A2"].fill = fill(C_ORANGE)
+        ws["A2"].alignment = align("right")
+        ws.row_dimensions[2].height = 16
+
+        ws.row_dimensions[3].height = 8  # spacer
+
+    def add_section_label(ws, row, num_cols, label):
+        ws.merge_cells(f"A{row}:{get_column_letter(num_cols)}{row}")
+        ws[f"A{row}"] = label
+        ws[f"A{row}"].font = font(bold=True, color=C_NAVY, size=10)
+        ws[f"A{row}"].fill = fill(C_LIGHT)
+        ws[f"A{row}"].alignment = align("left")
+        ws[f"A{row}"].border = thick_bottom_border()
+        ws.row_dimensions[row].height = 22
+
+    def add_total_row(
+        ws, row_num, num_cols, label_col, sum_cols, data_start, data_end, bg=C_NAVY
+    ):
+        for col in range(1, num_cols + 1):
+            cell = ws.cell(row=row_num, column=col)
+            cell.font = font(bold=True, color=C_WHITE, size=9)
+            cell.fill = fill(bg)
+            cell.alignment = align("center")
+            cell.border = border()
+            if col == label_col:
+                cell.value = "TOTAL"
+            elif col in sum_cols:
+                col_letter = get_column_letter(col)
+                cell.value = f"=SUM({col_letter}{data_start}:{col_letter}{data_end})"
+                cell.number_format = CURRENCY_FMT
+                cell.alignment = align("right")
+        ws.row_dimensions[row_num].height = 22
+
+    def set_col_widths(ws, widths):
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # WORKBOOK
+    # ══════════════════════════════════════════════════════════════════════════
     wb = Workbook()
 
-    # COMMON STYLES
-    header_fill = PatternFill(
-        start_color="4F81BD", end_color="4F81BD", fill_type="solid"
+    # ── SHEET 1: SUMMARY (first sheet) ────────────────────────────────────────
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+
+    # Summary sheet uses 12 columns (A:L) for KPI block
+    NUM_COLS_SUM = 12
+    add_title_banner(ws_sum, NUM_COLS_SUM, "Equipment Management Report")
+
+    good_count = sum(
+        1 for e in equipments if e.condition and e.condition.value == "GOOD"
     )
-    header_font = Font(bold=True, color="FFFFFF")
+    dmg_count = sum(
+        1 for e in equipments if e.condition and e.condition.value == "DAMAGED"
+    )
 
-    currency_format = '"₹"#,##0.00'
+    kpi_ext = [
+        ("Total Equipment", len(equipments), None),
+        ("Good Condition", good_count, None),
+        ("Damaged / Needs Repair", dmg_count, None),
+        ("Total Maintenance Cost", total_maint_cost, "Rs."),
+        ("Total Rental Cost", total_rental_cost, "Rs."),
+        ("Grand Total", grand_total, "Rs."),
+    ]
 
-    # SHEET 1: EQUIPMENT
-    ws = wb.active
-    ws.title = "Equipment"
+    # 6 KPIs × 2 cols each = 12 cols (A:L)
+    # Col widths: each KPI pair = 2 cols of width 14 each → total 12 cols
+    # A=14,B=14,C=14,D=14,E=14,F=14,G=16,H=16,I=16,J=16,K=16,L=16
+    kpi_col_widths = [14, 14, 14, 14, 14, 14, 18, 18, 16, 16, 16, 16]
+    for i, w in enumerate(kpi_col_widths, start=1):
+        ws_sum.column_dimensions[get_column_letter(i)].width = w
 
-    headers = [
+    # Helper: apply style to ALL cells in a merged range (not just top-left)
+    def style_merged(
+        ws,
+        start_col,
+        end_col,
+        row,
+        value=None,
+        fnt=None,
+        fll=None,
+        aln=None,
+        brd=None,
+        fmt=None,
+    ):
+        for col in range(start_col, end_col + 1):
+            c = ws.cell(row=row, column=col)
+            if fll:
+                c.fill = fll
+            if fnt:
+                c.font = fnt
+            if aln:
+                c.alignment = aln
+            if brd:
+                c.border = brd
+            if fmt:
+                c.number_format = fmt
+        # Value only on top-left
+        tl = ws.cell(row=row, column=start_col)
+        if value is not None:
+            tl.value = value
+
+    # Column number pairs for 6 KPIs (1-indexed)
+    kpi_col_nums = [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12)]
+
+    for row in [4, 5]:
+        ws_sum.row_dimensions[row].height = 24
+
+    for (sc, ec), (label, val, unit) in zip(kpi_col_nums, kpi_ext):
+        ws_sum.merge_cells(start_row=4, start_column=sc, end_row=4, end_column=ec)
+        style_merged(
+            ws_sum,
+            sc,
+            ec,
+            4,
+            value=label,
+            fnt=font(color="666666", size=8),
+            fll=fill(C_LIGHT),
+            aln=align("center"),
+            brd=border(),
+        )
+
+        ws_sum.merge_cells(start_row=5, start_column=sc, end_row=5, end_column=ec)
+        display = f"Rs. {val:,.0f}" if unit == "Rs." else str(val)
+        style_merged(
+            ws_sum,
+            sc,
+            ec,
+            5,
+            value=display,
+            fnt=font(bold=True, color=C_NAVY, size=12),
+            fll=fill(C_WHITE),
+            aln=align("center"),
+            brd=border(),
+        )
+
+    ws_sum.row_dimensions[6].height = 14
+
+    # COST BREAKDOWN section — spans full 12 cols
+    add_section_label(ws_sum, 7, NUM_COLS_SUM, "COST BREAKDOWN")
+
+    # Table uses cols 1-4 (A:D) but Description col merges B:C for more space
+    # Headers: A=Category, B:C=Description (merged), D=Count/Units, E=Amount
+    # Use 5 logical columns: A, B+C merged, D, E
+    TABLE_COLS = 5  # A B C D E  (B+C merged for description)
+
+    def style_table_row(ws, row_num, values, bgs, fgs, bold=False, num_fmts=None):
+        # values = [cat, desc, "", count, amt]  (col C always empty — B:C merged)
+        for c_i, val in enumerate(values, start=1):
+            c = ws.cell(row=row_num, column=c_i, value=val)
+            c.font = font(bold=bold, color=fgs, size=9)
+            c.fill = fill(bgs)
+            c.alignment = align("left" if c_i in (1, 2) else "center")
+            c.border = border()
+            if num_fmts and c_i in num_fmts:
+                c.number_format = num_fmts[c_i]
+                c.alignment = align("right")
+
+    # Table header row 8: merge B:C for Description
+    tbl_hdr_data = [
+        ("A", 1, 1, "Category"),
+        ("B", 2, 3, "Description"),
+        ("D", 4, 4, "Count / Units"),
+        ("E", 5, 5, "Amount (Rs.)"),
+    ]
+    for _, sc, ec, hdr in tbl_hdr_data:
+        if sc != ec:
+            ws_sum.merge_cells(start_row=8, start_column=sc, end_row=8, end_column=ec)
+        style_merged(
+            ws_sum,
+            sc,
+            ec,
+            8,
+            value=hdr,
+            fnt=font(bold=True, color=C_WHITE, size=9),
+            fll=fill(C_NAVY),
+            aln=align("center"),
+            brd=border(),
+        )
+    ws_sum.row_dimensions[8].height = 26
+
+    sum_rows = [
+        ("Equipment", "Total registered equipment", len(equipments), None),
+        ("Equipment", "Good condition", good_count, None),
+        ("Equipment", "Damaged / needs maintenance", dmg_count, None),
+        ("Maintenance", "Total maintenance records", len(maint), None),
+        ("Maintenance", "Total maintenance cost", None, total_maint_cost),
+        ("Rental", "Total rental records", len(rentals), None),
+        ("Rental", "Total rental revenue", None, total_rental_cost),
+        ("Grand Total", "Maintenance + Rental", None, grand_total),
+    ]
+
+    for r_i, (cat, desc, count, amt) in enumerate(sum_rows, start=9):
+        is_grand = cat == "Grand Total"
+        bg = C_NAVY if is_grand else (C_WHITE if r_i % 2 == 1 else C_ALT)
+        fg = C_WHITE if is_grand else "333333"
+
+        # Merge B:C for description
+        ws_sum.merge_cells(start_row=r_i, start_column=2, end_row=r_i, end_column=3)
+
+        from openpyxl.cell.cell import MergedCell
+
+        row_data = [
+            cat,
+            desc,
+            "",
+            count if count is not None else "",
+            amt if amt is not None else "",
+        ]
+
+        for c_i, val in enumerate(row_data, start=1):
+            cell = ws_sum.cell(row=r_i, column=c_i)
+
+            # Skip merged read-only cells
+            if isinstance(cell, MergedCell):
+                continue
+
+            cell.value = val
+            cell.font = font(bold=is_grand, color=fg, size=9)
+            cell.fill = fill(bg)
+            cell.alignment = align("left" if c_i in (1, 2, 3) else "center")
+            cell.border = border()
+
+            if c_i == 5 and amt is not None:
+                cell.number_format = CURRENCY_FMT
+                cell.alignment = align("right")
+
+        ws_sum.row_dimensions[r_i].height = 18
+
+    # ── SHEET 2: EQUIPMENT ────────────────────────────────────────────────────
+    ws = wb.create_sheet("Equipment")
+    NUM_COLS_EQ = 10
+
+    add_title_banner(ws, NUM_COLS_EQ, "Equipment List")
+    add_section_label(ws, 4, NUM_COLS_EQ, "EQUIPMENT DETAILS")
+
+    eq_headers = [
+        "#",
         "ID",
         "Code",
         "Name",
         "Condition",
         "Project",
-        "Working Hours",
-        "Fuel Used",
-        "Rental Cost",
+        "Working Hrs",
+        "Fuel Used (L)",
+        "Rental Cost (Rs.)",
         "Status",
     ]
-    ws.append(headers)
+    for col_i, h in enumerate(eq_headers, 1):
+        c = ws.cell(row=5, column=col_i, value=h)
+        c.font = font(bold=True, color=C_WHITE, size=9)
+        c.fill = fill(C_NAVY)
+        c.alignment = align("center", wrap=True)
+        c.border = border()
+    ws.row_dimensions[5].height = 30
 
-    for col in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
+    DATA_START_EQ = 6
+    for i, e in enumerate(equipments, 1):
+        cond = e.condition.value if e.condition else "-"
+        status = "Maintenance" if cond == "DAMAGED" else "Active"
+        bg = C_WHITE if i % 2 == 1 else C_ALT
 
-    stmt = select(Equipment).where(Equipment.is_deleted == False)
-    result = await db.execute(stmt)
-    equipments = result.scalars().all()
+        row_vals = [
+            i,
+            e.id,
+            e.equipment_code,
+            e.equipment_name,
+            cond,
+            e.project_id or "-",
+            float(e.working_hours or 0),
+            float(e.fuel_used or 0),
+            float(e.rental_cost or 0),
+            status,
+        ]
+        row_num = DATA_START_EQ + i - 1
+        for col_i, val in enumerate(row_vals, 1):
+            c = ws.cell(row=row_num, column=col_i, value=val)
+            c.font = font(size=9, color="333333")
+            c.fill = fill(bg)
+            c.alignment = align("center")
+            c.border = border()
 
-    for e in equipments:
-        ws.append(
-            [
-                e.id,
-                e.equipment_code,
-                e.equipment_name,
-                e.condition.value if e.condition else "-",
-                e.project_id or "-",
-                float(e.working_hours or 0),
-                float(e.fuel_used or 0),
-                float(e.rental_cost or 0),
-                (
-                    "Maintenance"
-                    if e.condition and e.condition.value == "DAMAGED"
-                    else "Active"
-                ),
-            ]
-        )
+            if col_i == 7:
+                c.number_format = DEC_FMT
+            if col_i == 8:
+                c.number_format = DEC_FMT
+            if col_i == 9:
+                c.number_format = CURRENCY_FMT
+                c.alignment = align("right")
 
-    # 🔹 Freeze + Filter
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+            # Condition coloring
+            if col_i == 5:
+                if cond == "GOOD":
+                    c.fill = fill(C_GREEN_BG)
+                    c.font = font(bold=True, color=C_GREEN_FG, size=9)
+                elif cond == "DAMAGED":
+                    c.fill = fill(C_RED_BG)
+                    c.font = font(bold=True, color=C_RED_FG, size=9)
 
-    # 🔹 Formatting
-    for row in ws.iter_rows(min_row=2):
-        # Condition coloring
-        condition_cell = row[3]
-        if condition_cell.value == "DAMAGED":
-            condition_cell.fill = PatternFill(start_color="FFCCCC", fill_type="solid")
-        elif condition_cell.value == "GOOD":
-            condition_cell.fill = PatternFill(start_color="CCFFCC", fill_type="solid")
+            # Status coloring
+            if col_i == 10:
+                if status == "Maintenance":
+                    c.fill = fill(C_RED_BG)
+                    c.font = font(bold=True, color=C_RED_FG, size=9)
+                else:
+                    c.fill = fill(C_GREEN_BG)
+                    c.font = font(bold=True, color=C_GREEN_FG, size=9)
 
-        # Cost formatting
-        cost_cell = row[7]
-        cost_cell.number_format = currency_format
-        cost_cell.alignment = Alignment(horizontal="right")
+        ws.row_dimensions[row_num].height = 18
 
-    # SHEET 2: MAINTENANCE
-    ws2 = wb.create_sheet(title="Maintenance")
+    data_end_eq = DATA_START_EQ + len(equipments) - 1
+    add_total_row(ws, data_end_eq + 1, NUM_COLS_EQ, 1, {9}, DATA_START_EQ, data_end_eq)
 
-    headers2 = ["Equip ID", "Description", "Date", "Cost"]
-    ws2.append(headers2)
+    ws.freeze_panes = f"A{DATA_START_EQ}"
+    ws.auto_filter.ref = f"A5:{get_column_letter(NUM_COLS_EQ)}{data_end_eq}"
+    set_col_widths(ws, [5, 6, 14, 24, 12, 10, 12, 14, 18, 14])
 
-    for col in range(1, len(headers2) + 1):
-        cell = ws2.cell(row=1, column=col)
-        cell.font = header_font
-        cell.fill = PatternFill(start_color="228B22", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center")
+    # ── SHEET 3: MAINTENANCE ──────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Maintenance")
+    NUM_COLS_M = 5
 
-    m_stmt = select(EquipmentMaintenance)
-    m_result = await db.execute(m_stmt)
-    maint = m_result.scalars().all()
+    add_title_banner(ws2, NUM_COLS_M, "Maintenance History")
+    add_section_label(ws2, 4, NUM_COLS_M, "MAINTENANCE RECORDS")
 
-    total_maint_cost = 0
+    m_headers = ["#", "Equip ID", "Description", "Date", "Cost (Rs.)"]
+    for col_i, h in enumerate(m_headers, 1):
+        c = ws2.cell(row=5, column=col_i, value=h)
+        c.font = font(bold=True, color=C_WHITE, size=9)
+        c.fill = fill(C_GREEN_HDR)
+        c.alignment = align("center", wrap=True)
+        c.border = border()
+    ws2.row_dimensions[5].height = 28
 
-    for m in maint:
+    DATA_START_M = 6
+    for i, m in enumerate(maint, 1):
         cost = float(m.cost or 0)
-        total_maint_cost += cost
+        bg = C_WHITE if i % 2 == 1 else C_ALT
+        row_num = DATA_START_M + i - 1
+        for col_i, val in enumerate(
+            [i, m.equipment_id, m.description, str(m.maintenance_date), cost], 1
+        ):
+            c = ws2.cell(row=row_num, column=col_i, value=val)
+            c.font = font(size=9, color="333333")
+            c.fill = fill(bg)
+            c.alignment = align("center")
+            c.border = border()
+            if col_i == 3:
+                c.alignment = align("left")
+            if col_i == 5:
+                c.number_format = CURRENCY_FMT
+                c.alignment = align("right")
+        ws2.row_dimensions[row_num].height = 18
 
-        ws2.append(
-            [
-                m.equipment_id,
-                m.description,
-                str(m.maintenance_date),
-                cost,
-            ]
-        )
+    data_end_m = DATA_START_M + len(maint) - 1
+    add_total_row(
+        ws2,
+        data_end_m + 1,
+        NUM_COLS_M,
+        1,
+        {5},
+        DATA_START_M,
+        data_end_m,
+        bg=C_GREEN_HDR,
+    )
 
-    ws2.freeze_panes = "A2"
-    ws2.auto_filter.ref = ws2.dimensions
+    ws2.freeze_panes = f"A{DATA_START_M}"
+    ws2.auto_filter.ref = f"A5:{get_column_letter(NUM_COLS_M)}{data_end_m}"
+    set_col_widths(ws2, [5, 10, 40, 16, 18])
 
-    for row in ws2.iter_rows(min_row=2, min_col=4, max_col=4):
-        for cell in row:
-            cell.number_format = currency_format
-            cell.alignment = Alignment(horizontal="right")
+    # ── SHEET 4: RENTALS ──────────────────────────────────────────────────────
+    ws3 = wb.create_sheet("Rentals")
+    NUM_COLS_R = 6
 
-    # SHEET 3: RENTALS
-    ws3 = wb.create_sheet(title="Rentals")
+    add_title_banner(ws3, NUM_COLS_R, "Rental History")
+    add_section_label(ws3, 4, NUM_COLS_R, "RENTAL RECORDS")
 
-    headers3 = ["Equip ID", "Client", "Start", "End", "Cost"]
-    ws3.append(headers3)
+    r_headers = ["#", "Equip ID", "Client", "Start Date", "End Date", "Cost (Rs.)"]
+    for col_i, h in enumerate(r_headers, 1):
+        c = ws3.cell(row=5, column=col_i, value=h)
+        c.font = font(bold=True, color=C_WHITE, size=9)
+        c.fill = fill(C_RED_HDR)
+        c.alignment = align("center", wrap=True)
+        c.border = border()
+    ws3.row_dimensions[5].height = 28
 
-    for col in range(1, len(headers3) + 1):
-        cell = ws3.cell(row=1, column=col)
-        cell.font = header_font
-        cell.fill = PatternFill(start_color="8B0000", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center")
-
-    r_stmt = select(EquipmentRental)
-    r_result = await db.execute(r_stmt)
-    rentals = r_result.scalars().all()
-
-    total_rental_cost = 0
-
-    for r in rentals:
+    DATA_START_R = 6
+    for i, r in enumerate(rentals, 1):
         cost = float(r.rental_cost or 0)
-        total_rental_cost += cost
-
-        ws3.append(
+        bg = C_WHITE if i % 2 == 1 else C_ALT
+        row_num = DATA_START_R + i - 1
+        for col_i, val in enumerate(
             [
+                i,
                 r.equipment_id,
                 r.client_name,
                 str(r.start_date),
                 str(r.end_date),
                 cost,
-            ]
-        )
+            ],
+            1,
+        ):
+            c = ws3.cell(row=row_num, column=col_i, value=val)
+            c.font = font(size=9, color="333333")
+            c.fill = fill(bg)
+            c.alignment = align("center")
+            c.border = border()
+            if col_i == 3:
+                c.alignment = align("left")
+            if col_i == 6:
+                c.number_format = CURRENCY_FMT
+                c.alignment = align("right")
+        ws3.row_dimensions[row_num].height = 18
 
-    ws3.freeze_panes = "A2"
-    ws3.auto_filter.ref = ws3.dimensions
+    data_end_r = DATA_START_R + len(rentals) - 1
+    add_total_row(
+        ws3, data_end_r + 1, NUM_COLS_R, 1, {6}, DATA_START_R, data_end_r, bg=C_RED_HDR
+    )
 
-    for row in ws3.iter_rows(min_row=2, min_col=5, max_col=5):
-        for cell in row:
-            cell.number_format = currency_format
-            cell.alignment = Alignment(horizontal="right")
+    ws3.freeze_panes = f"A{DATA_START_R}"
+    ws3.auto_filter.ref = f"A5:{get_column_letter(NUM_COLS_R)}{data_end_r}"
+    set_col_widths(ws3, [5, 10, 28, 14, 14, 18])
 
-    # SHEET 4: SUMMARY
-    ws4 = wb.create_sheet(title="Summary")
+    # ── ALERTS sheet (damaged equipment) ──────────────────────────────────────
+    damaged = [e for e in equipments if e.condition and e.condition.value == "DAMAGED"]
+    if damaged:
+        ws_alert = wb.create_sheet("Alerts")
+        add_title_banner(ws_alert, 4, "Equipment Alerts")
 
-    ws4["A1"] = "Total Equipment"
-    ws4["B1"] = len(equipments)
+        ws_alert.merge_cells("A4:D4")
+        ws_alert["A4"] = "ALERTS — Equipment Needing Attention"
+        ws_alert["A4"].font = font(bold=True, color=C_WHITE, size=10)
+        ws_alert["A4"].fill = fill(C_RED_HDR)
+        ws_alert["A4"].alignment = align("center")
+        ws_alert.row_dimensions[4].height = 22
 
-    ws4["A2"] = "Total Maintenance Cost"
-    ws4["B2"] = total_maint_cost
+        for col_i, h in enumerate(["Status", "Equipment Name", "Code", "Condition"], 1):
+            c = ws_alert.cell(row=5, column=col_i, value=h)
+            c.font = font(bold=True, color=C_WHITE, size=9)
+            c.fill = fill(C_ORANGE)
+            c.alignment = align("center")
+            c.border = border()
+        ws_alert.row_dimensions[5].height = 24
 
-    ws4["A3"] = "Total Rental Cost"
-    ws4["B3"] = total_rental_cost
+        for r_i, e in enumerate(damaged, start=6):
+            for col_i, val in enumerate(
+                [
+                    "DAMAGED",
+                    e.equipment_name or "-",
+                    e.equipment_code or "-",
+                    "Needs Maintenance",
+                ],
+                1,
+            ):
+                c = ws_alert.cell(row=r_i, column=col_i, value=val)
+                c.font = font(bold=(col_i == 1), color=C_RED_FG, size=9)
+                c.fill = fill(C_RED_BG)
+                c.alignment = align("center")
+                c.border = border()
+            ws_alert.row_dimensions[r_i].height = 18
 
-    ws4["A4"] = "Grand Total"
-    ws4["B4"] = total_maint_cost + total_rental_cost
+        set_col_widths(ws_alert, [16, 28, 18, 20])
 
-    for row in range(1, 5):
-        ws4[f"A{row}"].font = Font(bold=True)
-        ws4[f"B{row}"].number_format = currency_format
-
-    # AUTO WIDTH
-    for sheet in wb.worksheets:
-        for column in sheet.columns:
-            max_length = 0
-            col_letter = column[0].column_letter
-
-            for cell in column:
-                try:
-                    if cell.value:
-                        max_length = max(max_length, len(str(cell.value)))
-                except:
-                    pass
-
-            sheet.column_dimensions[col_letter].width = max_length + 3
-
-    # SAVE
+    # ── Save & stream ──────────────────────────────────────────────────────────
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)

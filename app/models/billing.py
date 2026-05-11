@@ -45,6 +45,8 @@ class RABill(Base, TimestampMixin):
         nullable=True,
     )
 
+    quotation_id = Column( Integer, ForeignKey("quotation_master.id", ondelete="SET NULL"), nullable=True, unique=True, index=True, )
+
     status = Column(
         String(50),
         default="Draft"  # Draft → Submitted → Approved → Paid
@@ -52,3 +54,4 @@ class RABill(Base, TimestampMixin):
 
     project = relationship("Project")
     contractor = relationship("Contractor")
+    quotation = relationship("QuotationMaster", lazy="selectin")

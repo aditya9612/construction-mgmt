@@ -47,3 +47,4 @@ from app.models.master_data import MaterialMaster
 from app.models.messages import Message
 from app.models.settings import UserSettings
 from app.models.chat import ChatSession, ChatMember, ChatMessage, MessageRead, MessageReaction
+from app.models.quotation import QuotationItem, QuotationMaster, QuotationStatus

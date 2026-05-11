@@ -201,7 +201,7 @@ async def create_user(
 
             user = User(
                 email=email,
-                hashed_password=get_password_hash(payload.password),
+                hashed_password=get_password_hash( payload.password or secrets.token_urlsafe(32) ),
                 full_name=payload.full_name,
                 mobile=mobile_val,
                 role=role,
@@ -318,6 +318,31 @@ async def list_users(
     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
     return {"items": items, "meta": meta.model_dump()}
 
+
+@router.get("/role-counts")
+async def get_role_counts(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
+):
+    rows = (
+        await db.execute(
+            select(User.role, func.count(User.id))
+            .where(
+                User.is_deleted == False,
+                User.is_active == True,
+            )
+            .group_by(User.role)
+        )
+    ).all()
+
+    # Initialize all roles with 0
+    result = {role: 0 for role in ROLES}
+
+    # Fill actual counts
+    for role, count in rows:
+        result[role] = count
+
+    return result
 
 @router.get("/activity-logs")
 async def get_activity_logs(

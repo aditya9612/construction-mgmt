@@ -177,3 +177,13 @@ class EquipmentStatus(str, Enum):
     IDLE = "IDLE"
     RENTED = "RENTED"
     MAINTENANCE = "MAINTENANCE"
+
+class AlertType(str, Enum):
+    LOW_STOCK = "LOW_STOCK" 
+
+
+class WorkActivityStatus(str, Enum):
+    ON_TRACK = "On Track"
+    DELAY = "Delay"
+    COMPLETED = "Completed"
+    NOT_STARTED = "Not Started"

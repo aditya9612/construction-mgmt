@@ -13,7 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
-
+from sqlalchemy import UniqueConstraint
 from app.core.enums import InvoiceStatus
 from app.models.base import Base
 
@@ -43,6 +43,8 @@ class Invoice(Base):
     type = Column(String(50), nullable=False)  # owner / labour / material / contractor
     reference_id = Column(Integer, nullable=True)
 
+    quotation_id = Column( Integer, ForeignKey("quotation_master.id", ondelete="SET NULL"), nullable=True, index=True, unique=True, )
+
     # Financials
     amount = Column(DECIMAL(18, 2), nullable=False)
 
@@ -71,6 +73,8 @@ class Invoice(Base):
         back_populates="invoice",
         cascade="all, delete-orphan",
     )
+
+    quotation = relationship("QuotationMaster", lazy="selectin")
 
 
 # ===================== TRANSACTION =====================

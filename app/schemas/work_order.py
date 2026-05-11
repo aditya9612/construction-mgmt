@@ -40,6 +40,7 @@ class WorkOrderOut(BaseModel):
     rate: Decimal
     total_amount: Decimal
     status: str
+    quotation_id: Optional[int]
 
     class Config:
         from_attributes = True

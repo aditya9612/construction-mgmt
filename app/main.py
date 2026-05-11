@@ -28,6 +28,7 @@ from app.api.project import (
     router as project_router,
     dsr_router,
     issues_router,
+    work_progress_router,
     qc_router,
     safety_router,
     checklist_router,
@@ -54,6 +55,7 @@ from app.api.settings import router as settings_router
 from app.api.alert import router as alert_router
 from app.api.accountant import router as accountant_router
 from app.api.chat import router as chats_router
+from app.api.quotation import router as quotation_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal
@@ -269,6 +271,8 @@ def create_app() -> FastAPI:
     api_router.include_router(approval_router)
     api_router.include_router(accountant_router)
     api_router.include_router(work_order_router)
+    api_router.include_router(work_progress_router)
+    api_router.include_router(quotation_router)
     api_router.include_router(reports_router)
     api_router.include_router(alert_router) 
     api_router.include_router(cad_router)

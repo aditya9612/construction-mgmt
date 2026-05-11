@@ -10,7 +10,7 @@ import re
 class BaseSchema(BaseModel):
     model_config = ConfigDict(
         from_attributes=True,
-        json_encoders={Decimal: lambda v: round(float(v), 2)},  
+        json_encoders={Decimal: lambda v: round(float(v), 2)},
     )
 
 
@@ -79,16 +79,25 @@ class MaterialOut(BaseSchema):
 
 
 # ================= PURCHASE =================
+
+
 class PurchaseMaterial(BaseSchema):
     quantity: Decimal
+    rate: Decimal 
     amount_paid: Decimal
     project_id: int
     issue_type: Optional[IssueType] = None
 
-    @field_validator("quantity", "amount_paid")
-    def positive(cls, v):
+    @field_validator("quantity")
+    def quantity_positive(cls, v):
         if v <= 0:
-            raise ValueError("Must be greater than 0")
+            raise ValueError("Quantity must be > 0")
+        return v
+
+    @field_validator("amount_paid")
+    def amount_valid(cls, v):
+        if v < 0:
+            raise ValueError("Payment cannot be negative")
         return v
 
 
@@ -106,29 +115,45 @@ class UsageMaterial(BaseSchema):
 
 
 # ================= SUPPLIER =================
-class SupplierCreate(BaseSchema):
-    name: str
-    contact: Optional[str] = None
 
-    @field_validator("name")
+
+class SupplierCreate(BaseSchema):
+    supplier_name: str
+    contact_person: Optional[str] = None
+    phone_email: Optional[str] = None
+    gst_number: Optional[str] = None
+    address: Optional[str] = None
+
+    @field_validator("supplier_name")
     def validate_name(cls, v):
         if not v or len(v.strip()) < 3:
             raise ValueError("Supplier name must be at least 3 characters")
-        return v.strip().title()  
+        return v.strip().title()
 
-    @field_validator("contact")
-    def validate_contact(cls, v):
+    @field_validator("phone_email")
+    def validate_phone(cls, v):
         if v is None:
             return v
-        if not re.fullmatch(r"\d{10}", v):
-            raise ValueError("Contact must be 10 digit number")
+        if v.isdigit() and not re.fullmatch(r"[6-9]\d{9}", v):
+            raise ValueError("Invalid phone number")
         return v
+
+    @field_validator("gst_number")
+    def validate_gst(cls, v):
+        if v is None:
+            return v
+        if not re.fullmatch(r"\d{2}[A-Z]{5}\d{4}[A-Z]\d[Z][A-Z\d]", v):
+            raise ValueError("Invalid GST number format")
+        return v.upper()
 
 
 class SupplierOut(BaseSchema):
     id: int
-    name: str
-    contact: Optional[str] = None
+    supplier_name: str
+    contact_person: Optional[str]
+    phone_email: Optional[str]
+    gst_number: Optional[str]
+    address: Optional[str]
 
 
 # ================= PURCHASE ORDER =================
@@ -153,8 +178,8 @@ class PurchaseOrderOut(BaseSchema):
     project_id: int
     material_name: str
     quantity: float
-    rate: float            
-    total_amount: float    
+    rate: float
+    total_amount: float
     status: Optional[str] = "CREATED"
 
 
@@ -187,7 +212,7 @@ class TransferOut(BaseSchema):
     material: Optional[TransferMaterial] = None
     from_project: Optional[TransferProject] = None
     to_project: Optional[TransferProject] = None
-    quantity: float   # ✅ FIX
+    quantity: float
     status: str
     created_at: Optional[datetime] = None
 
@@ -236,11 +261,11 @@ class SummaryOut(BaseSchema):
 class MaterialReport(BaseSchema):
     material_id: int
     material_name: str
-    total_purchased: float      
-    total_used: float           
-    remaining_stock: float      
-    total_cost: float           
-    payment_pending: float      
+    total_purchased: float
+    total_used: float
+    remaining_stock: float
+    total_cost: float
+    payment_pending: float
 
 
 # ================= PRICE HISTORY =================
