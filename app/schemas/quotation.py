@@ -297,6 +297,8 @@ class CreateQuotation(BaseModel):
 
     gst_number: Optional[str] = None
 
+    project_id: Optional[int] = None
+
     project_name: str
 
     project_type: str
@@ -401,6 +403,7 @@ class UpdateQuotation(BaseModel):
     tds_percent: Optional[float] = Field(None, ge=0, le=100)
 
     gst_percent: Optional[float] = Field(None, ge=0, le=100)
+    project_id: Optional[int] = None
     project_name: Optional[str] = None
     project_type: Optional[str] = None
 
@@ -471,6 +474,8 @@ class QuotationOut(BaseModel):
     billing_address: Optional[str]
 
     site_address: Optional[str]
+
+    project_id: Optional[int]
 
     project_name: str
 

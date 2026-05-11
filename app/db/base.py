@@ -48,3 +48,5 @@ from app.models.messages import Message
 from app.models.settings import UserSettings
 from app.models.chat import ChatSession, ChatMember, ChatMessage, MessageRead, MessageReaction
 from app.models.quotation import QuotationItem, QuotationMaster, QuotationStatus
+from app.models.project_visualization import ProjectVisualization
+from app.models.agreement import Agreement

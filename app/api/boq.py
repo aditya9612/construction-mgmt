@@ -955,11 +955,19 @@ async def generate_tasks_from_boq(
     task = Task(
         project_id=boq.project_id,
         activity_type_id=boq.activity_type_id,
-        name=boq.item_name,
-        quantity=boq.quantity,
+        title=boq.item_name,          # changed from name -> title
+        description=boq.description,  # optional but useful
+        priority=1,                   # required field in tasks table
+        status="PLANNED",             # required enum value
+        created_by_user_id=current_user.id,  # required field
+        completion_percentage=0       # required field
     )
 
     db.add(task)
     await db.commit()
+    await db.refresh(task)
 
-    return {"message": "Task created from BOQ"}
+    return {
+        "message": "Task created from BOQ",
+        "task_id": task.id
+    }

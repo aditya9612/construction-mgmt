@@ -50,6 +50,7 @@ def upgrade():
         sa.Column("billing_address", sa.Text(), nullable=True),
         sa.Column("site_address", sa.Text(), nullable=True),
         sa.Column("gst_number", sa.String(length=50), nullable=True),
+        sa.Column("project_id", sa.Integer(), nullable=True),
         sa.Column("project_name", sa.String(length=150), nullable=False),
         sa.Column("project_type", sa.String(length=100), nullable=False),
         sa.Column("project_start_date", sa.Date(), nullable=True),
@@ -105,6 +106,21 @@ def upgrade():
         "quotation_master",
         ["quotation_no"],
         unique=True,
+    )
+    # Create index for quotation_master.project_id
+    op.create_index(
+        op.f("ix_quotation_master_project_id"),
+        "quotation_master",
+        ["project_id"],
+        unique=False,
+    )
+    # Create foreign key: quotation_master.project_id -> projects.id
+    op.create_foreign_key(
+        "fk_quotation_master_project_id",
+        "quotation_master",
+        "projects",
+        ["project_id"],
+        ["id"],
     )
     op.create_table(
         "work_activities",
@@ -365,41 +381,109 @@ def upgrade():
     )
 
     # Add work_order_id to work_activities
-    op.add_column("work_activities", sa.Column("work_order_id", sa.Integer(), nullable=False))
+    op.add_column(
+        "work_activities", sa.Column("work_order_id", sa.Integer(), nullable=False)
+    )
 
     # Add discipline column to work_activities
-    op.add_column("work_activities", sa.Column("discipline", sa.String(length=100), nullable=True))
+    op.add_column(
+        "work_activities", sa.Column("discipline", sa.String(length=100), nullable=True)
+    )
 
     # Create index for work_order_id
     op.create_index(
-        op.f("ix_work_activities_work_order_id"),"work_activities",["work_order_id"],unique=False,)
+        op.f("ix_work_activities_work_order_id"),
+        "work_activities",
+        ["work_order_id"],
+        unique=False,
+    )
 
     # Create foreign key to work_orders table
     op.create_foreign_key(
-        "fk_work_activities_work_order_id","work_activities","work_orders",["work_order_id"], ["id"],ondelete="CASCADE", )
+        "fk_work_activities_work_order_id",
+        "work_activities",
+        "work_orders",
+        ["work_order_id"],
+        ["id"],
+        ondelete="CASCADE",
+    )
+    op.create_table(
+        "agreements",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("document_id", sa.String(length=50), nullable=False),
+        sa.Column("project_id", sa.Integer(), nullable=True),
+        sa.Column("owner_id", sa.Integer(), nullable=False),
+        sa.Column("type", sa.String(length=100), nullable=False),
+        sa.Column("status", sa.String(length=50), nullable=True),
+        sa.Column("file_url", sa.Text(), nullable=False),
+        sa.Column(
+            "uploaded_at",
+            sa.DateTime(),
+            server_default=sa.text("now()"),
+            nullable=True,
+        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["owner_id"], ["owners.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["project_id"], ["projects.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        op.f("ix_agreements_document_id"),
+        "agreements",
+        ["document_id"],
+        unique=True,
+    )
+    op.create_index(op.f("ix_agreements_id"), "agreements", ["id"], unique=False)
+    op.create_index(op.f("ix_agreements_owner_id"),"agreements",["owner_id"], unique=False,)
+    op.create_index(op.f("ix_agreements_project_id"),"agreements",["project_id"], unique=False,)
 
+    op.create_table(
+        "project_visualizations",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("visualization_id", sa.String(length=50), nullable=False),
+        sa.Column("project_id", sa.Integer(), nullable=False),
+        sa.Column("title", sa.String(length=255), nullable=False),
+        sa.Column("points", sa.Integer(), nullable=True),
+        sa.Column("image_url", sa.Text(), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(),
+            server_default=sa.text("now()"),
+            nullable=True,
+        ),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["project_id"], ["projects.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        op.f("ix_project_visualizations_id"),
+        "project_visualizations",
+        ["id"],
+        unique=False,
+    )
+    op.create_index(
+        op.f("ix_project_visualizations_project_id"),
+        "project_visualizations",["project_id"],unique=False,)
+    op.create_index(
+        op.f("ix_project_visualizations_visualization_id"),
+        "project_visualizations",["visualization_id"],unique=True,)
     # ### end Alembic commands ###
+
 
 def downgrade():
     # Drop foreign key
-    op.drop_constraint(
-        'fk_work_activities_work_order_id',
-        'work_activities',
-        type_='foreignkey'
-    )
+    op.drop_constraint("fk_work_activities_work_order_id", "work_activities", type_="foreignkey")
 
     # Drop index
-    op.drop_index(
-        op.f('ix_work_activities_work_order_id'),
-        table_name='work_activities'
-    )
+    op.drop_index(op.f("ix_work_activities_work_order_id"), table_name="work_activities")
 
     # Drop columns from work_activities
-    op.drop_column('work_activities', 'discipline')
-    op.drop_column('work_activities', 'work_order_id')
+    op.drop_column("work_activities", "discipline")
+    op.drop_column("work_activities", "work_order_id")
 
     # Drop discipline column from tasks
-    op.drop_column('tasks', 'discipline')
+    op.drop_column("tasks", "discipline")
     # ### commands auto generated by Alembic - please adjust! ###
     op.drop_constraint(None, "work_orders", type_="foreignkey")
     op.drop_index(op.f("ix_work_orders_quotation_id"), table_name="work_orders")
@@ -409,37 +493,24 @@ def downgrade():
     op.alter_column(
         "tasks", "created_by_user_id", existing_type=mysql.INTEGER(), nullable=True
     )
-    op.add_column(
-        "suppliers", sa.Column("contact", mysql.VARCHAR(length=50), nullable=True)
-    )
-    op.add_column(
-        "suppliers", sa.Column("name", mysql.VARCHAR(length=255), nullable=False)
-    )
-    op.create_index(
-        op.f("idx_supplier_deleted"), "suppliers", ["is_deleted"], unique=False
-    )
+    op.add_column("suppliers", sa.Column("contact", mysql.VARCHAR(length=50), nullable=True))
+    op.add_column("suppliers", sa.Column("name", mysql.VARCHAR(length=255), nullable=False))
+    op.create_index(op.f("idx_supplier_deleted"), "suppliers", ["is_deleted"], unique=False)
     op.drop_column("suppliers", "address")
     op.drop_column("suppliers", "gst_number")
     op.drop_column("suppliers", "phone_email")
     op.drop_column("suppliers", "contact_person")
     op.drop_column("suppliers", "supplier_name")
     op.alter_column(
-        "safety_incidents",
-        "ppe_compliance",
+        "safety_incidents","ppe_compliance",
         existing_type=mysql.TINYINT(display_width=1),
-        nullable=False,
-        existing_server_default=sa.text("'1'"),
-    )
+        nullable=False,existing_server_default=sa.text("'1'"),)
     op.alter_column(
-        "safety_incidents",
-        "safety_checklist_status",
+        "safety_incidents","safety_checklist_status",
         existing_type=sa.Enum(
             "PENDING", "COMPLETED", "FAILED", name="safetycheckliststatus"
         ),
-        type_=mysql.ENUM("COMPLETED", "PENDING", "FAILED"),
-        existing_nullable=False,
-        existing_server_default=sa.text("'PENDING'"),
-    )
+        type_=mysql.ENUM("COMPLETED", "PENDING", "FAILED"),existing_nullable=False,existing_server_default=sa.text("'PENDING'"),)
     op.drop_constraint(None, "ra_bills", type_="foreignkey")
     op.drop_index(op.f("ix_ra_bills_quotation_id"), table_name="ra_bills")
     op.drop_column("ra_bills", "quotation_id")
@@ -447,15 +518,10 @@ def downgrade():
     op.drop_index(op.f("ix_invoices_quotation_id"), table_name="invoices")
     op.drop_column("invoices", "quotation_id")
     op.drop_table("quotation_materials")
-    op.drop_index(
-        op.f("ix_quotation_extra_charges_expense_type"),
-        table_name="quotation_extra_charges",
-    )
+    op.drop_index(op.f("ix_quotation_extra_charges_expense_type"),table_name="quotation_extra_charges",)
     op.drop_table("quotation_extra_charges")
     op.drop_index(op.f("ix_quotation_labour_skill_type"), table_name="quotation_labour")
-    op.drop_index(
-        op.f("ix_quotation_labour_quotation_id"), table_name="quotation_labour"
-    )
+    op.drop_index(op.f("ix_quotation_labour_quotation_id"), table_name="quotation_labour")
     op.drop_table("quotation_labour")
     op.drop_table("measurement_details")
     op.drop_index(op.f("ix_quotation_items_item_type"), table_name="quotation_items")
@@ -463,9 +529,19 @@ def downgrade():
     op.drop_table("daily_progress_entries")
     op.drop_index(op.f("ix_work_activities_id"), table_name="work_activities")
     op.drop_table("work_activities")
-    op.drop_index(
-        op.f("ix_quotation_master_quotation_no"), table_name="quotation_master"
-    )
+    # Drop foreign key and index for project_id
+    op.drop_constraint("fk_quotation_master_project_id","quotation_master",type_="foreignkey",)
+    op.drop_index(op.f("ix_quotation_master_project_id"),table_name="quotation_master",)
+    op.drop_index(op.f("ix_quotation_master_quotation_no"), table_name="quotation_master")
     op.drop_table("quotation_master")
+    op.drop_index(op.f("ix_project_visualizations_visualization_id"),table_name="project_visualizations",)
+    op.drop_index(op.f("ix_project_visualizations_project_id"),table_name="project_visualizations",)
+    op.drop_index(op.f("ix_project_visualizations_id"),table_name="project_visualizations",)
+    op.drop_table("project_visualizations")
+    op.drop_index(op.f("ix_agreements_project_id"),table_name="agreements",)
+    op.drop_index(op.f("ix_agreements_owner_id"),table_name="agreements",)
+    op.drop_index(op.f("ix_agreements_id"),table_name="agreements",)
+    op.drop_index(op.f("ix_agreements_document_id"),table_name="agreements",)
+    op.drop_table("agreements")
     op.drop_table("company_settings")
     # ### end Alembic commands ###

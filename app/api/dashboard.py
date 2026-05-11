@@ -1026,7 +1026,11 @@ async def project_engineer_dashboard(
     redis=Depends(d.get_request_redis),
 ):
     # Check access
-    await assert_project_access(db, project_id, current_user)
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
 
     project = await db.get(m.Project, project_id)
     if not project:

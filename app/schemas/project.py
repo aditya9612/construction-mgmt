@@ -300,8 +300,17 @@ class DSRUpdate(BaseSchema):
         return v
 
 
-# ===================== OUTPUT =====================
+# ===================== DSR PHOTO OUTPUT =====================
 
+class DSRPhotoOut(BaseModel):
+    id: int
+    file_url: str
+
+    class Config:
+        from_attributes = True
+
+
+# ===================== OUTPUT =====================
 
 class DSROut(DSRBase):
     id: int
@@ -319,7 +328,8 @@ class DSROut(DSRBase):
     total_labour: int = 0
     skilled_labour: int = 0
     unskilled_labour: int = 0
-    photos: list[str] = []
+
+    photos: list[DSRPhotoOut] = []
 
     class Config:
         from_attributes = True
@@ -596,6 +606,7 @@ class WorkActivityCreate(BaseModel):
     unit: str
     start_date: date
     end_date: date
+    work_order_id: int
 
     # Use enum instead of str
     status: WorkActivityStatus = WorkActivityStatus.NOT_STARTED
