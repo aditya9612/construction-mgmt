@@ -13,12 +13,21 @@ from app.models.expense import Expense
 from app.models.invoice import Invoice, Transaction
 from app.models.labour import LabourAttendance
 from app.models.boq import BOQ
+from app.models.material import Material
+from app.models.project import WorkActivity, DailyProgressEntry, Issue, Milestone, Task
 from app.cache import redis as r
+from app.schemas.dashboard import (
+    EnhancedDashboardOut, DashboardVitals, IssueStats, MaterialStockStatus,
+    TodayWorkSummary, DisciplineProgress, RecentExpense, MilestoneTimelineEntry
+)
 
 # PDF + Excel
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 import pandas as pd
+
+from app.utils.common import assert_project_access
+from app.utils.helpers import NotFoundError
 
 DASHBOARD_READ_ROLES = [
     r.value
@@ -1007,3 +1016,136 @@ async def ml_forecast(
         "predictions": [round(float(p), 2) for p in predictions],
         "chart": chart,
     }
+
+
+@router.get("/engineer/{project_id}", response_model=EnhancedDashboardOut)
+async def project_engineer_dashboard(
+    project_id: int,
+    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(d.get_request_redis),
+):
+    # Check access
+    await assert_project_access(db, project_id, current_user)
+
+    project = await db.get(m.Project, project_id)
+    if not project:
+        raise NotFoundError("Project not found")
+
+    today = date.today()
+
+    # 1. Labor Today
+    labor_stats = await db.execute(
+        select(
+            func.sum(case((m.DailySiteReport.skilled_labour > 0, m.DailySiteReport.skilled_labour), else_=0)),
+            func.sum(case((m.DailySiteReport.unskilled_labour > 0, m.DailySiteReport.unskilled_labour), else_=0)),
+            func.sum(case((m.DailySiteReport.total_labour > 0, m.DailySiteReport.total_labour), else_=0))
+        ).where(m.DailySiteReport.project_id == project_id, m.DailySiteReport.report_date == today)
+    )
+    skilled, unskilled, total_labour = labor_stats.one()
+
+    # 2. Material Stock Status
+    material_stats = await db.execute(
+        select(Material.category, Material.remaining_stock, Material.minimum_stock_level)
+        .where(Material.project_id == project_id, Material.is_deleted == False)
+    )
+    materials = []
+    for cat, stock, min_level in material_stats.all():
+        status = "OK"
+        if stock <= 0:
+            status = "Out of Stock"
+        elif stock < min_level:
+            status = "Low"
+        materials.append(MaterialStockStatus(category=cat, status=status))
+
+    # 3. Open Issues
+    issue_stats_query = await db.execute(
+        select(
+            func.count(Issue.id),
+            func.sum(case((Issue.priority == "HIGH", 1), else_=0))
+        ).where(Issue.project_id == project_id, Issue.status == "OPEN")
+    )
+    total_issues, high_priority_issues = issue_stats_query.one()
+
+    # 4. Today's Work Summary
+    work_summary_query = await db.execute(
+        select(WorkActivity.activity_name, WorkActivity.status)
+        .join(DailyProgressEntry, WorkActivity.id == DailyProgressEntry.activity_id)
+        .where(WorkActivity.project_id == project_id, DailyProgressEntry.entry_date == today)
+    )
+    today_work = [TodayWorkSummary(activity_name=row[0], status=str(row[1])) for row in work_summary_query.all()]
+
+    # 5. Discipline-wise Progress
+    discipline_query = await db.execute(
+        select(WorkActivity.discipline, func.avg(WorkActivity.completion_percentage))
+        .where(WorkActivity.project_id == project_id)
+        .group_by(WorkActivity.discipline)
+    )
+    discipline_progress = [
+        DisciplineProgress(discipline=row[0] or "General", planned_percent=0, actual_percent=float(row[1] or 0))
+        for row in discipline_query.all()
+    ]
+
+    # 6. Timeline (Milestones)
+    milestones_query = await db.execute(
+        select(Milestone).where(Milestone.project_id == project_id).order_by(Milestone.start_date)
+    )
+    timeline = [
+        MilestoneTimelineEntry(
+            id=ms.id, title=ms.title, status=str(ms.status),
+            start_date=ms.start_date, end_date=ms.end_date
+        )
+        for ms in milestones_query.scalars().all()
+    ]
+
+    # 7. Recent Expenses
+    expenses_query = await db.execute(
+        select(Expense).where(Expense.project_id == project_id).order_by(Expense.expense_date.desc()).limit(5)
+    )
+    recent_expenses = [
+        RecentExpense(
+            date=e.expense_date, type="Expense", category=e.category,
+            note=e.remarks, amount=float(e.amount)
+        )
+        for e in expenses_query.scalars().all()
+    ]
+
+    # 8. Overall Progress & Planned
+    progress = await db.scalar(
+        select(func.avg(m.Task.completion_percentage)).where(m.Task.project_id == project_id)
+    )
+    
+    # Simple planned calculation based on timeline
+    planned_progress = 0
+    if project.start_date and project.end_date:
+        total_days = (project.end_date - project.start_date).days
+        elapsed_days = (today - project.start_date).days
+        if total_days > 0:
+            planned_progress = max(0, min(100, (elapsed_days / total_days) * 100))
+
+    variance = float(progress or 0) - planned_progress
+
+    # 9. Vitals Aggregation
+    vitals = DashboardVitals(
+        total_labour_today=int(total_labour or 0),
+        skilled_labour=int(skilled or 0),
+        unskilled_labour=int(unskilled or 0),
+        active_activities=len(today_work),
+        open_issues=IssueStats(total=int(total_issues or 0), high_priority=int(high_priority_issues or 0)),
+        material_stock_status=materials
+    )
+
+    return EnhancedDashboardOut(
+        project_id=project_id,
+        project_name=project.project_name,
+        status=str(project.status),
+        progress=float(progress or 0),
+        planned_progress=round(planned_progress, 2),
+        variance=round(variance, 2),
+        vitals=vitals,
+        today_work_summary=today_work,
+        discipline_progress=discipline_progress,
+        timeline=timeline,
+        recent_expenses=recent_expenses,
+        weather={"condition": "Clear", "temperature": 32}  # Placeholder
+    )

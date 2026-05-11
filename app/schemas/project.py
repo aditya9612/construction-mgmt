@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Optional, Union
+from typing import List, Optional, Union
 from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator
@@ -656,3 +656,20 @@ class DailyProgressResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class ProjectsModuleSummary(BaseModel):
+    total_projects: int
+    ongoing_sites: int
+    completed_projects: int
+    delayed_projects: int
+
+class ProjectActivityItem(BaseModel):
+    type: str  # task_completion, invoice, photo, issue
+    user_name: str
+    description: str
+    project_name: str
+    timestamp: datetime
+
+class ProjectsModuleResponse(BaseModel):
+    summary: ProjectsModuleSummary
+    activities: List[ProjectActivityItem]
