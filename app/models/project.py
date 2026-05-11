@@ -654,6 +654,7 @@ class WorkActivity(Base, TimestampMixin):
     planned_quantity = Column(DECIMAL(18, 2), default=0)
     unit = Column(String(50))
     engineer_id = Column(Integer)
+    work_order_id = Column( Integer, ForeignKey("work_orders.id", ondelete="CASCADE"), nullable=False, index=True, )
     total_completed = Column(DECIMAL(18, 2), default=0)
     remaining_quantity = Column(DECIMAL(18, 2), default=0)
     completion_percentage = Column(DECIMAL(5, 2), default=0)
