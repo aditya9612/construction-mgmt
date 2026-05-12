@@ -1,9 +1,12 @@
 from pydantic import BaseModel, field_validator
+from typing import Optional, List
 
 
 # ---------- COMMON ----------
-class NameBase(BaseModel):
+class MasterDataBase(BaseModel):
     name: str
+    unique_code: Optional[str] = None
+    category: Optional[str] = None
 
     @field_validator("name")
     def validate_name(cls, v):
@@ -13,11 +16,11 @@ class NameBase(BaseModel):
 
 
 # ---------- UNIT ----------
-class UnitCreate(NameBase):
+class UnitCreate(MasterDataBase):
     pass
 
 
-class UnitOut(NameBase):
+class UnitOut(MasterDataBase):
     id: int
 
     class Config:
@@ -25,11 +28,11 @@ class UnitOut(NameBase):
 
 
 # ---------- LABOUR ----------
-class LabourTypeCreate(NameBase):
+class LabourTypeCreate(MasterDataBase):
     pass
 
 
-class LabourTypeOut(NameBase):
+class LabourTypeOut(MasterDataBase):
     id: int
 
     class Config:
@@ -37,11 +40,11 @@ class LabourTypeOut(NameBase):
 
 
 # ---------- ACTIVITY ----------
-class ActivityTypeCreate(NameBase):
+class ActivityTypeCreate(MasterDataBase):
     pass
 
 
-class ActivityTypeOut(NameBase):
+class ActivityTypeOut(MasterDataBase):
     id: int
 
     class Config:
@@ -49,15 +52,30 @@ class ActivityTypeOut(NameBase):
 
 
 # ---------- MATERIAL ----------
-class MaterialMasterCreate(BaseModel):
-    name: str
+class MaterialMasterCreate(MasterDataBase):
     unit: str
 
 
-class MaterialMasterOut(BaseModel):
+class MaterialMasterOut(MasterDataBase):
     id: int
-    name: str
     unit: str
 
     class Config:
         from_attributes = True
+
+
+# ---------- UNIFIED ----------
+class MasterDataUnified(BaseModel):
+    id: int
+    name: str
+    unique_code: Optional[str]
+    category: Optional[str]
+    system_tag: str # MATERIAL, LABOR, ACTIVITY, UNIT
+    unit: Optional[str] = None
+
+
+class MasterDataStats(BaseModel):
+    total_materials: int
+    total_labour_types: int
+    total_activity_types: int
+    total_units: int

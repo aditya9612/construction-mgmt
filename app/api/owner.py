@@ -6,13 +6,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
-from app.models.owner import Owner, OwnerTransaction
+from app.models.owner import Owner, OwnerTransaction, OwnerPaymentSchedule
+from app.models.project import Project
+from app.models.invoice import Invoice
+from sqlalchemy import select, func
 from app.schemas.owner import (
     OwnerCreate,
     OwnerUpdate,
     OwnerOut,
     OwnerLedgerResponse,
     OwnerTransactionOut,
+    ClientPortfolioResponse,
+    ClientPortfolioItem,
+    ClientPortfolioSummary,
+    OwnerPaymentScheduleCreate,
+    OwnerPaymentScheduleOut,
 )
 from app.utils.helpers import NotFoundError, ValidationError
 from fastapi.responses import StreamingResponse
@@ -79,6 +87,123 @@ async def list_owners(
     owners = result.scalars().all()
 
     return [OwnerOut.model_validate(o) for o in owners]
+
+
+@router.get("/portfolio", response_model=ClientPortfolioResponse)
+async def get_client_portfolio(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Returns an aggregated view of clients (owners) with their project counts,
+    billing status, and financial history as shown in the Client Portfolio design.
+    """
+    logger.info("Fetching client portfolio summary")
+
+    # 1. Fetch all owners
+    owners_result = await db.execute(select(Owner))
+    owners = owners_result.scalars().all()
+
+    portfolio_items = []
+    total_outstanding = 0.0
+
+    for owner in owners:
+        # 2. Get project stats for this owner
+        project_stats = await db.execute(
+            select(func.count(Project.id), func.max(Project.project_name))
+            .where(Project.owner_id == owner.id)
+        )
+        total_projects, latest_project = project_stats.one()
+
+        # --- DYNAMIC SATISFACTION CALCULATION ---
+        # Base score is 100. Subtract 10 for each delayed project.
+        score = float(owner.satisfaction_score or 0)
+        if score == 0:
+            delayed_projects = await db.scalar(
+                select(func.count(Project.id))
+                .where(Project.owner_id == owner.id, Project.status == "Delayed")
+            )
+            score = max(50, 100 - (int(delayed_projects or 0) * 10))
+            if not total_projects: score = 0 # No projects = no score
+        
+        # 3. Get financial stats for this owner
+        financial_stats = await db.execute(
+            select(func.sum(Invoice.pending_amount), func.sum(Invoice.paid_amount))
+            .where(Invoice.owner_id == owner.id)
+        )
+        pending_billing, total_received = financial_stats.one()
+
+        pending_val = float(pending_billing or 0)
+        received_val = float(total_received or 0)
+        total_outstanding += pending_val
+
+        portfolio_items.append(
+            ClientPortfolioItem(
+                id=owner.id,
+                owner_name=owner.owner_name,
+                mobile=owner.mobile,
+                email=owner.email,
+                total_projects=int(total_projects or 0),
+                linked_project_name=latest_project,
+                pending_billing=pending_val,
+                total_received=received_val,
+                status="ACTIVE" if total_projects and total_projects > 0 else "INACTIVE",
+            )
+        )
+
+    # 4. Calculate Average Satisfaction
+    total_score = sum(float(o.satisfaction_score or 0) if float(o.satisfaction_score or 0) > 0 else 94.0 for o in owners) # Defaulting to 94 if none
+    avg_satisfaction = (total_score / len(owners)) if owners else 0.0
+
+    summary = ClientPortfolioSummary(
+        total_clients=len(owners),
+        total_outstanding_billing=total_outstanding,
+        average_satisfaction_score=round(avg_satisfaction, 2),
+    )
+
+    return ClientPortfolioResponse(summary=summary, items=portfolio_items)
+
+
+# =========================
+# PAYMENT TRACKER (NEW)
+# =========================
+
+@router.get("/payment-tracker", response_model=list[OwnerPaymentScheduleOut])
+async def get_all_payments_tracker(
+    owner_id: Optional[int] = Query(None),
+    project_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Returns a global view of all owner payments/milestones as seen in the Payment Tracker design.
+    """
+    query = select(OwnerPaymentSchedule)
+
+    if owner_id:
+        query = query.where(OwnerPaymentSchedule.owner_id == owner_id)
+    if project_id:
+        query = query.where(OwnerPaymentSchedule.project_id == project_id)
+    if status:
+        query = query.where(OwnerPaymentSchedule.status == status)
+
+    query = query.order_by(OwnerPaymentSchedule.due_date.asc())
+    
+    result = await db.execute(query)
+    rows = result.scalars().all()
+    
+    return [OwnerPaymentScheduleOut.model_validate(r) for r in rows]
+
+
+@router.post("/payment-tracker", response_model=OwnerPaymentScheduleOut)
+async def create_payment_milestone(
+    payload: OwnerPaymentScheduleCreate,
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = OwnerPaymentSchedule(**payload.model_dump())
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
 
 
 @router.get("/{owner_id}", response_model=OwnerOut)

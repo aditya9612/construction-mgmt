@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, DECIMAL
+from sqlalchemy import Column, Integer, String, DateTime, Date, ForeignKey, DECIMAL
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -17,6 +17,8 @@ class Owner(Base):
     email = Column(String(100), nullable=True)
     address = Column(String(255), nullable=True)
     pan = Column(String(20), nullable=True)
+    satisfaction_score = Column(DECIMAL(5, 2), default=0.0) # 0 to 100
+
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
@@ -49,3 +51,29 @@ class OwnerTransaction(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     owner = relationship("Owner", back_populates="transactions")
+
+
+class OwnerPaymentSchedule(Base):
+    __tablename__ = "owner_payment_schedules"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    owner_id = Column(Integer, ForeignKey("owners.id", ondelete="CASCADE"), index=True)
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+
+    milestone_name = Column(String(100), nullable=False)  # e.g., "Initial Booking", "1st Installment"
+    due_date = Column(Date, nullable=True)
+    amount = Column(DECIMAL(18, 2), nullable=False)
+    
+    status = Column(String(20), default="Unpaid")  # Unpaid, Paid, Partially Paid
+    paid_amount = Column(DECIMAL(18, 2), default=0.0)
+    
+    reference_code = Column(String(50), nullable=True)  # e.g., "REF-12345"
+    description = Column(String(255), nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    owner = relationship("Owner")
+    project = relationship("Project")
+

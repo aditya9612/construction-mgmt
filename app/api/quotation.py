@@ -27,6 +27,17 @@ import app.schemas.quotation as s
 from decimal import Decimal
 from app.models.work_order import WorkOrder
 from app.utils.common import generate_business_id
+import os
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.platypus import (
+    Image,
+    KeepTogether,
+)
+
+
 
 router = APIRouter(prefix="/quotations", tags=["Quotations"])
 
@@ -169,6 +180,52 @@ async def generate_quotation_no(
 
     return f"QT/{year}/{next_id:04d}"
 
+def create_styled_table(data, col_widths, highlight_last_row=False):
+    """
+    Create professional styled table with:
+    - Dark blue header
+    - White header text
+    - Alternating row colors
+    - Optional green total row
+    """
+
+    table = Table(data, colWidths=col_widths)
+
+    style = [
+        # Header
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING", (0, 0), (-1, 0), 6),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
+        ("TOPPADDING", (0, 1), (-1, -1), 4),
+    ]
+
+    # Alternating row colors
+    for row in range(1, len(data)):
+        if row % 2 == 0:
+            style.append(
+                ("BACKGROUND", (0, row), (-1, row),
+                 colors.HexColor("#F2F6FA"))
+            )
+
+    # Highlight final row (Grand Total)
+    if highlight_last_row and len(data) > 1:
+        last = len(data) - 1
+        style.extend([
+            ("BACKGROUND", (0, last), (-1, last),
+             colors.HexColor("#D9EAD3")),
+            ("FONTNAME", (0, last), (-1, last),
+             "Helvetica-Bold"),
+        ])
+
+    table.setStyle(TableStyle(style))
+    return table
 
 # =========================================================
 # QUOTATION TOTAL CALCULATION
@@ -399,42 +456,561 @@ def generate_upi_qr(quotation: QuotationMaster):
 # GENERATE PDF
 # =========================================================
 
+# def generate_quotation_pdf(
+#     quotation: QuotationMaster
+# ):
+
+#     buffer = BytesIO()
+
+#     doc = SimpleDocTemplate(
+#         buffer,
+#         pagesize=A4,
+#         rightMargin=20,
+#         leftMargin=20,
+#         topMargin=20,
+#         bottomMargin=20,
+#     )
+
+#     styles = getSampleStyleSheet()
+
+#     elements = []
+
+#     # =====================================================
+#     # HEADER
+#     # =====================================================
+
+#     title = Paragraph(
+#         f"<b>QUOTATION</b>",
+#         styles["Title"]
+#     )
+
+#     elements.append(title)
+
+#     elements.append(Spacer(1, 10))
+
+#     company_details = f"""
+#     <b>{quotation.company_name or ''}</b><br/>
+#     GST: {quotation.gst_number or '-'}<br/>
+#     Mobile: {quotation.mobile_number}<br/>
+#     Email: {quotation.email or '-'}
+#     """
+
+#     elements.append(
+#         Paragraph(
+#             company_details,
+#             styles["BodyText"]
+#         )
+#     )
+
+#     elements.append(Spacer(1, 12))
+
+#     # =====================================================
+#     # QUOTATION INFO
+#     # =====================================================
+
+#     quotation_info = [
+#         ["Quotation No", quotation.quotation_no],
+#         ["Date", quotation.created_at.strftime("%d-%m-%Y")],
+#         ["Project", quotation.project_name],
+#         ["Project Type", quotation.project_type],
+#         ["Engineer", quotation.engineer_name or "-"],
+#         ["Work Order", quotation.work_order_no or "-"],
+#     ]
+
+#     table = Table(
+#         quotation_info,
+#         colWidths=[120, 300]
+#     )
+
+#     table.setStyle(
+#         TableStyle(
+#             [
+#                 ("GRID", (0, 0), (-1, -1), 1, colors.black),
+#                 ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
+#             ]
+#         )
+#     )
+
+#     elements.append(table)
+
+#     elements.append(Spacer(1, 15))
+
+#     # =====================================================
+#     # CLIENT DETAILS
+#     # =====================================================
+
+#     client_title = Paragraph(
+#         "<b>Client Details</b>",
+#         styles["Heading2"]
+#     )
+
+#     elements.append(client_title)
+
+#     client_info = f"""
+#     <b>{quotation.client_name}</b><br/>
+#     Billing Address: {quotation.billing_address or '-'}<br/>
+#     Site Address: {quotation.site_address or '-'}<br/>
+#     Mobile: {quotation.mobile_number}<br/>
+#     GST: {quotation.gst_number or '-'}
+#     """
+
+#     elements.append(
+#         Paragraph(
+#             client_info,
+#             styles["BodyText"]
+#         )
+#     )
+
+#     elements.append(Spacer(1, 15))
+
+#     # =====================================================
+#     # ITEM TABLE
+#     # =====================================================
+
+#     item_data = [
+#         [
+#             "Item",
+#             "Qty",
+#             "Unit",
+#             "Rate",
+#             "Amount",
+#         ]
+#     ]
+
+#     for item in quotation.items:
+
+#         item_data.append(
+#             [
+#                 item.title,
+#                 str(item.quantity),
+#                 item.unit or "-",
+#                 f"{item.rate:.2f}",
+#                 f"{item.amount:.2f}",
+#             ]
+#         )
+
+#     item_table = Table(
+#         item_data,
+#         colWidths=[180, 70, 70, 80, 90]
+#     )
+
+#     item_table.setStyle(
+#         TableStyle(
+#             [
+#                 ("GRID", (0, 0), (-1, -1), 1, colors.black),
+
+#                 ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+
+#                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+#             ]
+#         )
+#     )
+
+#     elements.append(item_table)
+
+#     elements.append(Spacer(1, 15))
+
+#     # =====================================================
+#     # LABOUR TABLE
+#     # =====================================================
+
+#     if quotation.labour_items:
+
+#         labour_title = Paragraph(
+#             "<b>Labour Details</b>",
+#             styles["Heading2"]
+#         )
+
+#         elements.append(labour_title)
+
+#         labour_data = [
+#             [
+#                 "Skill",
+#                 "Count",
+#                 "Days",
+#                 "Daily Wage",
+#                 "Amount",
+#             ]
+#         ]
+
+#         for labour in quotation.labour_items:
+
+#             labour_data.append(
+#                 [
+#                     labour.skill_type,
+#                     str(labour.labour_count),
+#                     str(labour.labour_days),
+#                     f"{labour.daily_wage:.2f}",
+#                     f"{labour.amount:.2f}",
+#                 ]
+#             )
+
+#         labour_table = Table(
+#             labour_data,
+#             colWidths=[150, 80, 80, 100, 100]
+#         )
+
+#         labour_table.setStyle(
+#             TableStyle(
+#                 [
+#                     ("GRID", (0, 0), (-1, -1), 1, colors.black),
+
+#                     ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+#                 ]
+#             )
+#         )
+
+#         elements.append(labour_table)
+
+#         elements.append(Spacer(1, 15))
+
+#     # =====================================================
+#     # MATERIAL TABLE
+#     # =====================================================
+
+#     if quotation.material_items:
+
+#         material_title = Paragraph(
+#             "<b>Material Details</b>",
+#             styles["Heading2"]
+#         )
+
+#         elements.append(material_title)
+
+#         material_data = [
+#             [
+#                 "Material",
+#                 "Qty",
+#                 "Unit",
+#                 "Rate",
+#                 "Amount",
+#             ]
+#         ]
+
+#         for material in quotation.material_items:
+
+#             material_data.append(
+#                 [
+#                     material.material_name,
+#                     str(material.estimated_quantity),
+#                     material.unit,
+#                     f"{material.estimated_rate:.2f}",
+#                     f"{material.estimated_amount:.2f}",
+#                 ]
+#             )
+
+#         material_table = Table(
+#             material_data,
+#             colWidths=[180, 70, 70, 80, 90]
+#         )
+
+#         material_table.setStyle(
+#             TableStyle(
+#                 [
+#                     ("GRID", (0, 0), (-1, -1), 1, colors.black),
+
+#                     ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+#                 ]
+#             )
+#         )
+
+#         elements.append(material_table)
+
+#         elements.append(Spacer(1, 15))
+
+#     # =====================================================
+#     # EXTRA CHARGES
+#     # =====================================================
+
+#     if quotation.extra_charge_items:
+
+#         extra_title = Paragraph(
+#             "<b>Extra Charges</b>",
+#             styles["Heading2"]
+#         )
+
+#         elements.append(extra_title)
+
+#         extra_data = [
+#             [
+#                 "Type",
+#                 "Qty",
+#                 "Rate",
+#                 "Amount",
+#             ]
+#         ]
+
+#         for extra in quotation.extra_charge_items:
+
+#             extra_data.append(
+#                 [
+#                     extra.expense_type,
+#                     str(extra.quantity),
+#                     f"{extra.rate:.2f}",
+#                     f"{extra.amount:.2f}",
+#                 ]
+#             )
+
+#         extra_table = Table(
+#             extra_data,
+#             colWidths=[220, 90, 90, 90]
+#         )
+
+#         extra_table.setStyle(
+#             TableStyle(
+#                 [
+#                     ("GRID", (0, 0), (-1, -1), 1, colors.black),
+
+#                     ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+#                 ]
+#             )
+#         )
+
+#         elements.append(extra_table)
+
+#         elements.append(Spacer(1, 15))
+
+#     # =====================================================
+#     # TOTAL SUMMARY
+#     # =====================================================
+
+#     summary_data = [
+#         ["Subtotal", f"{quotation.subtotal:.2f}"],
+
+#         ["CGST", f"{quotation.cgst_amount:.2f}"],
+
+#         ["SGST", f"{quotation.sgst_amount:.2f}"],
+
+#         ["TDS", f"{quotation.tds_amount:.2f}"],
+
+#         ["Discount", f"{quotation.discount_amount:.2f}"],
+
+#         ["Advance Paid", f"{quotation.advance_paid:.2f}"],
+
+#         ["Grand Total", f"{quotation.grand_total:.2f}"],
+
+#         ["Balance Due", f"{quotation.balance_due:.2f}"],
+#     ]
+
+#     summary_table = Table(
+#         summary_data,
+#         colWidths=[200, 150]
+#     )
+
+#     summary_table.setStyle(
+#         TableStyle(
+#             [
+#                 ("GRID", (0, 0), (-1, -1), 1, colors.black),
+
+#                 ("BACKGROUND", (0, -2), (-1, -1), colors.lightgrey),
+
+#                 ("FONTNAME", (0, -2), (-1, -1), "Helvetica-Bold"),
+#             ]
+#         )
+#     )
+
+#     elements.append(summary_table)
+
+#     elements.append(Spacer(1, 20))
+
+#     # =====================================================
+#     # TERMS
+#     # =====================================================
+
+#     if quotation.terms_conditions:
+
+#         terms = Paragraph(
+#             f"<b>Terms & Conditions</b><br/>{quotation.terms_conditions}",
+#             styles["BodyText"]
+#         )
+
+#         elements.append(terms)
+
+#         elements.append(Spacer(1, 20))
+
+#     # =====================================================
+#     # QR CODE
+#     # =====================================================
+
+#     qr_drawing = generate_upi_qr(
+#         quotation
+#     )
+
+#     if qr_drawing:
+
+#         qr_title = Paragraph(
+#             "<b>Scan To Pay</b>",
+#             styles["Heading3"]
+#         )
+
+#         elements.append(qr_title)
+
+#         elements.append(qr_drawing)
+
+#         elements.append(Spacer(1, 20))
+
+#     # =====================================================
+#     # SIGNATURE
+#     # =====================================================
+
+#     signature = Paragraph(
+#         "<b>Authorized Signature</b>",
+#         styles["BodyText"]
+#     )
+
+#     elements.append(signature)
+
+#     # =====================================================
+#     # BUILD PDF
+#     # =====================================================
+
+#     doc.build(elements)
+
+#     buffer.seek(0)
+
+#     return buffer
+
+
 def generate_quotation_pdf(
     quotation: QuotationMaster
 ):
+    from io import BytesIO
+    import os
+
+    from reportlab.platypus import (
+        SimpleDocTemplate,
+        Paragraph,
+        Spacer,
+        Table,
+        Image,
+    )
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import (
+        getSampleStyleSheet,
+        ParagraphStyle,
+    )
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib import colors
 
     buffer = BytesIO()
+
+    # =====================================================
+    # DOCUMENT SETUP
+    # =====================================================
 
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
-        rightMargin=20,
         leftMargin=20,
+        rightMargin=20,
         topMargin=20,
         bottomMargin=20,
     )
 
     styles = getSampleStyleSheet()
-
     elements = []
 
     # =====================================================
-    # HEADER
+    # CUSTOM TITLE STYLE
     # =====================================================
 
-    title = Paragraph(
-        f"<b>QUOTATION</b>",
-        styles["Title"]
+    title_style = ParagraphStyle(
+        "QuotationTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=22,
+        leading=26,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#1F4E79"),
+        spaceAfter=10,
     )
 
-    elements.append(title)
+    # Replace your current logo_path code with this exact code
 
-    elements.append(Spacer(1, 10))
+    # =====================================================
+    # LOGO + TITLE
+    # =====================================================
+
+    # Dynamic project-based path (works in local and production)
+    # Current file: app/routers/quotation.py
+    # Required logo location: construction-mgmt/static/logo.png
+
+    project_root = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),  # app/routers
+            "..",                       # app
+            ".."                        # project root (construction-mgmt)
+        )
+    )
+
+    logo_path = os.path.join(
+        project_root,
+        "static",
+        "logo.png"
+    )
+
+    # Optional debug (remove later)
+    print("PROJECT ROOT:", project_root)
+    print("LOGO PATH:", logo_path)
+    print("LOGO EXISTS:", os.path.exists(logo_path))
+
+    # Create title
+    title_para = Paragraph(
+        "<b>PROJECT QUOTATION</b>",
+        title_style
+    )
+
+    # Create header table
+    if os.path.exists(logo_path):
+
+        logo = Image(
+            logo_path,
+            width=80,
+            height=80
+        )
+
+        header_table = Table(
+            [
+                [logo, title_para, ""]
+            ],
+            colWidths=[100, 350, 100]
+        )
+
+    else:
+
+        # If logo is missing, show title only
+        header_table = Table(
+            [
+                ["", title_para, ""]
+            ],
+            colWidths=[100, 350, 100]
+        )
+
+    # Style header table
+    header_table.setStyle(
+        TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (0, 0), (0, 0), "LEFT"),
+            ("ALIGN", (1, 0), (1, 0), "CENTER"),
+            ("ALIGN", (2, 0), (2, 0), "RIGHT"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ])
+    )
+
+    elements.append(header_table)
+    elements.append(Spacer(1, 15))
+
+    # =====================================================
+    # COMPANY DETAILS
+    # =====================================================
 
     company_details = f"""
     <b>{quotation.company_name or ''}</b><br/>
     GST: {quotation.gst_number or '-'}<br/>
-    Mobile: {quotation.mobile_number}<br/>
+    Mobile: {quotation.mobile_number or '-'}<br/>
     Email: {quotation.email or '-'}
     """
 
@@ -448,10 +1024,11 @@ def generate_quotation_pdf(
     elements.append(Spacer(1, 12))
 
     # =====================================================
-    # QUOTATION INFO
+    # QUOTATION INFORMATION
     # =====================================================
 
     quotation_info = [
+        ["Field", "Value"],
         ["Quotation No", quotation.quotation_no],
         ["Date", quotation.created_at.strftime("%d-%m-%Y")],
         ["Project", quotation.project_name],
@@ -460,21 +1037,12 @@ def generate_quotation_pdf(
         ["Work Order", quotation.work_order_no or "-"],
     ]
 
-    table = Table(
-        quotation_info,
-        colWidths=[120, 300]
-    )
-
-    table.setStyle(
-        TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
-            ]
+    elements.append(
+        create_styled_table(
+            quotation_info,
+            [150, 370]
         )
     )
-
-    elements.append(table)
 
     elements.append(Spacer(1, 15))
 
@@ -482,182 +1050,129 @@ def generate_quotation_pdf(
     # CLIENT DETAILS
     # =====================================================
 
-    client_title = Paragraph(
-        "<b>Client Details</b>",
-        styles["Heading2"]
-    )
-
-    elements.append(client_title)
-
-    client_info = f"""
-    <b>{quotation.client_name}</b><br/>
-    Billing Address: {quotation.billing_address or '-'}<br/>
-    Site Address: {quotation.site_address or '-'}<br/>
-    Mobile: {quotation.mobile_number}<br/>
-    GST: {quotation.gst_number or '-'}
-    """
+    client_info = [
+        ["Field", "Value"],
+        ["Client Name", quotation.client_name],
+        ["Billing Address", quotation.billing_address or "-"],
+        ["Site Address", quotation.site_address or "-"],
+        ["Mobile", quotation.mobile_number or "-"],
+        ["GST Number", quotation.gst_number or "-"],
+    ]
 
     elements.append(
         Paragraph(
+            "<b>Client Details</b>",
+            styles["Heading2"]
+        )
+    )
+
+    elements.append(
+        create_styled_table(
             client_info,
-            styles["BodyText"]
+            [150, 370]
         )
     )
 
     elements.append(Spacer(1, 15))
 
     # =====================================================
-    # ITEM TABLE
+    # ITEM DETAILS
     # =====================================================
 
     item_data = [
-        [
-            "Item",
-            "Qty",
-            "Unit",
-            "Rate",
-            "Amount",
-        ]
+        ["Item", "Qty", "Unit", "Rate", "Amount"]
     ]
 
     for item in quotation.items:
+        item_data.append([
+            item.title,
+            f"{item.quantity:.2f}",
+            item.unit or "-",
+            f"{item.rate:.2f}",
+            f"{item.amount:.2f}",
+        ])
 
-        item_data.append(
-            [
-                item.title,
-                str(item.quantity),
-                item.unit or "-",
-                f"{item.rate:.2f}",
-                f"{item.amount:.2f}",
-            ]
-        )
-
-    item_table = Table(
-        item_data,
-        colWidths=[180, 70, 70, 80, 90]
-    )
-
-    item_table.setStyle(
-        TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ]
+    elements.append(
+        Paragraph(
+            "<b>Item Details</b>",
+            styles["Heading2"]
         )
     )
 
-    elements.append(item_table)
+    elements.append(
+        create_styled_table(
+            item_data,
+            [180, 70, 70, 80, 90]
+        )
+    )
 
     elements.append(Spacer(1, 15))
 
     # =====================================================
-    # LABOUR TABLE
+    # LABOUR DETAILS
     # =====================================================
 
     if quotation.labour_items:
-
-        labour_title = Paragraph(
-            "<b>Labour Details</b>",
-            styles["Heading2"]
-        )
-
-        elements.append(labour_title)
-
         labour_data = [
-            [
-                "Skill",
-                "Count",
-                "Days",
-                "Daily Wage",
-                "Amount",
-            ]
+            ["Skill", "Count", "Days", "Daily Wage", "Amount"]
         ]
 
         for labour in quotation.labour_items:
+            labour_data.append([
+                labour.skill_type,
+                str(labour.labour_count),
+                f"{labour.labour_days:.2f}",
+                f"{labour.daily_wage:.2f}",
+                f"{labour.amount:.2f}",
+            ])
 
-            labour_data.append(
-                [
-                    labour.skill_type,
-                    str(labour.labour_count),
-                    str(labour.labour_days),
-                    f"{labour.daily_wage:.2f}",
-                    f"{labour.amount:.2f}",
-                ]
-            )
-
-        labour_table = Table(
-            labour_data,
-            colWidths=[150, 80, 80, 100, 100]
-        )
-
-        labour_table.setStyle(
-            TableStyle(
-                [
-                    ("GRID", (0, 0), (-1, -1), 1, colors.black),
-
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ]
+        elements.append(
+            Paragraph(
+                "<b>Labour Details</b>",
+                styles["Heading2"]
             )
         )
 
-        elements.append(labour_table)
+        elements.append(
+            create_styled_table(
+                labour_data,
+                [150, 80, 80, 100, 100]
+            )
+        )
 
         elements.append(Spacer(1, 15))
 
     # =====================================================
-    # MATERIAL TABLE
+    # MATERIAL DETAILS
     # =====================================================
 
     if quotation.material_items:
-
-        material_title = Paragraph(
-            "<b>Material Details</b>",
-            styles["Heading2"]
-        )
-
-        elements.append(material_title)
-
         material_data = [
-            [
-                "Material",
-                "Qty",
-                "Unit",
-                "Rate",
-                "Amount",
-            ]
+            ["Material", "Qty", "Unit", "Rate", "Amount"]
         ]
 
         for material in quotation.material_items:
+            material_data.append([
+                material.material_name,
+                f"{material.estimated_quantity:.2f}",
+                material.unit,
+                f"{material.estimated_rate:.2f}",
+                f"{material.estimated_amount:.2f}",
+            ])
 
-            material_data.append(
-                [
-                    material.material_name,
-                    str(material.estimated_quantity),
-                    material.unit,
-                    f"{material.estimated_rate:.2f}",
-                    f"{material.estimated_amount:.2f}",
-                ]
-            )
-
-        material_table = Table(
-            material_data,
-            colWidths=[180, 70, 70, 80, 90]
-        )
-
-        material_table.setStyle(
-            TableStyle(
-                [
-                    ("GRID", (0, 0), (-1, -1), 1, colors.black),
-
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ]
+        elements.append(
+            Paragraph(
+                "<b>Material Details</b>",
+                styles["Heading2"]
             )
         )
 
-        elements.append(material_table)
+        elements.append(
+            create_styled_table(
+                material_data,
+                [180, 70, 70, 80, 90]
+            )
+        )
 
         elements.append(Spacer(1, 15))
 
@@ -666,142 +1181,196 @@ def generate_quotation_pdf(
     # =====================================================
 
     if quotation.extra_charge_items:
-
-        extra_title = Paragraph(
-            "<b>Extra Charges</b>",
-            styles["Heading2"]
-        )
-
-        elements.append(extra_title)
-
         extra_data = [
-            [
-                "Type",
-                "Qty",
-                "Rate",
-                "Amount",
-            ]
+            ["Type", "Qty", "Rate", "Amount"]
         ]
 
         for extra in quotation.extra_charge_items:
+            extra_data.append([
+                extra.expense_type,
+                f"{extra.quantity:.2f}",
+                f"{extra.rate:.2f}",
+                f"{extra.amount:.2f}",
+            ])
 
-            extra_data.append(
-                [
-                    extra.expense_type,
-                    str(extra.quantity),
-                    f"{extra.rate:.2f}",
-                    f"{extra.amount:.2f}",
-                ]
-            )
-
-        extra_table = Table(
-            extra_data,
-            colWidths=[220, 90, 90, 90]
-        )
-
-        extra_table.setStyle(
-            TableStyle(
-                [
-                    ("GRID", (0, 0), (-1, -1), 1, colors.black),
-
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ]
+        elements.append(
+            Paragraph(
+                "<b>Extra Charges</b>",
+                styles["Heading2"]
             )
         )
 
-        elements.append(extra_table)
+        elements.append(
+            create_styled_table(
+                extra_data,
+                [220, 90, 90, 90]
+            )
+        )
 
         elements.append(Spacer(1, 15))
 
     # =====================================================
-    # TOTAL SUMMARY
+    # SUMMARY
     # =====================================================
 
     summary_data = [
+        ["Description", "Amount"],
         ["Subtotal", f"{quotation.subtotal:.2f}"],
-
         ["CGST", f"{quotation.cgst_amount:.2f}"],
-
         ["SGST", f"{quotation.sgst_amount:.2f}"],
-
         ["TDS", f"{quotation.tds_amount:.2f}"],
-
         ["Discount", f"{quotation.discount_amount:.2f}"],
-
         ["Advance Paid", f"{quotation.advance_paid:.2f}"],
-
         ["Grand Total", f"{quotation.grand_total:.2f}"],
-
         ["Balance Due", f"{quotation.balance_due:.2f}"],
     ]
 
-    summary_table = Table(
-        summary_data,
-        colWidths=[200, 150]
-    )
-
-    summary_table.setStyle(
-        TableStyle(
-            [
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-
-                ("BACKGROUND", (0, -2), (-1, -1), colors.lightgrey),
-
-                ("FONTNAME", (0, -2), (-1, -1), "Helvetica-Bold"),
-            ]
+    elements.append(
+        Paragraph(
+            "<b>Financial Summary</b>",
+            styles["Heading2"]
         )
     )
 
-    elements.append(summary_table)
+    elements.append(
+        create_styled_table(
+            summary_data,
+            [250, 150],
+            highlight_last_row=True
+        )
+    )
 
     elements.append(Spacer(1, 20))
 
     # =====================================================
-    # TERMS
+    # AMOUNT IN WORDS
+    # =====================================================
+
+    elements.append(
+        Paragraph(
+            f"<b>Amount in Words:</b> "
+            f"{amount_to_words(int(quotation.grand_total))} Only",
+            styles["BodyText"]
+        )
+    )
+
+    elements.append(Spacer(1, 15))
+
+    # =====================================================
+    # TERMS & CONDITIONS
     # =====================================================
 
     if quotation.terms_conditions:
-
-        terms = Paragraph(
-            f"<b>Terms & Conditions</b><br/>{quotation.terms_conditions}",
-            styles["BodyText"]
+        elements.append(
+            Paragraph(
+                f"<b>Terms & Conditions</b><br/>"
+                f"{quotation.terms_conditions}",
+                styles["BodyText"]
+            )
         )
-
-        elements.append(terms)
-
         elements.append(Spacer(1, 20))
 
     # =====================================================
-    # QR CODE
+    # QR CODE + SIGNATURE (TOGETHER)
     # =====================================================
 
-    qr_drawing = generate_upi_qr(
-        quotation
-    )
+    # Create a single block so QR code and signature stay together
+    payment_elements = []
+
+    # -----------------------------
+    # QR CODE
+    # -----------------------------
+    qr_drawing = generate_upi_qr(quotation)
 
     if qr_drawing:
+        payment_elements.append(
+            Paragraph(
+                "<b>Scan To Pay</b>",
+                styles["Heading3"]
+            )
+        )
+        payment_elements.append(Spacer(1, 5))
+        payment_elements.append(qr_drawing)
+        payment_elements.append(Spacer(1, 15))
 
-        qr_title = Paragraph(
+    # -----------------------------
+    # SIGNATURE
+    # -----------------------------
+
+    # Build one table so QR code and signature always remain together
+    project_root = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),  # app/routers
+            "..",                       # app
+            ".."                        # project root
+        )
+    )
+
+    signature_path = os.path.join(
+        project_root,
+        "static",
+        "signature.png"
+    )
+
+    # Prepare table rows
+    payment_rows = []
+
+    # Scan To Pay title
+    payment_rows.append([
+        Paragraph(
             "<b>Scan To Pay</b>",
             styles["Heading3"]
         )
+    ])
 
-        elements.append(qr_title)
+    # QR Code
+    qr_drawing = generate_upi_qr(quotation)
+    if qr_drawing:
+        payment_rows.append([qr_drawing])
 
-        elements.append(qr_drawing)
+    # Spacer row
+    payment_rows.append([""])
 
-        elements.append(Spacer(1, 20))
+    # Signature image
+    if os.path.exists(signature_path):
+        signature_img = Image(
+            signature_path,
+            width=140,
+            height=50
+        )
+        payment_rows.append([signature_img])
 
-    # =====================================================
-    # SIGNATURE
-    # =====================================================
+    # Authorized Signature text
+    payment_rows.append([
+        Paragraph(
+            "<b>Authorized Signature</b>",
+            styles["BodyText"]
+        )
+    ])
 
-    signature = Paragraph(
-        "<b>Authorized Signature</b>",
-        styles["BodyText"]
+    # Create single-column table
+    payment_table = Table(
+        payment_rows,
+        colWidths=[180]
     )
 
-    elements.append(signature)
+    # Style the table
+    payment_table.setStyle(
+        TableStyle([
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ])
+    )
+
+    # Keep the whole block together on the same page
+    elements.append(
+        KeepTogether([payment_table])
+    )
+
 
     # =====================================================
     # BUILD PDF
@@ -812,7 +1381,6 @@ def generate_quotation_pdf(
     buffer.seek(0)
 
     return buffer
-
 
 
 # =========================================================

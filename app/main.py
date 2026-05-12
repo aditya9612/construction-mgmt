@@ -20,7 +20,7 @@ from app.models.chat import ChatMessage, MessageStatus
 
 from app.api.ai import router as ai_router
 from app.api.auth import router as auth_router
-# from app.api.document import router as document_router
+from app.api.document import router as document_router
 from app.api.equipment import router as equipment_router
 from app.api.labour import router as labour_router
 from app.api.material import router as material_router
@@ -256,7 +256,7 @@ def create_app() -> FastAPI:
     api_router.include_router(labour_router)
     api_router.include_router(master_router)
     api_router.include_router(equipment_router)
-    # api_router.include_router(document_router)
+    api_router.include_router(document_router)
     api_router.include_router(site_request_router)
     api_router.include_router(communication_router)
     api_router.include_router(chats_router)

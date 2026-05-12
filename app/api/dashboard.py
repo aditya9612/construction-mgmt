@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date, datetime, timedelta
 import io
 
+from app.core.enums import InvoiceStatus
 from app.db.session import get_db_session
 from app.core import dependencies as d
 from app.models.user import User, UserRole
@@ -21,7 +22,8 @@ from app.cache import redis as r
 from app.schemas.dashboard import (
     EnhancedDashboardOut, DashboardVitals, IssueStats, MaterialStockStatus,
     TodayWorkSummary, DisciplineProgress, RecentExpense, MilestoneTimelineEntry,
-    AdminDashboardOut, AdminVitals, AdminProjectOverview, ProjectActivity
+    AdminDashboardOut, AdminVitals, AdminProjectOverview, ProjectActivity,
+    AccountantDashboardOut, AccountantVitals, ProjectBudgetSummary, MonthlyTrend
 )
 
 # PDF + Excel
@@ -337,47 +339,133 @@ async def manager_dashboard(
 # =========================================
 # ACCOUNTANT DASHBOARD
 # =========================================
-@router.get("/accountant")
+@router.get("/accountant", response_model=AccountantDashboardOut)
 async def accountant_dashboard(
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    # if current_user.role != UserRole.ACCOUNTANT:
-    #     return {"error": "Access denied"}
-
     async def logic():
-        # total_budget = await db.scalar(select(func.sum(m.Project.budget)))
         project_ids = await get_user_project_ids(db, current_user)
+        
+        # 1. Vitals
+        total_revenue = await db.scalar(
+            select(func.sum(Invoice.total_amount))
+        )
+        total_expense = await db.scalar(
+            select(func.sum(Expense.amount))
+        )
+        pending_payments_count = await db.scalar(
+            select(func.count(Invoice.id)).where(Invoice.status == InvoiceStatus.PENDING)
+        )
+        total_invoices_count = await db.scalar(
+            select(func.count(Invoice.id))
+        )
 
+        vitals = AccountantVitals(
+            total_revenue=float(total_revenue or 0),
+            total_expense=float(total_expense or 0),
+            pending_payments_count=int(pending_payments_count or 0),
+            total_invoices_count=int(total_invoices_count or 0)
+        )
+
+        # 2. Consumption Status
         total_budget = await db.scalar(
             select(func.sum(BOQ.total_cost)).where(
                 BOQ.is_latest == True, BOQ.project_id.in_(project_ids)
             )
         )
+        total_spent = float(total_expense or 0)
+        total_budget_val = float(total_budget or 0)
+        consumption_percentage = (total_spent / total_budget_val * 100) if total_budget_val else 0
 
-        total_spent = await db.scalar(
-            select(func.sum(Expense.amount)).where(Expense.project_id.in_(project_ids))
+        consumption_status = {
+            "total_budget": total_budget_val,
+            "total_spent": total_spent,
+            "percentage": round(consumption_percentage, 1)
+        }
+
+        # 3. Monthly Expense Analysis (Last 6 months)
+        monthly_trends = []
+        for i in range(5, -1, -1):
+            target_date = datetime.utcnow() - timedelta(days=i*30)
+            month_str = target_date.strftime("%b")
+            
+            # Simple month-based aggregation
+            month_start = target_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if i == 0:
+                month_end = datetime.utcnow()
+            else:
+                month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(seconds=1)
+
+            month_expense = await db.scalar(
+                select(func.sum(Expense.amount))
+                .where(Expense.expense_date >= month_start.date(), Expense.expense_date <= month_end.date())
+            )
+            monthly_trends.append(MonthlyTrend(month=month_str, amount=float(month_expense or 0)))
+
+        # 4. Project Cost Summary
+        project_cost_summary = []
+        projects_query = await db.execute(select(m.Project).where(m.Project.id.in_(project_ids)))
+        projects = projects_query.scalars().all()
+        
+        for p in projects:
+            p_budget = await db.scalar(
+                select(func.sum(BOQ.total_cost)).where(BOQ.project_id == p.id, BOQ.is_latest == True)
+            ) or 0
+            p_actual = await db.scalar(
+                select(func.sum(Expense.amount)).where(Expense.project_id == p.id)
+            ) or 0
+            
+            variance = ((float(p_actual) - float(p_budget)) / float(p_budget) * 100) if p_budget else 0
+            
+            project_cost_summary.append(ProjectBudgetSummary(
+                project_name=p.project_name,
+                budgeted=float(p_budget),
+                actual=float(p_actual),
+                variance_percent=round(variance, 1)
+            ))
+
+        # 5. Recent Invoices
+        recent_invoices_query = await db.execute(
+            select(Invoice, m.Project.project_name)
+            .join(m.Project, Invoice.project_id == m.Project.id)
+            .order_by(Invoice.created_at.desc())
+            .limit(5)
         )
+        recent_invoices = []
+        for inv, proj_name in recent_invoices_query.all():
+            recent_invoices.append({
+                "invoice_id": inv.id,
+                "project_name": proj_name,
+                "amount": float(inv.total_amount),
+                "status": inv.status.value if hasattr(inv.status, 'value') else str(inv.status),
+                "date": inv.created_at.strftime("%Y-%m-%d")
+            })
 
-        receivables = await db.scalar(select(func.sum(Invoice.pending_amount)))
-
-        inflow = await db.scalar(
-            select(func.sum(Transaction.amount)).where(Transaction.type == "receipt")
+        # 6. Recent Transactions
+        recent_tx_query = await db.execute(
+            select(Transaction, m.Project.project_name)
+            .join(m.Project, Transaction.project_id == m.Project.id)
+            .order_by(Transaction.created_at.desc())
+            .limit(5)
         )
-        outflow = await db.scalar(
-            select(func.sum(Transaction.amount)).where(Transaction.type == "payment")
-        )
-
-        kpi = await get_kpi_comparison(db)
+        recent_transactions = []
+        for tx, proj_name in recent_tx_query.all():
+            recent_transactions.append({
+                "type": tx.type,
+                "description": f"Payment for {proj_name}" if tx.type == "payment" else f"Receipt from {proj_name}",
+                "amount": float(tx.amount),
+                "time": tx.created_at.strftime("%H:%M")
+            })
 
         return {
-            "role": "accountant",
-            "total_budget": float(total_budget or 0),
-            "total_spent": float(total_spent or 0),
-            "receivables": float(receivables or 0),
-            "cash_balance": float((inflow or 0) - (outflow or 0)),
-            "kpi_comparison": kpi,
+            "vitals": vitals.dict(),
+            "consumption_status": consumption_status,
+            "monthly_expense_analysis": [t.dict() for t in monthly_trends],
+            "project_cost_summary": [p.dict() for p in project_cost_summary],
+            "recent_invoices": recent_invoices,
+            "recent_transactions": recent_transactions
         }
 
     version = await r.get_cache_version(redis, VERSION_KEY)
@@ -723,7 +811,7 @@ async def dashboard_graph(
         .where(*expense_filters)
         .group_by("period")
         .order_by("period")
-        .limit(1000)  # ✅ 2. ADD LIMIT HERE ALSO
+        .limit(1000)  #  2. ADD LIMIT HERE ALSO
     )
 
     expense_data = {str(r[0]): float(r[1] or 0) for r in expense_result.all()}

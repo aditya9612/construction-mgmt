@@ -108,14 +108,27 @@ async def get_agreement_stats(db: AsyncSession = Depends(get_db_session)):
         select(func.count(Agreement.id)).where(Agreement.uploaded_at >= first_of_month)
     )
 
-    # Simple storage calculation (mock for now to match UI)
-    storage = "432 MB"
-    missing = 12
+    # 1. Real Storage Calculation
+    total_size = 0
+    if os.path.exists(UPLOAD_DIR):
+        for f in os.listdir(UPLOAD_DIR):
+            fp = os.path.join(UPLOAD_DIR, f)
+            if os.path.isfile(fp):
+                total_size += os.path.getsize(fp)
+    
+    storage_str = f"{round(total_size / (1024 * 1024), 2)} MB"
+
+    # 2. Real Missing Documents Calculation (Owners without any agreement)
+    owners_count = await db.scalar(select(func.count(Owner.id)))
+    owners_with_aggr = await db.scalar(
+        select(func.count(func.distinct(Agreement.owner_id)))
+    )
+    missing = max(0, (owners_count or 0) - (owners_with_aggr or 0))
 
     return {
         "total_agreements": total or 0,
         "active_contracts": active or 0,
-        "storage_used": storage,
+        "storage_used": storage_str,
         "missing_docs": missing,
         "recent_uploads": recent or 0,
     }

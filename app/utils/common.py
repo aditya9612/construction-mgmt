@@ -101,3 +101,30 @@ async def generate_business_id(
 
     # If still failing
     raise Exception("Unable to generate unique business ID after retries")
+
+
+async def create_system_alert(
+    db: AsyncSession,
+    user_id: int,
+    title: str,
+    message: str,
+    priority: str = "Medium",
+    category: str = "System"
+):
+    """
+    Creates a notification for a user.
+    """
+    from app.models.alert import Alert
+    
+    alert = Alert(
+        user_id=user_id,
+        title=title,
+        message=message,
+        priority=priority,
+        category=category,
+        status="unread"
+    )
+    
+    db.add(alert)
+    await db.flush()
+    return alert

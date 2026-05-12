@@ -19,7 +19,7 @@ from app.schemas.invoice import (
     InvoiceOut,
     LabourInvoiceCreate,
 )
-from app.utils.common import assert_project_access
+from app.utils.common import assert_project_access, create_system_alert
 from app.utils.helpers import NotFoundError, ValidationError
 from decimal import Decimal
 from fastapi.responses import StreamingResponse
@@ -250,6 +250,16 @@ async def create_invoice_from_quotation(
         quotation.converted_to_invoice = True
         quotation.status = QuotationStatus.CONVERTED
 
+        # 11. Trigger Notification
+        await create_system_alert(
+            db,
+            project.owner_id, # Assuming owner has a user_id or we send to admin
+            "New Invoice Generated",
+            f"An invoice of ₹{invoice.total_amount:,.2f} has been generated for project {project.project_name}.",
+            priority="Medium",
+            category="Finance"
+        )
+
         await db.commit()
 
     except Exception:
@@ -447,6 +457,15 @@ async def mark_paid(
     invoice.paid_amount += remaining
     invoice.pending_amount = 0
     invoice.status = "paid"
+
+    await create_system_alert(
+        db,
+        invoice.owner_id,
+        "Payment Received",
+        f"Payment of ₹{remaining:,.2f} received for Invoice #{invoice.id}.",
+        priority="Medium",
+        category="Finance"
+    )
 
     await db.commit()
 

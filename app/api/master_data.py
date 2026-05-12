@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional, List
 
 from app.db.session import get_db_session
 from app.models import master_data as m
@@ -24,6 +25,78 @@ VERSION_KEY = "master_version"
 
 #  FIX: define once (NO inline callable)
 admin_required = require_roles([UserRole.ADMIN])
+
+
+# ===================== STATS =====================
+@router.get("/stats", response_model=s.MasterDataStats)
+async def get_master_stats(
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Returns counts for all master data types for the dashboard.
+    """
+    materials = await db.scalar(select(func.count(m.MaterialMaster.id)))
+    labour = await db.scalar(select(func.count(m.LabourType.id)))
+    activity = await db.scalar(select(func.count(m.ActivityType.id)))
+    units = await db.scalar(select(func.count(m.Unit.id)))
+
+    return s.MasterDataStats(
+        total_materials=int(materials or 0),
+        total_labour_types=int(labour or 0),
+        total_activity_types=int(activity or 0),
+        total_units=int(units or 0),
+    )
+
+
+# ===================== ALL / SEARCH =====================
+@router.get("/all", response_model=List[s.MasterDataUnified])
+async def get_all_master_data(
+    search: Optional[str] = None,
+    tag: Optional[str] = Query(None, description="MATERIAL, LABOR, ACTIVITY, UNIT"),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Returns a unified list of all master data with optional searching and tag filtering.
+    """
+    results = []
+
+    # 1. Materials
+    if not tag or tag == "MATERIAL":
+        q = select(m.MaterialMaster)
+        if search:
+            q = q.where(or_(m.MaterialMaster.name.ilike(f"%{search}%"), m.MaterialMaster.unique_code.ilike(f"%{search}%")))
+        res = await db.execute(q)
+        for x in res.scalars().all():
+            results.append(s.MasterDataUnified(id=x.id, name=x.name, unique_code=x.unique_code, category=x.category, system_tag="MATERIAL", unit=x.unit))
+
+    # 2. Labor
+    if not tag or tag == "LABOR":
+        q = select(m.LabourType)
+        if search:
+            q = q.where(or_(m.LabourType.name.ilike(f"%{search}%"), m.LabourType.unique_code.ilike(f"%{search}%")))
+        res = await db.execute(q)
+        for x in res.scalars().all():
+            results.append(s.MasterDataUnified(id=x.id, name=x.name, unique_code=x.unique_code, category=x.category, system_tag="LABOR"))
+
+    # 3. Activity
+    if not tag or tag == "ACTIVITY":
+        q = select(m.ActivityType)
+        if search:
+            q = q.where(or_(m.ActivityType.name.ilike(f"%{search}%"), m.ActivityType.unique_code.ilike(f"%{search}%")))
+        res = await db.execute(q)
+        for x in res.scalars().all():
+            results.append(s.MasterDataUnified(id=x.id, name=x.name, unique_code=x.unique_code, category=x.category, system_tag="ACTIVITY"))
+
+    # 4. Units
+    if not tag or tag == "UNIT":
+        q = select(m.Unit)
+        if search:
+            q = q.where(or_(m.Unit.name.ilike(f"%{search}%"), m.Unit.unique_code.ilike(f"%{search}%")))
+        res = await db.execute(q)
+        for x in res.scalars().all():
+            results.append(s.MasterDataUnified(id=x.id, name=x.name, unique_code=x.unique_code, category=x.category, system_tag="UNIT"))
+
+    return results
 
 
 # ===================== UNITS =====================
@@ -182,6 +255,40 @@ async def create_material_master(
     return obj
 
 
+# ===================== UPDATE =====================
+@router.put("/{entity}/{id}")
+async def update_master(
+    entity: str,
+    id: int,
+    payload: dict,
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    current_user: User = Depends(admin_required),
+):
+    mapping = {
+        "units": m.Unit,
+        "labour-types": m.LabourType,
+        "activity-types": m.ActivityType,
+        "materials": m.MaterialMaster,
+    }
+
+    model = mapping.get(entity)
+    if not model:
+        raise NotFoundError("Invalid master type")
+
+    obj = await db.get(model, id)
+    if not obj:
+        raise NotFoundError("Item not found")
+
+    for k, v in payload.items():
+        if hasattr(obj, k):
+            setattr(obj, k, v)
+
+    await db.commit()
+    await r.bump_cache_version(redis, VERSION_KEY)
+    return {"message": "updated"}
+
+
 # ===================== DELETE =====================
 @router.delete("/{entity}/{id}")
 async def delete_master(
@@ -212,4 +319,4 @@ async def delete_master(
     await db.commit()
 
     await r.bump_cache_version(redis, VERSION_KEY)
-    return {"message": "deleted"}
+    return {"message": "deleted"}

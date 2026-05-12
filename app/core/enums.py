@@ -187,3 +187,10 @@ class WorkActivityStatus(str, Enum):
     DELAY = "Delay"
     COMPLETED = "Completed"
     NOT_STARTED = "Not Started"
+
+
+class DocumentStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    UNDER_REVIEW = "UNDER_REVIEW"

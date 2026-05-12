@@ -94,3 +94,31 @@ class ProjectsManagementDashboardOut(BaseModel):
     summary: dict  # {total, ongoing, completed, delayed}
     recent_activities: List[ProjectActivity]
     master_projects: List[AdminProjectOverview]
+
+
+class AccountantVitals(BaseModel):
+    total_revenue: float
+    total_expense: float
+    pending_payments_count: int
+    total_invoices_count: int
+
+
+class ProjectBudgetSummary(BaseModel):
+    project_name: str
+    budgeted: float
+    actual: float
+    variance_percent: float
+
+
+class MonthlyTrend(BaseModel):
+    month: str
+    amount: float
+
+
+class AccountantDashboardOut(BaseModel):
+    vitals: AccountantVitals
+    consumption_status: dict  # {total_budget, total_spent, percentage}
+    monthly_expense_analysis: List[MonthlyTrend]
+    project_cost_summary: List[ProjectBudgetSummary]
+    recent_invoices: List[dict]
+    recent_transactions: List[dict]

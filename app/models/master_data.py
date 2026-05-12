@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, Text
 from app.models.base import Base
 
 
@@ -7,6 +7,8 @@ class Unit(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String(100), unique=True, nullable=False)
+    unique_code = Column(String(50), unique=True, nullable=True)
+    category = Column(String(100), nullable=True)
 
 
 class LabourType(Base):
@@ -14,6 +16,8 @@ class LabourType(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String(100), unique=True, nullable=False)
+    unique_code = Column(String(50), unique=True, nullable=True)
+    category = Column(String(100), nullable=True)
 
 
 class ActivityType(Base):
@@ -21,6 +25,8 @@ class ActivityType(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String(100), unique=True, nullable=False)
+    unique_code = Column(String(50), unique=True, nullable=True)
+    category = Column(String(100), nullable=True)
 
 
 class MaterialMaster(Base):
@@ -29,3 +35,5 @@ class MaterialMaster(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(150), nullable=False)
     unit = Column(String(50), nullable=False)
+    unique_code = Column(String(50), unique=True, nullable=True)
+    category = Column(String(100), nullable=True)

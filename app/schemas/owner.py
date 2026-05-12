@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Optional
 from pydantic import Field, EmailStr, field_validator
 from app.schemas.base import BaseSchema
@@ -13,6 +14,7 @@ class OwnerCreate(BaseSchema):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     pan: Optional[str] = None
+    satisfaction_score: Optional[float] = Field(0.0, ge=0, le=100)
 
     @field_validator("pan")
     @classmethod
@@ -34,6 +36,7 @@ class OwnerUpdate(BaseSchema):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     pan: Optional[str] = None
+    satisfaction_score: Optional[float] = Field(None, ge=0, le=100)
 
     @field_validator("pan")
     @classmethod
@@ -57,6 +60,7 @@ class OwnerOut(BaseSchema):
     email: Optional[EmailStr]
     address: Optional[str]
     pan: Optional[str]
+    satisfaction_score: float
 
     class Config:
         from_attributes = True
@@ -85,3 +89,66 @@ class OwnerLedgerResponse(BaseSchema):
     total_debit: float
     balance: float
     transactions: list[OwnerTransactionOut]
+
+
+# =========================
+# CLIENT PORTFOLIO (NEW)
+# =========================
+
+class ClientPortfolioItem(BaseSchema):
+    id: int
+    owner_name: str
+    mobile: str
+    email: Optional[EmailStr] = None
+    
+    total_projects: int
+    linked_project_name: Optional[str] = None
+    
+    pending_billing: float
+    total_received: float
+    
+    status: str # ACTIVE / INACTIVE
+
+    class Config:
+        from_attributes = True
+
+
+class ClientPortfolioSummary(BaseSchema):
+    total_clients: int
+    total_outstanding_billing: float
+    average_satisfaction_score: float # Mocked for now
+
+
+class ClientPortfolioResponse(BaseSchema):
+    summary: ClientPortfolioSummary
+    items: list[ClientPortfolioItem]
+
+
+# =========================
+# PAYMENT TRACKER (NEW)
+# =========================
+
+class OwnerPaymentScheduleCreate(BaseSchema):
+    owner_id: int
+    project_id: int
+    milestone_name: str
+    due_date: Optional[date] = None
+    amount: float
+    description: Optional[str] = None
+    reference_code: Optional[str] = None
+
+
+class OwnerPaymentScheduleOut(BaseSchema):
+    id: int
+    owner_id: int
+    project_id: int
+    milestone_name: str
+    due_date: Optional[date] = None
+    amount: float
+    paid_amount: float
+    status: str
+    reference_code: Optional[str]
+    description: Optional[str]
+
+    class Config:
+        from_attributes = True

@@ -17,7 +17,7 @@ from app.db.session import get_db_session
 from app.schemas.material import MaterialReport
 from app.schemas.material import PriceHistoryOut
 from app.core.enums import IssueType, TransactionType, TransferStatus
-from app.utils.common import generate_business_id
+from app.utils.common import generate_business_id, create_system_alert
 from sqlalchemy.orm import selectinload
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
@@ -1293,8 +1293,24 @@ async def usage(
     # ===== ALERT =====
     if obj.remaining_stock == 0:
         alert_type = "OUT_OF_STOCK"
+        await create_system_alert(
+            db, 
+            current_user.id, 
+            "Out of Stock", 
+            f"Material {obj.material_name} is completely exhausted.",
+            priority="High",
+            category="Inventory"
+        )
     elif obj.remaining_stock <= obj.minimum_stock_level:
         alert_type = "LOW_STOCK"
+        await create_system_alert(
+            db, 
+            current_user.id, 
+            "Low Stock Warning", 
+            f"Material {obj.material_name} is below the minimum level ({obj.remaining_stock} {obj.unit} left).",
+            priority="Medium",
+            category="Inventory"
+        )
     else:
         alert_type = "IN_STOCK"
 
@@ -2795,7 +2811,7 @@ async def create_material(
     # ===== NORMALIZE NAME =====
     raw_name = payload.material_name.strip()
     normalized_name = raw_name.strip().lower()
-    data["material_name"] = normalized_name  # ✅ store normalized
+    data["material_name"] = normalized_name  #  store normalized
 
     # ===== VALIDATE SUPPLIER =====
     supplier = await db.get(Supplier, payload.supplier_id)
