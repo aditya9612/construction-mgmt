@@ -116,7 +116,6 @@ def safe_delete(file_path: str):
 
 # ================= CENTRAL CALCULATION =================
 
-
 def build_material_response(obj, supplier_name: str | None):
     total_amount = float(obj.total_amount or 0)
     payment_given = float(obj.payment_given or 0)

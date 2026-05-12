@@ -45,7 +45,6 @@ if TYPE_CHECKING:
 
 # ===================== PROJECT =====================
 
-
 class Project(Base, TimestampMixin):
     __tablename__ = "projects"
 

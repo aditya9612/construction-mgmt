@@ -119,7 +119,6 @@ router = APIRouter(
 
 VERSION_KEY = "cache_version:equipment"
 
-
 # === UTILITY FUNCTIONS ===
 async def get_active_equipment_or_404(db: AsyncSession, equipment_id: int):
     """Get active (not deleted) equipment or 404"""

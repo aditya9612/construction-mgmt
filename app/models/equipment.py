@@ -21,7 +21,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.enums import EquipmentCondition, EquipmentStatus
 from app.models.base import Base, TimestampMixin
 
-
 class Equipment(Base, TimestampMixin):
     __tablename__ = "equipment"
 

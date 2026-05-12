@@ -643,7 +643,6 @@ class WorkActivityResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
 class DailyProgressCreate(BaseModel):
     activity_id: int
     entry_date: date
@@ -655,7 +654,6 @@ class DailyProgressCreate(BaseModel):
 class DailyProgressUpdate(BaseModel):
     today_progress: Optional[float] = None
     remarks: Optional[str] = None
-
 
 class DailyProgressResponse(BaseModel):
     id: int

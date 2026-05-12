@@ -40,7 +40,6 @@ class MaterialCreate(BaseSchema):
             raise ValueError("Value cannot be negative")
         return v
 
-
 class MaterialUpdate(BaseSchema):
     material_name: Optional[str] = None
     category: Optional[str] = None
