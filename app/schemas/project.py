@@ -302,6 +302,7 @@ class DSRUpdate(BaseSchema):
 
 # ===================== DSR PHOTO OUTPUT =====================
 
+
 class DSRPhotoOut(BaseModel):
     id: int
     file_url: str
@@ -311,6 +312,7 @@ class DSRPhotoOut(BaseModel):
 
 
 # ===================== OUTPUT =====================
+
 
 class DSROut(DSRBase):
     id: int
@@ -602,13 +604,14 @@ class WorkActivityCreate(BaseModel):
     project_id: int
     boq_code: int
     activity_name: str
-    planned_quantity: float
+
+    planned_quantity: float = Field(gt=0)
+
     unit: str
     start_date: date
     end_date: date
     work_order_id: int
 
-    # Use enum instead of str
     status: WorkActivityStatus = WorkActivityStatus.NOT_STARTED
 
     engineer_id: int
@@ -616,12 +619,13 @@ class WorkActivityCreate(BaseModel):
 
 class WorkActivityUpdate(BaseModel):
     activity_name: Optional[str] = None
-    planned_quantity: Optional[float] = None
+
+    planned_quantity: Optional[float] = Field(default=None, gt=0)
+
     unit: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
 
-    # Optional enum for partial updates
     status: Optional[WorkActivityStatus] = None
 
 
@@ -643,10 +647,11 @@ class WorkActivityResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
 class DailyProgressCreate(BaseModel):
     activity_id: int
     entry_date: date
-    today_progress: float
+    today_progress: float = Field(gt=0)
     remarks: Optional[str] = None
     created_by: int
 
@@ -655,16 +660,18 @@ class DailyProgressUpdate(BaseModel):
     today_progress: Optional[float] = None
     remarks: Optional[str] = None
 
+
 class DailyProgressResponse(BaseModel):
     id: int
     activity_id: int
     entry_date: date
-    today_progress: float
+    today_progress: float = Field(gt=0)
     remarks: Optional[str] = None
     created_by: int
 
     class Config:
         from_attributes = True
+
 
 class ProjectsModuleSummary(BaseModel):
     total_projects: int
@@ -672,12 +679,14 @@ class ProjectsModuleSummary(BaseModel):
     completed_projects: int
     delayed_projects: int
 
+
 class ProjectActivityItem(BaseModel):
     type: str  # task_completion, invoice, photo, issue
     user_name: str
     description: str
     project_name: str
     timestamp: datetime
+
 
 class ProjectsModuleResponse(BaseModel):
     summary: ProjectsModuleSummary
