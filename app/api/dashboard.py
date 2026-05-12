@@ -14,11 +14,14 @@ from app.models.invoice import Invoice, Transaction
 from app.models.labour import LabourAttendance
 from app.models.boq import BOQ
 from app.models.material import Material
-from app.models.project import WorkActivity, DailyProgressEntry, Issue, Milestone, Task
+from app.models.project import WorkActivity, DailyProgressEntry, Issue, Milestone, Task, DailySiteReport
+from app.models.approval import Approval
+from app.models.user import User, UserRole, ActivityLog
 from app.cache import redis as r
 from app.schemas.dashboard import (
     EnhancedDashboardOut, DashboardVitals, IssueStats, MaterialStockStatus,
-    TodayWorkSummary, DisciplineProgress, RecentExpense, MilestoneTimelineEntry
+    TodayWorkSummary, DisciplineProgress, RecentExpense, MilestoneTimelineEntry,
+    AdminDashboardOut, AdminVitals, AdminProjectOverview, ProjectActivity
 )
 
 # PDF + Excel
@@ -96,7 +99,7 @@ async def get_kpi_comparison(db):
 # =========================================
 # ADMIN DASHBOARD
 # =========================================
-@router.get("/admin")
+@router.get("/admin", response_model=AdminDashboardOut)
 async def admin_dashboard(
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
@@ -108,6 +111,7 @@ async def admin_dashboard(
     async def logic():
         today = date.today()
 
+        # 1. Project Overview
         project_stats = await db.execute(
             select(
                 func.count(m.Project.id),
@@ -118,42 +122,121 @@ async def admin_dashboard(
         )
         total, active, completed, delayed = project_stats.one()
 
+        # 2. Financials
         revenue = await db.scalar(
             select(func.sum(Invoice.total_amount)).where(Invoice.status == "paid")
         )
-
         expense = await db.scalar(select(func.sum(Expense.amount)))
-        project_ids = await get_user_project_ids(db, current_user)
 
-        budget = await db.scalar(
-            select(func.sum(BOQ.total_cost)).where(
-                BOQ.is_latest == True, BOQ.project_id.in_(project_ids)
-            )
+        # 3. Vitals
+        labour_today = await db.scalar(
+            select(func.sum(DailySiteReport.total_labour))
+            .where(DailySiteReport.report_date == today)
         )
-        progress = await db.scalar(
-            select(func.avg(m.Task.completion_percentage)).where(
-                m.Task.project_id.in_(project_ids)
-            )
+        pending_approvals = await db.scalar(
+            select(func.count(Approval.id)).where(Approval.status == "Pending")
         )
+        action_items = await db.scalar(
+            select(func.count(Issue.id)).where(Issue.priority == "HIGH", Issue.status == "OPEN")
+        )
+        material_reports = await db.scalar(
+            select(func.count(DailySiteReport.id))
+            .where(DailySiteReport.report_date == today, DailySiteReport.material_used != None)
+        )
+        open_issues = await db.scalar(
+            select(func.count(Issue.id)).where(Issue.status == "OPEN")
+        )
+
+        vitals = AdminVitals(
+            total_labour_today=int(labour_today or 0),
+            pending_approvals=int(pending_approvals or 0),
+            action_items=int(action_items or 0),
+            material_used_today=int(material_reports or 0),
+            site_issues_open=int(open_issues or 0)
+        )
+
+        # 4. Active Users
+        active_users_count = await db.scalar(
+            select(func.count(User.id)).where(User.is_active == True, User.is_deleted == False)
+        )
+
+        # 5. Master Projects
+        projects_query = await db.execute(select(m.Project))
+        projects = projects_query.scalars().all()
+        master_projects = []
+
+        for p in projects:
+            # Progress
+            avg_progress = await db.scalar(
+                select(func.avg(m.Task.completion_percentage)).where(m.Task.project_id == p.id)
+            ) or 0
+            
+            # Planned Progress
+            planned = 0
+            if p.start_date and p.end_date:
+                total_days = (p.end_date - p.start_date).days
+                elapsed_days = (today - p.start_date).days
+                if total_days > 0:
+                    planned = max(0, min(100, (elapsed_days / total_days) * 100))
+            
+            master_projects.append(AdminProjectOverview(
+                id=p.id,
+                name=p.project_name,
+                start_date=p.start_date,
+                end_date=p.end_date,
+                progress=round(float(avg_progress), 2),
+                performance_score=round(float(avg_progress) - planned, 2),
+                health=str(p.status.value) if hasattr(p.status, 'value') else str(p.status)
+            ))
+
+        # 6. Discipline Progress
+        discipline_query = await db.execute(
+            select(m.Task.discipline, func.avg(m.Task.completion_percentage))
+            .group_by(m.Task.discipline)
+        )
+        discipline_progress = [
+            DisciplineProgress(discipline=row[0] or "General", planned_percent=0, actual_percent=float(row[1] or 0))
+            for row in discipline_query.all()
+        ]
+
+        # 7. Recent Activities
+        activities_query = await db.execute(
+            select(ActivityLog, User.full_name)
+            .join(User, ActivityLog.performed_by == User.id)
+            .order_by(ActivityLog.created_at.desc())
+            .limit(10)
+        )
+        recent_activities = []
+        for log, user_name in activities_query.all():
+            recent_activities.append(ProjectActivity(
+                type=log.action,
+                user=user_name or "Unknown",
+                description=str(log.details.get('message', log.action)) if log.details else log.action,
+                time=log.created_at.strftime("%H:%M"),
+                project_name="Global" # Could be enhanced to join with projects if entity_id is project
+            ))
+
         kpi = await get_kpi_comparison(db)
 
-        return {
-            "role": "admin",
-            "project_overview": {
+        return AdminDashboardOut(
+            project_overview={
                 "total": total or 0,
                 "active": active or 0,
                 "completed": completed or 0,
                 "delayed": delayed or 0,
             },
-            "financial": {
+            financial={
                 "revenue": float(revenue or 0),
                 "expense": float(expense or 0),
                 "profit": float((revenue or 0) - (expense or 0)),
             },
-            "budget_variance": float((budget or 0) - (expense or 0)),
-            "efficiency": round(progress or 0, 2),
-            "kpi_comparison": kpi,
-        }
+            vitals=vitals,
+            active_users=int(active_users_count or 0),
+            discipline_progress=discipline_progress,
+            master_projects=master_projects,
+            recent_activities=recent_activities,
+            kpi_comparison=kpi,
+        ).dict()
 
     version = await r.get_cache_version(redis, VERSION_KEY)
     return await cache_get_set(redis, "admin_dashboard", version, logic)

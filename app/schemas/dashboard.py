@@ -61,6 +61,8 @@ class AdminVitals(BaseModel):
     total_labour_today: int
     pending_approvals: int
     action_items: int  # High priority open issues
+    material_used_today: int
+    site_issues_open: int
 
 class AdminProjectOverview(BaseModel):
     id: int
@@ -71,20 +73,22 @@ class AdminProjectOverview(BaseModel):
     performance_score: float  # variance
     health: str  # Active, Delayed, etc.
 
-class AdminDashboardOut(BaseModel):
-    project_overview: dict  # {total, active, completed, delayed}
-    financial: dict       # {revenue, expense, profit}
-    vitals: AdminVitals
-    discipline_progress: List[DisciplineProgress]
-    master_projects: List[AdminProjectOverview]
-    kpi_comparison: Optional[dict] = None
-
 class ProjectActivity(BaseModel):
     type: str  # task_completion, invoice_submission, site_photo, issue_report
     user: str
     description: str
     time: str
     project_name: Optional[str] = None
+
+class AdminDashboardOut(BaseModel):
+    project_overview: dict  # {total, active, completed, delayed}
+    financial: dict       # {revenue, expense, profit}
+    vitals: AdminVitals
+    active_users: int
+    discipline_progress: List[DisciplineProgress]
+    master_projects: List[AdminProjectOverview]
+    recent_activities: List[ProjectActivity]
+    kpi_comparison: Optional[dict] = None
 
 class ProjectsManagementDashboardOut(BaseModel):
     summary: dict  # {total, ongoing, completed, delayed}
