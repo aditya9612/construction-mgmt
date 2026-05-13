@@ -2462,9 +2462,18 @@ async def create_milestone(
             db, current_user, project_id=project_id, payload=payload
         )
         await bump_cache_version(redis, VERSION_KEY)
-    except Exception:
-        logger.exception(f"Milestone creation failed project_id={project_id}")
-        raise
+
+    except Exception as e:
+        # This will print the complete error and stack trace in server logs
+        logger.exception(
+            f"Milestone creation failed project_id={project_id}. Error: {repr(e)}"
+        )
+
+        # This will return the actual error message in the API response
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
     logger.info(f"Milestone created id={out.id}")
 
@@ -4969,7 +4978,7 @@ site_request_router = APIRouter(prefix="/site-requests", tags=["Site Requests"])
 @site_request_router.post("", response_model=s.SiteRequestOut)
 async def create_request(
     payload: s.SiteRequestCreate,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     obj = m.SiteRequest(
@@ -5182,7 +5191,7 @@ async def mark_delivered(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(Message, id)   # ✅ FIXED (removed m.)
+    obj = await db.get(Message, id)
 
     if not obj:
         raise NotFoundError("Message not found")
@@ -5251,7 +5260,6 @@ async def delete_message(
     if obj.created_by != current_user.id:
         raise ValidationError("Not allowed")
 
-    # ✅ FIX: prevent delete if replies exist
     result = await db.execute(
         select(Message).where(Message.parent_id == id)
     )
@@ -5275,7 +5283,7 @@ async def update_message(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(Message, id)   # ✅ FIXED (removed m.)
+    obj = await db.get(Message, id) 
 
     if not obj:
         raise NotFoundError("Message not found")

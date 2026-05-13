@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -160,10 +160,20 @@ async def update_measurement(
 
     try:
         await db.commit()
-    except Exception:
+
+    except Exception as e:
         await db.rollback()
-        logger.exception(f"Measurement update failed id={id}")
-        raise
+
+        # Full stack trace in server logs
+        logger.exception(
+            f"Measurement update failed id={id}. Error: {repr(e)}"
+        )
+
+        # Return actual database error in API response for debugging
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
     await db.refresh(obj)
 
@@ -199,10 +209,20 @@ async def delete_measurement(
     try:
         await db.delete(obj)
         await db.commit()
-    except Exception:
+
+    except Exception as e:
         await db.rollback()
-        logger.exception(f"Measurement delete failed id={id}")
-        raise
+
+        # Full stack trace in server logs
+        logger.exception(
+            f"Measurement delete failed id={id}. Error: {repr(e)}"
+        )
+
+        # Return actual database error in API response for debugging
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
     logger.info(f"Measurement deleted id={id}")
 
