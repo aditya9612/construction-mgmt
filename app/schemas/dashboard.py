@@ -122,3 +122,73 @@ class AccountantDashboardOut(BaseModel):
     project_cost_summary: List[ProjectBudgetSummary]
     recent_invoices: List[dict]
     recent_transactions: List[dict]
+
+
+# =========================================
+# PM COMMAND CENTER (NEW)
+# =========================================
+
+class PMKpiCards(BaseModel):
+    total_managed_projects: int
+    active_site_deployments: int
+    avg_completion_percent: float
+    delayed_sites_count: int
+    pending_reviews_count: int
+
+class PMProjectPerformance(BaseModel):
+    id: int
+    name: str
+    business_id: str
+    progress: float
+    status: str  # ON TRACK, DELAYED, AT RISK
+    start_date: Optional[date]
+    end_date: Optional[date]
+    budget_utilization_actual: float
+    budget_utilization_total: float
+
+class PMResourceOrchestration(BaseModel):
+    user_id: int
+    full_name: str
+    initials: str
+    assigned_project: str
+    status: str  # On Site, Travelling, Off Duty
+    last_seen: str  # "10 mins ago"
+
+class PMCostTrackingItem(BaseModel):
+    month: str
+    actual_cost: float
+    budget: float
+
+class PMDelayRiskAnalysis(BaseModel):
+    project_name: str
+    risk_type: str
+    priority: str  # High, Medium, Low
+    status: str    # CRITICAL, WARNING, MONITORED
+
+class PMCriticalAlert(BaseModel):
+    id: int
+    alert_type: str
+    message: str
+    project_name: str
+    timestamp: datetime
+
+class PMTaskOverview(BaseModel):
+    id: int
+    task_name: str
+    engineer_name: str
+    status: str  # In Progress, Pending, Completed
+    due_date: Optional[date]
+
+class PMCommandCenterOut(BaseModel):
+    header_date: str
+    kpis: PMKpiCards
+    project_performance: List[PMProjectPerformance]
+    quality_score: int
+    safety_score: int
+    resource_orchestration: List[PMResourceOrchestration]
+    cost_tracking: List[PMCostTrackingItem]
+    risk_analysis: List[PMDelayRiskAnalysis]
+    critical_alerts: List[PMCriticalAlert]
+    task_management: List[PMTaskOverview]
+    recent_activities: List[ProjectActivity]
+
