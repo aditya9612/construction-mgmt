@@ -16,6 +16,8 @@ from app.core.enums import (
     TaskPriority,
     WorkActivityStatus,
 )
+from sqlalchemy import select, func
+from decimal import Decimal, ROUND_HALF_UP
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
@@ -4001,7 +4003,87 @@ work_progress_router = APIRouter(
     dependencies=[default_rate_limiter_dependency()],
 )
 
-# =========================================================
+import json
+from decimal import Decimal
+from app.models.project import (
+    WorkActivity,
+    DailyProgressEntry,
+    ActivityHistory,
+    Project,
+    Task,
+    TaskProgress,
+    Comment,
+)
+
+
+def json_serializer(obj):
+
+    if isinstance(obj, Decimal):
+        return float(obj)
+
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+
+    if hasattr(obj, "value"):
+        return obj.value
+
+    return str(obj)
+
+
+async def create_activity_log(
+    db,
+    activity_id,
+    action,
+    changed_by,
+    old_value=None,
+    new_value=None,
+    remarks=None,
+):
+
+    log = ActivityHistory(
+        activity_id=activity_id,
+        action=action,
+        old_value=(
+            json.loads(json.dumps(old_value, default=json_serializer))
+            if old_value
+            else None
+        ),
+        new_value=(
+            json.loads(json.dumps(new_value, default=json_serializer))
+            if new_value
+            else None
+        ),
+        changed_by=changed_by,
+        remarks=remarks,
+    )
+
+    db.add(log)
+
+
+def update_activity_status(activity):
+
+    if (
+        activity.end_date
+        and activity.end_date < date.today()
+        and activity.completion_percentage < Decimal("100")
+    ):
+
+        activity.status = WorkActivityStatus.DELAY
+
+    elif activity.completion_percentage >= Decimal("100"):
+
+        activity.status = WorkActivityStatus.COMPLETED
+
+    elif activity.completion_percentage > Decimal("0"):
+
+        activity.status = WorkActivityStatus.ON_TRACK
+
+    else:
+
+        activity.status = WorkActivityStatus.NOT_STARTED
+
+
+# ==============work progress===========================================
 # 1. CREATE ACTIVITY
 
 
@@ -4014,34 +4096,78 @@ async def create_activity(
 
     try:
 
-        activity = m.WorkActivity(
-            **data.dict(),
-            remaining_quantity=data.planned_quantity,
-            total_completed=0,
-            completion_percentage=0,
+        # ================= CREATE ACTIVITY =================
+
+        activity = WorkActivity(
+            **data.model_dump(),
+            total_completed=Decimal("0.00"),
+            remaining_quantity=(data.planned_quantity - Decimal("0.00")).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            ),
+            completion_percentage=Decimal("0.00"),
         )
 
+        update_activity_status(activity)
+
         db.add(activity)
+
+        # ================= GENERATE ID BEFORE COMMIT =================
+
+        await db.flush()
+
+        # ================= AUDIT LOG =================
+
+        await create_activity_log(
+            db=db,
+            activity_id=activity.id,
+            action="CREATE",
+            changed_by=current_user.id,
+            new_value={
+                "activity_name": activity.activity_name,
+                "planned_quantity": str(activity.planned_quantity),
+                "status": activity.status.value,
+            },
+        )
+
+        # ================= SAVE =================
 
         await db.commit()
 
         await db.refresh(activity)
 
-        return {"message": "Activity Created", "data": activity}
+        # ================= RESPONSE =================
 
-    except IntegrityError:
+        return {
+            "message": "Activity Created",
+            "data": activity,
+        }
+
+    # ================= FOREIGN KEY / CONSTRAINT ERRORS =================
+
+    except IntegrityError as e:
 
         await db.rollback()
+
+        print("INTEGRITY ERROR =>", str(e))
 
         raise HTTPException(
-            status_code=400, detail="Invalid project_id, engineer_id, or work_order_id"
+            status_code=400,
+            detail=str(e),
         )
 
-    except Exception:
+    # ================= INTERNAL SERVER ERROR =================
+
+    except Exception as e:
 
         await db.rollback()
 
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        print("ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
 
 
 # =========================================================
@@ -4051,26 +4177,50 @@ async def create_activity(
 @work_progress_router.get("/activities")
 async def list_activities(
     project_id: int | None = None,
-    status: WorkActivityStatus | None = None,  # changed from str
+    status: WorkActivityStatus | None = None,
     engineer_id: int | None = None,
+    # Pagination
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    stmt = select(m.WorkActivity)
+
+    stmt = select(WorkActivity)
+
+    # ================= FILTERS =================
 
     if project_id:
-        stmt = stmt.where(m.WorkActivity.project_id == project_id)
+        stmt = stmt.where(WorkActivity.project_id == project_id)
 
     if status:
-        stmt = stmt.where(m.WorkActivity.status == status)
+        stmt = stmt.where(WorkActivity.status == status)
 
     if engineer_id:
-        stmt = stmt.where(m.WorkActivity.engineer_id == engineer_id)
+        stmt = stmt.where(WorkActivity.engineer_id == engineer_id)
+
+    # ================= ORDERING =================
+
+    stmt = stmt.order_by(WorkActivity.created_at.desc())
+
+    # ================= PAGINATION =================
+
+    stmt = stmt.offset(offset).limit(limit)
+
+    # ================= EXECUTE =================
 
     result = await db.execute(stmt)
+
     activities = result.scalars().all()
 
-    return activities
+    # ================= RESPONSE =================
+
+    return {
+        "limit": limit,
+        "offset": offset,
+        "page_count": len(activities),
+        "data": activities,
+    }
 
 
 # =========================================================
@@ -4084,16 +4234,19 @@ async def get_activity(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    result = await db.execute(select(m.WorkActivity).where(m.WorkActivity.id == id))
-
+    result = await db.execute(select(WorkActivity).where(WorkActivity.id == id))
     activity = result.scalars().first()
+
+    # ================= NOT FOUND =================
+
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity Not Found")
 
     return activity
 
 
 # =========================================================
 # 4. UPDATE ACTIVITY
-
 
 @work_progress_router.put("/activities/{id}")
 async def update_activity(
@@ -4103,23 +4256,146 @@ async def update_activity(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    result = await db.execute(select(m.WorkActivity).where(m.WorkActivity.id == id))
+    # ================= GET ACTIVITY =================
+
+    result = await db.execute(select(WorkActivity).where(WorkActivity.id == id))
 
     activity = result.scalars().first()
 
-    if not activity:
-        return {"message": "Activity Not Found"}
+    # ================= NOT FOUND =================
 
-    for key, value in data.dict(exclude_unset=True).items():
+    if not activity:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Activity Not Found",
+        )
+
+    # ================= STORE OLD DATA FOR AUDIT =================
+
+    old_data = {
+        "activity_name": activity.activity_name,
+        "planned_quantity": str(activity.planned_quantity),
+        "status": activity.status.value,
+    }
+
+    # ================= VALIDATE DATES =================
+
+    new_start_date = data.start_date or activity.start_date
+
+    new_end_date = data.end_date or activity.end_date
+
+    if new_end_date < new_start_date:
+
+        raise HTTPException(
+            status_code=400,
+            detail="End date cannot be before start date",
+        )
+
+    # ================= VALIDATE PLANNED QUANTITY =================
+
+    if (
+        data.planned_quantity is not None
+        and data.planned_quantity < activity.total_completed
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Planned quantity cannot be less than completed quantity",
+        )
+
+    # ================= UPDATE FIELDS =================
+
+    update_data = data.dict(exclude_unset=True)
+
+    for key, value in update_data.items():
 
         setattr(activity, key, value)
 
-    await db.commit()
+    # ================= RECALCULATE VALUES =================
 
-    await db.refresh(activity)
+    if activity.planned_quantity > 0:
 
-    return {"message": "Activity Updated", "data": activity}
+        # ================= REMAINING QUANTITY =================
 
+        activity.remaining_quantity = (
+            activity.planned_quantity - activity.total_completed
+        ).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+
+        # ================= COMPLETION PERCENTAGE =================
+
+        percentage = (
+            (activity.total_completed / activity.planned_quantity)
+            * Decimal("100")
+        ).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+
+        # ================= PREVENT ABOVE 100 =================
+
+        activity.completion_percentage = min(
+            percentage,
+            Decimal("100.00"),
+        )
+
+    else:
+
+        activity.remaining_quantity = Decimal("0.00")
+
+        activity.completion_percentage = Decimal("0.00")
+
+    # ================= STATUS UPDATE =================
+
+    update_activity_status(activity)
+
+    # ================= STORE NEW DATA FOR AUDIT =================
+
+    new_data = {
+        "activity_name": activity.activity_name,
+        "planned_quantity": str(activity.planned_quantity),
+        "status": activity.status.value,
+    }
+
+    # ================= SAVE =================
+
+    try:
+
+        # ================= CREATE AUDIT LOG =================
+
+        await create_activity_log(
+            db=db,
+            activity_id=activity.id,
+            action="UPDATE",
+            changed_by=current_user.id,
+            old_value=old_data,
+            new_value=new_data,
+        )
+
+        await db.commit()
+
+        await db.refresh(activity)
+
+    # ================= DB ERROR =================
+
+    except Exception:
+
+        await db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
+
+    # ================= RESPONSE =================
+
+    return {
+        "message": "Activity Updated",
+        "data": activity,
+    }
 
 # =========================================================
 # 5. DELETE ACTIVITY
@@ -4132,25 +4408,85 @@ async def delete_activity(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    result = await db.execute(select(m.WorkActivity).where(m.WorkActivity.id == id))
+    try:
 
-    activity = result.scalars().first()
+        # ================= GET ACTIVITY =================
 
-    if not activity:
-        return {"message": "Activity Not Found"}
+        result = await db.execute(select(WorkActivity).where(WorkActivity.id == id))
 
-    await db.delete(activity)
+        activity = result.scalars().first()
 
-    await db.commit()
+        # ================= NOT FOUND =================
 
-    return {"message": "Activity Deleted"}
+        if not activity:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Activity Not Found",
+            )
+
+        # ================= CREATE DELETE AUDIT LOG =================
+
+        await create_activity_log(
+            db=db,
+            activity_id=activity.id,
+            action="DELETE",
+            changed_by=current_user.id,
+            old_value={
+                "activity_name": activity.activity_name,
+                "planned_quantity": str(activity.planned_quantity),
+                "status": activity.status.value,
+            },
+            remarks="Activity deleted",
+        )
+
+        # ================= SAVE LOG BEFORE DELETE =================
+
+        await db.flush()
+
+        # ================= DELETE ACTIVITY =================
+
+        await db.delete(activity)
+
+        # ================= SAVE =================
+
+        await db.commit()
+
+        # ================= RESPONSE =================
+
+        return {
+            "message": "Activity Deleted Successfully",
+        }
+
+    # ================= HANDLE HTTP ERRORS =================
+
+    except HTTPException:
+
+        await db.rollback()
+
+        raise
+
+    # ================= HANDLE OTHER ERRORS =================
+
+    except Exception as e:
+
+        await db.rollback()
+
+        print("DELETE ACTIVITY ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
 
 # =========================================================
 # 6. ADD DAILY PROGRESS
 
-
-@work_progress_router.post("/daily-entry")
+@work_progress_router.post(
+    "/daily-entry",
+    response_model=s.DailyProgressWithActivityResponse,
+)
 async def add_daily_progress(
     data: s.DailyProgressCreate,
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
@@ -4160,62 +4496,117 @@ async def add_daily_progress(
     # ================= CHECK ACTIVITY EXISTS =================
 
     result = await db.execute(
-        select(m.WorkActivity).where(m.WorkActivity.id == data.activity_id)
+        select(WorkActivity)
+        .where(WorkActivity.id == data.activity_id)
+        .with_for_update()
     )
 
     activity = result.scalars().first()
 
     if not activity:
-        raise HTTPException(status_code=404, detail="Activity Not Found")
+
+        raise HTTPException(
+            status_code=404,
+            detail="Activity Not Found",
+        )
+
+    # ================= STORE OLD DATA FOR AUDIT =================
+
+    old_data = {
+        "total_completed": str(activity.total_completed),
+        "completion_percentage": str(activity.completion_percentage),
+        "status": activity.status.value,
+    }
+
+    # ================= DECIMAL CONVERSIONS =================
+
+    current_completed = Decimal(str(activity.total_completed or 0))
+
+    today_progress = Decimal(str(data.today_progress))
+
+    planned_quantity = Decimal(str(activity.planned_quantity or 0))
 
     # ================= CALCULATE PROGRESS =================
 
-    current_completed = float(activity.total_completed or 0)
-
-    new_completed = current_completed + data.today_progress
+    new_completed = current_completed + today_progress
 
     # ================= VALIDATE OVER PROGRESS =================
 
-    if new_completed > float(activity.planned_quantity):
+    if new_completed > planned_quantity:
+
+        await db.rollback()
 
         raise HTTPException(
-            status_code=400, detail="Progress cannot exceed planned quantity"
+            status_code=400,
+            detail="Progress cannot exceed planned quantity",
         )
 
     # ================= CREATE ENTRY =================
 
-    entry = m.DailyProgressEntry(**data.dict())
+    entry = DailyProgressEntry(
+        activity_id=data.activity_id,
+        entry_date=data.entry_date,
+        today_progress=data.today_progress,
+        remarks=data.remarks,
+        created_by=current_user.id,
+    )
 
     db.add(entry)
 
     # ================= UPDATE ACTIVITY =================
 
-    activity.total_completed = new_completed
+    activity.total_completed = new_completed.quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
 
-    activity.remaining_quantity = float(activity.planned_quantity) - new_completed
+    activity.remaining_quantity = (planned_quantity - new_completed).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
 
-    # ================= AVOID DIVIDE BY ZERO =================
+    # ================= COMPLETION PERCENTAGE =================
 
-    if float(activity.planned_quantity) > 0:
-        activity.completion_percentage = round(
-            (new_completed / float(activity.planned_quantity)) * 100, 2
+    if planned_quantity > 0:
+
+        percentage = ((new_completed / planned_quantity) * Decimal("100")).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
         )
-    else:
-        activity.completion_percentage = 0
 
-    # ================= AUTO STATUS UPDATE =================
+        # ================= PREVENT ABOVE 100 =================
 
-    if activity.completion_percentage >= 100:
-
-        activity.status = WorkActivityStatus.COMPLETED
-
-    elif activity.completion_percentage > 0:
-
-        activity.status = WorkActivityStatus.ON_TRACK
+        activity.completion_percentage = min(
+            percentage,
+            Decimal("100.00"),
+        )
 
     else:
 
-        activity.status = WorkActivityStatus.NOT_STARTED
+        activity.completion_percentage = Decimal("0.00")
+
+    # ================= STATUS UPDATE =================
+
+    update_activity_status(activity)
+
+    # ================= STORE NEW DATA FOR AUDIT =================
+
+    new_data = {
+        "total_completed": str(activity.total_completed),
+        "completion_percentage": str(activity.completion_percentage),
+        "status": activity.status.value,
+    }
+
+    # ================= CREATE AUDIT LOG =================
+
+    await create_activity_log(
+        db=db,
+        activity_id=activity.id,
+        action="DAILY_PROGRESS_ADD",
+        changed_by=current_user.id,
+        old_value=old_data,
+        new_value=new_data,
+    )
 
     # ================= SAVE TO DB =================
 
@@ -4235,7 +4626,7 @@ async def add_daily_progress(
 
         raise HTTPException(
             status_code=400,
-            detail=("Progress entry already exists " "for this activity on this date"),
+            detail="Progress entry already exists for this activity on this date",
         )
 
     # ================= OTHER ERRORS =================
@@ -4244,7 +4635,10 @@ async def add_daily_progress(
 
         await db.rollback()
 
-        raise HTTPException(status_code=500, detail="Something went wrong")
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
     # ================= RESPONSE =================
 
@@ -4255,36 +4649,56 @@ async def add_daily_progress(
     }
 
 
+
 # =========================================================
 # 7. LIST DAILY ENTRIES
-
 
 @work_progress_router.get("/daily-entry")
 async def list_daily_entries(
     activity_id: int | None = None,
-    entry_date: str | None = None,
+    entry_date: date | None = None,
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    stmt = select(m.DailyProgressEntry)
+    stmt = select(DailyProgressEntry)
+
+    # ================= FILTERS =================
 
     if activity_id:
-        stmt = stmt.where(m.DailyProgressEntry.activity_id == activity_id)
+        stmt = stmt.where(DailyProgressEntry.activity_id == activity_id)
 
     if entry_date:
-        stmt = stmt.where(m.DailyProgressEntry.entry_date == entry_date)
+        stmt = stmt.where(DailyProgressEntry.entry_date == entry_date)
+
+    # ================= ORDERING =================
+
+    stmt = stmt.order_by(DailyProgressEntry.entry_date.desc())
+
+    # ================= PAGINATION =================
+
+    stmt = stmt.offset(offset).limit(limit)
+
+    # ================= EXECUTE =================
 
     result = await db.execute(stmt)
 
     entries = result.scalars().all()
 
-    return entries
+    # ================= RESPONSE =================
+
+    return {
+        "limit": limit,
+        "offset": offset,
+        "page_count": len(entries),
+        "data": entries,
+    }
 
 
 # =========================================================
 # 8. UPDATE DAILY ENTRY
-
 
 @work_progress_router.put("/daily-entry/{id}")
 async def update_daily_entry(
@@ -4294,24 +4708,178 @@ async def update_daily_entry(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    result = await db.execute(
-        select(m.DailyProgressEntry).where(m.DailyProgressEntry.id == id)
-    )
+    try:
 
-    entry = result.scalars().first()
+        # ================= LOCK DAILY ENTRY =================
 
-    if not entry:
-        return {"message": "Daily Entry Not Found"}
+        result = await db.execute(
+            select(DailyProgressEntry)
+            .where(DailyProgressEntry.id == id)
+            .with_for_update()
+        )
 
-    for key, value in data.dict(exclude_unset=True).items():
+        entry = result.scalars().first()
 
-        setattr(entry, key, value)
+        if not entry:
 
-    await db.commit()
+            raise HTTPException(
+                status_code=404,
+                detail="Daily Entry Not Found",
+            )
 
-    await db.refresh(entry)
+        # ================= LOCK ACTIVITY =================
 
-    return {"message": "Daily Entry Updated", "data": entry}
+        result = await db.execute(
+            select(WorkActivity)
+            .where(WorkActivity.id == entry.activity_id)
+            .with_for_update()
+        )
+
+        activity = result.scalars().first()
+
+        if not activity:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Activity Not Found",
+            )
+
+        # ================= OLD AUDIT DATA =================
+
+        old_data = {
+            "today_progress": str(entry.today_progress),
+            "total_completed": str(activity.total_completed),
+            "status": activity.status.value,
+        }
+
+        # ================= DECIMAL VALUES =================
+
+        old_progress = Decimal(str(entry.today_progress or 0))
+
+        current_total = Decimal(str(activity.total_completed or 0))
+
+        planned_quantity = Decimal(str(activity.planned_quantity or 0))
+
+        # ================= UPDATE ENTRY =================
+
+        for key, value in data.dict(exclude_unset=True).items():
+
+            setattr(entry, key, value)
+
+        new_progress = Decimal(str(entry.today_progress or 0))
+
+        difference = new_progress - old_progress
+
+        updated_total = current_total + difference
+
+        # ================= VALIDATE NEGATIVE TOTAL =================
+
+        if updated_total < 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid progress calculation",
+            )
+
+        # ================= VALIDATE OVER PROGRESS =================
+
+        if updated_total > planned_quantity:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Progress cannot exceed planned quantity",
+            )
+
+        # ================= UPDATE ACTIVITY =================
+
+        activity.total_completed = updated_total.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+
+        activity.remaining_quantity = (planned_quantity - updated_total).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+
+        # ================= COMPLETION PERCENTAGE =================
+
+        if planned_quantity > 0:
+
+            percentage = (
+                (updated_total / planned_quantity) * Decimal("100")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+
+            # ================= PREVENT ABOVE 100 =================
+
+            activity.completion_percentage = min(
+                percentage,
+                Decimal("100.00"),
+            )
+
+        else:
+
+            activity.completion_percentage = Decimal("0.00")
+
+        # ================= STATUS UPDATE =================
+
+        update_activity_status(activity)
+
+        # ================= NEW AUDIT DATA =================
+
+        new_data = {
+            "today_progress": str(entry.today_progress),
+            "total_completed": str(activity.total_completed),
+            "status": activity.status.value,
+        }
+
+        # ================= CREATE AUDIT LOG =================
+
+        await create_activity_log(
+            db=db,
+            activity_id=activity.id,
+            action="DAILY_PROGRESS_UPDATE",
+            changed_by=current_user.id,
+            old_value=old_data,
+            new_value=new_data,
+        )
+
+        # ================= SAVE =================
+
+        await db.commit()
+
+        await db.refresh(entry)
+
+        await db.refresh(activity)
+
+        # ================= RESPONSE =================
+
+        return {
+            "message": "Daily Entry Updated",
+            "data": entry,
+            "activity": activity,
+        }
+
+    # ================= HANDLE ERRORS =================
+
+    except HTTPException:
+
+        await db.rollback()
+
+        raise
+
+    except Exception:
+
+        await db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
+
 
 
 # =========================================================
@@ -4325,20 +4893,157 @@ async def delete_daily_entry(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    result = await db.execute(
-        select(m.DailyProgressEntry).where(m.DailyProgressEntry.id == id)
-    )
+    try:
 
-    entry = result.scalars().first()
+        # ================= LOCK DAILY ENTRY =================
 
-    if not entry:
-        return {"message": "Daily Entry Not Found"}
+        result = await db.execute(
+            select(DailyProgressEntry)
+            .where(DailyProgressEntry.id == id)
+            .with_for_update()
+        )
 
-    await db.delete(entry)
+        entry = result.scalars().first()
 
-    await db.commit()
+        if not entry:
 
-    return {"message": "Daily Entry Deleted"}
+            raise HTTPException(
+                status_code=404,
+                detail="Daily Entry Not Found",
+            )
+
+        # ================= LOCK RELATED ACTIVITY =================
+
+        activity_result = await db.execute(
+            select(WorkActivity)
+            .where(WorkActivity.id == entry.activity_id)
+            .with_for_update()
+        )
+
+        activity = activity_result.scalars().first()
+
+        if not activity:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Related Activity Not Found",
+            )
+
+        # ================= OLD DATA FOR AUDIT =================
+
+        old_data = {
+            "deleted_progress": str(entry.today_progress),
+            "old_total_completed": str(activity.total_completed),
+            "old_completion_percentage": str(activity.completion_percentage),
+            "old_status": activity.status.value,
+        }
+
+        # ================= DECIMAL VALUES =================
+
+        deleted_progress = Decimal(str(entry.today_progress or 0))
+
+        current_total = Decimal(str(activity.total_completed or 0))
+
+        planned_quantity = Decimal(str(activity.planned_quantity or 0))
+
+        # ================= REVERSE PROGRESS =================
+
+        new_total = max(
+            Decimal("0.00"),
+            current_total - deleted_progress,
+        )
+
+        # ================= UPDATE ACTIVITY =================
+
+        activity.total_completed = new_total.quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+
+        activity.remaining_quantity = (planned_quantity - new_total).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+
+        # ================= RECALCULATE PERCENTAGE =================
+
+        if planned_quantity > 0:
+
+            percentage = ((new_total / planned_quantity) * Decimal("100")).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+
+            # ================= PREVENT ABOVE 100 =================
+
+            activity.completion_percentage = min(
+                percentage,
+                Decimal("100.00"),
+            )
+
+        else:
+
+            activity.completion_percentage = Decimal("0.00")
+
+        # ================= UPDATE STATUS =================
+
+        update_activity_status(activity)
+
+        # ================= NEW DATA FOR AUDIT =================
+
+        new_data = {
+            "new_total_completed": str(activity.total_completed),
+            "new_completion_percentage": str(activity.completion_percentage),
+            "new_status": activity.status.value,
+        }
+
+        # ================= CREATE AUDIT LOG =================
+
+        await create_activity_log(
+            db=db,
+            activity_id=activity.id,
+            action="DAILY_PROGRESS_DELETE",
+            changed_by=current_user.id,
+            old_value=old_data,
+            new_value=new_data,
+            remarks="Daily progress entry deleted",
+        )
+
+        # ================= DELETE ENTRY =================
+
+        await db.delete(entry)
+
+        # ================= SAVE CHANGES =================
+
+        await db.commit()
+
+        # ================= REFRESH ACTIVITY =================
+
+        await db.refresh(activity)
+
+        # ================= RESPONSE =================
+
+        return {
+            "message": "Daily Entry Deleted Successfully",
+            "activity": activity,
+        }
+
+    # ================= ERROR HANDLING =================
+
+    except HTTPException:
+
+        await db.rollback()
+
+        raise
+
+    except Exception:
+
+        await db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
 
 # =========================================================
@@ -4351,17 +5056,44 @@ async def project_summary(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(
-        select(m.WorkActivity).where(m.WorkActivity.project_id == project_id)
+
+    # ================= TOTAL ACTIVITIES =================
+
+    total_result = await db.execute(
+        select(func.count())
+        .select_from(WorkActivity)
+        .where(WorkActivity.project_id == project_id)
     )
 
-    activities = result.scalars().all()
+    total_activities = total_result.scalar()
 
-    total_activities = len(activities)
+    # ================= COMPLETED ACTIVITIES =================
 
-    completed = len([a for a in activities if a.status == WorkActivityStatus.COMPLETED])
+    completed_result = await db.execute(
+        select(func.count())
+        .select_from(WorkActivity)
+        .where(
+            WorkActivity.project_id == project_id,
+            WorkActivity.status == WorkActivityStatus.COMPLETED,
+        )
+    )
 
-    delayed = len([a for a in activities if a.status == WorkActivityStatus.DELAY])
+    completed = completed_result.scalar()
+
+    # ================= DELAYED ACTIVITIES =================
+
+    delayed_result = await db.execute(
+        select(func.count())
+        .select_from(WorkActivity)
+        .where(
+            WorkActivity.project_id == project_id,
+            WorkActivity.status == WorkActivityStatus.DELAY,
+        )
+    )
+
+    delayed = delayed_result.scalar()
+
+    # ================= RESPONSE =================
 
     return {
         "total_activities": total_activities,
@@ -4376,16 +5108,37 @@ async def project_summary(
 
 @work_progress_router.get("/delay-report")
 async def delay_report(
+    # Pagination
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(
-        select(m.WorkActivity).where(m.WorkActivity.status == WorkActivityStatus.DELAY)
+
+    # ================= QUERY =================
+
+    stmt = (
+        select(WorkActivity)
+        .where(WorkActivity.status == WorkActivityStatus.DELAY)
+        .order_by(WorkActivity.created_at.desc())
+        .offset(offset)
+        .limit(limit)
     )
+
+    # ================= EXECUTE =================
+
+    result = await db.execute(stmt)
 
     activities = result.scalars().all()
 
-    return activities
+    # ================= RESPONSE =================
+
+    return {
+        "limit": limit,
+        "offset": offset,
+        "page_count": len(activities),
+        "data": activities,
+    }
 
 
 # =========================================================
@@ -4395,39 +5148,67 @@ async def delay_report(
 @work_progress_router.get("/site-engineer/today-progress")
 async def today_progress(
     engineer_id: int,
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    # ================= QUERY =================
+
+    stmt = (
+        select(DailyProgressEntry)
+        .join(
+            WorkActivity,
+            WorkActivity.id == DailyProgressEntry.activity_id,
+        )
+        .where(
+            WorkActivity.engineer_id == engineer_id,
+            DailyProgressEntry.entry_date == date.today(),
+        )
+        .order_by(DailyProgressEntry.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+
+    # ================= EXECUTE =================
+
+    result = await db.execute(stmt)
+
+    entries = result.scalars().all()
+
+    # ================= RESPONSE =================
+
+    return {
+        "limit": limit,
+        "offset": offset,
+        "page_count": len(entries),
+        "data": entries,
+    }
+
+
+# =========================================================
+# 13. ACTIVITY HISTORY
+
+
+@work_progress_router.get("/activities/{id}/history")
+async def activity_history(
+    id: int,
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
 
     result = await db.execute(
-        select(m.WorkActivity).where(m.WorkActivity.engineer_id == engineer_id)
+        select(ActivityHistory)
+        .where(ActivityHistory.activity_id == id)
+        .order_by(ActivityHistory.created_at.desc())
     )
 
-    activities = result.scalars().all()
+    logs = result.scalars().all()
 
-    return activities
-
-
-# =========================================================
-# 13. SITE ENGINEER SUBMIT WORK
-
-
-@work_progress_router.post("/site-engineer/progress-entry")
-async def site_engineer_progress(
-    data: s.DailyProgressCreate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-
-    entry = m.DailyProgressEntry(**data.dict())
-
-    db.add(entry)
-
-    await db.commit()
-
-    await db.refresh(entry)
-
-    return {"message": "Today's Work Submitted", "data": entry}
+    return {
+        "data": logs,
+    }
 
 
 # ===================== QC =====================
