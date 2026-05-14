@@ -58,6 +58,10 @@ class CompanySettingsUpdate(BaseModel):
 
     address: Optional[str] = None
 
+    instagram_handle: Optional[str] = None
+
+    whatsapp_number: Optional[str] = None
+
     bank_name: Optional[str] = None
 
     account_holder_name: Optional[str] = None
@@ -88,6 +92,10 @@ class CompanySettingsOut(BaseModel):
     website: Optional[str]
 
     address: Optional[str]
+
+    instagram_handle: Optional[str]
+    
+    whatsapp_number: Optional[str]
 
     bank_name: Optional[str]
 

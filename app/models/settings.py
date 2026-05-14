@@ -54,6 +54,10 @@ class CompanySettings(Base, TimestampMixin):
 
     address: Mapped[str | None] = mapped_column(Text)
 
+    instagram_handle: Mapped[str | None] = mapped_column(String(255))
+    
+    whatsapp_number: Mapped[str | None] = mapped_column(String(20))
+
     bank_name: Mapped[str | None] = mapped_column(String(255))
 
     account_holder_name: Mapped[str | None] = mapped_column(String(255))

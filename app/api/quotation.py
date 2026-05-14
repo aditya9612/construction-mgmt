@@ -10,7 +10,8 @@ from app.models.labour import Labour
 from datetime import date, datetime
 from num2words import num2words
 from app.db.session import get_db_session
-
+from app.models.settings import CompanySettings
+from sqlalchemy import select
 from app.models.material import Material
 from app.models.project import Project
 from app.models.quotation import (
@@ -36,8 +37,6 @@ from reportlab.platypus import (
     Image,
     KeepTogether,
 )
-
-
 
 router = APIRouter(prefix="/quotations", tags=["Quotations"])
 
@@ -115,70 +114,41 @@ def calculate_item(item_type, length, width, height, rate):
 # =========================================================
 
 
-async def get_quotation_or_404(
-    quotation_id: int,
-    db: AsyncSession
-):
+async def get_quotation_or_404(quotation_id: int, db: AsyncSession):
 
     result = await db.execute(
         select(QuotationMaster)
         .options(
-            selectinload(
-                QuotationMaster.items
-            ).selectinload(
+            selectinload(QuotationMaster.items).selectinload(
                 QuotationItem.measurements
             ),
-
-            selectinload(
-                QuotationMaster.labour_items
-            ),
-
-            selectinload(
-                QuotationMaster.material_items
-            ),
-
-            selectinload(
-                QuotationMaster.extra_charge_items
-            )
+            selectinload(QuotationMaster.labour_items),
+            selectinload(QuotationMaster.material_items),
+            selectinload(QuotationMaster.extra_charge_items),
         )
-        .where(
-            QuotationMaster.id == quotation_id
-        )
+        .where(QuotationMaster.id == quotation_id)
     )
 
     quotation = result.scalars().first()
 
     if not quotation:
-        raise HTTPException(
-            404,
-            "Quotation not found"
-        )
+        raise HTTPException(404, "Quotation not found")
 
     return quotation
 
 
-async def generate_quotation_no(
-    db: AsyncSession
-):
+async def generate_quotation_no(db: AsyncSession):
 
     year = datetime.now().year
 
-    result = await db.execute(
-        select(
-            func.max(
-                QuotationMaster.id
-            )
-        )
-    )
+    result = await db.execute(select(func.max(QuotationMaster.id)))
 
     last_id = result.scalar()
 
-    next_id = (
-        (last_id or 0)
-        + 1
-    )
+    next_id = (last_id or 0) + 1
 
     return f"QT/{year}/{next_id:04d}"
+
 
 def create_styled_table(data, col_widths, highlight_last_row=False):
     """
@@ -210,166 +180,109 @@ def create_styled_table(data, col_widths, highlight_last_row=False):
     for row in range(1, len(data)):
         if row % 2 == 0:
             style.append(
-                ("BACKGROUND", (0, row), (-1, row),
-                 colors.HexColor("#F2F6FA"))
+                ("BACKGROUND", (0, row), (-1, row), colors.HexColor("#F2F6FA"))
             )
 
     # Highlight final row (Grand Total)
     if highlight_last_row and len(data) > 1:
         last = len(data) - 1
-        style.extend([
-            ("BACKGROUND", (0, last), (-1, last),
-             colors.HexColor("#D9EAD3")),
-            ("FONTNAME", (0, last), (-1, last),
-             "Helvetica-Bold"),
-        ])
+        style.extend(
+            [
+                ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#D9EAD3")),
+                ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
+            ]
+        )
 
     table.setStyle(TableStyle(style))
     return table
+
 
 # =========================================================
 # QUOTATION TOTAL CALCULATION
 # =========================================================
 
-def calculate_quotation_totals(
-    quotation: QuotationMaster
-):
+
+def calculate_quotation_totals(quotation: QuotationMaster):
 
     # =====================================================
     # ITEM TOTAL
     # =====================================================
 
-    item_total = sum(
-        item.amount or 0
-        for item in quotation.items
-    )
+    item_total = sum(item.amount or 0 for item in quotation.items)
 
     # =====================================================
     # LABOUR TOTAL
     # =====================================================
 
-    labour_total = sum(
-        labour.amount or 0
-        for labour in quotation.labour_items
-    )
+    labour_total = sum(labour.amount or 0 for labour in quotation.labour_items)
 
     # =====================================================
     # MATERIAL TOTAL
     # =====================================================
 
     material_total = sum(
-        material.estimated_amount or 0
-        for material in quotation.material_items
+        material.estimated_amount or 0 for material in quotation.material_items
     )
 
     # =====================================================
     # EXTRA CHARGES TOTAL
     # =====================================================
 
-    extra_total = sum(
-        extra.amount or 0
-        for extra in quotation.extra_charge_items
-    )
+    extra_total = sum(extra.amount or 0 for extra in quotation.extra_charge_items)
 
     # =====================================================
     # SUBTOTAL
     # =====================================================
 
-    subtotal = (
-        item_total
-        + labour_total
-        + material_total
-        + extra_total
-    )
+    subtotal = item_total + labour_total + material_total + extra_total
 
     # =====================================================
     # GST BREAKDOWN
     # =====================================================
 
-    cgst_amount = (
-        subtotal
-        * quotation.cgst_percent
-    ) / 100
+    cgst_amount = (subtotal * quotation.cgst_percent) / 100
 
-    sgst_amount = (
-        subtotal
-        * quotation.sgst_percent
-    ) / 100
+    sgst_amount = (subtotal * quotation.sgst_percent) / 100
 
-    gross_total = (
-        subtotal
-        + cgst_amount
-        + sgst_amount
-    )
+    gross_total = subtotal + cgst_amount + sgst_amount
 
     # =====================================================
     # TDS DEDUCTION
     # =====================================================
 
-    tds_amount = (
-        gross_total
-        * quotation.tds_percent
-    ) / 100
+    tds_amount = (gross_total * quotation.tds_percent) / 100
 
     # =====================================================
     # FINAL GRAND TOTAL
     # =====================================================
 
-    grand_total = (
-        gross_total
-        - tds_amount
-        - quotation.discount_amount
-    )
+    grand_total = gross_total - tds_amount - quotation.discount_amount
 
     # =====================================================
     # BALANCE DUE
     # =====================================================
 
-    balance_due = (
-        grand_total
-        - quotation.advance_paid
-    )
+    balance_due = grand_total - quotation.advance_paid
 
     # =====================================================
     # SAVE VALUES
     # =====================================================
 
-    quotation.subtotal = round(
-        subtotal,
-        2
-    )
+    quotation.subtotal = round(subtotal, 2)
 
-    quotation.cgst_amount = round(
-        cgst_amount,
-        2
-    )
+    quotation.cgst_amount = round(cgst_amount, 2)
 
-    quotation.sgst_amount = round(
-        sgst_amount,
-        2
-    )
+    quotation.sgst_amount = round(sgst_amount, 2)
 
-    quotation.tds_amount = round(
-        tds_amount,
-        2
-    )
+    quotation.tds_amount = round(tds_amount, 2)
 
     # OPTIONAL OLD GST SUPPORT
 
-    quotation.gst_amount = round(
-        cgst_amount + sgst_amount,
-        2
-    )
+    quotation.gst_amount = round(cgst_amount + sgst_amount, 2)
 
-    quotation.grand_total = round(
-        grand_total,
-        2
-    )
+    quotation.grand_total = round(grand_total, 2)
 
-    quotation.balance_due = round(
-        balance_due,
-        2
-    )
+    quotation.balance_due = round(balance_due, 2)
 
 
 def calculate_labour_amount(
@@ -385,12 +298,10 @@ def calculate_labour_amount(
 
 def amount_to_words(amount):
 
-    words = num2words(
-        amount,
-        lang="en_IN"
-    )
+    words = num2words(amount, lang="en_IN")
 
     return words.title()
+
 
 from io import BytesIO
 from datetime import datetime
@@ -418,10 +329,10 @@ from reportlab.graphics.barcode import qr
 
 from app.models.quotation import QuotationMaster
 
-
 # =========================================================
 # GENERATE QR IMAGE
 # =========================================================
+
 
 def generate_upi_qr(quotation: QuotationMaster):
 
@@ -453,7 +364,7 @@ def generate_upi_qr(quotation: QuotationMaster):
 
 
 def generate_quotation_pdf(
-    quotation: QuotationMaster
+    quotation: QuotationMaster, company_settings: CompanySettings | None = None
 ):
     from io import BytesIO
     import os
@@ -512,28 +423,16 @@ def generate_quotation_pdf(
     # LOGO + TITLE
     # =====================================================
 
-    # Dynamic project-based path (works in local and production)
-    # Current file: app/routers/quotation.py
-    # Required logo location: construction-mgmt/static/logo.png
+    # =====================================================
+    # DYNAMIC LOGO FROM COMPANY SETTINGS
+    # Uses logo uploaded from /settings/upload-logo
+    # =====================================================
 
-    project_root = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),  # app/routers
-            "..",                       # app
-            ".."                        # project root (construction-mgmt)
-        )
-    )
+    logo_path = None
 
-    logo_path = os.path.join(
-        project_root,
-        "static",
-        "logo.png"
-    )
-
-    # Optional debug (remove later)
-    print("PROJECT ROOT:", project_root)
-    print("LOGO PATH:", logo_path)
-    print("LOGO EXISTS:", os.path.exists(logo_path))
+    if company_settings and company_settings.company_logo:
+        if os.path.exists(company_settings.company_logo):
+            logo_path = company_settings.company_logo
 
     # Create title
     title_para = Paragraph(
@@ -542,7 +441,7 @@ def generate_quotation_pdf(
     )
 
     # Create header table
-    if os.path.exists(logo_path):
+    if logo_path:
 
         logo = Image(
             logo_path,
@@ -559,7 +458,7 @@ def generate_quotation_pdf(
 
     else:
 
-        # If logo is missing, show title only
+        # If no uploaded logo exists, show title only
         header_table = Table(
             [
                 ["", title_para, ""]
@@ -569,21 +468,22 @@ def generate_quotation_pdf(
 
     # Style header table
     header_table.setStyle(
-        TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ALIGN", (0, 0), (0, 0), "LEFT"),
-            ("ALIGN", (1, 0), (1, 0), "CENTER"),
-            ("ALIGN", (2, 0), (2, 0), "RIGHT"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ])
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                ("ALIGN", (1, 0), (1, 0), "CENTER"),
+                ("ALIGN", (2, 0), (2, 0), "RIGHT"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
     )
 
     elements.append(header_table)
     elements.append(Spacer(1, 15))
-
     # =====================================================
     # COMPANY DETAILS
     # =====================================================
@@ -595,12 +495,7 @@ def generate_quotation_pdf(
     Email: {quotation.email or '-'}
     """
 
-    elements.append(
-        Paragraph(
-            company_details,
-            styles["BodyText"]
-        )
-    )
+    elements.append(Paragraph(company_details, styles["BodyText"]))
 
     elements.append(Spacer(1, 12))
 
@@ -618,12 +513,7 @@ def generate_quotation_pdf(
         ["Work Order", quotation.work_order_no or "-"],
     ]
 
-    elements.append(
-        create_styled_table(
-            quotation_info,
-            [150, 370]
-        )
-    )
+    elements.append(create_styled_table(quotation_info, [150, 370]))
 
     elements.append(Spacer(1, 15))
 
@@ -640,19 +530,9 @@ def generate_quotation_pdf(
         ["GST Number", quotation.gst_number or "-"],
     ]
 
-    elements.append(
-        Paragraph(
-            "<b>Client Details</b>",
-            styles["Heading2"]
-        )
-    )
+    elements.append(Paragraph("<b>Client Details</b>", styles["Heading2"]))
 
-    elements.append(
-        create_styled_table(
-            client_info,
-            [150, 370]
-        )
-    )
+    elements.append(create_styled_table(client_info, [150, 370]))
 
     elements.append(Spacer(1, 15))
 
@@ -660,32 +540,22 @@ def generate_quotation_pdf(
     # ITEM DETAILS
     # =====================================================
 
-    item_data = [
-        ["Item", "Qty", "Unit", "Rate", "Amount"]
-    ]
+    item_data = [["Item", "Qty", "Unit", "Rate", "Amount"]]
 
     for item in quotation.items:
-        item_data.append([
-            item.title,
-            f"{item.quantity:.2f}",
-            item.unit or "-",
-            f"{item.rate:.2f}",
-            f"{item.amount:.2f}",
-        ])
-
-    elements.append(
-        Paragraph(
-            "<b>Item Details</b>",
-            styles["Heading2"]
+        item_data.append(
+            [
+                item.title,
+                f"{item.quantity:.2f}",
+                item.unit or "-",
+                f"{item.rate:.2f}",
+                f"{item.amount:.2f}",
+            ]
         )
-    )
 
-    elements.append(
-        create_styled_table(
-            item_data,
-            [180, 70, 70, 80, 90]
-        )
-    )
+    elements.append(Paragraph("<b>Item Details</b>", styles["Heading2"]))
+
+    elements.append(create_styled_table(item_data, [180, 70, 70, 80, 90]))
 
     elements.append(Spacer(1, 15))
 
@@ -694,32 +564,22 @@ def generate_quotation_pdf(
     # =====================================================
 
     if quotation.labour_items:
-        labour_data = [
-            ["Skill", "Count", "Days", "Daily Wage", "Amount"]
-        ]
+        labour_data = [["Skill", "Count", "Days", "Daily Wage", "Amount"]]
 
         for labour in quotation.labour_items:
-            labour_data.append([
-                labour.skill_type,
-                str(labour.labour_count),
-                f"{labour.labour_days:.2f}",
-                f"{labour.daily_wage:.2f}",
-                f"{labour.amount:.2f}",
-            ])
-
-        elements.append(
-            Paragraph(
-                "<b>Labour Details</b>",
-                styles["Heading2"]
+            labour_data.append(
+                [
+                    labour.skill_type,
+                    str(labour.labour_count),
+                    f"{labour.labour_days:.2f}",
+                    f"{labour.daily_wage:.2f}",
+                    f"{labour.amount:.2f}",
+                ]
             )
-        )
 
-        elements.append(
-            create_styled_table(
-                labour_data,
-                [150, 80, 80, 100, 100]
-            )
-        )
+        elements.append(Paragraph("<b>Labour Details</b>", styles["Heading2"]))
+
+        elements.append(create_styled_table(labour_data, [150, 80, 80, 100, 100]))
 
         elements.append(Spacer(1, 15))
 
@@ -728,32 +588,22 @@ def generate_quotation_pdf(
     # =====================================================
 
     if quotation.material_items:
-        material_data = [
-            ["Material", "Qty", "Unit", "Rate", "Amount"]
-        ]
+        material_data = [["Material", "Qty", "Unit", "Rate", "Amount"]]
 
         for material in quotation.material_items:
-            material_data.append([
-                material.material_name,
-                f"{material.estimated_quantity:.2f}",
-                material.unit,
-                f"{material.estimated_rate:.2f}",
-                f"{material.estimated_amount:.2f}",
-            ])
-
-        elements.append(
-            Paragraph(
-                "<b>Material Details</b>",
-                styles["Heading2"]
+            material_data.append(
+                [
+                    material.material_name,
+                    f"{material.estimated_quantity:.2f}",
+                    material.unit,
+                    f"{material.estimated_rate:.2f}",
+                    f"{material.estimated_amount:.2f}",
+                ]
             )
-        )
 
-        elements.append(
-            create_styled_table(
-                material_data,
-                [180, 70, 70, 80, 90]
-            )
-        )
+        elements.append(Paragraph("<b>Material Details</b>", styles["Heading2"]))
+
+        elements.append(create_styled_table(material_data, [180, 70, 70, 80, 90]))
 
         elements.append(Spacer(1, 15))
 
@@ -762,31 +612,21 @@ def generate_quotation_pdf(
     # =====================================================
 
     if quotation.extra_charge_items:
-        extra_data = [
-            ["Type", "Qty", "Rate", "Amount"]
-        ]
+        extra_data = [["Type", "Qty", "Rate", "Amount"]]
 
         for extra in quotation.extra_charge_items:
-            extra_data.append([
-                extra.expense_type,
-                f"{extra.quantity:.2f}",
-                f"{extra.rate:.2f}",
-                f"{extra.amount:.2f}",
-            ])
-
-        elements.append(
-            Paragraph(
-                "<b>Extra Charges</b>",
-                styles["Heading2"]
+            extra_data.append(
+                [
+                    extra.expense_type,
+                    f"{extra.quantity:.2f}",
+                    f"{extra.rate:.2f}",
+                    f"{extra.amount:.2f}",
+                ]
             )
-        )
 
-        elements.append(
-            create_styled_table(
-                extra_data,
-                [220, 90, 90, 90]
-            )
-        )
+        elements.append(Paragraph("<b>Extra Charges</b>", styles["Heading2"]))
+
+        elements.append(create_styled_table(extra_data, [220, 90, 90, 90]))
 
         elements.append(Spacer(1, 15))
 
@@ -806,19 +646,10 @@ def generate_quotation_pdf(
         ["Balance Due", f"{quotation.balance_due:.2f}"],
     ]
 
-    elements.append(
-        Paragraph(
-            "<b>Financial Summary</b>",
-            styles["Heading2"]
-        )
-    )
+    elements.append(Paragraph("<b>Financial Summary</b>", styles["Heading2"]))
 
     elements.append(
-        create_styled_table(
-            summary_data,
-            [250, 150],
-            highlight_last_row=True
-        )
+        create_styled_table(summary_data, [250, 150], highlight_last_row=True)
     )
 
     elements.append(Spacer(1, 20))
@@ -831,7 +662,7 @@ def generate_quotation_pdf(
         Paragraph(
             f"<b>Amount in Words:</b> "
             f"{amount_to_words(int(quotation.grand_total))} Only",
-            styles["BodyText"]
+            styles["BodyText"],
         )
     )
 
@@ -844,9 +675,8 @@ def generate_quotation_pdf(
     if quotation.terms_conditions:
         elements.append(
             Paragraph(
-                f"<b>Terms & Conditions</b><br/>"
-                f"{quotation.terms_conditions}",
-                styles["BodyText"]
+                f"<b>Terms & Conditions</b><br/>" f"{quotation.terms_conditions}",
+                styles["BodyText"],
             )
         )
         elements.append(Spacer(1, 20))
@@ -864,12 +694,7 @@ def generate_quotation_pdf(
     qr_drawing = generate_upi_qr(quotation)
 
     if qr_drawing:
-        payment_elements.append(
-            Paragraph(
-                "<b>Scan To Pay</b>",
-                styles["Heading3"]
-            )
-        )
+        payment_elements.append(Paragraph("<b>Scan To Pay</b>", styles["Heading3"]))
         payment_elements.append(Spacer(1, 5))
         payment_elements.append(qr_drawing)
         payment_elements.append(Spacer(1, 15))
@@ -877,81 +702,264 @@ def generate_quotation_pdf(
     # -----------------------------
     # SIGNATURE
     # -----------------------------
+    company_name = (
+        company_settings.company_name
+        if company_settings and company_settings.company_name
+        else quotation.company_name
+        or ""
+    )
+    # =====================================================
+    # QR CODE + SIGNATURE (SIDE BY SIDE)
+    # =====================================================
+    # Replace your existing QR CODE + SIGNATURE section with this code.
+    # IMPORTANT: This version removes KeepTogether inside table cells,
+    # which fixes the LayoutError shown in your log :contentReference[oaicite:0]{index=0}
 
-    # Build one table so QR code and signature always remain together
+    # Project root
     project_root = os.path.abspath(
         os.path.join(
-            os.path.dirname(__file__),  # app/routers
-            "..",                       # app
-            ".."                        # project root
+            os.path.dirname(__file__),  # app/api or app/routers
+            "..",  # app
+            "..",  # project root
         )
     )
 
-    signature_path = os.path.join(
-        project_root,
-        "static",
-        "signature.png"
-    )
+    signature_path = None
 
-    # Prepare table rows
-    payment_rows = []
+    if company_settings and company_settings.signature_image:
+        if os.path.exists(company_settings.signature_image):
+            signature_path = company_settings.signature_image
 
-    # Scan To Pay title
-    payment_rows.append([
-        Paragraph(
-            "<b>Scan To Pay</b>",
-            styles["Heading3"]
-        )
-    ])
-
-    # QR Code
+    # -----------------------------------------------------
+    # QR CODE
+    # -----------------------------------------------------
     qr_drawing = generate_upi_qr(quotation)
     if qr_drawing:
-        payment_rows.append([qr_drawing])
+        elements.append(Paragraph("<b><i>Scan To Pay</i></b>", styles["Heading3"]))
+        elements.append(Spacer(1, 5))
+        qr_drawing.hAlign = 'LEFT'
+        elements.append(qr_drawing)
+        elements.append(Spacer(1, 35))
 
-    # Spacer row
-    payment_rows.append([""])
+    # -----------------------------------------------------
+    # SIGNATURE
+    # -----------------------------------------------------
+    if signature_path and os.path.exists(signature_path):
+        signature_img = Image(signature_path, width=140, height=50)
+        signature_img.hAlign = 'LEFT'
+        elements.append(signature_img)
+        elements.append(Spacer(1, 5))
 
-    # Signature image
-    if os.path.exists(signature_path):
-        signature_img = Image(
-            signature_path,
-            width=140,
-            height=50
-        )
-        payment_rows.append([signature_img])
-
-    # Authorized Signature text
-    payment_rows.append([
-        Paragraph(
-            "<b>Authorized Signature</b>",
-            styles["BodyText"]
-        )
-    ])
-
-    # Create single-column table
-    payment_table = Table(
-        payment_rows,
-        colWidths=[180]
-    )
-
-    # Style the table
-    payment_table.setStyle(
-        TableStyle([
-            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 2),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ])
-    )
-
-    # Keep the whole block together on the same page
     elements.append(
-        KeepTogether([payment_table])
+        Paragraph(
+            f"<b>Authorized Signature</b><br/>{company_name}",
+            styles["BodyText"],
+        )
+    )
+    elements.append(Spacer(1, 10))
+
+    # Horizontal line
+    line_table = Table([[""]], colWidths=[555]) # Full width line
+    line_table.setStyle(TableStyle([
+        ("LINEABOVE", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    elements.append(line_table)
+    elements.append(Spacer(1, 15))
+
+    # =====================================================
+    # FOOTER (DRAWN DIRECTLY IN PDF)
+    # =====================================================
+
+    footer_style = ParagraphStyle(
+        "FooterStyle",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=10,
+        leading=13,
+        textColor=colors.black,
     )
 
+    # =====================================================
+    # FOOTER DATA FROM COMPANY SETTINGS
+    # =====================================================
+
+    mobile = (
+        company_settings.mobile_number
+        if company_settings and company_settings.mobile_number
+        else "-"
+    )
+
+    email = (
+        company_settings.email
+        if company_settings and company_settings.email
+        else "-"
+    )
+
+    instagram_handle = (
+        company_settings.instagram_handle
+        if company_settings and company_settings.instagram_handle
+        else "-"
+    )
+
+    whatsapp_number = (
+        company_settings.whatsapp_number
+        if company_settings and company_settings.whatsapp_number
+        else "-"
+    )
+
+    website = (
+        company_settings.website
+        if company_settings and company_settings.website
+        else "-"
+    )
+
+    address = (
+        company_settings.address
+        if company_settings and company_settings.address
+        else "-"
+    )
+
+    # =====================================================
+    # ICON HELPERS
+    # =====================================================
+
+    icon_dir = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",      # app
+            "..",      # project root
+            "static",
+        )
+    )
+
+
+    from reportlab.lib.utils import ImageReader
+
+
+    def get_icon(filename):
+        """
+        Load icon from static/icons and return a fixed-size
+        ReportLab Image that renders reliably in tables.
+        """
+        path = os.path.join(icon_dir, filename)
+
+        if not os.path.exists(path):
+            print(f"Icon not found: {path}")
+            return Spacer(1, 18)  # preserve alignment if icon is missing
+
+        try:
+            # Create image with explicit dimensions
+            img = Image(
+                path,
+                width=18,
+                height=18
+            )
+
+            # Ensure proper alignment inside table cells
+            img.hAlign = "CENTER"
+
+            return img
+
+        except Exception as e:
+            print(f"Error loading icon {filename}: {e}")
+            return Spacer(1, 18)
+
+
+    def create_icon_text_table(icon_filename, text, col_width=150):
+        """
+        Creates a small 2-column table:
+        [ icon ][ text ]
+        """
+        table = Table(
+            [
+                [
+                    get_icon(icon_filename),
+                    Paragraph(text, footer_style),
+                ]
+            ],
+            colWidths=[24, col_width],
+        )
+
+        table.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ]
+            )
+        )
+
+        return table
+
+
+    # =====================================================
+    # FOOTER CONTENT (3 COLUMNS)
+    # =====================================================
+
+    left_column = [
+        create_icon_text_table("phone.png", mobile, 140),
+        Spacer(1, 8),
+        create_icon_text_table("email.png", email, 140),
+    ]
+
+    center_column = [
+        create_icon_text_table("instagram.png", instagram_handle, 140),
+        Spacer(1, 8),
+        create_icon_text_table("whatsapp.png", whatsapp_number, 140),
+    ]
+
+    right_column = [
+        create_icon_text_table("location.png", address, 210),
+        Spacer(1, 8),
+        create_icon_text_table("website.png", website, 210),
+    ]
+
+    # =====================================================
+    # MAIN FOOTER TABLE
+    # =====================================================
+
+    footer_data = [
+        [
+            left_column,
+            center_column,
+            right_column,
+        ]
+    ]
+
+    footer_table = Table(
+        footer_data,
+        colWidths=[175, 175, 230],
+    )
+
+    footer_table.setStyle(
+        TableStyle(
+            [
+                # Background color
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#D9DDE3")),
+
+                # Green top border
+                ("LINEABOVE", (0, 0), (-1, 0), 4, colors.HexColor("#4CAF50")),
+
+                # Alignment
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+
+                # Padding
+                ("LEFTPADDING", (0, 0), (-1, -1), 15),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 15),
+                ("TOPPADDING", (0, 0), (-1, -1), 12),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+            ]
+        )
+    )
+
+    elements.append(footer_table)
 
     # =====================================================
     # BUILD PDF
@@ -986,7 +994,6 @@ async def create_quotation(
         billing_address=payload.billing_address,
         site_address=payload.site_address,
         gst_number=payload.gst_number,
-
         # PROJECT DETAILS
         project_name=payload.project_name,
         project_type=payload.project_type,
@@ -994,7 +1001,6 @@ async def create_quotation(
         project_end_date=payload.project_end_date,
         engineer_name=payload.engineer_name,
         work_order_no=payload.work_order_no,
-
         # TAX DETAILS
         gst_percent=payload.gst_percent,
         discount_amount=payload.discount_amount,
@@ -1002,7 +1008,6 @@ async def create_quotation(
         cgst_percent=payload.cgst_percent,
         sgst_percent=payload.sgst_percent,
         tds_percent=payload.tds_percent,
-
         # PAYMENT DETAILS
         payment_mode=payload.payment_mode,
         upi_id=payload.upi_id,
@@ -1011,7 +1016,6 @@ async def create_quotation(
         account_number=payload.account_number,
         ifsc_code=payload.ifsc_code,
         due_date=payload.due_date,
-
         # EXTRA
         notes=payload.notes,
         terms_conditions=payload.terms_conditions,
@@ -1151,7 +1155,6 @@ async def create_quotation(
 
         db.add(material_item)
 
-
     # =====================================================
     # EXTRA CHARGE ITEMS
     # =====================================================
@@ -1160,38 +1163,22 @@ async def create_quotation(
 
         if extra_data.equipment_id:
 
-            equipment = await db.get(
-                Equipment,
-                extra_data.equipment_id
-            )
+            equipment = await db.get(Equipment, extra_data.equipment_id)
 
             if not equipment:
-                raise HTTPException(
-                    404,
-                    "Equipment not found"
-                )
+                raise HTTPException(404, "Equipment not found")
 
-        amount = (
-            extra_data.quantity
-            * extra_data.rate
-        )
+        amount = extra_data.quantity * extra_data.rate
 
         extra_charge = QuotationExtraCharge(
             quotation=quotation,
-
             equipment_id=extra_data.equipment_id,
-
             expense_type=extra_data.expense_type,
-
             description=extra_data.description,
-
             quantity=extra_data.quantity,
-
             rate=extra_data.rate,
-
             amount=amount,
-
-            notes=extra_data.notes
+            notes=extra_data.notes,
         )
 
         db.add(extra_charge)
@@ -1213,35 +1200,17 @@ async def create_quotation(
 # =========================================================
 
 
-@router.get(
-    "/",
-    response_model=list[s.QuotationOut]
-)
-async def list_quotations(
-    db: AsyncSession = Depends(get_db_session)
-):
+@router.get("/", response_model=list[s.QuotationOut])
+async def list_quotations(db: AsyncSession = Depends(get_db_session)):
 
     result = await db.execute(
-        select(QuotationMaster)
-        .options(
-
-            selectinload(
-                QuotationMaster.items
-            ).selectinload(
+        select(QuotationMaster).options(
+            selectinload(QuotationMaster.items).selectinload(
                 QuotationItem.measurements
             ),
-
-            selectinload(
-                QuotationMaster.labour_items
-            ),
-
-            selectinload(
-                QuotationMaster.material_items
-            ),
-
-            selectinload(
-                QuotationMaster.extra_charge_items
-            )
+            selectinload(QuotationMaster.labour_items),
+            selectinload(QuotationMaster.material_items),
+            selectinload(QuotationMaster.extra_charge_items),
         )
     )
 
@@ -1264,48 +1233,32 @@ async def get_quotation(quotation_id: int, db: AsyncSession = Depends(get_db_ses
 # =========================================================
 
 
-@router.put(
-    "/{quotation_id}",
-    response_model=s.QuotationOut
-)
+@router.put("/{quotation_id}", response_model=s.QuotationOut)
 async def update_quotation(
     quotation_id: int,
     payload: s.UpdateQuotation,
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    quotation = await get_quotation_or_404(
-        quotation_id,
-        db
-    )
+    quotation = await get_quotation_or_404(quotation_id, db)
 
     # =====================================================
     # APPROVED CHECK
     # =====================================================
 
     if quotation.is_approved:
-        raise HTTPException(
-            400,
-            "Approved quotation cannot be edited"
-        )
+        raise HTTPException(400, "Approved quotation cannot be edited")
 
-    update_data = payload.model_dump(
-        exclude_unset=True
-    )
+    update_data = payload.model_dump(exclude_unset=True)
 
     for key, value in update_data.items():
         setattr(quotation, key, value)
 
-    calculate_quotation_totals(
-        quotation
-    )
+    calculate_quotation_totals(quotation)
 
     await db.commit()
 
-    return await get_quotation_or_404(
-        quotation_id,
-        db
-    )
+    return await get_quotation_or_404(quotation_id, db)
 
 
 # =========================================================
@@ -1315,32 +1268,23 @@ async def update_quotation(
 
 @router.delete("/{quotation_id}")
 async def delete_quotation(
-    quotation_id: int,
-    db: AsyncSession = Depends(get_db_session)
+    quotation_id: int, db: AsyncSession = Depends(get_db_session)
 ):
 
-    quotation = await get_quotation_or_404(
-        quotation_id,
-        db
-    )
+    quotation = await get_quotation_or_404(quotation_id, db)
 
     # =====================================================
     # APPROVED CHECK
     # =====================================================
 
     if quotation.is_approved:
-        raise HTTPException(
-            400,
-            "Approved quotation cannot be deleted"
-        )
+        raise HTTPException(400, "Approved quotation cannot be deleted")
 
     await db.delete(quotation)
 
     await db.commit()
 
-    return {
-        "message": "Quotation deleted successfully"
-    }
+    return {"message": "Quotation deleted successfully"}
 
 
 # =========================================================
@@ -1415,6 +1359,7 @@ async def add_quotation_item(
 # UPDATE ITEM
 # =========================================================
 
+
 @router.put("/quotation-items/{item_id}")
 async def update_quotation_item(
     item_id: int,
@@ -1424,42 +1369,25 @@ async def update_quotation_item(
 
     result = await db.execute(
         select(QuotationItem)
-        .options(
-            selectinload(
-                QuotationItem.measurements
-            )
-        )
-        .where(
-            QuotationItem.id == item_id
-        )
+        .options(selectinload(QuotationItem.measurements))
+        .where(QuotationItem.id == item_id)
     )
 
     item = result.scalars().first()
 
     if not item:
-        raise HTTPException(
-            404,
-            "Quotation item not found"
-        )
+        raise HTTPException(404, "Quotation item not found")
 
-    quotation = await get_quotation_or_404(
-        item.quotation_id,
-        db
-    )
+    quotation = await get_quotation_or_404(item.quotation_id, db)
 
     # =====================================================
     # APPROVED CHECK
     # =====================================================
 
     if quotation.is_approved:
-        raise HTTPException(
-            400,
-            "Approved quotation cannot be modified"
-        )
+        raise HTTPException(400, "Approved quotation cannot be modified")
 
-    update_data = payload.model_dump(
-        exclude_unset=True
-    )
+    update_data = payload.model_dump(exclude_unset=True)
 
     for key, value in update_data.items():
 
@@ -1492,19 +1420,14 @@ async def update_quotation_item(
 
             measurement = MeasurementDetail(
                 quotation_item=item,
-
                 length=m.length,
                 width=m.width,
                 height=m.height,
-
                 unit=m.unit,
-
                 cubic_feet=result["cubic_feet"],
                 cubic_meter=result["cubic_meter"],
                 brass=result["brass"],
-
                 quantity=result["quantity"],
-
                 formula_used=result["formula"],
             )
 
@@ -1514,15 +1437,9 @@ async def update_quotation_item(
 
             total_amount += result["amount"]
 
-        item.quantity = round(
-            total_quantity,
-            2
-        )
+        item.quantity = round(total_quantity, 2)
 
-        item.amount = round(
-            total_amount,
-            2
-        )
+        item.amount = round(total_amount, 2)
 
     else:
 
@@ -1530,10 +1447,7 @@ async def update_quotation_item(
         # RATE UPDATE ONLY
         # =================================================
 
-        item.amount = round(
-            item.quantity * item.rate,
-            2
-        )
+        item.amount = round(item.quantity * item.rate, 2)
 
     # =====================================================
     # RECALCULATE QUOTATION TOTALS
@@ -1541,56 +1455,38 @@ async def update_quotation_item(
 
     await db.flush()
 
-    calculate_quotation_totals(
-        quotation
-    )
+    calculate_quotation_totals(quotation)
 
     await db.commit()
 
-    return {
-        "message": "Quotation item updated successfully"
-    }
+    return {"message": "Quotation item updated successfully"}
 
 
 # =========================================================
 # DELETE ITEM
 # =========================================================
 
+
 @router.delete("/quotation-items/{item_id}")
 async def delete_quotation_item(
-    item_id: int,
-    db: AsyncSession = Depends(get_db_session)
+    item_id: int, db: AsyncSession = Depends(get_db_session)
 ):
 
-    result = await db.execute(
-        select(QuotationItem)
-        .where(
-            QuotationItem.id == item_id
-        )
-    )
+    result = await db.execute(select(QuotationItem).where(QuotationItem.id == item_id))
 
     item = result.scalars().first()
 
     if not item:
-        raise HTTPException(
-            404,
-            "Quotation item not found"
-        )
+        raise HTTPException(404, "Quotation item not found")
 
-    quotation = await get_quotation_or_404(
-        item.quotation_id,
-        db
-    )
+    quotation = await get_quotation_or_404(item.quotation_id, db)
 
     # =====================================================
     # APPROVED CHECK
     # =====================================================
 
     if quotation.is_approved:
-        raise HTTPException(
-            400,
-            "Approved quotation cannot be modified"
-        )
+        raise HTTPException(400, "Approved quotation cannot be modified")
 
     await db.delete(item)
 
@@ -1600,15 +1496,11 @@ async def delete_quotation_item(
     # RECALCULATE TOTALS
     # =====================================================
 
-    calculate_quotation_totals(
-        quotation
-    )
+    calculate_quotation_totals(quotation)
 
     await db.commit()
 
-    return {
-        "message": "Quotation item deleted successfully"
-    }
+    return {"message": "Quotation item deleted successfully"}
 
 
 # =========================================================
@@ -1674,103 +1566,72 @@ async def reject_quotation(
 # CONVERT TO BILL
 # =========================================================
 
+
 @router.post("/{quotation_id}/convert-to-bill")
 async def convert_to_bill(
     quotation_id: int,
-    project_id: int,      # Required query parameter
-    contractor_id: int,   # Required query parameter
-    db: AsyncSession = Depends(get_db_session)
+    project_id: int,  # Required query parameter
+    contractor_id: int,  # Required query parameter
+    db: AsyncSession = Depends(get_db_session),
 ):
 
     # GET QUOTATION
 
-    quotation = await get_quotation_or_404(
-        quotation_id,
-        db
-    )
+    quotation = await get_quotation_or_404(quotation_id, db)
 
     # APPROVAL CHECK
 
     if not quotation.is_approved:
-        raise HTTPException(
-            400,
-            "Quotation must be approved first"
-        )
+        raise HTTPException(400, "Quotation must be approved first")
 
     # DUPLICATE CONVERSION CHECK
 
     if quotation.converted_to_bill:
-        raise HTTPException(
-            400,
-            "Already converted to bill"
-        )
+        raise HTTPException(400, "Already converted to bill")
 
     # VALIDATE PROJECT
 
-    project = await db.get(
-        Project,
-        project_id
-    )
+    project = await db.get(Project, project_id)
 
     if not project:
-        raise HTTPException(
-            404,
-            "Project not found"
-        )
+        raise HTTPException(404, "Project not found")
 
     # VALIDATE CONTRACTOR
 
-    contractor = await db.get(
-        Contractor,
-        contractor_id
-    )
+    contractor = await db.get(Contractor, contractor_id)
 
     if not contractor:
-        raise HTTPException(
-            404,
-            "Contractor not found"
-        )
+        raise HTTPException(404, "Contractor not found")
 
     # PREPARE AMOUNTS
 
-    grand_total = Decimal(
-        str(quotation.grand_total or 0)
-    )
+    grand_total = Decimal(str(quotation.grand_total or 0))
 
-    gst_percent = Decimal(
-        str(quotation.gst_percent or 0)
-    )
+    gst_percent = Decimal(str(quotation.gst_percent or 0))
 
     # CREATE RA BILL
 
     bill = RABill(
         # Link back to quotation
         quotation_id=quotation.id,
-
         # Required references selected by user
         project_id=project.id,
         contractor_id=contractor.id,
-
         # Optional work order linkage
         work_order_id=None,
-
         # Auto-generated bill number
         bill_number=f"BILL-{quotation.quotation_no}",
-
         # Description
         work_description=quotation.project_name,
-
         # Preserve quotation total
         quantity=Decimal("1"),
         rate=grand_total,
-
         # Financial values
         gross_amount=grand_total,
         deductions=Decimal("0"),
         net_amount=grand_total,
         gst_percent=gst_percent,
         total_amount=grand_total,
-
         # Bill metadata
         bill_date=date.today(),
         status="Draft",
@@ -1798,7 +1659,7 @@ async def convert_to_bill(
         "project_id": project.id,
         "project_name": project.project_name,
         "contractor_id": contractor.id,
-        "contractor_name": contractor.name
+        "contractor_name": contractor.name,
     }
 
 
@@ -1809,34 +1670,24 @@ async def convert_to_bill(
 
 @router.post("/{quotation_id}/convert-to-invoice")
 async def convert_to_invoice(
-    quotation_id: int,
-    db: AsyncSession = Depends(get_db_session)
+    quotation_id: int, db: AsyncSession = Depends(get_db_session)
 ):
 
-    quotation = await get_quotation_or_404(
-        quotation_id,
-        db
-    )
+    quotation = await get_quotation_or_404(quotation_id, db)
 
     # =====================================================
     # APPROVAL CHECK
     # =====================================================
 
     if not quotation.is_approved:
-        raise HTTPException(
-            400,
-            "Quotation must be approved first"
-        )
+        raise HTTPException(400, "Quotation must be approved first")
 
     # =====================================================
     # DUPLICATE CONVERSION CHECK
     # =====================================================
 
     if quotation.converted_to_invoice:
-        raise HTTPException(
-            400,
-            "Already converted to invoice"
-        )
+        raise HTTPException(400, "Already converted to invoice")
 
     quotation.converted_to_invoice = True
 
@@ -1844,21 +1695,20 @@ async def convert_to_invoice(
 
     await db.commit()
 
-    return {
-        "message": "Converted to invoice successfully"
-    }
+    return {"message": "Converted to invoice successfully"}
 
 
 # =========================================================
 # CONVERT TO WORK ORDER
 # =========================================================
 
+
 @router.post("/{quotation_id}/convert-to-work-order")
 async def convert_to_work_order(
     quotation_id: int,
-    project_id: int,      # Required query parameter
-    contractor_id: int,   # Required query parameter
-    db: AsyncSession = Depends(get_db_session)
+    project_id: int,  # Required query parameter
+    contractor_id: int,  # Required query parameter
+    db: AsyncSession = Depends(get_db_session),
 ):
     from decimal import Decimal
 
@@ -1871,79 +1721,53 @@ async def convert_to_work_order(
     # GET QUOTATION
     # =====================================================
 
-    quotation = await get_quotation_or_404(
-        quotation_id,
-        db
-    )
+    quotation = await get_quotation_or_404(quotation_id, db)
 
     # =====================================================
     # APPROVAL CHECK
     # =====================================================
 
     if not quotation.is_approved:
-        raise HTTPException(
-            400,
-            "Quotation must be approved first"
-        )
+        raise HTTPException(400, "Quotation must be approved first")
 
     # =====================================================
     # DUPLICATE CONVERSION CHECK
     # =====================================================
 
     if quotation.converted_to_work_order:
-        raise HTTPException(
-            400,
-            "Already converted to work order"
-        )
+        raise HTTPException(400, "Already converted to work order")
 
     # =====================================================
     # VALIDATE PROJECT
     # =====================================================
 
-    project = await db.get(
-        Project,
-        project_id
-    )
+    project = await db.get(Project, project_id)
 
     if not project:
-        raise HTTPException(
-            404,
-            "Project not found"
-        )
+        raise HTTPException(404, "Project not found")
 
     # =====================================================
     # VALIDATE CONTRACTOR
     # =====================================================
 
-    contractor = await db.get(
-        Contractor,
-        contractor_id
-    )
+    contractor = await db.get(Contractor, contractor_id)
 
     if not contractor:
-        raise HTTPException(
-            404,
-            "Contractor not found"
-        )
+        raise HTTPException(404, "Contractor not found")
 
     # =====================================================
     # GENERATE WORK ORDER NUMBER
     # =====================================================
 
     work_order_number = await generate_business_id(
-        db,
-        WorkOrder,
-        "work_order_number",
-        "WO"
+        db, WorkOrder, "work_order_number", "WO"
     )
 
     # =====================================================
     # CREATE WORK ORDER
     # =====================================================
 
-    grand_total = Decimal(
-        str(quotation.grand_total or 0)
-    )
+    grand_total = Decimal(str(quotation.grand_total or 0))
 
     work_order = WorkOrder(
         quotation_id=quotation.id,
@@ -1951,8 +1775,7 @@ async def convert_to_work_order(
         contractor_id=contractor.id,
         work_order_number=work_order_number,
         work_description=(
-            f"{quotation.project_name} "
-            f"(From Quotation {quotation.quotation_no})"
+            f"{quotation.project_name} " f"(From Quotation {quotation.quotation_no})"
         ),
         total_quantity=Decimal("1"),
         completed_quantity=Decimal("0"),
@@ -1985,10 +1808,8 @@ async def convert_to_work_order(
         "project_id": project.id,
         "project_name": project.project_name,
         "contractor_id": contractor.id,
-        "contractor_name": contractor.name
+        "contractor_name": contractor.name,
     }
-
-
 
 
 # =========================================================
@@ -2408,50 +2229,20 @@ async def list_extra_charges(
 # PDF GENERATION
 # =========================================================
 
-# =========================================================
-# PDF GENERATION
-# =========================================================
 
-@router.get(
-    "/{quotation_id}/pdf",
-    responses={
-        200: {
-            "content": {
-                "application/pdf": {}
-            },
-            "description": "PDF file"
-        }
-    }
-)
-async def generate_pdf(
-    quotation_id: int,
-    db: AsyncSession = Depends(get_db_session)
-):
-    # Get quotation
-    quotation = await get_quotation_or_404(
-        quotation_id,
-        db
-    )
+@router.get("/{quotation_id}/pdf")
+async def generate_pdf(quotation_id: int, db: AsyncSession = Depends(get_db_session)):
+    quotation = await get_quotation_or_404(quotation_id, db)
 
-    # Generate PDF buffer
-    pdf_buffer = generate_quotation_pdf(
-        quotation
-    )
+    result = await db.execute(select(CompanySettings))
+    company_settings = result.scalars().first()
 
-    # Safe filename:
-    # QT/2026/0001 -> QT-2026-0001
-    safe_filename = (
-        quotation.quotation_no
-        .replace("/", "-")
-        .replace("\\", "-")
-    )
+    pdf_buffer = generate_quotation_pdf(quotation, company_settings)
 
-    # Return PDF stream
+    safe_filename = quotation.quotation_no.replace("/", "-").replace("\\", "-")
+
     return StreamingResponse(
         pdf_buffer,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{safe_filename}.pdf"',
-            "Content-Type": "application/pdf"
-        }
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}.pdf"'},
     )
