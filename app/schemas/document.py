@@ -50,4 +50,3 @@ class DocumentStats(BaseSchema):
     total_storage_gb: float
     pending_approvals: int
     total_documents: int
-
