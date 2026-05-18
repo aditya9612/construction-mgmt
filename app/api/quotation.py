@@ -396,7 +396,7 @@ def generate_quotation_pdf(
         leftMargin=20,
         rightMargin=20,
         topMargin=20,
-        bottomMargin=20,
+        bottomMargin=110,   # Reserve space for fixed footer
     )
 
     styles = getSampleStyleSheet()
@@ -530,11 +530,14 @@ def generate_quotation_pdf(
         ["GST Number", quotation.gst_number or "-"],
     ]
 
-    elements.append(Paragraph("<b>Client Details</b>", styles["Heading2"]))
-
-    elements.append(create_styled_table(client_info, [150, 370]))
-
-    elements.append(Spacer(1, 15))
+    elements.append(
+        KeepTogether([
+            Paragraph("<b>Client Details</b>", styles["Heading2"]),
+            Spacer(1, 6),
+            create_styled_table(client_info, [150, 370]),
+            Spacer(1, 15),
+        ])
+    )
 
     # =====================================================
     # ITEM DETAILS
@@ -553,11 +556,14 @@ def generate_quotation_pdf(
             ]
         )
 
-    elements.append(Paragraph("<b>Item Details</b>", styles["Heading2"]))
-
-    elements.append(create_styled_table(item_data, [180, 70, 70, 80, 90]))
-
-    elements.append(Spacer(1, 15))
+    elements.append(
+        KeepTogether([
+            Paragraph("<b>Item Details</b>", styles["Heading2"]),
+            Spacer(1, 6),
+            create_styled_table(item_data, [180, 70, 70, 80, 90]),
+            Spacer(1, 15),
+        ])
+    )
 
     # =====================================================
     # LABOUR DETAILS
@@ -577,11 +583,14 @@ def generate_quotation_pdf(
                 ]
             )
 
-        elements.append(Paragraph("<b>Labour Details</b>", styles["Heading2"]))
-
-        elements.append(create_styled_table(labour_data, [150, 80, 80, 100, 100]))
-
-        elements.append(Spacer(1, 15))
+    elements.append(
+        KeepTogether([
+            Paragraph("<b>Labour Details</b>", styles["Heading2"]),
+            Spacer(1, 6),
+            create_styled_table(labour_data, [150, 80, 80, 100, 100]),
+            Spacer(1, 15),
+        ])
+    )
 
     # =====================================================
     # MATERIAL DETAILS
@@ -601,11 +610,14 @@ def generate_quotation_pdf(
                 ]
             )
 
-        elements.append(Paragraph("<b>Material Details</b>", styles["Heading2"]))
-
-        elements.append(create_styled_table(material_data, [180, 70, 70, 80, 90]))
-
-        elements.append(Spacer(1, 15))
+        elements.append(
+            KeepTogether([
+                Paragraph("<b>Material Details</b>", styles["Heading2"]),
+                Spacer(1, 6),
+                create_styled_table(material_data, [180, 70, 70, 80, 90]),
+                Spacer(1, 15),
+            ])
+        )
 
     # =====================================================
     # EXTRA CHARGES
@@ -624,11 +636,14 @@ def generate_quotation_pdf(
                 ]
             )
 
-        elements.append(Paragraph("<b>Extra Charges</b>", styles["Heading2"]))
-
-        elements.append(create_styled_table(extra_data, [220, 90, 90, 90]))
-
-        elements.append(Spacer(1, 15))
+        elements.append(
+            KeepTogether([
+                Paragraph("<b>Extra Charges</b>", styles["Heading2"]),
+                Spacer(1, 6),
+                create_styled_table(extra_data, [220, 90, 90, 90]),
+                Spacer(1, 15),
+            ])
+        )
 
     # =====================================================
     # SUMMARY
@@ -646,13 +661,14 @@ def generate_quotation_pdf(
         ["Balance Due", f"{quotation.balance_due:.2f}"],
     ]
 
-    elements.append(Paragraph("<b>Financial Summary</b>", styles["Heading2"]))
-
     elements.append(
-        create_styled_table(summary_data, [250, 150], highlight_last_row=True)
+        KeepTogether([
+            Paragraph("<b>Financial Summary</b>", styles["Heading2"]),
+            Spacer(1, 6),
+            create_styled_table(summary_data, [250, 150], highlight_last_row=True),
+            Spacer(1, 20),
+        ])
     )
-
-    elements.append(Spacer(1, 20))
 
     # =====================================================
     # AMOUNT IN WORDS
@@ -904,21 +920,21 @@ def generate_quotation_pdf(
     # =====================================================
 
     left_column = [
-        create_icon_text_table("phone.png", mobile, 140),
+        create_icon_text_table("phone.png", mobile, 126),
         Spacer(1, 8),
-        create_icon_text_table("email.png", email, 140),
+        create_icon_text_table("email.png", email, 126),
     ]
 
     center_column = [
-        create_icon_text_table("instagram.png", instagram_handle, 140),
+        create_icon_text_table("instagram.png", instagram_handle, 126),
         Spacer(1, 8),
-        create_icon_text_table("whatsapp.png", whatsapp_number, 140),
+        create_icon_text_table("whatsapp.png", whatsapp_number, 126),
     ]
 
     right_column = [
-        create_icon_text_table("location.png", address, 210),
+        create_icon_text_table("location.png", address, 140),
         Spacer(1, 8),
-        create_icon_text_table("website.png", website, 210),
+        create_icon_text_table("website.png", website, 140),
     ]
 
     # =====================================================
@@ -935,7 +951,7 @@ def generate_quotation_pdf(
 
     footer_table = Table(
         footer_data,
-        colWidths=[175, 175, 230],
+        colWidths=[180, 180, 195],
     )
 
     footer_table.setStyle(
@@ -959,13 +975,35 @@ def generate_quotation_pdf(
         )
     )
 
-    elements.append(footer_table)
+    # =====================================================
+    # DRAW FIXED FOOTER ON EVERY PAGE
+    # =====================================================
+
+    def draw_footer(canvas, doc):
+        """
+        Draw footer at fixed position at the bottom of every page.
+        """
+        canvas.saveState()
+
+        # Position from bottom of page
+        x = doc.leftMargin
+        y = 15
+
+        # Calculate size and draw
+        footer_table.wrapOn(canvas, doc.width, 80)
+        footer_table.drawOn(canvas, x, y)
+
+        canvas.restoreState()
 
     # =====================================================
     # BUILD PDF
     # =====================================================
 
-    doc.build(elements)
+    doc.build(
+        elements,
+        onFirstPage=draw_footer,
+        onLaterPages=draw_footer,
+    )
 
     buffer.seek(0)
 

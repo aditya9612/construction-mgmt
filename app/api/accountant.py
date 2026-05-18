@@ -62,15 +62,17 @@ def generate_offer_pdf(offer):
     BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
     logo_path = os.path.join(BASE_DIR, "static", "logo.png")
     stamp_path = os.path.join(BASE_DIR, "static", "stamp.png")
+    phone_icon = os.path.join(BASE_DIR, "static", "phone.png")
+    email_icon = os.path.join(BASE_DIR, "static", "email.png")
+    loc_icon = os.path.join(BASE_DIR, "static", "location.png")
 
     file_path = f"media/offers/offer_{offer.id}.pdf"
     os.makedirs("media/offers", exist_ok=True)
 
-    doc = SimpleDocTemplate(file_path, pagesize=A4)
+    doc = SimpleDocTemplate(file_path, pagesize=A4, rightMargin=50, leftMargin=50, topMargin=80, bottomMargin=50)
 
     styles = getSampleStyleSheet()
 
-    #  FIX 1: Better spacing styles (ONLY CHANGE)
     normal = ParagraphStyle(name='NormalSmall', fontSize=10, leading=16, spaceAfter=6)
     bold = ParagraphStyle(name='Bold', fontSize=10, leading=16, spaceAfter=8, spaceBefore=6)
     title = ParagraphStyle(name='Title', alignment=1, fontSize=14, spaceAfter=18)
@@ -83,19 +85,19 @@ def generate_offer_pdf(offer):
     header = Table([
         [
             Image(logo_path, width=130, height=60) if os.path.exists(logo_path) else "",
-            Paragraph("<para align=right><b>Date :</b></para>", normal)
+            Paragraph("<para align=right>Date : ______________</para>", normal)
         ]
-    ], colWidths=[300, 200])
+    ], colWidths=[220, 275])
+
+    header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
 
     content.append(header)
-
-    #  FIX 2: Bigger space after header
-    content.append(Spacer(1, 8))
+    content.append(Spacer(1, 16))
 
     # ================= TITLE =================
-    content.append(Paragraph("<b>OFFER LETTER</b>", title))
-
-    #  FIX 3: More gap like image
+    content.append(Paragraph("<b><u>OFFER LETTER</u></b>", title))
     content.append(Spacer(1, 8))
 
     # ================= SECOND DATE =================
@@ -109,7 +111,6 @@ def generate_offer_pdf(offer):
     content.append(Paragraph(offer.society_name or "-", normal))
     content.append(Paragraph(offer.address or "-", normal))
 
-    #  FIX 5: spacing before subject
     content.append(Spacer(1, 14))
 
     # ================= SUBJECT =================
@@ -148,24 +149,21 @@ def generate_offer_pdf(offer):
     ))
 
     content.append(Paragraph("<b>Our Re-Development offer includes:</b>", bold))
-
-    #  FIX 6: space before table
     content.append(Spacer(1, 12))
 
     # ================= TABLE =================
     table = Table([
         ["CARPET AREA", f"EXISTING FLAT OWNER WILL GET {offer.extra_carpet_percent}% EXTRA CARPET AREA."]
-    ], colWidths=[180, 300])
+    ], colWidths=[150, 340])
 
     table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 1, colors.black),
-        ("BACKGROUND", (0, 0), (0, 0), colors.lightgrey),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("PADDING", (0, 0), (-1, -1), 6),
     ]))
 
     content.append(table)
-
-    #  FIX 7: more breathing space after table
     content.append(Spacer(1, 16))
 
     # ================= NOTE =================
@@ -178,74 +176,88 @@ def generate_offer_pdf(offer):
 
     # ================= FOOTER =================
     content.append(Spacer(1, 12))  # small gap
+    
+    phone_img = f'<img src="{phone_icon}" width="10" height="10"/>' if os.path.exists(phone_icon) else ""
+    email_img = f'<img src="{email_icon}" width="10" height="10"/>' if os.path.exists(email_icon) else ""
+    loc_img = f'<img src="{loc_icon}" width="10" height="10"/>' if os.path.exists(loc_icon) else ""
 
     footer = Table([
         [
             Image(stamp_path, width=90, height=90) if os.path.exists(stamp_path) else "",
             Paragraph(
                 f"<para align=right>"
-                f"{offer.contact_phone or '-'}<br/>"
-                f"{offer.contact_email or '-'}<br/>"
-                f"SITE ADD: S.No.57/6B, Plot No.03, Abhiruchi Mall, Pune"
+                f"{offer.contact_phone or '-'} {phone_img}<br/>"
+                f"{offer.contact_email or '-'} {email_img}<br/>"
+                f"SITE ADD: S.No.57/6B, Plot No.03, Abhiruchi Mall, Pune {loc_img}"
                 f"</para>",
                 normal
             )
         ]
-    ], colWidths=[180, 320])
+    ], colWidths=[180, 310])
+
+    footer.setStyle(TableStyle([
+        ('LEFTPADDING', (0, 0), (0, 0), 50),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
 
     content.append(footer)
 
-    # ================= BACKGROUND (UNCHANGED) =================
+    # ================= BACKGROUND =================
     def draw_background(canvas, doc):
         from reportlab.lib import colors
 
         W, H = doc.pagesize
 
-        # ================= TOP RIGHT =================
+        # 1) WATERMARK
+        if os.path.exists(logo_path):
+            canvas.saveState()
+            canvas.drawImage(logo_path, W/2 - 250, H/2 - 120, width=500, height=240, preserveAspectRatio=True, anchor='c')
+            canvas.setFillColor(colors.white)
+            canvas.setFillAlpha(0.88)
+            canvas.rect(0, 0, W, H, fill=1, stroke=0)
+            canvas.restoreState()
+
+        # 2) CORNER RIBBONS
         canvas.saveState()
+        
+        gold = colors.HexColor("#D4AF37")
+        grey = colors.HexColor("#666666")
 
-        # DARK BAND (outer)
-        canvas.setFillColor(colors.HexColor("#d4a017"))
+        # Top Right
+        canvas.setFillColor(gold)
         p = canvas.beginPath()
-        p.moveTo(W - 160, H)
-        p.lineTo(W, H)
-        p.lineTo(W, H - 90)
-        p.lineTo(W - 110, H - 45)
+        p.moveTo(W, H-40)
+        p.lineTo(W-40, H)
+        p.lineTo(W-100, H)
+        p.lineTo(W, H-100)
         p.close()
         canvas.drawPath(p, fill=1, stroke=0)
 
-        # LIGHT BAND (inner parallel)
-        canvas.setFillColor(colors.HexColor("#f4c542"))
+        canvas.setFillColor(grey)
         p = canvas.beginPath()
-        p.moveTo(W - 130, H)
-        p.lineTo(W, H)
-        p.lineTo(W, H - 60)
-        p.lineTo(W - 90, H - 30)
+        p.moveTo(W, H-120)
+        p.lineTo(W-120, H)
+        p.lineTo(W-140, H)
+        p.lineTo(W, H-140)
         p.close()
         canvas.drawPath(p, fill=1, stroke=0)
 
-        canvas.restoreState()
-
-        # ================= BOTTOM LEFT =================
-        canvas.saveState()
-
-        # DARK BAND
-        canvas.setFillColor(colors.HexColor("#d4a017"))
+        # Bottom Left
+        canvas.setFillColor(gold)
         p = canvas.beginPath()
-        p.moveTo(0, 0)
-        p.lineTo(0, 140)
-        p.lineTo(140, 50)
-        p.lineTo(90, 0)
-        p.close()
-        canvas.drawPath(p, fill=1, stroke=0)
-
-        # LIGHT BAND (parallel)
-        canvas.setFillColor(colors.HexColor("#f4c542"))
-        p = canvas.beginPath()
-        p.moveTo(0, 0)
+        p.moveTo(0, 40)
+        p.lineTo(40, 0)
+        p.lineTo(100, 0)
         p.lineTo(0, 100)
-        p.lineTo(105, 35)
-        p.lineTo(65, 0)
+        p.close()
+        canvas.drawPath(p, fill=1, stroke=0)
+
+        canvas.setFillColor(grey)
+        p = canvas.beginPath()
+        p.moveTo(0, 120)
+        p.lineTo(120, 0)
+        p.lineTo(140, 0)
+        p.lineTo(0, 140)
         p.close()
         canvas.drawPath(p, fill=1, stroke=0)
 
