@@ -13,7 +13,6 @@ class BaseSchema(BaseModel):
         json_encoders={Decimal: lambda v: round(float(v), 2)},
     )
 
-
 # ================= MATERIAL =================
 class MaterialCreate(BaseSchema):
     project_id: int
@@ -40,7 +39,6 @@ class MaterialCreate(BaseSchema):
         if v < 0:
             raise ValueError("Value cannot be negative")
         return v
-
 
 class MaterialUpdate(BaseSchema):
     material_name: Optional[str] = None

@@ -344,6 +344,122 @@ async def get_role_counts(
 
     return result
 
+@router.get("/roles")
+async def list_roles_by_status(
+    status: str = Query(
+        "all",
+        pattern="^(all|active|inactive)$",
+        description="Filter roles by user status: all, active, inactive"
+    ),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Return unique roles based on user active/inactive status.
+    """
+
+    # Base query
+    query = (
+        select(
+            User.role,
+            func.count(User.id).label("user_count")
+        )
+        .where(User.is_deleted == False)
+    )
+
+    # Apply status filter
+    if status == "active":
+        query = query.where(User.is_active == True)
+
+    elif status == "inactive":
+        query = query.where(User.is_active == False)
+
+    # Group by role
+    query = query.group_by(User.role).order_by(User.role)
+
+    # Execute query
+    rows = (await db.execute(query)).all()
+
+    # Format response
+    items = [
+        {
+            "role": role,
+            "user_count": count
+        }
+        for role, count in rows
+    ]
+
+    return {
+        "items": items
+    }
+
+
+@router.put("/roles/{role}/status")
+async def update_role_status(
+    role: str,
+    is_active: bool = Query(
+        ...,
+        description="true = activate role users, false = deactivate role users"
+    ),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Activate or deactivate all users of a given role.
+    """
+
+    # Validate role
+    if role not in ROLES:
+        raise AppError(
+            status_code=404,
+            message=f"Invalid role. Available roles: {ROLES}"
+        )
+
+    # Fetch all non-deleted users with this role
+    result = await db.execute(
+        select(User).where(
+            User.role == role,
+            User.is_deleted == False
+        )
+    )
+    users = result.scalars().all()
+
+    if not users:
+        raise NotFoundError(f"No users found for role '{role}'")
+
+    # Update only changed users
+    updated_count = 0
+
+    for user in users:
+        if user.is_active != is_active:
+            user.is_active = is_active
+            user.updated_by = current_user.id
+            updated_count += 1
+
+    await db.flush()
+
+    # Activity log
+    await log_activity(
+        db,
+        action="UPDATE_ROLE_STATUS",
+        entity="ROLE",
+        entity_id=0,
+        performed_by=current_user.id,
+        details={
+            "role": role,
+            "is_active": is_active,
+            "updated_users": updated_count,
+        },
+    )
+
+    return {
+        "message": "Role status updated successfully",
+        "role": role,
+        "is_active": is_active,
+        "updated_users": updated_count,
+    }
+
+
 @router.get("/activity-logs")
 async def get_activity_logs(
     entity_id: Optional[int] = Query(None),

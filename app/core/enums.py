@@ -183,10 +183,10 @@ class AlertType(str, Enum):
 
 
 class WorkActivityStatus(str, Enum):
-    ON_TRACK = "On Track"
-    DELAY = "Delay"
-    COMPLETED = "Completed"
-    NOT_STARTED = "Not Started"
+    ON_TRACK = "ON_TRACK"
+    DELAY = "DELAY"
+    COMPLETED = "COMPLETED"
+    NOT_STARTED = "NOT_STARTED"
 
 
 class DocumentStatus(str, Enum):

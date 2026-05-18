@@ -892,7 +892,7 @@ async def generate_payroll(
         d.require_roles(
             [
                 r.value
-                for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.ACCOUNTANT]
+                for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.ACCOUNTANT , UserRole.SITE_ENGINEER]
             ]
         )
     ),
@@ -1060,7 +1060,7 @@ async def generate_payroll(
 @router.post("/payroll/pay")
 async def pay_salary(
     payload: s.PayrollPayment,
-    current_user: User = Depends(d.require_roles(PAYROLL_ROLES)),
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
