@@ -83,6 +83,8 @@ from app.schemas.material import (
     TransferOut,
 )
 
+from app.core.logger import logger
+
 MATERIAL_READ_ROLES = [
     r.value
     for r in [
@@ -282,41 +284,136 @@ async def material_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    import traceback
+    from decimal import Decimal
+    from fastapi import HTTPException
 
-    # ✅ total materials (same)
-    total_materials = await db.scalar(
-        select(func.count(Material.id)).where(Material.is_deleted == False)
-    )
+    try:
+        print("\n" + "=" * 80)
+        print("DEBUG: /materials/summary API called")
+        print("=" * 80)
 
-    # 🔥 FIX: use WAC instead of purchase_rate
-    rows = (
-        (await db.execute(select(Material).where(Material.is_deleted == False)))
-        .scalars()
-        .all()
-    )
+        # ==========================================================
+        # STEP 1: TOTAL MATERIALS
+        # ==========================================================
+        print("DEBUG: Fetching total materials count...")
 
-    total_stock = Decimal("0")
+        total_materials = await db.scalar(
+            select(func.count(Material.id)).where(Material.is_deleted == False)
+        )
 
-    for m in rows:
-        purchased = m.quantity_purchased or Decimal("0")
-        total_amt = m.total_amount or Decimal("0")
-        remaining = m.remaining_stock or Decimal("0")
+        print(f"DEBUG: total_materials = {total_materials}")
 
-        avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
+        # ==========================================================
+        # STEP 2: FETCH ALL MATERIALS
+        # ==========================================================
+        print("DEBUG: Fetching all active materials...")
 
-        total_stock += remaining * avg_rate
+        result = await db.execute(
+            select(Material).where(Material.is_deleted == False)
+        )
 
-    # ✅ pending (same)
-    total_pending = await db.scalar(
-        select(func.sum(Material.payment_pending)).where(Material.is_deleted == False)
-    )
+        rows = result.scalars().all()
 
-    return {
-        "total_materials": total_materials or 0,
-        "total_stock_value": round(float(total_stock or 0), 2),
-        "total_pending_payments": round(float(total_pending or 0), 2),
-    }
+        print(f"DEBUG: Number of materials fetched = {len(rows)}")
 
+        # ==========================================================
+        # STEP 3: CALCULATE TOTAL STOCK VALUE
+        # ==========================================================
+        total_stock = Decimal("0")
+
+        print("DEBUG: Starting stock valuation calculation...")
+
+        for index, m in enumerate(rows, start=1):
+            try:
+                print("-" * 60)
+                print(f"DEBUG: Processing material #{index}")
+                print(f"DEBUG: id = {m.id}")
+                print(f"DEBUG: material_name = {m.material_name}")
+                print(f"DEBUG: quantity_purchased = {m.quantity_purchased}")
+                print(f"DEBUG: total_amount = {m.total_amount}")
+                print(f"DEBUG: remaining_stock = {m.remaining_stock}")
+
+                purchased = m.quantity_purchased or Decimal("0")
+                total_amt = m.total_amount or Decimal("0")
+                remaining = m.remaining_stock or Decimal("0")
+
+                print(f"DEBUG: purchased = {purchased}")
+                print(f"DEBUG: total_amt = {total_amt}")
+                print(f"DEBUG: remaining = {remaining}")
+
+                # Weighted Average Cost (WAC)
+                if purchased > 0:
+                    avg_rate = total_amt / purchased
+                else:
+                    avg_rate = Decimal("0")
+
+                print(f"DEBUG: avg_rate = {avg_rate}")
+
+                material_stock_value = remaining * avg_rate
+
+                print(f"DEBUG: material_stock_value = {material_stock_value}")
+
+                total_stock += material_stock_value
+
+                print(f"DEBUG: running total_stock = {total_stock}")
+
+            except Exception as material_error:
+                print("ERROR while processing material:")
+                print(f"ERROR: material_id = {getattr(m, 'id', None)}")
+                print(
+                    f"ERROR: material_name = {getattr(m, 'material_name', None)}"
+                )
+                print(f"ERROR: {str(material_error)}")
+                traceback.print_exc()
+                raise
+
+        print("=" * 80)
+        print(f"DEBUG: Final total_stock = {total_stock}")
+        print("=" * 80)
+
+        # ==========================================================
+        # STEP 4: TOTAL PENDING PAYMENTS
+        # ==========================================================
+        print("DEBUG: Fetching total pending payments...")
+
+        total_pending = await db.scalar(
+            select(func.sum(Material.payment_pending)).where(
+                Material.is_deleted == False
+            )
+        )
+
+        print(f"DEBUG: total_pending = {total_pending}")
+
+        # ==========================================================
+        # STEP 5: PREPARE RESPONSE
+        # ==========================================================
+        response = {
+            "total_materials": total_materials or 0,
+            "total_stock_value": round(float(total_stock or 0), 2),
+            "total_pending_payments": round(float(total_pending or 0), 2),
+        }
+
+        print("=" * 80)
+        print("DEBUG: Final Response")
+        print(response)
+        print("=" * 80)
+
+        return response
+
+    except Exception as e:
+        print("\n" + "!" * 80)
+        print("CRITICAL ERROR IN /materials/summary")
+        print(f"ERROR TYPE: {type(e).__name__}")
+        print(f"ERROR MESSAGE: {str(e)}")
+        traceback.print_exc()
+        print("!" * 80 + "\n")
+
+        # Optional: return actual error in API response while debugging
+        raise HTTPException(
+            status_code=500,
+            detail=f"Material summary failed: {type(e).__name__}: {str(e)}"
+        )
 
 # ================= SUPPLIERS =================
 
@@ -593,27 +690,79 @@ async def get_material_alerts(
     if threshold is not None:
         query = query.where(Material.remaining_stock <= threshold)
     else:
-        query = query.where(Material.remaining_stock <= Material.minimum_stock_level)
+        query = query.where(
+            Material.remaining_stock <= Material.minimum_stock_level
+        )
 
     query = query.order_by(Material.remaining_stock.asc())
 
     result = await db.execute(query)
     rows = result.all()
 
+    logger.info(f"Total material alerts fetched: {len(rows)}")
+
     data = []
 
     for obj, supplier_name in rows:
-        response = build_material_response(obj, supplier_name)
+        try:
+            # Log raw database values
+            logger.info(
+                f"""
+VALIDATING MATERIAL ALERT
+-----------------------------------
+Material ID         : {obj.id}
+Material Name       : {obj.material_name}
+Supplier Name       : {supplier_name}
+Quantity Purchased  : {obj.quantity_purchased}
+Quantity Used       : {obj.quantity_used}
+Remaining Stock     : {obj.remaining_stock}
+Minimum Stock Level : {obj.minimum_stock_level}
+Threshold Param     : {threshold}
+-----------------------------------
+"""
+            )
 
-        # ✅ ONLY override alert for NEAR_LOW case
-        if (
-            threshold is not None
-            and response.alert_type == "IN_STOCK"
-            and response.remaining_stock <= threshold
-        ):
-            response.alert_type = "NEAR_LOW"
+            # Build response
+            response = build_material_response(obj, supplier_name)
 
-        data.append(response)
+            # Override alert type for threshold-based near-low condition
+            if (
+                threshold is not None
+                and response.alert_type == "IN_STOCK"
+                and response.remaining_stock <= threshold
+            ):
+                response.alert_type = "NEAR_LOW"
+
+            # Validate explicitly against response model
+            validated = MaterialOut.model_validate(response)
+
+            logger.info(
+                f"Material ID {obj.id} validated successfully. "
+                f"Alert Type: {validated.alert_type}"
+            )
+
+            data.append(validated)
+
+        except Exception as e:
+            logger.exception(
+                f"""
+FAILED TO VALIDATE MATERIAL ALERT
+===================================
+Material ID         : {obj.id}
+Material Name       : {obj.material_name}
+Supplier Name       : {supplier_name}
+Remaining Stock     : {obj.remaining_stock}
+Minimum Stock Level : {obj.minimum_stock_level}
+Threshold Param     : {threshold}
+
+Error:
+{repr(e)}
+===================================
+"""
+            )
+            raise
+
+    logger.info("All material alerts validated successfully.")
 
     return data
 

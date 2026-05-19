@@ -2,7 +2,7 @@ import enum
 from datetime import date
 from typing import Any, Dict, Optional
 
-from sqlalchemy import JSON, VARCHAR, Boolean, Date, Enum, Integer, String, Text
+from sqlalchemy import JSON, VARCHAR, Boolean, Date, Enum, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from datetime import datetime
 from typing import Optional
@@ -35,6 +35,10 @@ class UserRole(str, enum.Enum):
 
 class User(Base, TimestampMixin):
     __tablename__ = "users"
+
+    __table_args__ = (
+        Index("idx_users_is_deleted_id", "is_deleted", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
