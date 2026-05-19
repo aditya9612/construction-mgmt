@@ -280,13 +280,84 @@ async def create_invoice_from_quotation(
     return InvoiceOut.model_validate(invoice)
 
 
+# @router.get("", response_model=list[InvoiceOut])
+# async def list_invoices(
+#     db: AsyncSession = Depends(get_db_session),
+#     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+# ):
+#     rows = (await db.execute(select(Invoice))).scalars().all()
+#     return [InvoiceOut.model_validate(r) for r in rows]
+
 @router.get("", response_model=list[InvoiceOut])
 async def list_invoices(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
     rows = (await db.execute(select(Invoice))).scalars().all()
-    return [InvoiceOut.model_validate(r) for r in rows]
+
+    logger.info(f"Total invoices fetched: {len(rows)}")
+
+    result = []
+
+    for row in rows:
+        try:
+            # Log raw SQLAlchemy object values before validation
+            logger.info(
+                f"""
+VALIDATING INVOICE
+-----------------------------------
+ID              : {row.id}
+Project ID      : {row.project_id}
+Owner ID        : {row.owner_id}
+Type            : {row.type}
+Reference ID    : {row.reference_id}
+Quotation ID    : {row.quotation_id}
+Amount          : {row.amount} ({type(row.amount)})
+GST Percent     : {row.gst_percent} ({type(row.gst_percent)})
+GST Amount      : {row.gst_amount} ({type(row.gst_amount)})
+Tax Percent     : {row.tax_percent} ({type(row.tax_percent)})
+Tax Amount      : {row.tax_amount} ({type(row.tax_amount)})
+Total Amount    : {row.total_amount} ({type(row.total_amount)})
+Paid Amount     : {row.paid_amount} ({type(row.paid_amount)})
+Pending Amount  : {row.pending_amount} ({type(row.pending_amount)})
+Status          : {row.status} ({type(row.status)})
+Description     : {row.description} ({type(row.description)})
+Created At      : {row.created_at} ({type(row.created_at)})
+Linked Expenses : {row.linked_expense_ids} ({type(row.linked_expense_ids)})
+-----------------------------------
+"""
+            )
+
+            # Validate with Pydantic
+            validated = InvoiceOut.model_validate(row)
+
+            # Log success
+            logger.info(f"Invoice ID {row.id} validated successfully.")
+
+            result.append(validated)
+
+        except Exception as e:
+            # Detailed error log
+            logger.exception(
+                f"""
+FAILED TO VALIDATE INVOICE
+===================================
+Invoice ID      : {row.id}
+Type            : {row.type}
+Status          : {row.status}
+Quotation ID    : {row.quotation_id}
+Linked Expenses : {row.linked_expense_ids}
+
+Error:
+{repr(e)}
+===================================
+"""
+            )
+            raise
+
+    logger.info("All invoices validated successfully.")
+
+    return result
 
 
 from datetime import datetime, time
