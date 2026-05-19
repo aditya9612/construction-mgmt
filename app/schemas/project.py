@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from decimal import Decimal
 from typing import List, Optional, Union
 from enum import Enum
 
@@ -598,39 +599,63 @@ class MessageCreate(BaseSchema):
         return v
 
 
+# ========work progress============
 class WorkActivityCreate(BaseModel):
     project_id: int
-    boq_code: int
+    boq_code: Optional[int] = None
     activity_name: str
-    planned_quantity: float
+
+    planned_quantity: Decimal = Field(gt=0)
+
     unit: str
     start_date: date
     end_date: date
     work_order_id: int
-
-    # Use enum instead of str
-    status: WorkActivityStatus = WorkActivityStatus.NOT_STARTED
-
     engineer_id: int
 
 
+    @field_validator("end_date")
+    def validate_dates(cls, v, info: ValidationInfo):
+
+        start_date = info.data.get("start_date")
+
+        if start_date and v < start_date:
+            raise ValueError("End date cannot be before start date")
+
+        return v
+
+
 class WorkActivityUpdate(BaseModel):
+
     activity_name: Optional[str] = None
-    planned_quantity: Optional[float] = None
+
+    planned_quantity: Optional[Decimal] = Field(
+        default=None,
+        gt=0,
+    )
+
     unit: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
 
-    # Optional enum for partial updates
-    status: Optional[WorkActivityStatus] = None
+    @field_validator("end_date")
+    def validate_dates(cls, v, info: ValidationInfo):
+
+        start_date = info.data.get("start_date")
+
+        if start_date and v and v < start_date:
+
+            raise ValueError("End date cannot be before start date")
+
+        return v
 
 
 class WorkActivityResponse(BaseModel):
     id: int
     project_id: int
-    boq_code: int
+    boq_code: Optional[int] = None
     activity_name: str
-    planned_quantity: float
+    planned_quantity: Decimal
     unit: str
     start_date: date
     end_date: date
@@ -647,13 +672,17 @@ class WorkActivityResponse(BaseModel):
 class DailyProgressCreate(BaseModel):
     activity_id: int
     entry_date: date
-    today_progress: float
+    today_progress: Decimal = Field(gt=0)
     remarks: Optional[str] = None
-    created_by: int
 
 
 class DailyProgressUpdate(BaseModel):
-    today_progress: Optional[float] = None
+
+    today_progress: Optional[Decimal] = Field(
+        default=None,
+        gt=0,
+    )
+
     remarks: Optional[str] = None
 
 
@@ -661,12 +690,22 @@ class DailyProgressResponse(BaseModel):
     id: int
     activity_id: int
     entry_date: date
-    today_progress: float
+    today_progress: Decimal
     remarks: Optional[str] = None
     created_by: int
 
     class Config:
         from_attributes = True
+
+class DailyProgressWithActivityResponse(BaseModel):
+
+    message: str
+    progress: DailyProgressResponse
+    activity: WorkActivityResponse
+
+    class Config:
+        from_attributes = True
+        
 
 class ProjectsModuleSummary(BaseModel):
     total_projects: int
@@ -674,12 +713,14 @@ class ProjectsModuleSummary(BaseModel):
     completed_projects: int
     delayed_projects: int
 
+
 class ProjectActivityItem(BaseModel):
     type: str  # task_completion, invoice, photo, issue
     user_name: str
     description: str
     project_name: str
     timestamp: datetime
+
 
 class ProjectsModuleResponse(BaseModel):
     summary: ProjectsModuleSummary

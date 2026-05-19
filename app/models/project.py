@@ -2,6 +2,7 @@ from datetime import date
 from typing import Optional, TYPE_CHECKING
 from sqlalchemy import (
     DECIMAL,
+    JSON,
     TIMESTAMP,
     Boolean,
     CheckConstraint,
@@ -646,27 +647,48 @@ class SiteRequest(Base, TimestampMixin):
 
 # =================work progress===========================
 
-
 class WorkActivity(Base, TimestampMixin):
+
     __tablename__ = "work_activities"
 
     id = Column(Integer, primary_key=True, index=True)
-    project_id = Column(Integer, nullable=False)
-    boq_code = Column(Integer)
+
+    project_id = Column(
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    boq_code = Column(Integer, nullable=True)
+
     activity_name = Column(String(255), nullable=False)
+
     planned_quantity = Column(DECIMAL(18, 2), default=0)
+
     unit = Column(String(50))
-    engineer_id = Column(Integer)
+
+    engineer_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     work_order_id = Column(
         Integer,
         ForeignKey("work_orders.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
+
     total_completed = Column(DECIMAL(18, 2), default=0)
+
     remaining_quantity = Column(DECIMAL(18, 2), default=0)
-    completion_percentage: Column = Column(DECIMAL(5, 2), default=0)
-    discipline: Column = Column(String(100), nullable=True)
+
+    completion_percentage = Column(DECIMAL(5, 2), default=0)
+
+    discipline = Column(String(100), nullable=True)
 
     status = Column(
         SAEnum(WorkActivityStatus),
@@ -675,8 +697,52 @@ class WorkActivity(Base, TimestampMixin):
     )
 
     start_date = Column(Date)
+
     end_date = Column(Date)
-    created_at = Column(TIMESTAMP, server_default=func.now())
+
+    created_at = Column(
+        TIMESTAMP,
+        server_default=func.now(),
+    )
+
+    # ================= RELATIONSHIPS =================
+
+    project = relationship("Project")
+
+    engineer = relationship("User")
+
+    progress_entries = relationship(
+        "DailyProgressEntry",
+        back_populates="activity",
+        cascade="all, delete-orphan",
+    )
+
+    # ================= UPDATED HISTORY RELATIONSHIP =================
+
+    history_logs = relationship(
+        "ActivityHistory",
+        back_populates="activity",
+    )
+
+    # ================= CONSTRAINTS =================
+
+    __table_args__ = (
+        CheckConstraint(
+            "planned_quantity >= 0",
+            name="check_planned_quantity_positive",
+        ),
+        CheckConstraint(
+            "end_date >= start_date",
+            name="check_activity_dates",
+        ),
+        CheckConstraint(
+            "completion_percentage >= 0 AND completion_percentage <= 100",
+            name="check_completion_percentage_range",
+        ),
+    )
+
+
+# ================= DAILY PROGRESS ENTRY =================
 
 
 class DailyProgressEntry(Base, TimestampMixin):
@@ -684,9 +750,121 @@ class DailyProgressEntry(Base, TimestampMixin):
     __tablename__ = "daily_progress_entries"
 
     id = Column(Integer, primary_key=True)
-    activity_id = Column(Integer, ForeignKey("work_activities.id"))
-    entry_date = Column(Date)
-    today_progress = Column(DECIMAL(18, 2), default=0)
+
+    activity_id = Column(
+        Integer,
+        ForeignKey("work_activities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    entry_date = Column(Date, nullable=False, index=True)
+
+    today_progress = Column(
+        DECIMAL(18, 2),
+        default=0,
+        nullable=False,
+    )
+
     remarks = Column(Text)
-    created_by = Column(Integer)
-    created_at = Column(TIMESTAMP, server_default=func.now())
+
+    created_by = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=True,
+    )
+
+    created_at = Column(
+        TIMESTAMP,
+        server_default=func.now(),
+    )
+
+    activity = relationship(
+        "WorkActivity",
+        back_populates="progress_entries",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "activity_id",
+            "entry_date",
+            name="uq_activity_entry_date",
+        ),
+        CheckConstraint(
+            "today_progress >= 0",
+            name="check_today_progress_positive",
+        ),
+    )
+
+
+# ================= ACTIVITY HISTORY =================
+
+
+class ActivityHistory(Base):
+
+    __tablename__ = "activity_history"
+
+    id = Column(Integer, primary_key=True)
+
+    # ================= UPDATED FOREIGN KEY =================
+
+    activity_id = Column(
+        Integer,
+        ForeignKey("work_activities.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # CREATE / UPDATE / DELETE / DAILY_PROGRESS_UPDATE
+    action = Column(String(50), nullable=False)
+
+    # old values before change
+    old_value = Column(JSON, nullable=True)
+
+    # new values after change
+    new_value = Column(JSON, nullable=True)
+
+    changed_by = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+
+    remarks = Column(
+        Text,
+        nullable=True,
+    )
+
+    created_at = Column(
+    TIMESTAMP,
+    server_default=func.now(),
+)
+
+    updated_at = Column(
+    TIMESTAMP,
+    server_default=func.now(),
+    onupdate=func.now(),
+    nullable=False,
+)
+
+    # ================= RELATIONSHIPS =================
+
+    activity = relationship(
+        "WorkActivity",
+        back_populates="history_logs",
+    )
+
+    user = relationship("User")
+
+    # ================= INDEXES =================
+
+    __table_args__ = (
+        Index(
+            "idx_activity_history_activity",
+            "activity_id",
+        ),
+        Index(
+            "idx_activity_history_changed_by",
+            "changed_by",
+        ),
+    )

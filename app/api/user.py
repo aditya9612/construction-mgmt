@@ -406,6 +406,14 @@ async def update_role_status(
 ):
     """
     Activate or deactivate all users of a given role.
+
+    Authorization:
+        - Only Admin users can call this endpoint.
+
+    Business Rules:
+        - Admin can activate/deactivate all roles except Admin itself.
+        - Admin role cannot be deactivated because at least one active
+          administrator must always exist to manage the system.
     """
 
     # Validate role
@@ -413,6 +421,16 @@ async def update_role_status(
         raise AppError(
             status_code=404,
             message=f"Invalid role. Available roles: {ROLES}"
+        )
+
+    # Prevent deactivation of Admin role
+    if role == UserRole.ADMIN.value and not is_active:
+        raise AppError(
+            status_code=400,
+            message=(
+                "Admin role cannot be deactivated because at least one "
+                "active administrator is required to manage the system."
+            )
         )
 
     # Fetch all non-deleted users with this role
@@ -427,7 +445,7 @@ async def update_role_status(
     if not users:
         raise NotFoundError(f"No users found for role '{role}'")
 
-    # Update only changed users
+    # Update only users whose status is changing
     updated_count = 0
 
     for user in users:
@@ -458,34 +476,6 @@ async def update_role_status(
         "is_active": is_active,
         "updated_users": updated_count,
     }
-
-
-@router.get("/activity-logs")
-async def get_activity_logs(
-    entity_id: Optional[int] = Query(None),
-    action: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
-):
-    # base query
-    query = select(ActivityLog)
-
-    # filter only USER logs
-    query = query.where(ActivityLog.entity == "USER")
-
-    # JOIN with User to apply soft-delete filter
-    query = query.join(User, User.id == ActivityLog.entity_id, isouter=True)
-    query = query.where((User.is_deleted == False) | (User.id == None))
-
-    # optional filters
-    if entity_id:
-        query = query.where(ActivityLog.entity_id == entity_id)
-
-    if action:
-        query = query.where(ActivityLog.action == action)
-
-    result = await db.execute(query.order_by(ActivityLog.created_at.desc()))
-    return result.scalars().all()
 
 
 @router.get("/{user_id}", response_model=UserOut)
