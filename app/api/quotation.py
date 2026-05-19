@@ -1704,37 +1704,181 @@ async def convert_to_bill(
 # =========================================================
 # CONVERT TO INVOICE
 # =========================================================
+# =========================================================
+# CONVERT TO INVOICE
+# =========================================================
+# IMPORTANT:
+# Do NOT use generate_business_id() here because your Invoice model
+# does not have either `invoice_number` or `invoice_no`.
+#
+# Your actual Invoice model (used in app/api/invoice.py) relies on:
+# - id (primary key)
+# - project_id
+# - owner_id
+# - quotation_id
+# - type
+# - amount
+# - gst_percent
+# - gst_amount
+# - tax_percent
+# - tax_amount
+# - total_amount
+# - paid_amount
+# - pending_amount
+# - status
+# - description
+#
+# So create the invoice exactly like /api/v1/invoices/from-quotation does.
+
+from app.models.invoice import Invoice
+from app.models.owner import OwnerTransaction
+from app.models.project import Project
+from decimal import Decimal
 
 
 @router.post("/{quotation_id}/convert-to-invoice")
 async def convert_to_invoice(
-    quotation_id: int, db: AsyncSession = Depends(get_db_session)
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session)
 ):
-
+    # =====================================================
+    # 1. GET QUOTATION
+    # =====================================================
     quotation = await get_quotation_or_404(quotation_id, db)
 
     # =====================================================
-    # APPROVAL CHECK
+    # 2. APPROVAL CHECK
     # =====================================================
-
     if not quotation.is_approved:
         raise HTTPException(400, "Quotation must be approved first")
 
     # =====================================================
-    # DUPLICATE CONVERSION CHECK
+    # 3. DUPLICATE CHECK
     # =====================================================
-
     if quotation.converted_to_invoice:
         raise HTTPException(400, "Already converted to invoice")
 
-    quotation.converted_to_invoice = True
+    # =====================================================
+    # 4. PROJECT CHECK
+    # =====================================================
+    if not quotation.project_id:
+        raise HTTPException(
+            400,
+            "Quotation is not linked to any project"
+        )
 
+    # =====================================================
+    # 5. LOAD PROJECT
+    # =====================================================
+    project = await db.get(Project, quotation.project_id)
+
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # =====================================================
+    # 6. PREVENT DUPLICATE INVOICE
+    # =====================================================
+    existing_invoice = await db.scalar(
+        select(Invoice).where(
+            Invoice.quotation_id == quotation.id
+        )
+    )
+
+    if existing_invoice:
+        raise HTTPException(
+            400,
+            "Invoice already exists for this quotation"
+        )
+
+    # =====================================================
+    # 7. CALCULATE GST %
+    # =====================================================
+    gst_percent = Decimal(
+        (quotation.cgst_percent or 0)
+        + (quotation.sgst_percent or 0)
+    )
+
+    grand_total = Decimal(str(quotation.grand_total or 0))
+
+    # =====================================================
+    # 8. CREATE INVOICE
+    # =====================================================
+    invoice = Invoice(
+        project_id=quotation.project_id,
+        owner_id=project.owner_id,
+
+        quotation_id=quotation.id,
+
+        type="owner",
+        reference_id=quotation.id,
+
+        amount=Decimal(str(quotation.subtotal or 0)),
+
+        gst_percent=gst_percent,
+        gst_amount=Decimal(str(quotation.gst_amount or 0)),
+
+        tax_percent=Decimal(str(quotation.tds_percent or 0)),
+        tax_amount=Decimal(str(quotation.tds_amount or 0)),
+
+        total_amount=grand_total,
+
+        paid_amount=Decimal("0"),
+        pending_amount=grand_total,
+
+        status="pending",
+
+        description=(
+            f"Invoice generated from quotation "
+            f"{quotation.quotation_no}"
+        ),
+    )
+
+    db.add(invoice)
+
+    # Generate invoice.id
+    await db.flush()
+
+    # =====================================================
+    # 9. OWNER LEDGER ENTRY
+    # =====================================================
+    owner_txn = OwnerTransaction(
+        owner_id=project.owner_id,
+        project_id=quotation.project_id,
+        type="credit",
+        amount=grand_total,
+        reference_type="invoice",
+        reference_id=invoice.id,
+        description=(
+            f"Invoice generated from quotation "
+            f"{quotation.quotation_no}"
+        ),
+    )
+
+    db.add(owner_txn)
+
+    # =====================================================
+    # 10. UPDATE QUOTATION
+    # =====================================================
+    quotation.converted_to_invoice = True
     quotation.status = QuotationStatus.CONVERTED
 
+    # =====================================================
+    # 11. SAVE
+    # =====================================================
     await db.commit()
 
-    return {"message": "Converted to invoice successfully"}
+    # Refresh invoice
+    await db.refresh(invoice)
 
+    # =====================================================
+    # 12. RESPONSE
+    # =====================================================
+    return {
+        "message": "Converted to invoice successfully",
+        "invoice_id": invoice.id,
+        "invoice_total": float(invoice.total_amount),
+        "invoice_status": invoice.status,
+    }
 
 # =========================================================
 # CONVERT TO WORK ORDER

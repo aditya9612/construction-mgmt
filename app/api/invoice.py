@@ -252,14 +252,16 @@ async def create_invoice_from_quotation(
 
         # 11. Trigger Notification
         await create_system_alert(
-            db,
-            project.owner_id, # Assuming owner has a user_id or we send to admin
-            "New Invoice Generated",
-            f"An invoice of ₹{invoice.total_amount:,.2f} has been generated for project {project.project_name}.",
-            priority="Medium",
-            category="Finance"
+            db=db,
+            user_id=current_user.id,
+            project_id=quotation.project_id,
+            alert_type="invoice_generated",
+            title="New Invoice Generated",
+            message=(
+                f"An invoice of Rs. {invoice.total_amount:,.2f} "
+                f"has been generated for project {project.project_name}."
+            ),
         )
-
         await db.commit()
 
     except Exception:

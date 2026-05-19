@@ -2036,7 +2036,7 @@ class ReportsService:
                 "outstanding": outstanding
             },
             "tasks": [{
-                "name": t.task_name,
+                "name": t.title,
                 "assignee": str(t.assigned_user_id) if t.assigned_user_id else "Unassigned",
                 "start_date": t.start_date,
                 "end_date": t.end_date,
@@ -2044,7 +2044,7 @@ class ReportsService:
                 "progress": getattr(t, "completion_percentage", 0)
             } for t in tasks],
             "milestones": [{
-                "name": ms.milestone_name,
+                "name": ms.title,
                 "end_date": ms.end_date,
                 "status": ms.status.value if hasattr(ms.status, "value") else str(ms.status),
                 "completion": ms.completion_percentage if hasattr(ms, 'completion_percentage') else (100 if (hasattr(ms.status, "value") and ms.status.value == 'Completed') or str(ms.status) == 'Completed' else 0)

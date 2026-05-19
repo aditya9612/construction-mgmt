@@ -2,6 +2,8 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import date, datetime
 
+from app.core.enums import InvoiceStatus
+
 
 class InvoiceBase(BaseModel):
     project_id: int
@@ -42,7 +44,7 @@ class InvoiceOut(BaseModel):
     paid_amount: float
     pending_amount: float
 
-    status: str
+    status: InvoiceStatus
     description: Optional[str]
     created_at: datetime
 

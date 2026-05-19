@@ -38,6 +38,15 @@ VERSION_KEY = "cache_version:documents"
 UPLOAD_DIR = Path("uploads/documents")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+def is_real_value(value):
+    """
+    Returns True only when the value is a meaningful user input.
+    Ignores:
+    - None
+    - Empty string
+    - Swagger placeholder "string"
+    """
+    return value not in (None, "", "string")
 
 @router.get("/stats", response_model=DocumentStats)
 async def get_document_stats(
@@ -63,8 +72,8 @@ async def get_document_stats(
     )
 
 
-@router.post("/upload", response_model=DocumentOut)
-async def upload_document(
+@router.post("", response_model=DocumentOut)
+async def create_document(
     project_id: int = Form(...),
     title: Optional[str] = Form(None),
     document_type: Optional[str] = Form("Other"),
@@ -147,42 +156,6 @@ async def create_folder(
 
     await bump_cache_version(redis, VERSION_KEY)
 
-    project_name = await db.scalar(
-        select(Project.project_name).where(Project.id == obj.project_id)
-    )
-
-    out = DocumentOut.model_validate(obj)
-    out.project_name = project_name
-
-    return out
-
-@router.post("", response_model=DocumentOut)
-async def create_document(
-    payload: DocumentCreate,
-    current_user: User = Depends(require_roles(DOCUMENT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(get_request_redis),
-):
-    """
-    Creates a document record (metadata only).
-    """
-    # Ignore uploaded_by_user_id from request and always use logged-in user
-    data = payload.model_dump(exclude_unset=True)
-    data["uploaded_by_user_id"] = current_user.id
-
-    # If status is not provided, default to PENDING
-    if "status" not in data:
-        data["status"] = DocumentStatus.PENDING
-
-    obj = Document(**data)
-
-    db.add(obj)
-    await db.commit()          # Save to database
-    await db.refresh(obj)      # Load uploaded_at, created_at, updated_at, id
-
-    await bump_cache_version(redis, VERSION_KEY)
-
-    # Load project name
     project_name = await db.scalar(
         select(Project.project_name).where(Project.id == obj.project_id)
     )
@@ -285,26 +258,70 @@ async def get_document(
 @router.put("/{document_id}", response_model=DocumentOut)
 async def update_document(
     document_id: int,
-    payload: DocumentUpdate,
+    title: Optional[str] = Form(None),
+    document_type: Optional[str] = Form(None),
+    remarks: Optional[str] = Form(None),
+    status: Optional[DocumentStatus] = Form(None),
+    version: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
     current_user: User = Depends(require_roles(DOCUMENT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    obj = await db.scalar(select(Document).where(Document.id == document_id))
-    if obj is None:
+    obj = await db.get(Document, document_id)
+
+    if not obj:
         raise NotFoundError("Document not found")
 
-    data = payload.model_dump(exclude_unset=True)
-    for k, v in data.items():
-        setattr(obj, k, v)
+    if is_real_value(title):
+        obj.title = title
 
-    await db.flush()
+    if is_real_value(document_type):
+        obj.document_type = document_type
+
+    if is_real_value(remarks):
+        obj.remarks = remarks
+
+    if status is not None:
+        obj.status = status
+
+    if is_real_value(version):
+        obj.version = version
+
+
+    # Replace file if uploaded
+    if file is not None:
+        # Delete old file
+        if obj.file_url and os.path.exists(obj.file_url):
+            os.remove(obj.file_url)
+
+        # Save new file
+        file_extension = Path(file.filename).suffix
+        unique_filename = f"{uuid.uuid4()}{file_extension}"
+        file_path = UPLOAD_DIR / unique_filename
+
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        obj.file_url = str(file_path)
+        obj.file_size = os.path.getsize(file_path)
+
+        # Optional: if title not provided, use uploaded filename
+        if title is None:
+            obj.title = Path(file.filename).stem
+
+    await db.commit()
+    await db.refresh(obj)
+
     await bump_cache_version(redis, VERSION_KEY)
-    
-    # Reload with project name
-    project_name = await db.scalar(select(Project.project_name).where(Project.id == obj.project_id))
+
+    project_name = await db.scalar(
+        select(Project.project_name).where(Project.id == obj.project_id)
+    )
+
     out = DocumentOut.model_validate(obj)
     out.project_name = project_name
+
     return out
 
 
@@ -319,8 +336,14 @@ async def delete_document(
     if obj is None:
         raise NotFoundError("Document not found")
 
+    # Delete physical file
+    if obj.file_url and os.path.exists(obj.file_url):
+        os.remove(obj.file_url)
+
+    # Delete database record
     await db.delete(obj)
     await db.flush()
+
     await bump_cache_version(redis, VERSION_KEY)
     return None
 
@@ -332,12 +355,21 @@ async def download_document(
     db: AsyncSession = Depends(get_db_session),
 ):
     doc = await db.get(Document, document_id)
+
     if not doc or not doc.file_url:
         raise NotFoundError("Document or file not found")
-    
-    # If file_url is a local path
-    if os.path.exists(doc.file_url):
-        return FileResponse(doc.file_url, filename=doc.title)
-    
-    # Else, maybe redirect or handle as URL (basic implementation)
-    return {"file_url": doc.file_url}
+
+    if not os.path.exists(doc.file_url):
+        raise NotFoundError("Physical file not found")
+
+    # Extract extension from stored file path
+    file_extension = Path(doc.file_url).suffix  # .jpg, .png, .pdf, etc.
+
+    # Preserve extension in download name
+    download_name = f"{doc.title}{file_extension}"
+
+    return FileResponse(
+        path=doc.file_url,
+        filename=download_name,
+        media_type="application/octet-stream",
+    )

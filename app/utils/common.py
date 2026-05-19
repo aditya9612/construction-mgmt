@@ -103,28 +103,43 @@ async def generate_business_id(
     raise Exception("Unable to generate unique business ID after retries")
 
 
+# app/utils/common.py
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
 async def create_system_alert(
     db: AsyncSession,
     user_id: int,
     title: str,
     message: str,
     priority: str = "Medium",
-    category: str = "System"
+    category: str = "System",
+    project_id: int | None = None,
+    alert_type: str | None = None,
 ):
     """
-    Creates a notification for a user.
+    Creates a system alert.
+
+    Extra parameters (title, priority, category, project_id, alert_type)
+    are accepted so that existing API calls do not need to change.
+
+    Stored fields:
+    - project_id
+    - alert_type
+    - user_id
+    - message
     """
+
     from app.models.alert import Alert
-    
+
     alert = Alert(
+        project_id=project_id,          # <-- important fix
+        alert_type=alert_type,          # <-- important fix
         user_id=user_id,
-        title=title,
-        message=message,
-        priority=priority,
-        category=category,
-        status="unread"
+        message=f"{title}: {message}",
     )
-    
+
     db.add(alert)
     await db.flush()
-    return alert
+    return alert
