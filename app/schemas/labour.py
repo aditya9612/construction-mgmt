@@ -1,6 +1,6 @@
 from decimal import Decimal
 from typing import Optional, List
-from datetime import date, time
+from datetime import date, time, datetime
 from pydantic import BaseModel, field_validator
 from app.core import enums as e
 
@@ -155,3 +155,108 @@ class AdvancePayment(BaseModel):
     project_id: int
     amount: Decimal
     description: Optional[str]
+
+
+# ======================
+# NEW PAYROLL & FISCAL SCHEMAS
+# ======================
+class PayrollDetailsOut(BaseModel):
+    id: int
+    labour_id: int
+    project_id: int
+    month: int
+    year: int
+    total_working_hours: Decimal
+    total_overtime_hours: Decimal
+    total_wage: Decimal
+    paid_amount: Decimal
+    remaining_amount: Decimal
+    status: e.PayrollStatus
+
+    # Enriched properties
+    labour_name: str
+    worker_code: str
+    skill_type: e.SkillType
+    daily_wage_rate: Decimal
+    contractor_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+        json_encoders = {Decimal: float}
+
+
+class PayrollStatsOut(BaseModel):
+    paid_this_month: Decimal
+    pending_due: Decimal
+    monthly_budget: Decimal
+    advance_logs: int
+
+    class Config:
+        json_encoders = {Decimal: float}
+
+
+class ContractorLiabilityOut(BaseModel):
+    contractor_id: Optional[int] = None
+    contractor_name: str
+    total_wage: Decimal
+    paid_amount: Decimal
+    remaining_amount: Decimal
+
+    class Config:
+        json_encoders = {Decimal: float}
+
+
+class WeeklyVelocityOut(BaseModel):
+    week_number: int
+    total_wage: Decimal
+    attendance_count: int
+
+    class Config:
+        json_encoders = {Decimal: float}
+
+
+class DisbursementHistoryOut(BaseModel):
+    id: int
+    labour_id: int
+    labour_name: str
+    amount: Decimal
+    mode: str
+    reference: str
+    created_at: datetime
+
+    class Config:
+        json_encoders = {Decimal: float}
+
+
+class FiscalSummaryOut(BaseModel):
+    total_payout: Decimal
+    high_payouts: int
+    ot_intensive: int
+    advance_adjusted: Decimal
+
+    class Config:
+        json_encoders = {Decimal: float}
+
+
+class PayrollMomentumOut(BaseModel):
+    month: int
+    year: int
+    period_name: str
+    total_wage: Decimal
+
+    class Config:
+        json_encoders = {Decimal: float}
+
+
+class AggregateReportOut(BaseModel):
+    labour_id: int
+    labour_name: str
+    skill_type: e.SkillType
+    daily_wage: Decimal
+    days_present: int
+    ot_hours: Decimal
+    total_wage_earned: Decimal
+    status: str
+
+    class Config:
+        json_encoders = {Decimal: float}

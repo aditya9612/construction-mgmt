@@ -5,7 +5,7 @@ from sqlalchemy import case
 from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_, select, extract, tuple_
+from sqlalchemy import func, or_, select, extract, tuple_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache import redis as r
 from app.core import dependencies as d
@@ -20,6 +20,7 @@ from app.schemas import labour as s
 from app.utils.helpers import NotFoundError, PermissionDeniedError, ValidationError
 from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
+from app.models.approval import Approval
 from app.core.logger import logger
 import pandas as pd
 from app.utils.common import assert_project_access, generate_business_id
@@ -190,6 +191,163 @@ async def list_labour(
     await r.cache_set_json(redis, cache_key, result)
 
     return PaginatedResponse[s.LabourOut].model_validate(result)
+
+@router.get("/payroll", response_model=list[s.PayrollDetailsOut])
+async def get_payroll_list(
+    project_id: int,
+    month: int,
+    year: int,
+    contractor_id: Optional[int] = Query(None),
+    search: Optional[str] = Query(None),
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    query = (
+        select(LabourPayroll, Labour)
+        .join(Labour, Labour.id == LabourPayroll.labour_id)
+        .where(
+            LabourPayroll.project_id == project_id,
+            LabourPayroll.month == month,
+            LabourPayroll.year == year,
+        )
+    )
+
+    if contractor_id:
+        query = query.where(Labour.contractor_id == contractor_id)
+
+    if search:
+        query = query.where(
+            or_(
+                Labour.labour_name.ilike(f"%{search}%"),
+                Labour.worker_code.ilike(f"%{search}%"),
+            )
+        )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    output = []
+    for payroll, labour in rows:
+        output.append(
+            s.PayrollDetailsOut(
+                id=payroll.id,
+                labour_id=payroll.labour_id,
+                project_id=payroll.project_id,
+                month=payroll.month,
+                year=payroll.year,
+                total_working_hours=payroll.total_working_hours,
+                total_overtime_hours=payroll.total_overtime_hours,
+                total_wage=payroll.total_wage,
+                paid_amount=payroll.paid_amount,
+                remaining_amount=payroll.remaining_amount,
+                status=payroll.status,
+                # Enriched properties
+                labour_name=labour.labour_name,
+                worker_code=labour.worker_code,
+                skill_type=labour.skill_type,
+                daily_wage_rate=labour.daily_wage_rate,
+                contractor_id=labour.contractor_id,
+            )
+        )
+    return output
+
+
+@router.get("/payroll/stats", response_model=s.PayrollStatsOut)
+async def get_payroll_stats(
+    project_id: int,
+    month: int,
+    year: int,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    payroll_sum = await db.execute(
+        select(
+            func.sum(LabourPayroll.paid_amount).label("paid"),
+            func.sum(LabourPayroll.remaining_amount).label("pending"),
+            func.sum(LabourPayroll.total_wage).label("budget"),
+        ).where(
+            LabourPayroll.project_id == project_id,
+            LabourPayroll.month == month,
+            LabourPayroll.year == year,
+        )
+    )
+    res = payroll_sum.first()
+
+    paid = res.paid if res and res.paid is not None else Decimal("0")
+    pending = res.pending if res and res.pending is not None else Decimal("0")
+    budget = res.budget if res and res.budget is not None else Decimal("0")
+
+    # Count labour advances recorded as expenses
+    advance_count = (
+        await db.scalar(
+            select(func.count(Expense.id)).where(
+                Expense.project_id == project_id,
+                Expense.category == "Labour Advance",
+                extract("month", Expense.expense_date) == month,
+                extract("year", Expense.expense_date) == year,
+            )
+        )
+        or 0
+    )
+
+    return s.PayrollStatsOut(
+        paid_this_month=paid,
+        pending_due=pending,
+        monthly_budget=budget,
+        advance_logs=advance_count,
+    )
+
+
+@router.get(
+    "/payroll/contractor-liability", response_model=list[s.ContractorLiabilityOut]
+)
+async def get_contractor_liability(
+    project_id: int,
+    month: int,
+    year: int,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    query = (
+        select(
+            Labour.contractor_id,
+            Contractor.name.label("contractor_name"),
+            func.sum(LabourPayroll.total_wage).label("total_wage"),
+            func.sum(LabourPayroll.paid_amount).label("paid_amount"),
+            func.sum(LabourPayroll.remaining_amount).label("remaining_amount"),
+        )
+        .join(Labour, Labour.id == LabourPayroll.labour_id)
+        .outerjoin(Contractor, Contractor.id == Labour.contractor_id)
+        .where(
+            LabourPayroll.project_id == project_id,
+            LabourPayroll.month == month,
+            LabourPayroll.year == year,
+        )
+        .group_by(Labour.contractor_id, Contractor.name)
+    )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    output = []
+    for r in rows:
+        output.append(
+            s.ContractorLiabilityOut(
+                contractor_id=r.contractor_id,
+                contractor_name=r.contractor_name or "Independent",
+                total_wage=r.total_wage or Decimal("0"),
+                paid_amount=r.paid_amount or Decimal("0"),
+                remaining_amount=r.remaining_amount or Decimal("0"),
+            )
+        )
+    return output
+
 
 
 @router.put("/{labour_id}", response_model=s.LabourOut)
@@ -892,7 +1050,12 @@ async def generate_payroll(
         d.require_roles(
             [
                 r.value
-                for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.ACCOUNTANT , UserRole.SITE_ENGINEER]
+                for r in [
+                    UserRole.ADMIN,
+                    UserRole.PROJECT_MANAGER,
+                    UserRole.ACCOUNTANT,
+                    UserRole.SITE_ENGINEER,
+                ]
             ]
         )
     ),
@@ -1528,3 +1691,534 @@ async def get_labour(
     await r.cache_set_json(redis, cache_key, out.model_dump())
 
     return out
+
+
+# ==========================================
+# NEW PAYROLL & FISCAL REPORTING ENDPOINTS
+# ==========================================
+
+
+@router.get("/payroll", response_model=list[s.PayrollDetailsOut])
+async def get_payroll_list(
+    project_id: int,
+    month: int,
+    year: int,
+    contractor_id: Optional[int] = Query(None),
+    search: Optional[str] = Query(None),
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    query = (
+        select(LabourPayroll, Labour)
+        .join(Labour, Labour.id == LabourPayroll.labour_id)
+        .where(
+            LabourPayroll.project_id == project_id,
+            LabourPayroll.month == month,
+            LabourPayroll.year == year,
+        )
+    )
+
+    if contractor_id:
+        query = query.where(Labour.contractor_id == contractor_id)
+
+    if search:
+        query = query.where(
+            or_(
+                Labour.labour_name.ilike(f"%{search}%"),
+                Labour.worker_code.ilike(f"%{search}%"),
+            )
+        )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    output = []
+    for payroll, labour in rows:
+        output.append(
+            s.PayrollDetailsOut(
+                id=payroll.id,
+                labour_id=payroll.labour_id,
+                project_id=payroll.project_id,
+                month=payroll.month,
+                year=payroll.year,
+                total_working_hours=payroll.total_working_hours,
+                total_overtime_hours=payroll.total_overtime_hours,
+                total_wage=payroll.total_wage,
+                paid_amount=payroll.paid_amount,
+                remaining_amount=payroll.remaining_amount,
+                status=payroll.status,
+                # Enriched properties
+                labour_name=labour.labour_name,
+                worker_code=labour.worker_code,
+                skill_type=labour.skill_type,
+                daily_wage_rate=labour.daily_wage_rate,
+                contractor_id=labour.contractor_id,
+            )
+        )
+    return output
+
+
+@router.get("/payroll/stats", response_model=s.PayrollStatsOut)
+async def get_payroll_stats(
+    project_id: int,
+    month: int,
+    year: int,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    payroll_sum = await db.execute(
+        select(
+            func.sum(LabourPayroll.paid_amount).label("paid"),
+            func.sum(LabourPayroll.remaining_amount).label("pending"),
+            func.sum(LabourPayroll.total_wage).label("budget"),
+        ).where(
+            LabourPayroll.project_id == project_id,
+            LabourPayroll.month == month,
+            LabourPayroll.year == year,
+        )
+    )
+    res = payroll_sum.first()
+
+    paid = res.paid if res and res.paid is not None else Decimal("0")
+    pending = res.pending if res and res.pending is not None else Decimal("0")
+    budget = res.budget if res and res.budget is not None else Decimal("0")
+
+    advance_count = (
+        await db.scalar(
+            select(func.count(Approval.id)).where(
+                Approval.project_id == project_id,
+                Approval.entity_type == "advance",
+                Approval.status == "Pending",
+            )
+        )
+        or 0
+    )
+
+    return s.PayrollStatsOut(
+        paid_this_month=paid,
+        pending_due=pending,
+        monthly_budget=budget,
+        advance_logs=advance_count,
+    )
+
+
+@router.get(
+    "/payroll/contractor-liability", response_model=list[s.ContractorLiabilityOut]
+)
+async def get_contractor_liability(
+    project_id: int,
+    month: int,
+    year: int,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    query = (
+        select(
+            Labour.contractor_id,
+            Contractor.name.label("contractor_name"),
+            func.sum(LabourPayroll.total_wage).label("total_wage"),
+            func.sum(LabourPayroll.paid_amount).label("paid_amount"),
+            func.sum(LabourPayroll.remaining_amount).label("remaining_amount"),
+        )
+        .join(Labour, Labour.id == LabourPayroll.labour_id)
+        .outerjoin(Contractor, Contractor.id == Labour.contractor_id)
+        .where(
+            LabourPayroll.project_id == project_id,
+            LabourPayroll.month == month,
+            LabourPayroll.year == year,
+        )
+        .group_by(Labour.contractor_id, Contractor.name)
+    )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    output = []
+    for r in rows:
+        output.append(
+            s.ContractorLiabilityOut(
+                contractor_id=r.contractor_id,
+                contractor_name=r.contractor_name or "Independent",
+                total_wage=r.total_wage or Decimal("0"),
+                paid_amount=r.paid_amount or Decimal("0"),
+                remaining_amount=r.remaining_amount or Decimal("0"),
+            )
+        )
+    return output
+
+
+@router.get("/payroll/weekly-velocity", response_model=list[s.WeeklyVelocityOut])
+async def get_weekly_velocity(
+    project_id: int,
+    month: int,
+    year: int,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    query = (
+        select(
+            extract("week", LabourAttendance.attendance_date).label("week_number"),
+            func.count(LabourAttendance.id).label("attendance_count"),
+            func.sum(
+                (Labour.daily_wage_rate / Decimal("8")) * LabourAttendance.working_hours
+                + LabourAttendance.overtime_rate * LabourAttendance.overtime_hours
+            ).label("total_wage"),
+        )
+        .join(Labour, Labour.id == LabourAttendance.labour_id)
+        .where(
+            LabourAttendance.project_id == project_id,
+            extract("month", LabourAttendance.attendance_date) == month,
+            extract("year", LabourAttendance.attendance_date) == year,
+        )
+        .group_by("week_number")
+        .order_by("week_number")
+    )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    output = []
+    for r in rows:
+        output.append(
+            s.WeeklyVelocityOut(
+                week_number=int(r.week_number),
+                total_wage=r.total_wage or Decimal("0"),
+                attendance_count=r.attendance_count or 0,
+            )
+        )
+    return output
+
+
+@router.get(
+    "/payroll/disbursement-history", response_model=list[s.DisbursementHistoryOut]
+)
+async def get_disbursement_history(
+    project_id: int,
+    month: int,
+    year: int,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    query = (
+        select(Transaction)
+        .where(
+            Transaction.project_id == project_id,
+            Transaction.type == "payment",
+            Transaction.reference.like("payroll:%"),
+            extract("month", Transaction.created_at) == month,
+            extract("year", Transaction.created_at) == year,
+        )
+        .order_by(Transaction.created_at.desc())
+    )
+
+    result = await db.execute(query)
+    txns = result.scalars().all()
+
+    if not txns:
+        return []
+
+    labour_txn_map = {}
+    for txn in txns:
+        try:
+            labour_id = int(txn.reference.replace("payroll:", ""))
+            labour_txn_map[labour_id] = txn
+        except ValueError:
+            continue
+
+    if not labour_txn_map:
+        return []
+
+    labour_result = await db.execute(
+        select(Labour).where(Labour.id.in_(list(labour_txn_map.keys())))
+    )
+    labours = {l.id: l for l in labour_result.scalars().all()}
+
+    output = []
+    for labour_id, txn in labour_txn_map.items():
+        labour = labours.get(labour_id)
+        if not labour:
+            continue
+        output.append(
+            s.DisbursementHistoryOut(
+                id=txn.id,
+                labour_id=labour.id,
+                labour_name=labour.labour_name,
+                amount=txn.amount,
+                mode=txn.mode,
+                reference=txn.reference,
+                created_at=txn.created_at,
+            )
+        )
+    return output
+
+
+@router.get("/payroll/fiscal-summary", response_model=s.FiscalSummaryOut)
+async def get_fiscal_summary(
+    project_id: int,
+    month: int,
+    year: int,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    payroll_sum = await db.execute(
+        select(
+            func.sum(LabourPayroll.total_wage).label("total_payout"),
+            func.sum(case((LabourPayroll.total_wage > 5000, 1), else_=0)).label(
+                "high_payouts"
+            ),
+        ).where(
+            LabourPayroll.project_id == project_id,
+            LabourPayroll.month == month,
+            LabourPayroll.year == year,
+        )
+    )
+    res = payroll_sum.first()
+
+    total_payout = (
+        res.total_payout if res and res.total_payout is not None else Decimal("0")
+    )
+
+    high_payouts = res.high_payouts if res and res.high_payouts is not None else 0
+
+    # Calculate only Labour Advance expenses for the selected month
+    advance_adjusted = await db.scalar(
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id,
+            Expense.category == "Labour Advance",
+            extract("month", Expense.expense_date) == month,
+            extract("year", Expense.expense_date) == year,
+        )
+    ) or Decimal("0")
+
+    ot_count = (
+        await db.scalar(
+            select(func.count(func.distinct(LabourAttendance.labour_id))).where(
+                LabourAttendance.project_id == project_id,
+                extract("month", LabourAttendance.attendance_date) == month,
+                extract("year", LabourAttendance.attendance_date) == year,
+                LabourAttendance.overtime_hours > 0,
+            )
+        )
+        or 0
+    )
+
+    return s.FiscalSummaryOut(
+        total_payout=total_payout,
+        high_payouts=high_payouts,
+        ot_intensive=ot_count,
+        advance_adjusted=advance_adjusted,
+    )
+
+
+@router.get("/payroll/momentum", response_model=list[s.PayrollMomentumOut])
+async def get_payroll_momentum(
+    project_id: int,
+    months: int = Query(6, ge=1, le=12),
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    today = date.today()
+    period_start = today - timedelta(days=30 * months)
+
+    query = (
+        select(
+            LabourPayroll.month,
+            LabourPayroll.year,
+            func.sum(LabourPayroll.total_wage).label("total_wage"),
+        )
+        .where(
+            LabourPayroll.project_id == project_id,
+            or_(
+                LabourPayroll.year > period_start.year,
+                and_(
+                    LabourPayroll.year == period_start.year,
+                    LabourPayroll.month >= period_start.month,
+                ),
+            ),
+        )
+        .group_by(LabourPayroll.year, LabourPayroll.month)
+        .order_by(LabourPayroll.year.desc(), LabourPayroll.month.desc())
+        .limit(months)
+    )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    month_names = {
+        1: "Jan",
+        2: "Feb",
+        3: "Mar",
+        4: "Apr",
+        5: "May",
+        6: "Jun",
+        7: "Jul",
+        8: "Aug",
+        9: "Sep",
+        10: "Oct",
+        11: "Nov",
+        12: "Dec",
+    }
+
+    output = []
+    for r in reversed(rows):
+        output.append(
+            s.PayrollMomentumOut(
+                month=r.month,
+                year=r.year,
+                period_name=month_names.get(r.month, str(r.month)),
+                total_wage=r.total_wage or Decimal("0"),
+            )
+        )
+    return output
+
+
+# ==========================================================
+# FIX 3: Replace the ENTIRE get_aggregate_report() function
+# with the version below
+# ==========================================================
+
+
+@router.get("/payroll/aggregate-report", response_model=list[s.AggregateReportOut])
+async def get_aggregate_report(
+    project_id: int,
+    month: int,
+    year: int,
+    group_by: str = Query("monthly", pattern="^(daily|weekly|monthly)$"),
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
+
+    # ------------------------------------------------------
+    # Determine grouping expression
+    # ------------------------------------------------------
+    if group_by == "daily":
+        period_expr = LabourAttendance.attendance_date
+    elif group_by == "weekly":
+        period_expr = extract("week", LabourAttendance.attendance_date)
+    else:  # monthly
+        # Monthly report remains labour-wise summary
+        period_expr = None
+
+    # ------------------------------------------------------
+    # Base columns
+    # ------------------------------------------------------
+    columns = [
+        Labour.id.label("labour_id"),
+        Labour.labour_name,
+        Labour.skill_type,
+        Labour.daily_wage_rate.label("daily_wage"),
+        func.count(
+            case(
+                (LabourAttendance.status == AttendanceStatus.PRESENT, 1),
+                else_=None,
+            )
+        ).label("days_present"),
+        func.coalesce(
+            func.sum(LabourAttendance.overtime_hours),
+            Decimal("0"),
+        ).label("ot_hours"),
+        func.coalesce(
+            func.sum(
+                (Labour.daily_wage_rate / Decimal("8")) * LabourAttendance.working_hours
+                + LabourAttendance.overtime_rate * LabourAttendance.overtime_hours
+            ),
+            Decimal("0"),
+        ).label("total_wage_earned"),
+        Labour.status.label("status"),
+    ]
+
+    # Add period column for daily/weekly
+    if period_expr is not None:
+        columns.append(period_expr.label("period"))
+
+    # ------------------------------------------------------
+    # Build query
+    # ------------------------------------------------------
+    query = (
+        select(*columns)
+        .join(LabourProject, LabourProject.labour_id == Labour.id)
+        .outerjoin(
+            LabourAttendance,
+            and_(
+                LabourAttendance.labour_id == Labour.id,
+                LabourAttendance.project_id == project_id,
+                extract("month", LabourAttendance.attendance_date) == month,
+                extract("year", LabourAttendance.attendance_date) == year,
+            ),
+        )
+        .where(LabourProject.project_id == project_id)
+    )
+
+    # ------------------------------------------------------
+    # Group by
+    # ------------------------------------------------------
+    group_columns = [
+        Labour.id,
+        Labour.labour_name,
+        Labour.skill_type,
+        Labour.daily_wage_rate,
+        Labour.status,
+    ]
+
+    if period_expr is not None:
+        group_columns.append(period_expr)
+
+    query = query.group_by(*group_columns)
+
+    # ------------------------------------------------------
+    # Ordering
+    # ------------------------------------------------------
+    if period_expr is not None:
+        query = query.order_by("period", Labour.labour_name)
+    else:
+        query = query.order_by(Labour.labour_name)
+
+    # ------------------------------------------------------
+    # Execute
+    # ------------------------------------------------------
+    result = await db.execute(query)
+    rows = result.all()
+
+    # ------------------------------------------------------
+    # Build response
+    # Note: response schema remains unchanged, so "period"
+    # is used only for grouping and ordering.
+    # ------------------------------------------------------
+    output = []
+
+    for r in rows:
+        output.append(
+            s.AggregateReportOut(
+                labour_id=r.labour_id,
+                labour_name=r.labour_name,
+                skill_type=r.skill_type,
+                daily_wage=r.daily_wage,
+                days_present=r.days_present or 0,
+                ot_hours=r.ot_hours or Decimal("0"),
+                total_wage_earned=r.total_wage_earned or Decimal("0"),
+                status=(
+                    r.status.value if hasattr(r.status, "value") else str(r.status)
+                ),
+            )
+        )
+
+    return output

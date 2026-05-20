@@ -168,7 +168,10 @@ async def list_boq(
 ):
     version = await get_cache_version(redis, VERSION_KEY)
 
-    cache_key = f"cache:boq:list:{version}:{limit}:{offset}:{search}:{status}:{project_id}:{category}:{version_no}"
+    cache_key = (
+        f"cache:boq:list:{version}:{limit}:{offset}:{search}:"
+        f"{status}:{project_id}:{category}:{version_no}"
+    )
 
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
@@ -177,14 +180,21 @@ async def list_boq(
     if search:
         logger.info(f"BOQ search query={search}")
 
-    query = select(BOQ)
-    count_query = select(func.count()).select_from(BOQ)
+    # Exclude soft-deleted BOQs by default
+    query = select(BOQ).where(BOQ.status != "Deleted")
+    count_query = (
+        select(func.count())
+        .select_from(BOQ)
+        .where(BOQ.status != "Deleted")
+    )
 
     if search:
         like = f"%{search}%"
         query = query.where(BOQ.item_name.ilike(like))
         count_query = count_query.where(BOQ.item_name.ilike(like))
 
+    # Allow filtering by specific status if provided
+    # (e.g. status="Approved", status="Pending")
     if status:
         query = query.where(BOQ.status == status)
         count_query = count_query.where(BOQ.status == status)
@@ -212,7 +222,10 @@ async def list_boq(
     items = [BOQOut.model_validate(r).model_dump() for r in rows]
     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
 
-    result = {"items": items, "meta": meta.model_dump()}
+    result = {
+        "items": items,
+        "meta": meta.model_dump(),
+    }
 
     await cache_set_json(redis, cache_key, result)
 
