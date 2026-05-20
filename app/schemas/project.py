@@ -303,6 +303,7 @@ class DSRUpdate(BaseSchema):
 
 # ===================== DSR PHOTO OUTPUT =====================
 
+
 class DSRPhotoOut(BaseModel):
     id: int
     file_url: str
@@ -312,6 +313,7 @@ class DSRPhotoOut(BaseModel):
 
 
 # ===================== OUTPUT =====================
+
 
 class DSROut(DSRBase):
     id: int
@@ -534,18 +536,26 @@ class DrawingCreate(BaseSchema):
     project_id: int
     drawing_name: str
     version: str
-    approved_by: Optional[str]
-    date: Optional[date]
-    remarks: Optional[str]
+    date: Optional[dt_date] = None
+    remarks: Optional[str] = None
+
+
+class DrawingUpdate(BaseSchema):
+    drawing_name: Optional[str] = None
+    version: Optional[str] = None
+    date: Optional[dt_date] = None
+    remarks: Optional[str] = None
 
 
 class DrawingOut(DrawingCreate):
     id: int
     file_url: str
 
+    approval_status: Optional[str] = None
+    approval_id: Optional[int] = None
+
     class Config:
         from_attributes = True
-
 
 # ===================== CREATE =====================
 
@@ -612,7 +622,6 @@ class WorkActivityCreate(BaseModel):
     end_date: date
     work_order_id: int
     engineer_id: int
-
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
@@ -697,6 +706,7 @@ class DailyProgressResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
 class DailyProgressWithActivityResponse(BaseModel):
 
     message: str
@@ -705,7 +715,7 @@ class DailyProgressWithActivityResponse(BaseModel):
 
     class Config:
         from_attributes = True
-        
+
 
 class ProjectsModuleSummary(BaseModel):
     total_projects: int

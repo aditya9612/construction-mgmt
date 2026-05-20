@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +15,7 @@ from app.models.material import Material
 from app.utils.common import assert_project_access
 from app.utils.email import send_email
 from app.core.dependencies import get_current_active_user, require_roles
-from app.core.enums import InvoiceStatus, LabourStatus
+from app.core.enums import InvoiceStatus, IssueStatus, LabourStatus, TaskStatus
 from app.db.session import get_db_session
 from app.models import project as m
 from app.models.accountant import FixedAsset
@@ -766,3 +766,278 @@ async def asset_report(db: AsyncSession = Depends(get_db_session),current_user: 
 #         "message": "WhatsApp message sent",
 #         "response": result
 #     }
+
+
+# =========================================================
+# FINANCIAL SUMMARY
+# =========================================================
+@router.get("/financial-summary")
+async def financial_summary(
+    project_id: int,
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    total_expense = await db.scalar(
+        select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
+    )
+    total_invoice = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
+    )
+    paid_invoice = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PAID
+        )
+    )
+    pending_invoice = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PENDING
+        )
+    )
+    expense_val = round(float(total_expense or 0), 2)
+    invoice_val = round(float(total_invoice or 0), 2)
+    return {
+        "project_id": project_id,
+        "total_expense": expense_val,
+        "total_invoice": invoice_val,
+        "paid_invoice": round(float(paid_invoice or 0), 2),
+        "pending_invoice": round(float(pending_invoice or 0), 2),
+        "profit": round(invoice_val - expense_val, 2),
+    }
+# =========================================================
+# QUARTERLY AUDIT SUMMARY
+# =========================================================
+@router.get("/quarterly-audit-summary")
+async def quarterly_audit_summary(
+    project_id: int,
+    year: int,
+    quarter: int,
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    if quarter not in [1, 2, 3, 4]:
+        raise HTTPException(status_code=400, detail="Quarter must be between 1 and 4")
+    quarter_map = {
+        1: (1, 3),
+        2: (4, 6),
+        3: (7, 9),
+        4: (10, 12),
+    }
+    start_month, end_month = quarter_map[quarter]
+    total_expense = await db.scalar(
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id,
+            func.extract("year", Expense.expense_date) == year,
+            func.extract("month", Expense.expense_date).between(start_month, end_month),
+        )
+    )
+    total_invoice = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(
+            Invoice.project_id == project_id,
+            func.extract("year", Invoice.created_at) == year,
+            func.extract("month", Invoice.created_at).between(start_month, end_month),
+        )
+    )
+    completed_tasks = await db.scalar(
+        select(func.count())
+        .select_from(m.Task)
+        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.COMPLETED)
+    )
+    delayed_tasks = await db.scalar(
+        select(func.count())
+        .select_from(m.Task)
+        .where(
+            m.Task.project_id == project_id,
+            m.Task.end_date.isnot(None),
+            m.Task.end_date < date.today(),
+            m.Task.status != TaskStatus.COMPLETED,
+        )
+    )
+    return {
+        "project_id": project_id,
+        "quarter": f"Q{quarter}",
+        "year": year,
+        "total_expense": round(float(total_expense or 0), 2),
+        "total_invoice": round(float(total_invoice or 0), 2),
+        "completed_tasks": int(completed_tasks or 0),
+        "delayed_tasks": int(delayed_tasks or 0),
+    }
+# =========================================================
+# WORK SUMMARY
+# =========================================================
+@router.get("/work-summary")
+async def work_summary(
+    project_id: int,
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    result = await db.execute(select(m.Task).where(m.Task.project_id == project_id))
+    tasks = result.scalars().all()
+    summary = []
+    for task in tasks:
+        actual = round(float(task.completion_percentage or 0), 2)
+        # Future ready
+        planned = 100
+        if actual >= 90:
+            efficiency = "HIGH"
+        elif actual >= 60:
+            efficiency = "MEDIUM"
+        else:
+            efficiency = "LOW"
+        summary.append(
+            {
+                "task_id": task.id,
+                "category": task.title,
+                "plan_percentage": planned,
+                "actual_percentage": actual,
+                "efficiency": efficiency,
+                "status": task.status.value if task.status else None,
+            }
+        )
+    return {
+        "project_id": project_id,
+        "total_tasks": len(summary),
+        "work_summary": summary,
+    }
+# =========================================================
+# AUDIT PDF
+# =========================================================
+@router.get("/audit-pdf")
+async def audit_pdf(
+    project_id: int,
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    # ================= FINANCIAL =================
+    total_expense = await db.scalar(
+        select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
+    )
+    total_invoice = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
+    )
+    paid_invoice = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PAID
+        )
+    )
+    pending_invoice = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PENDING
+        )
+    )
+    # ================= TASKS =================
+    total_tasks = await db.scalar(
+        select(func.count()).select_from(m.Task).where(m.Task.project_id == project_id)
+    )
+    completed_tasks = await db.scalar(
+        select(func.count())
+        .select_from(m.Task)
+        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.COMPLETED)
+    )
+    in_progress_tasks = await db.scalar(
+        select(func.count())
+        .select_from(m.Task)
+        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.IN_PROGRESS)
+    )
+    # ================= ISSUES =================
+    open_issues = await db.scalar(
+        select(func.count())
+        .select_from(m.Issue)
+        .where(m.Issue.project_id == project_id, m.Issue.status == IssueStatus.OPEN)
+    )
+    closed_issues = await db.scalar(
+        select(func.count())
+        .select_from(m.Issue)
+        .where(m.Issue.project_id == project_id, m.Issue.status == IssueStatus.CLOSED)
+    )
+    # ================= PROGRESS =================
+    progress = await db.scalar(
+        select(func.avg(m.Task.completion_percentage)).where(
+            m.Task.project_id == project_id
+        )
+    )
+    # ================= PDF =================
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer)
+    styles = getSampleStyleSheet()
+    content = []
+    # TITLE
+    content.append(Paragraph("Detailed Audit Report", styles["Title"]))
+    content.append(Spacer(1, 20))
+    # FINANCIAL
+    content.append(Paragraph("Financial Summary", styles["Heading1"]))
+    content.append(
+        Paragraph(
+            f"Total Expense: Rs. {round(float(total_expense or 0), 2)}",
+            styles["Normal"],
+        )
+    )
+    content.append(
+        Paragraph(
+            f"Total Invoice: Rs. {round(float(total_invoice or 0), 2)}",
+            styles["Normal"],
+        )
+    )
+    content.append(
+        Paragraph(
+            f"Paid Invoice: Rs. {round(float(paid_invoice or 0), 2)}", styles["Normal"]
+        )
+    )
+    content.append(
+        Paragraph(
+            f"Pending Invoice: Rs. {round(float(pending_invoice or 0), 2)}",
+            styles["Normal"],
+        )
+    )
+    content.append(
+        Paragraph(
+            f"Profit: Rs. {round(float((total_invoice or 0) - (total_expense or 0)), 2)}",
+            styles["Normal"],
+        )
+    )
+    content.append(Spacer(1, 20))
+    # WORK
+    content.append(Paragraph("Work Summary", styles["Heading1"]))
+    content.append(Paragraph(f"Total Tasks: {int(total_tasks or 0)}", styles["Normal"]))
+    content.append(
+        Paragraph(f"Completed Tasks: {int(completed_tasks or 0)}", styles["Normal"])
+    )
+    content.append(
+        Paragraph(f"In Progress Tasks: {int(in_progress_tasks or 0)}", styles["Normal"])
+    )
+    content.append(Spacer(1, 20))
+    # ISSUES
+    content.append(Paragraph("Issue Summary", styles["Heading1"]))
+    content.append(Paragraph(f"Open Issues: {int(open_issues or 0)}", styles["Normal"]))
+    content.append(
+        Paragraph(f"Closed Issues: {int(closed_issues or 0)}", styles["Normal"])
+    )
+    content.append(Spacer(1, 20))
+    # PROGRESS
+    content.append(Paragraph("Project Progress", styles["Heading1"]))
+    content.append(
+        Paragraph(
+            f"Overall Progress: {round(float(progress or 0), 2)} %", styles["Normal"]
+        )
+    )
+    content.append(Spacer(1, 20))
+    # FOOTER
+    content.append(
+        Paragraph(
+            f"Generated On: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
+            styles["Italic"],
+        )
+    )
+    # BUILD
+    doc.build(content)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=audit_report_{project_id}.pdf"
+        },
+    )

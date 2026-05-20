@@ -611,19 +611,26 @@ class DrawingDocument(Base, TimestampMixin):
 
     id = Column(Integer, primary_key=True)
 
-    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+    project_id = Column(
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
-    drawing_name = Column(String(255))
-    version = Column(String(50))
+    drawing_name = Column(String(255), nullable=False)
+    version = Column(String(50), nullable=False)
 
-    file_url = Column(String(500))
+    file_url = Column(String(500), nullable=False)
 
-    approved_by = Column(String(100))
-    date = Column(Date)
-
-    remarks = Column(Text)
+    date = Column(Date, nullable=True)
+    remarks = Column(Text, nullable=True)
 
     project = relationship("Project")
+
+    __table_args__ = (
+        Index("idx_drawing_project", "project_id"),
+    )
 
 
 class SiteRequest(Base, TimestampMixin):

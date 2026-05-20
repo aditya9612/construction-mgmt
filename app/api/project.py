@@ -11,6 +11,7 @@ from app.core.enums import PRIORITY_MAP, REVERSE_PRIORITY_MAP, LabourStatus, Mil
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
+from app.models.approval import Approval
 from app.models.labour import LabourAttendance
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.cache.redis import (
@@ -27,7 +28,7 @@ from app.core.dependencies import (
     require_roles,
 )
 from app.models.contractor import Contractor
-from sqlalchemy import select, func, or_
+from sqlalchemy import delete, select, func, or_
 from app.models import project as m
 from app.models.messages import MessageStatus
 from app.models.user import User, UserRole
@@ -149,6 +150,13 @@ FINANCIAL_ROLES = [
 
 READ_ROLES = [r.value for r in UserRole]
 
+DRAWING_WRITE_ROLES = TASK_WRITE_ROLES
+DRAWING_READ_ROLES = READ_ROLES
+
+DRAWING_DELETE_ROLES = [
+    UserRole.ADMIN.value,
+    UserRole.PROJECT_MANAGER.value,
+]
 
 class ProjectsRepository:
     async def create_project(self, db: AsyncSession, data: dict) -> m.Project:
@@ -5711,7 +5719,6 @@ async def delete_photo(
 drawing_router = APIRouter(prefix="/drawings", tags=["Drawings & Documents"])
 
 
-#  Upload Drawing
 @drawing_router.post(
     "/upload",
     response_model=s.DrawingOut
@@ -5720,32 +5727,29 @@ async def upload_drawing(
     project_id: int = Form(...),
     drawing_name: str = Form(...),
     version: str = Form(...),
-    approved_by: Optional[str] = Form(None),
     date: Optional[date] = Form(None),
     remarks: Optional[str] = Form(None),
-
     file: UploadFile = File(...),
-
     current_user: User = Depends(
-        require_roles(TASK_WRITE_ROLES)
+        require_roles(DRAWING_WRITE_ROLES)
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    
-    # ensure folder exists
+    # Ensure upload folder exists
     os.makedirs("uploads/drawings", exist_ok=True)
 
-    # unique filename recommended
+    # TODO: Prefer a unique filename to avoid overwriting
     file_path = f"uploads/drawings/{file.filename}"
 
+    # Save uploaded file
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
+    # Create drawing record
     obj = m.DrawingDocument(
         project_id=project_id,
         drawing_name=drawing_name,
         version=version,
-        approved_by=approved_by,
         date=date,
         remarks=remarks,
         file_url=file_path,
@@ -5753,11 +5757,98 @@ async def upload_drawing(
 
     db.add(obj)
 
+    # Flush to generate obj.id before creating approval
+    await db.flush()
+
+    # Create approval request automatically
+    approval = Approval(
+        entity_type="drawing",
+        entity_id=obj.id,
+        requested_by=current_user.id,
+        remarks=f"Approval requested for drawing: {drawing_name}",
+        status="Pending",
+    )
+    db.add(approval)
+
     await db.commit()
     await db.refresh(obj)
 
     return obj
 
+
+@drawing_router.put(
+    "/{id}",
+    response_model=s.DrawingOut
+)
+async def update_drawing(
+    id: int,
+    payload: s.DrawingUpdate,
+    current_user: User = Depends(
+        require_roles(DRAWING_WRITE_ROLES)
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await db.get(m.DrawingDocument, id)
+
+    if not obj:
+        raise NotFoundError("Drawing not found")
+
+    # Update only provided fields
+    update_data = payload.model_dump(exclude_unset=True)
+
+    for field, value in update_data.items():
+        setattr(obj, field, value)
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return obj
+
+
+# ===================== Approval History =====================
+
+@drawing_router.get("/{id}/approval-history")
+async def get_drawing_approval_history(
+    id: int,
+    current_user: User = Depends(
+        require_roles(DRAWING_READ_ROLES)
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    # Ensure drawing exists
+    drawing = await db.get(m.DrawingDocument, id)
+
+    if not drawing:
+        raise NotFoundError("Drawing not found")
+
+    # Get all approvals for this drawing
+    result = await db.execute(
+        select(Approval)
+        .where(
+            Approval.entity_type == "drawing",
+            Approval.entity_id == id,
+        )
+        .order_by(Approval.id.desc())
+    )
+
+    approvals = result.scalars().all()
+
+    # Return raw approval objects if you already have response_model support,
+    # otherwise return a simplified JSON structure.
+    return [
+        {
+            "id": approval.id,
+            "entity_type": approval.entity_type,
+            "entity_id": approval.entity_id,
+            "requested_by": approval.requested_by,
+            "approved_by": approval.approved_by,
+            "status": approval.status,
+            "remarks": approval.remarks,
+            "created_at": approval.created_at,
+            "updated_at": approval.updated_at,
+        }
+        for approval in approvals
+    ]
 
 # ===================== Version History =====================
 
@@ -5768,10 +5859,13 @@ async def upload_drawing(
 async def get_versions(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(
+        require_roles(DRAWING_READ_ROLES)
+    ),
     skip: int = 0,
     limit: int = 50,
 ):
+    # Fetch all drawing versions for the project
     result = await db.execute(
         select(m.DrawingDocument)
         .where(
@@ -5782,8 +5876,27 @@ async def get_versions(
         .limit(limit)
     )
 
-    return result.scalars().all()
+    drawings = result.scalars().all()
 
+    # Populate approval_status and approval_id for each drawing
+    for drawing in drawings:
+        approval = await db.scalar(
+            select(Approval)
+            .where(
+                Approval.entity_type == "drawing",
+                Approval.entity_id == drawing.id,
+            )
+            .order_by(Approval.id.desc())
+        )
+
+        if approval:
+            drawing.approval_status = approval.status
+            drawing.approval_id = approval.id
+        else:
+            drawing.approval_status = None
+            drawing.approval_id = None
+
+    return drawings
 
 # ===================== Latest Version =====================
 
@@ -5794,16 +5907,14 @@ async def get_versions(
 async def get_latest(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(
+        require_roles(DRAWING_READ_ROLES)
+    ),
 ):
     latest = await db.scalar(
         select(m.DrawingDocument)
-        .where(
-            m.DrawingDocument.project_id == project_id
-        )
-        .order_by(
-            m.DrawingDocument.created_at.desc()
-        )
+        .where(m.DrawingDocument.project_id == project_id)
+        .order_by(m.DrawingDocument.created_at.desc())
     )
 
     if not latest:
@@ -5811,6 +5922,19 @@ async def get_latest(
             status_code=404,
             detail="No drawings found"
         )
+
+    # Fetch approval record
+    approval = await db.scalar(
+        select(Approval).where(
+            Approval.entity_type == "drawing",
+            Approval.entity_id == latest.id,
+        )
+    )
+
+    # Inject dynamic fields for response schema
+    if approval:
+        latest.approval_status = approval.status
+        latest.approval_id = approval.id
 
     return latest
 
@@ -5822,7 +5946,7 @@ async def delete_drawing(
     id: int,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(
-        require_roles(TASK_WRITE_ROLES)
+        require_roles(DRAWING_DELETE_ROLES)
     ),
 ):
     obj = await db.get(m.DrawingDocument, id)
@@ -5830,9 +5954,17 @@ async def delete_drawing(
     if not obj:
         raise NotFoundError("Drawing not found")
 
-    # optional file delete
-    if os.path.exists(obj.file_url):
+    # Delete file from disk if it exists
+    if obj.file_url and os.path.exists(obj.file_url):
         os.remove(obj.file_url)
+
+    # Optional: delete related approval records
+    await db.execute(
+        delete(Approval).where(
+            Approval.entity_type == "drawing",
+            Approval.entity_id == id,
+        )
+    )
 
     await db.delete(obj)
     await db.commit()
@@ -5846,21 +5978,21 @@ async def delete_drawing(
 async def download_document(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(
+        require_roles(DRAWING_READ_ROLES)
+    ),
 ):
     doc = await db.get(m.DrawingDocument, id)
 
     if not doc:
         raise NotFoundError("Document not found")
 
-    file_path = doc.file_url
-
-    if not os.path.exists(file_path):
+    if not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
     return FileResponse(
-        path=file_path,
-        filename=os.path.basename(file_path),
+        path=doc.file_url,
+        filename=os.path.basename(doc.file_url),
         media_type="application/octet-stream",
     )
 
@@ -5871,23 +6003,23 @@ async def download_document(
 async def view_document(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(
+        require_roles(DRAWING_READ_ROLES)
+    ),
 ):
     doc = await db.get(m.DrawingDocument, id)
 
     if not doc:
         raise NotFoundError("Document not found")
 
-    file_path = doc.file_url
-
-    if not os.path.exists(file_path):
+    if not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
-    media_type, _ = mimetypes.guess_type(file_path)
+    media_type, _ = mimetypes.guess_type(doc.file_url)
 
     return FileResponse(
-        path=file_path,
-        filename=os.path.basename(file_path),
+        path=doc.file_url,
+        filename=os.path.basename(doc.file_url),
         media_type=media_type or "application/octet-stream",
         headers={
             "Content-Disposition": "inline"
