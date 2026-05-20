@@ -4,6 +4,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.cache.redis import cache_get_json, cache_set_json
 from app.core.logger import logger
 from app.core.security import decode_access_token
 from app.db.session import get_db_session
@@ -13,7 +14,37 @@ from app.core.request_context import set_current_user_id
 security = HTTPBearer()
 
 
+# async def get_current_user(
+#     credentials: HTTPAuthorizationCredentials = Depends(security),
+#     db: AsyncSession = Depends(get_db_session),
+# ) -> User:
+#     token = credentials.credentials
+
+#     credentials_exception = HTTPException(
+#         status_code=status.HTTP_401_UNAUTHORIZED,
+#         detail="Could not validate credentials",
+#         headers={"WWW-Authenticate": "Bearer"},
+#     )
+
+#     try:
+#         payload = decode_access_token(token)
+#         user_id = payload.get("sub")
+#         if user_id is None:
+#             raise credentials_exception
+#     except Exception:
+#         logger.warning("JWT decode failed")
+#         raise credentials_exception
+
+#     user = await db.scalar(select(User).where(User.id == int(user_id)))
+#     if user is None:
+#         logger.warning(f"User not found id={user_id}")
+#         raise credentials_exception
+
+#     return user
+
+
 async def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db_session),
 ) -> User:
@@ -34,10 +65,49 @@ async def get_current_user(
         logger.warning("JWT decode failed")
         raise credentials_exception
 
+    # --------------------------------------------------
+    # Try Redis cache first
+    # --------------------------------------------------
+    redis = getattr(request.app.state, "redis", None)
+    cache_key = f"cache:user:{user_id}"
+
+    if redis:
+        try:
+            cached = await cache_get_json(redis, cache_key)
+            if cached:
+                return User(**cached)
+        except Exception as e:
+            logger.warning(f"Redis cache read failed: {e}")
+
+    # --------------------------------------------------
+    # Fallback to database
+    # --------------------------------------------------
     user = await db.scalar(select(User).where(User.id == int(user_id)))
     if user is None:
         logger.warning(f"User not found id={user_id}")
         raise credentials_exception
+
+    # --------------------------------------------------
+    # Store in Redis for future requests
+    # --------------------------------------------------
+    if redis:
+        try:
+            await cache_set_json(
+                redis,
+                cache_key,
+                {
+                    "id": user.id,
+                    "email": user.email,
+                    "hashed_password": user.hashed_password,
+                    "full_name": user.full_name,
+                    "mobile": user.mobile,
+                    "role": user.role,
+                    "is_active": user.is_active,
+                    "is_deleted": user.is_deleted,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Redis cache write failed: {e}")
 
     return user
 

@@ -4,7 +4,8 @@ from typing import Optional
 from pydantic import ValidationError
 from sqlalchemy import String, and_, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.dependencies import get_current_active_user, require_roles
+from app.cache.redis import cache_get_json, cache_set_json, get_cache_version
+from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
 from app.core.security import get_password_hash
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
@@ -285,6 +286,41 @@ async def me(current_user: User = Depends(get_current_active_user)):
     return UserOut.model_validate(current_user)
 
 
+# @router.get("", response_model=PaginatedResponse[UserOut])
+# async def list_users(
+#     limit: int = Query(20, ge=1, le=100),
+#     offset: int = Query(0, ge=0),
+#     search: Optional[str] = None,
+#     current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+#     db: AsyncSession = Depends(get_db_session),
+# ):
+#     query = select(User).where(User.is_deleted == False)
+#     count_query = select(func.count()).select_from(User).where(User.is_deleted == False)
+
+#     if search:
+#         logger.info(f"User search query={search}")
+#         like = f"%{search}%"
+#         cond = or_(
+#             User.email.ilike(like),
+#             User.full_name.ilike(like),
+#             User.mobile.cast(String).ilike(like),
+#         )
+#         query = query.where(cond)
+#         count_query = count_query.where(cond)
+
+#     total = await db.scalar(count_query)
+#     rows = (
+#         (await db.execute(query.order_by(User.id.desc()).limit(limit).offset(offset)))
+#         .scalars()
+#         .all()
+#     )
+
+#     items = [UserOut.model_validate(r) for r in rows]
+#     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
+#     return {"items": items, "meta": meta.model_dump()}
+
+VERSION_KEY = "cache_version:users"
+
 @router.get("", response_model=PaginatedResponse[UserOut])
 async def list_users(
     limit: int = Query(20, ge=1, le=100),
@@ -292,12 +328,26 @@ async def list_users(
     search: Optional[str] = None,
     current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
+    version = await get_cache_version(redis, VERSION_KEY)
+
+    cache_key = (
+        f"cache:users:list:{version}:"
+        f"{current_user.id}:{current_user.role}:"
+        f"{limit}:{offset}:{search}"
+    )
+
+    cached = await cache_get_json(redis, cache_key)
+    if cached is not None:
+        return PaginatedResponse[UserOut].model_validate(cached)
+
     query = select(User).where(User.is_deleted == False)
-    count_query = select(func.count()).select_from(User).where(User.is_deleted == False)
+    count_query = select(func.count()).select_from(User).where(
+        User.is_deleted == False
+    )
 
     if search:
-        logger.info(f"User search query={search}")
         like = f"%{search}%"
         cond = or_(
             User.email.ilike(like),
@@ -308,16 +358,34 @@ async def list_users(
         count_query = count_query.where(cond)
 
     total = await db.scalar(count_query)
+
     rows = (
-        (await db.execute(query.order_by(User.id.desc()).limit(limit).offset(offset)))
+        (
+            await db.execute(
+                query.order_by(User.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
         .scalars()
         .all()
     )
 
     items = [UserOut.model_validate(r) for r in rows]
-    meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
-    return {"items": items, "meta": meta.model_dump()}
+    meta = PaginationMeta(
+        total=int(total or 0),
+        limit=limit,
+        offset=offset,
+    )
 
+    result = PaginatedResponse[UserOut](
+        items=items,
+        meta=meta,
+    )
+
+    await cache_set_json(redis, cache_key, result.model_dump())
+
+    return result
 
 @router.get("/role-counts")
 async def get_role_counts(

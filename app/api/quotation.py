@@ -760,9 +760,13 @@ def generate_quotation_pdf(
     # -----------------------------------------------------
     # SIGNATURE
     # -----------------------------------------------------
-    if signature_path and os.path.exists(signature_path):
+    if (
+        signature_path
+        and os.path.exists(signature_path)
+        and signature_path.lower().endswith((".png", ".jpg", ".jpeg"))
+    ):
         signature_img = Image(signature_path, width=140, height=50)
-        signature_img.hAlign = 'LEFT'
+        signature_img.hAlign = "LEFT"
         elements.append(signature_img)
         elements.append(Spacer(1, 5))
 
@@ -1701,9 +1705,6 @@ async def convert_to_bill(
     }
 
 
-# =========================================================
-# CONVERT TO INVOICE
-# =========================================================
 # =========================================================
 # CONVERT TO INVOICE
 # =========================================================

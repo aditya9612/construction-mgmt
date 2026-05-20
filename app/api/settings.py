@@ -1,7 +1,7 @@
 import os
 import shutil
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -219,7 +219,25 @@ async def upload_signature(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db_session)
 ):
+    import os
+    import shutil
 
+    # =====================================================
+    # ALLOWED IMAGE TYPES ONLY
+    # =====================================================
+    allowed_extensions = {".png", ".jpg", ".jpeg"}
+
+    ext = os.path.splitext(file.filename)[1].lower()
+
+    if ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PNG, JPG, and JPEG files are allowed for signature images."
+        )
+
+    # =====================================================
+    # GET OR CREATE COMPANY SETTINGS
+    # =====================================================
     result = await db.execute(
         select(CompanySettings)
     )
@@ -227,21 +245,30 @@ async def upload_signature(
     settings = result.scalars().first()
 
     if not settings:
-
         settings = CompanySettings()
-
         db.add(settings)
 
-    file_path = (
-        f"{UPLOAD_DIR}/signature_{file.filename}"
-    )
+    # =====================================================
+    # ENSURE UPLOAD DIRECTORY EXISTS
+    # =====================================================
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+    # =====================================================
+    # SANITIZE FILE NAME
+    # =====================================================
+    safe_filename = os.path.basename(file.filename)
+
+    # =====================================================
+    # SAVE FILE
+    # =====================================================
+    file_path = f"{UPLOAD_DIR}/signature_{safe_filename}"
 
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(
-            file.file,
-            buffer
-        )
+        shutil.copyfileobj(file.file, buffer)
 
+    # =====================================================
+    # SAVE PATH IN DATABASE
+    # =====================================================
     settings.signature_image = file_path
 
     await db.commit()
