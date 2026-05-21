@@ -60,7 +60,7 @@ class OwnerOut(BaseSchema):
     email: Optional[EmailStr]
     address: Optional[str]
     pan: Optional[str]
-    satisfaction_score: float
+    satisfaction_score: Optional[float] = 0.0
 
     class Config:
         from_attributes = True

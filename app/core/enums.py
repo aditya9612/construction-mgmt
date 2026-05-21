@@ -18,6 +18,7 @@ class PaymentMode(str, Enum):
     BANK_TRANSFER = "BankTransfer"
     CHEQUE = "Cheque"
     UPI = "UPI"
+    ADJUSTMENT = "Adjustment"
 
 
 class PayrollStatus(str, Enum):

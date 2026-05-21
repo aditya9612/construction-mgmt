@@ -1,9 +1,40 @@
 from datetime import date
-
-from fastapi import APIRouter, Depends, Query
+import io
+from reportlab.lib.pagesizes import A4
+from fastapi import APIRouter, Depends, HTTPException
+from reportlab.lib import colors
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.dependencies import get_current_active_user, require_roles
+from app.api.reports import REPORT_READ_ROLES
+from app.core.dependencies import require_roles
+from app.core.enums import InvoiceStatus, PaymentMode
+from app.models.expense import Expense
+from app.models.final_measurement import FinalMeasurement
+from app.models.labour import Labour, LabourAttendance
+from app.models.project import Project, Task
+from app.db.session import get_db_session
+from app.models.invoice import Invoice, Transaction
+from app.models.owner import OwnerTransaction
+from app.models.user import User
+from app.schemas.invoice import (
+    AnalyticsSummaryOut,
+    InvoiceCreate,
+    InvoiceUpdate,
+    InvoiceOut,
+    LabourInvoiceCreate,
+)
+from app.utils.common import assert_project_access, create_system_alert
+from app.utils.helpers import NotFoundError, ValidationError
+from decimal import Decimal
+from fastapi.responses import StreamingResponse
+from io import BytesIO
+from app.core.logger import logger
+from app.models.quotation import QuotationMaster, QuotationStatus
+from app.models.user import UserRole
+from fastapi import APIRouter, Depends
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.dependencies import require_roles
 from app.models.expense import Expense
 from app.models.final_measurement import FinalMeasurement
 from app.models.labour import Labour, LabourAttendance
@@ -28,6 +59,7 @@ from app.core.logger import logger
 from app.models.quotation import QuotationMaster, QuotationStatus
 from app.models.user import UserRole
 
+
 INVOICE_READ_ROLES = [
     r.value
     for r in [
@@ -50,7 +82,6 @@ INVOICE_WRITE_ROLES = [
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
-from sqlalchemy import and_
 
 # @router.post("/{type}", response_model=InvoiceOut)
 # async def create_invoice(
@@ -122,7 +153,7 @@ from sqlalchemy import and_
 
 #             paid_amount=Decimal(0),
 #             pending_amount=total_amount,
-#             status="pending",
+#             status=InvoiceStatus.PENDING,
 #         )
 
 #         db.add(obj)
@@ -152,6 +183,351 @@ from sqlalchemy import and_
 #     logger.info(f"Invoice created id={obj.id}")
 
 #     return InvoiceOut.model_validate(obj)
+
+
+@router.get("/client/payments/pdf")
+async def client_payments_pdf(
+    project_id: int,
+    invoice_id: int | None = None,
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    # =====================================================
+    # PROJECT ACCESS
+    # =====================================================
+
+    await assert_project_access(db=db, project_id=project_id, current_user=current_user)
+
+    # =====================================================
+    # PDF SETUP
+    # =====================================================
+
+    buffer = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=35,
+        leftMargin=35,
+        topMargin=35,
+        bottomMargin=30,
+    )
+
+    styles = getSampleStyleSheet()
+
+    content = []
+
+    # =====================================================
+    # SINGLE PAYMENT RECEIPT PDF
+    # =====================================================
+
+    if invoice_id:
+
+        result = await db.execute(
+            select(Invoice).where(
+                Invoice.id == invoice_id, Invoice.project_id == project_id
+            )
+        )
+
+        invoice = result.scalar_one_or_none()
+
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+        # =================================================
+        # VALUES
+        # =================================================
+
+        payment_method = (
+            invoice.type.replace("_", " ").upper() if invoice.type else "BANK TRANSFER"
+        )
+
+        if payment_method == "OWNER":
+            payment_method = "BANK TRANSFER"
+
+        payment_id = f"PAY-{1000 + invoice.id}"
+
+        invoice_number = f"INV-{datetime.now().year}-{invoice.id:04d}"
+
+        # =================================================
+        # TITLE
+        # =================================================
+
+        content.append(Paragraph("<b>Project Transparency Portal</b>", styles["Title"]))
+
+        content.append(Spacer(1, 20))
+
+        content.append(Paragraph("<b>Payment Receipt</b>", styles["Heading1"]))
+
+        content.append(Spacer(1, 18))
+
+        # =================================================
+        # RECEIPT TABLE
+        # =================================================
+
+        receipt_data = [
+            ["Payment ID", payment_id],
+            ["Invoice Number", invoice_number],
+            ["Project ID", str(invoice.project_id)],
+            ["Owner ID", str(invoice.owner_id)],
+            ["Payment Method", payment_method],
+            [
+                "Payment Status",
+                invoice.status.value.upper() if invoice.status else "COMPLETED",
+            ],
+            [
+                "Created Date",
+                (
+                    invoice.created_at.strftime("%d %b %Y")
+                    if invoice.created_at
+                    else "N/A"
+                ),
+            ],
+        ]
+
+        receipt_table = Table(receipt_data, colWidths=[180, 300])
+
+        receipt_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
+                    ("GRID", (0, 0), (-1, -1), 1, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+
+        content.append(receipt_table)
+
+        content.append(Spacer(1, 25))
+
+        # =================================================
+        # PAYMENT SUMMARY
+        # =================================================
+
+        content.append(Paragraph("<b>Payment Summary</b>", styles["Heading2"]))
+
+        content.append(Spacer(1, 12))
+
+        summary_data = [
+            ["Description", "Amount"],
+            ["Base Amount", f"Rs. {float(invoice.amount or 0):,.2f}"],
+            ["GST Amount", f"Rs. {float(invoice.gst_amount or 0):,.2f}"],
+            ["Tax Amount", f"Rs. {float(invoice.tax_amount or 0):,.2f}"],
+            ["Total Amount", f"Rs. {float(invoice.total_amount or 0):,.2f}"],
+            ["Paid Amount", f"Rs. {float(invoice.paid_amount or 0):,.2f}"],
+            ["Pending Amount", f"Rs. {float(invoice.pending_amount or 0):,.2f}"],
+        ]
+
+        summary_table = Table(summary_data, colWidths=[240, 240])
+
+        summary_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbeafe")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("GRID", (0, 0), (-1, -1), 1, colors.grey),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+
+        content.append(summary_table)
+
+        content.append(Spacer(1, 25))
+
+        # =================================================
+        # DESCRIPTION
+        # =================================================
+
+        content.append(Paragraph("<b>Invoice Description</b>", styles["Heading2"]))
+
+        content.append(Spacer(1, 8))
+
+        content.append(
+            Paragraph(
+                invoice.description or "Payment made by client to contractor.",
+                styles["BodyText"],
+            )
+        )
+
+        content.append(Spacer(1, 30))
+
+        # =================================================
+        # FOOTER
+        # =================================================
+
+        content.append(
+            Paragraph("This is a system generated payment receipt.", styles["Italic"])
+        )
+
+        content.append(Spacer(1, 8))
+
+        content.append(
+            Paragraph(
+                f"Generated On: " f"{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
+                styles["Italic"],
+            )
+        )
+
+        # =================================================
+        # BUILD PDF
+        # =================================================
+
+        doc.build(content)
+
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; "
+                f"filename=payment_receipt_{invoice.id}.pdf"
+            },
+        )
+
+    # =====================================================
+    # PAYMENT HISTORY REPORT PDF
+    # =====================================================
+
+    result = await db.execute(
+        select(Invoice)
+        .where(Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PAID)
+        .order_by(Invoice.created_at.desc())
+    )
+
+    invoices = result.scalars().all()
+
+    # =====================================================
+    # TITLE
+    # =====================================================
+
+    content.append(Paragraph("<b>Payment History Report</b>", styles["Title"]))
+
+    content.append(Spacer(1, 20))
+
+    # =====================================================
+    # TABLE
+    # =====================================================
+
+    table_data = [
+        [
+            "Payment ID",
+            "Invoice",
+            "Amount Paid",
+            "Payment Date",
+            "Method",
+            "Status",
+        ]
+    ]
+
+    total_paid = 0
+
+    for invoice in invoices:
+
+        paid_amount = float(invoice.paid_amount or 0)
+
+        total_paid += paid_amount
+
+        payment_method = (
+            invoice.type.replace("_", " ").upper() if invoice.type else "BANK TRANSFER"
+        )
+
+        if payment_method == "OWNER":
+            payment_method = "BANK TRANSFER"
+
+        table_data.append(
+            [
+                f"PAY-{1000 + invoice.id}",
+                f"INV-{datetime.now().year}-{invoice.id:04d}",
+                f"Rs. {paid_amount:,.2f}",
+                (
+                    invoice.created_at.strftime("%d %b %Y")
+                    if invoice.created_at
+                    else "N/A"
+                ),
+                payment_method,
+                invoice.status.value.upper() if invoice.status else "COMPLETED",
+            ]
+        )
+
+    payment_table = Table(table_data, colWidths=[80, 110, 110, 100, 100, 80])
+
+    payment_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbeafe")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 1, colors.grey),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ]
+        )
+    )
+
+    content.append(payment_table)
+
+    content.append(Spacer(1, 25))
+
+    # =====================================================
+    # TOTAL SUMMARY
+    # =====================================================
+
+    content.append(
+        Paragraph(f"<b>Total Payments:</b> {len(invoices)}", styles["Heading2"])
+    )
+
+    content.append(Spacer(1, 8))
+
+    content.append(
+        Paragraph(
+            f"<b>Total Amount Paid:</b> " f"Rs. {total_paid:,.2f}", styles["Heading2"]
+        )
+    )
+
+    content.append(Spacer(1, 25))
+
+    # =====================================================
+    # FOOTER
+    # =====================================================
+
+    content.append(
+        Paragraph(
+            "This is a system generated payment history report.", styles["Italic"]
+        )
+    )
+
+    content.append(Spacer(1, 8))
+
+    content.append(
+        Paragraph(
+            f"Generated On: " f"{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
+            styles["Italic"],
+        )
+    )
+
+    # =====================================================
+    # BUILD PDF
+    # =====================================================
+
+    doc.build(content)
+
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; "
+            f"filename=payments_report_{project_id}.pdf"
+        },
+    )
 
 
 @router.post("/from-quotation/{quotation_id}", response_model=InvoiceOut)
@@ -193,40 +569,25 @@ async def create_invoice_from_quotation(
         raise ValidationError("Invoice already exists for this quotation")
 
     # 7. Calculate GST % (combine CGST + SGST)
-    gst_percent = Decimal(
-        (quotation.cgst_percent or 0) +
-        (quotation.sgst_percent or 0)
-    )
+    gst_percent = Decimal((quotation.cgst_percent or 0) + (quotation.sgst_percent or 0))
 
     # 8. Create invoice
     invoice = Invoice(
         project_id=quotation.project_id,
         owner_id=project.owner_id,
-
         quotation_id=quotation.id,
-
         type="owner",
         reference_id=quotation.id,
-
         amount=Decimal(quotation.subtotal or 0),
-
         gst_percent=gst_percent,
         gst_amount=Decimal(quotation.gst_amount or 0),
-
         tax_percent=Decimal(quotation.tds_percent or 0),
         tax_amount=Decimal(quotation.tds_amount or 0),
-
         total_amount=Decimal(quotation.grand_total or 0),
-
         paid_amount=Decimal(0),
         pending_amount=Decimal(quotation.grand_total or 0),
-
-        status="pending",
-
-        description=(
-            f"Invoice generated from quotation "
-            f"{quotation.quotation_no}"
-        ),
+        status=InvoiceStatus.PENDING,
+        description=(f"Invoice generated from quotation " f"{quotation.quotation_no}"),
     )
 
     try:
@@ -266,9 +627,7 @@ async def create_invoice_from_quotation(
 
     except Exception:
         await db.rollback()
-        logger.exception(
-            f"Failed to create invoice from quotation_id={quotation_id}"
-        )
+        logger.exception(f"Failed to create invoice from quotation_id={quotation_id}")
         raise
 
     await db.refresh(invoice)
@@ -288,6 +647,7 @@ async def create_invoice_from_quotation(
 #     rows = (await db.execute(select(Invoice))).scalars().all()
 #     return [InvoiceOut.model_validate(r) for r in rows]
 
+
 @router.get("", response_model=list[InvoiceOut])
 async def list_invoices(
     db: AsyncSession = Depends(get_db_session),
@@ -302,8 +662,7 @@ async def list_invoices(
     for row in rows:
         try:
             # Log raw SQLAlchemy object values before validation
-            logger.info(
-                f"""
+            logger.info(f"""
 VALIDATING INVOICE
 -----------------------------------
 ID              : {row.id}
@@ -325,8 +684,7 @@ Description     : {row.description} ({type(row.description)})
 Created At      : {row.created_at} ({type(row.created_at)})
 Linked Expenses : {row.linked_expense_ids} ({type(row.linked_expense_ids)})
 -----------------------------------
-"""
-            )
+""")
 
             # Validate with Pydantic
             validated = InvoiceOut.model_validate(row)
@@ -338,8 +696,7 @@ Linked Expenses : {row.linked_expense_ids} ({type(row.linked_expense_ids)})
 
         except Exception as e:
             # Detailed error log
-            logger.exception(
-                f"""
+            logger.exception(f"""
 FAILED TO VALIDATE INVOICE
 ===================================
 Invoice ID      : {row.id}
@@ -351,8 +708,7 @@ Linked Expenses : {row.linked_expense_ids}
 Error:
 {repr(e)}
 ===================================
-"""
-            )
+""")
             raise
 
     logger.info("All invoices validated successfully.")
@@ -519,7 +875,7 @@ async def mark_paid(
         invoice_id=invoice.id,
         type="receipt",
         amount=remaining,
-        mode="system",
+        mode=PaymentMode.ADJUSTMENT.value,
         reference="auto-mark-paid",
         created_by=current_user.id,
     )
@@ -529,7 +885,7 @@ async def mark_paid(
     # Update invoice correctly
     invoice.paid_amount += remaining
     invoice.pending_amount = 0
-    invoice.status = "paid"
+    invoice.status = InvoiceStatus.PAID
 
     await create_system_alert(
         db,
@@ -537,7 +893,7 @@ async def mark_paid(
         "Payment Received",
         f"Payment of ₹{remaining:,.2f} received for Invoice #{invoice.id}.",
         priority="Medium",
-        category="Finance"
+        category="Finance",
     )
 
     await db.commit()
@@ -546,13 +902,13 @@ async def mark_paid(
         "message": "Invoice marked as paid",
         "paid": float(invoice.paid_amount),
         "pending": float(invoice.pending_amount),
-        "status": invoice.status,
+        "status": invoice.status.value,
     }
 
 
 from io import BytesIO
 from fastapi.responses import StreamingResponse
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table , Spacer, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -695,7 +1051,7 @@ async def create_labour_invoice(
             total_amount=total_amount,
             paid_amount=Decimal(0),
             pending_amount=total_amount,
-            status="pending",
+            status=InvoiceStatus.PENDING,
             description=description,
         )
 
@@ -765,7 +1121,7 @@ async def create_material_invoice(
             total_amount=total_amount,
             paid_amount=Decimal(0),
             pending_amount=total_amount,
-            status="pending",
+            status=InvoiceStatus.PENDING,
             description="Material invoice (aggregated)",
         )
 
@@ -840,7 +1196,7 @@ async def create_invoice_from_measurement(
             total_amount=total_amount,
             paid_amount=Decimal(0),
             pending_amount=total_amount,
-            status="pending",
+            status=InvoiceStatus.PENDING,
             description="Invoice from final measurement",
         )
 
@@ -953,7 +1309,7 @@ async def analytics_summary(
 async def pay_invoice(
     id: int,
     amount: Decimal,
-    mode: str,
+    mode: PaymentMode,
     reference: str | None = None,
     current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
@@ -978,7 +1334,7 @@ async def pay_invoice(
         invoice_id=invoice.id,
         type="receipt",
         amount=amount,
-        mode=mode,
+        mode=mode.value,
         reference=reference or f"inv:{invoice.id}",
         created_by=current_user.id,
     )
@@ -988,10 +1344,11 @@ async def pay_invoice(
     invoice.paid_amount += amount
     invoice.pending_amount = invoice.total_amount - invoice.paid_amount
 
-    if invoice.pending_amount == 0:
-        invoice.status = "paid"
+    if invoice.pending_amount <= 0:
+        invoice.pending_amount = 0
+        invoice.status = InvoiceStatus.PAID
     else:
-        invoice.status = "partial"
+        invoice.status = InvoiceStatus.PARTIAL
 
     await db.commit()
 
@@ -999,7 +1356,7 @@ async def pay_invoice(
         "message": "Payment recorded",
         "paid": float(invoice.paid_amount),
         "pending": float(invoice.pending_amount),
-        "status": invoice.status,
+        "status": invoice.status.value,
     }
 
 

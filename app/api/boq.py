@@ -3,6 +3,7 @@ from typing import Optional
 from openpyxl import Workbook
 from fastapi.responses import FileResponse
 import tempfile
+import csv
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -949,6 +950,46 @@ async def boq_logs(
         }
         for r in rows
     ]
+
+@router.get("/{boq_id}/logs/export/csv")
+async def export_boq_logs_csv(
+    boq_id: int,
+    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    rows = (
+        (
+            await db.execute(
+                select(BOQAudit)
+                .where(BOQAudit.boq_id == boq_id)
+                .order_by(BOQAudit.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not rows:
+        raise NotFoundError("No audit logs found for this BOQ")
+
+    file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", newline="", encoding="utf-8")
+    file_path = file.name
+
+    writer = csv.writer(file)
+    writer.writerow(["ID", "Action", "Message", "User ID", "Timestamp", "Changes"])
+
+    for r in rows:
+        writer.writerow([
+            r.id,
+            r.action,
+            r.message,
+            r.user_id,
+            r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
+            str(r.changes) if r.changes else ""
+        ])
+
+    file.close()
+    return FileResponse(file_path, filename=f"boq_audit_logs_{boq_id}.csv", media_type="text/csv")
 
 @router.post("/{boq_id}/generate-tasks")
 async def generate_tasks_from_boq(

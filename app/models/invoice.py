@@ -61,8 +61,8 @@ class Invoice(Base):
     pending_amount = Column(DECIMAL(18, 2), nullable=False)
 
     # Status (ENUM)
-    status = Column(Enum(InvoiceStatus), default=InvoiceStatus.PENDING)
-
+    status = Column( Enum( InvoiceStatus, values_callable=lambda obj: [e.value for e in obj] ), default=InvoiceStatus.PENDING )
+                    
     # Meta
     description = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
