@@ -1,18 +1,34 @@
 from decimal import Decimal
 from typing import Optional
-from app.schemas.base import BaseSchema
 
+from pydantic import field_validator
+from app.schemas.base import BaseSchema
+from app.core.validators import (
+    validate_positive_required,
+    validate_non_empty_string,
+)
 
 class BOQCreate(BaseSchema):
     project_id: int
     item_name: str
     category: str
     description: Optional[str] = None
-    quantity: Decimal = Decimal("0")
+    quantity: Decimal = Decimal("1")
     unit: str = "unit"
-    unit_cost: Decimal = Decimal("0")
+    unit_cost: Decimal = Decimal("1")
     status: Optional[str] = "Active"
     activity_type_id: Optional[int] = None
+
+    @field_validator("quantity", "unit_cost")
+    @classmethod
+    def positive_values_validator(cls, v):
+        return validate_positive_required(v)
+
+
+    @field_validator("item_name", "category", "unit")
+    @classmethod
+    def string_validator(cls, v):
+        return validate_non_empty_string(v)
 
 
 class BOQUpdate(BaseSchema):
@@ -25,15 +41,29 @@ class BOQUpdate(BaseSchema):
     is_completed: Optional[bool] = None
     status: Optional[str] = None
 
+    @field_validator("quantity", "unit_cost")
+    @classmethod
+    def positive_values_validator(cls, v):
+        if v is None:
+            return v
+        return validate_positive_required(v)
+
+    @field_validator("item_name", "category", "unit")
+    @classmethod
+    def string_validator(cls, v):
+        if v is None:
+            return v
+        return validate_non_empty_string(v)
+
 
 class BOQActualsUpdate(BaseSchema):
     actual_quantity: Decimal
     actual_cost: Decimal
 
-
-from decimal import Decimal
-from typing import Optional
-from app.schemas.base import BaseSchema
+    @field_validator("actual_quantity", "actual_cost")
+    @classmethod
+    def actuals_validator(cls, v):
+        return validate_positive_required(v)
 
 
 class BOQOut(BaseSchema):
@@ -50,8 +80,8 @@ class BOQOut(BaseSchema):
 
     quantity: float
     unit: str
-    unit_cost: float 
-    total_cost: float 
+    unit_cost: float
+    total_cost: float
 
     actual_quantity: float
     actual_cost: float
@@ -59,13 +89,13 @@ class BOQOut(BaseSchema):
 
     is_completed: bool
     status: str
+    approval_status: str
 
     class Config:
         from_attributes = True
 
-        json_encoders = {
-            Decimal: float
-        }
+        json_encoders = {Decimal: float}
+
 
 class BOQBulkCreate(BaseSchema):
     items: list[BOQCreate]

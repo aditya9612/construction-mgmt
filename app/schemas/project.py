@@ -6,6 +6,8 @@ from enum import Enum
 from pydantic import BaseModel, Field, field_validator
 from typing_extensions import Annotated
 from app.core.enums import (
+    ChecklistStatus,
+    DocumentStatus,
     IssueCategory,
     IssuePriority,
     IssueStatus,
@@ -23,6 +25,7 @@ from app.core.enums import (
 from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
 from datetime import date as dt_date
+from app.core.validators import validate_non_empty_string, validate_start_end_dates
 
 # ===================== PROJECT =====================
 
@@ -37,10 +40,11 @@ class ProjectCreate(BaseSchema):
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
-        start_date = info.data.get("start_date")
-        if v and start_date and v < start_date:
-            raise ValueError("End date cannot be before start date")
-        return v
+
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v
+        )
 
 
 class ProjectUpdate(BaseSchema):
@@ -49,6 +53,14 @@ class ProjectUpdate(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[ProjectStatus] = None
+
+    @field_validator("end_date")
+    def validate_dates(cls, v, info: ValidationInfo):
+
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v
+        )
 
 
 class ProjectOut(BaseSchema):
@@ -93,6 +105,14 @@ class MilestoneCreate(BaseSchema):
     end_date: Optional[date] = None
     status: Optional[MilestoneStatus] = MilestoneStatus.PLANNED
 
+    @field_validator("end_date")
+    def validate_dates(cls, v, info: ValidationInfo):
+
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v
+        )
+
 
 class MilestoneUpdate(BaseSchema):
     title: Optional[str] = None
@@ -100,6 +120,14 @@ class MilestoneUpdate(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[MilestoneStatus] = None
+
+    @field_validator("end_date")
+    def validate_dates(cls, v, info: ValidationInfo):
+
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v
+        )
 
 
 class MilestoneOut(BaseSchema):
@@ -125,6 +153,14 @@ class TaskCreate(BaseSchema):
     assigned_user_ids: Optional[list[int]] = None
     activity_type_id: Optional[int] = None
 
+    @field_validator("end_date")
+    def validate_dates(cls, v, info: ValidationInfo):
+
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v
+        )
+
 
 class TaskUpdate(BaseSchema):
     title: Optional[str] = None
@@ -134,10 +170,18 @@ class TaskUpdate(BaseSchema):
     end_date: Optional[date] = None
     assigned_user_id: Optional[int] = None
 
+    @field_validator("end_date")
+    def validate_dates(cls, v, info: ValidationInfo):
+
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v
+        )
 
 class TaskOut(BaseSchema):
     id: int
     project_id: int
+    boq_id: Optional[int] = None
     title: str
     description: Optional[str] = None
     priority: TaskPriority
@@ -360,9 +404,7 @@ class IssueBase(BaseSchema):
 
     @field_validator("title")
     def validate_title(cls, v):
-        if not v.strip():
-            raise ValueError("Title cannot be empty")
-        return v
+        return validate_non_empty_string(v)
 
     @field_validator("reported_date")
     def validate_reported_date(cls, v):
@@ -457,6 +499,16 @@ class SafetyCreate(BaseSchema):
         if not v.strip():
             raise ValueError("Field cannot be empty")
         return v
+    
+    @field_validator("date")
+    def validate_date(cls, v):
+
+        if v > date.today():
+            raise ValueError(
+                "Future date not allowed"
+            )
+
+        return v
 
 
 class SafetyOut(SafetyCreate):
@@ -495,14 +547,8 @@ class ChecklistItemCreate(BaseSchema):
 class ChecklistLogCreate(BaseSchema):
     project_id: int
     checklist_id: int
-    status: str
+    status: ChecklistStatus
     remarks: Optional[str] = None
-
-    @field_validator("status")
-    def validate_status(cls, v):
-        if v not in ["Done", "Pending"]:
-            raise ValueError("Status must be Done or Pending")
-        return v
 
 
 class ChecklistLogOut(BaseModel):
@@ -539,6 +585,10 @@ class DrawingCreate(BaseSchema):
     date: Optional[dt_date] = None
     remarks: Optional[str] = None
 
+    @field_validator("drawing_name", "version")
+    def validate_fields(cls, v):
+        return validate_non_empty_string(v)
+
 
 class DrawingUpdate(BaseSchema):
     drawing_name: Optional[str] = None
@@ -546,12 +596,16 @@ class DrawingUpdate(BaseSchema):
     date: Optional[dt_date] = None
     remarks: Optional[str] = None
 
+    @field_validator("drawing_name", "version")
+    def validate_fields(cls, v):
+        return validate_non_empty_string(v)
+
 
 class DrawingOut(DrawingCreate):
     id: int
     file_url: str
 
-    approval_status: Optional[str] = None
+    approval_status: Optional[DocumentStatus] = None
     approval_id: Optional[int] = None
 
     class Config:
@@ -568,9 +622,7 @@ class SiteRequestCreate(BaseSchema):
 
     @field_validator("description")
     def validate_description(cls, v):
-        if not v.strip():
-            raise ValueError("Description cannot be empty")
-        return v
+        return validate_non_empty_string(v)
 
 
 # ===================== ACTION =====================
@@ -604,9 +656,7 @@ class MessageCreate(BaseSchema):
 
     @field_validator("message")
     def validate_message(cls, v):
-        if not v.strip():
-            raise ValueError("Message cannot be empty")
-        return v
+        return validate_non_empty_string(v)
 
 
 # ========work progress============
@@ -626,12 +676,10 @@ class WorkActivityCreate(BaseModel):
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        start_date = info.data.get("start_date")
-
-        if start_date and v < start_date:
-            raise ValueError("End date cannot be before start date")
-
-        return v
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v
+        )
 
 
 class WorkActivityUpdate(BaseModel):
@@ -650,13 +698,10 @@ class WorkActivityUpdate(BaseModel):
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        start_date = info.data.get("start_date")
-
-        if start_date and v and v < start_date:
-
-            raise ValueError("End date cannot be before start date")
-
-        return v
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v
+        )
 
 
 class WorkActivityResponse(BaseModel):

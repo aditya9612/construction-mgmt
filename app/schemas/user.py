@@ -1,10 +1,15 @@
 from datetime import date, datetime
-import re
 from typing import Any, Optional
-
-from pydantic import EmailStr, field_validator, model_validator
-
+from pydantic import EmailStr, Field, field_validator, model_validator
 from app.schemas.base import BaseSchema
+from app.core.validators import (
+    validate_pan,
+    validate_aadhaar,
+    validate_mobile,
+    validate_full_name,
+    validate_joining_date,
+    validate_password,
+)
 
 
 class UserRoleSchema(BaseSchema):
@@ -47,56 +52,39 @@ class UserCreatePayload(BaseSchema):
     address: Optional[str] = None
     pan_number: Optional[str] = None
     aadhaar_number: Optional[str] = None
-    designation: Optional[str] = None
+    designation: Optional[str] = Field(None, max_length=100)
     joining_date: Optional[date] = None
     is_active: bool = True
 
     @field_validator("pan_number")
     @classmethod
-    def validate_pan(cls, v):
-        if v is None:
-            return v
-
-        v = v.strip().upper() 
-
-        if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]$", v):
-            raise ValueError("Invalid PAN format (e.g., ABCDE1234F)")
-
-        return v
+    def pan_validator(cls, v):
+        return validate_pan(v)
 
     @field_validator("aadhaar_number")
     @classmethod
-    def validate_aadhaar(cls, v):
-        if v is None:
-            return v
+    def aadhaar_validator(cls, v):
+        return validate_aadhaar(v)
 
-        v = v.replace(" ", "").strip() 
-
-        if not re.match(r"^[0-9]{12}$", v):
-            raise ValueError("Aadhaar must be 12 digits")
-
-        return v
-    
     @field_validator("mobile_number")
     @classmethod
-    def validate_mobile(cls, v):
-        if v is None:
-            return v
+    def mobile_validator(cls, v):
+        return validate_mobile(v)
 
-        # normalize (same idea as your helper)
-        digits = "".join(c for c in v if c.isdigit())
+    @field_validator("full_name")
+    @classmethod
+    def full_name_validator(cls, v):
+        return validate_full_name(v)
 
-        # handle +91 / 91 / 0
-        if digits.startswith("91") and len(digits) == 12:
-            digits = digits[2:]
-        elif digits.startswith("0") and len(digits) == 11:
-            digits = digits[1:]
+    @field_validator("joining_date")
+    @classmethod
+    def joining_date_validator(cls, v):
+        return validate_joining_date(v)
 
-        # final validation
-        if not re.match(r"^[6-9][0-9]{9}$", digits):
-            raise ValueError("Invalid Indian mobile number")
-
-        return digits
+    @field_validator("password")
+    @classmethod
+    def password_validator(cls, v):
+        return validate_password(v)
 
 
 # -------- UPDATE --------
@@ -108,53 +96,34 @@ class UserUpdatePayload(BaseSchema):
     address: Optional[str] = None
     pan_number: Optional[str] = None
     aadhaar_number: Optional[str] = None
-    designation: Optional[str] = None
+    designation: Optional[str] = Field(None, max_length=100)
     joining_date: Optional[date] = None
     is_active: Optional[bool] = None
 
     @field_validator("pan_number")
     @classmethod
-    def validate_pan(cls, v):
-        if v is None:
-            return v
-
-        v = v.strip().upper()  
-
-        if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]$", v):
-            raise ValueError("Invalid PAN format (e.g., ABCDE1234F)")
-
-        return v
+    def pan_validator(cls, v):
+        return validate_pan(v)
 
     @field_validator("aadhaar_number")
     @classmethod
-    def validate_aadhaar(cls, v):
-        if v is None:
-            return v
+    def aadhaar_validator(cls, v):
+        return validate_aadhaar(v)
 
-        v = v.replace(" ", "").strip() 
-
-        if not re.match(r"^[0-9]{12}$", v):
-            raise ValueError("Aadhaar must be 12 digits")
-
-        return v
-    
     @field_validator("mobile_number")
     @classmethod
-    def validate_mobile(cls, v):
-        if v is None:
-            return v
+    def mobile_validator(cls, v):
+        return validate_mobile(v)
 
-        digits = "".join(c for c in v if c.isdigit())
+    @field_validator("full_name")
+    @classmethod
+    def full_name_validator(cls, v):
+        return validate_full_name(v)
 
-        if digits.startswith("91") and len(digits) == 12:
-            digits = digits[2:]
-        elif digits.startswith("0") and len(digits) == 11:
-            digits = digits[1:]
-
-        if not re.match(r"^[6-9][0-9]{9}$", digits):
-            raise ValueError("Invalid Indian mobile number")
-
-        return digits
+    @field_validator("joining_date")
+    @classmethod
+    def joining_date_validator(cls, v):
+        return validate_joining_date(v)
 
 
 class UserOut(BaseSchema):
@@ -190,6 +159,7 @@ class UserOut(BaseSchema):
                 "is_active": data.is_active,
             }
         return data
+
 
 class UserAuditOut(BaseSchema):
     id: int

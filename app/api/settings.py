@@ -1,18 +1,23 @@
 import os
 import shutil
-
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form , HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.db.session import get_db_session
 from app.models.settings import CompanySettings, UserSettings
 from app.schemas.settings import CompanySettingsOut, CompanySettingsUpdate, UserSettingsUpdate, UserSettingsOut
-
 from app.models.user import User
 from app.core.dependencies import get_current_active_user
-from app.schemas.user import UserOut, UserUpdatePayload
-
+from app.schemas.user import UserOut
+from datetime import date
+from typing import Optional
+from app.core.validators import (
+    validate_and_save_image,
+    validate_full_name,
+    validate_pan,
+    validate_aadhaar,
+    validate_joining_date,
+)
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
 
@@ -51,7 +56,7 @@ async def update_settings(
         obj = UserSettings(user_id=current_user.id)
         db.add(obj)
 
-    for k, v in payload.dict(exclude_unset=True).items():
+    for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
     await db.commit()
@@ -60,24 +65,97 @@ async def update_settings(
     return obj
 
 
-@router.put("/profile", response_model=UserOut)
+PROFILE_UPLOAD_DIR = "uploads/profile"
+
+os.makedirs(
+    PROFILE_UPLOAD_DIR,
+    exist_ok=True
+)
+
+@router.put(
+    "/profile",
+    response_model=UserOut
+)
 async def update_profile(
-    payload: UserUpdatePayload,
+
+    # =========================================
+    # FORM FIELDS
+    # =========================================
+
+    full_name: Optional[str] = Form(None),
+
+    address: Optional[str] = Form(None),
+
+    pan_number: Optional[str] = Form(None),
+
+    aadhaar_number: Optional[str] = Form(None),
+
+    designation: Optional[str] = Form(None),
+
+    joining_date: Optional[date] = Form(None),
+
+
+    # =========================================
+    # FILE
+    # =========================================
+
+    profile_image: UploadFile = File(None),
+
     current_user: User = Depends(get_current_active_user),
+
     db: AsyncSession = Depends(get_db_session),
 ):
-    data = payload.dict(exclude_unset=True)
 
-    #  SECURITY: block sensitive fields
-    data.pop("role", None)
-    data.pop("mobile_number", None)
-    data.pop("email", None)
+    # =========================================
+    # VALIDATE + UPDATE TEXT FIELDS
+    # =========================================
 
-    #  Update allowed fields only
-    for k, v in data.items():
-        setattr(current_user, k, v)
+    if full_name is not None:
+        current_user.full_name = validate_full_name(
+            full_name
+        )
+
+    if address is not None:
+        current_user.address = address.strip()
+
+    if pan_number is not None:
+        current_user.pan_number = validate_pan(
+            pan_number
+        )
+
+    if aadhaar_number is not None:
+        current_user.aadhaar_number = validate_aadhaar(
+            aadhaar_number
+        )
+
+    if designation is not None:
+        current_user.designation = designation.strip()
+
+    if joining_date is not None:
+        current_user.joining_date = validate_joining_date(
+            joining_date
+        )
+
+    # =========================================
+    # PROFILE IMAGE VALIDATION + UPLOAD
+    # =========================================
+
+    if profile_image:
+
+        file_path = await validate_and_save_image(
+            file=profile_image,
+            upload_dir=PROFILE_UPLOAD_DIR,
+            prefix="profile"
+        )
+
+        current_user.profile_image = file_path
+
+    # =========================================
+    # SAVE
+    # =========================================
 
     await db.commit()
+
     await db.refresh(current_user)
 
     return current_user
@@ -190,15 +268,11 @@ async def upload_logo(
 
         db.add(settings)
 
-    file_path = (
-        f"{UPLOAD_DIR}/logo_{file.filename}"
+    file_path = await validate_and_save_image(
+        file=file,
+        upload_dir=UPLOAD_DIR,
+        prefix="logo"
     )
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(
-            file.file,
-            buffer
-        )
 
     settings.company_logo = file_path
 
@@ -219,25 +293,7 @@ async def upload_signature(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db_session)
 ):
-    import os
-    import shutil
 
-    # =====================================================
-    # ALLOWED IMAGE TYPES ONLY
-    # =====================================================
-    allowed_extensions = {".png", ".jpg", ".jpeg"}
-
-    ext = os.path.splitext(file.filename)[1].lower()
-
-    if ext not in allowed_extensions:
-        raise HTTPException(
-            status_code=400,
-            detail="Only PNG, JPG, and JPEG files are allowed for signature images."
-        )
-
-    # =====================================================
-    # GET OR CREATE COMPANY SETTINGS
-    # =====================================================
     result = await db.execute(
         select(CompanySettings)
     )
@@ -248,27 +304,12 @@ async def upload_signature(
         settings = CompanySettings()
         db.add(settings)
 
-    # =====================================================
-    # ENSURE UPLOAD DIRECTORY EXISTS
-    # =====================================================
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    file_path = await validate_and_save_image(
+        file=file,
+        upload_dir=UPLOAD_DIR,
+        prefix="signature"
+    )
 
-    # =====================================================
-    # SANITIZE FILE NAME
-    # =====================================================
-    safe_filename = os.path.basename(file.filename)
-
-    # =====================================================
-    # SAVE FILE
-    # =====================================================
-    file_path = f"{UPLOAD_DIR}/signature_{safe_filename}"
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # =====================================================
-    # SAVE PATH IN DATABASE
-    # =====================================================
     settings.signature_image = file_path
 
     await db.commit()

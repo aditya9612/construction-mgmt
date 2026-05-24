@@ -195,3 +195,7 @@ class DocumentStatus(str, Enum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
     UNDER_REVIEW = "UNDER_REVIEW"
+
+class ChecklistStatus(str, Enum):
+    DONE = "DONE"
+    PENDING = "PENDING"

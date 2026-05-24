@@ -26,8 +26,10 @@ async def create_approval(
         select(Approval).where(
             Approval.entity_type == payload.entity_type,
             Approval.entity_id == payload.entity_id,
+            Approval.status == "Pending",
         )
     )
+    
     if existing:
         raise ValidationError("Approval already exists")
 
@@ -40,7 +42,33 @@ async def create_approval(
     )
 
     db.add(obj)
+
     await db.flush()
+
+    if payload.entity_type == "boq":
+        from app.models.boq import BOQ
+
+        boq = await db.get(BOQ, payload.entity_id)
+
+        if boq:
+            boq.approval_status = "Pending"
+
+    elif obj.entity_type == "drawing":
+        from app.models.project import DrawingDocument
+        from app.core.enums import DocumentStatus
+
+        drawing = await db.get(
+            DrawingDocument,
+            obj.entity_id
+        )
+
+        if drawing:
+            drawing.approval_status = DocumentStatus.UNDER_REVIEW
+            drawing.approval_id = obj.id
+            
+    await db.flush()
+    await db.commit()
+    await db.refresh(obj)
 
     return ApprovalOut.model_validate(obj)
 
@@ -80,8 +108,29 @@ async def approve(
         if bill:
             bill.status = "Approved"
 
-    await db.flush()
+    elif obj.entity_type == "boq":
+        from app.models.boq import BOQ
 
+        boq = await db.get(BOQ, obj.entity_id)
+
+        if boq:
+            boq.approval_status = "Approved"
+
+    elif obj.entity_type == "drawing":
+        from app.models.project import DrawingDocument
+        from app.core.enums import DocumentStatus
+
+        drawing = await db.get(
+            DrawingDocument,
+            obj.entity_id
+        )
+
+        if drawing:
+            drawing.approval_status = DocumentStatus.APPROVED
+            drawing.approval_id = obj.id
+
+    await db.flush()
+    await db.commit()
     return {"message": "Approved"}
 
 
@@ -99,6 +148,12 @@ async def reject(
     if obj.status == "Rejected":
         raise ValidationError("Already rejected")
 
+
+    if not payload.remarks:
+        raise ValidationError(
+            "Remarks required for rejection"
+        )
+
     obj.status = "Rejected"
     obj.approved_by = current_user.id
     obj.remarks = payload.remarks
@@ -110,6 +165,27 @@ async def reject(
         if bill:
             bill.status = "Rejected"
 
-    await db.flush()
+    elif obj.entity_type == "boq":
+        from app.models.boq import BOQ
 
+        boq = await db.get(BOQ, obj.entity_id)
+
+        if boq:
+            boq.approval_status = "Rejected"
+
+    elif obj.entity_type == "drawing":
+        from app.models.project import DrawingDocument
+        from app.core.enums import DocumentStatus
+
+        drawing = await db.get(
+            DrawingDocument,
+            obj.entity_id
+        )
+
+        if drawing:
+            drawing.approval_status = DocumentStatus.REJECTED
+            drawing.approval_id = obj.id
+
+    await db.flush()
+    await db.commit()
     return {"message": "Rejected"}

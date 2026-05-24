@@ -2,7 +2,11 @@ from pydantic import BaseModel, field_validator
 from datetime import date
 from typing import Optional
 from decimal import Decimal
-
+from app.core.validators import (
+    validate_positive_required,
+    validate_non_negative,
+    validate_bill_date,
+)
 
 class RABillBase(BaseModel):
     project_id: int
@@ -17,16 +21,15 @@ class RABillBase(BaseModel):
     bill_date: date
 
     @field_validator("quantity", "rate")
-    def validate_positive_required(cls, v):
-        if v <= 0:
-            raise ValueError("Must be greater than 0")
-        return v
+    @classmethod
+    def positive_validator(cls, v):
+        return validate_positive_required(v)
+
 
     @field_validator("deductions", "gst_percent")
-    def validate_non_negative(cls, v):
-        if v < 0:
-            raise ValueError("Cannot be negative")
-        return v
+    @classmethod
+    def non_negative_validator(cls, v):
+        return validate_non_negative(v)
 
 
 class RABillCreate(RABillBase):
@@ -43,12 +46,26 @@ class RABillUpdate(BaseModel):
     status: Optional[str] = None
     bill_date: Optional[date] = None
 
-    @field_validator("bill_date")
-    def validate_bill_date(cls, v):
-        if v and v > date.today():
-            raise ValueError("Future bill date not allowed")
-        return v
+    @field_validator("quantity", "rate")
+    @classmethod
+    def positive_validator(cls, v):
+        if v is None:
+            return v
+        return validate_positive_required(v)
 
+
+    @field_validator("deductions", "gst_percent")
+    @classmethod
+    def non_negative_validator(cls, v):
+        if v is None:
+            return v
+        return validate_non_negative(v)
+
+
+    @field_validator("bill_date")
+    @classmethod
+    def bill_date_validator(cls, v):
+        return validate_bill_date(v)
 
 class RABillOut(BaseModel):
     id: int

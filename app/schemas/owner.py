@@ -14,7 +14,7 @@ class OwnerCreate(BaseSchema):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     pan: Optional[str] = None
-    satisfaction_score: Optional[float] = Field(0.0, ge=0, le=100)
+    satisfaction_score: float = Field( 0.0, ge=0, le=100 )
 
     @field_validator("pan")
     @classmethod
@@ -36,7 +36,7 @@ class OwnerUpdate(BaseSchema):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     pan: Optional[str] = None
-    satisfaction_score: Optional[float] = Field(None, ge=0, le=100)
+    satisfaction_score: float = Field( 0.0, ge=0, le=100 )
 
     @field_validator("pan")
     @classmethod

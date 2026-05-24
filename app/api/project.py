@@ -7,7 +7,8 @@ from openpyxl import Workbook
 from typing import Annotated, List, Optional, Union
 from fastapi import APIRouter, Depends, Query, Request, Form
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.enums import PRIORITY_MAP, REVERSE_PRIORITY_MAP, LabourStatus, MilestoneStatus, SkillType, TaskPriority, WorkActivityStatus
+from app.core.enums import PRIORITY_MAP, REVERSE_PRIORITY_MAP, DocumentStatus, LabourStatus, MilestoneStatus, SkillType, TaskPriority, WorkActivityStatus
+from app.core.validators import validate_drawing_file
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
@@ -28,7 +29,7 @@ from app.core.dependencies import (
     require_roles,
 )
 from app.models.contractor import Contractor
-from sqlalchemy import delete, select, func, or_
+from sqlalchemy import delete, select, func, or_, update
 from app.models import project as m
 from app.models.messages import MessageStatus
 from app.models.user import User, UserRole
@@ -59,22 +60,23 @@ from app.utils.common import assert_project_access, generate_business_id
 def compute_project_status(project):
     today = date.today()
 
-    # Highest priority statuses from database
     if project.status == s.ProjectStatus.ON_HOLD:
         return "On Hold"
 
     if project.status == s.ProjectStatus.COMPLETED:
         return "Completed"
 
-    # Date-based computed statuses
-    if project.start_date and today < project.start_date:
+    if project.status == s.ProjectStatus.PLANNED:
         return "Planned"
 
-    if project.end_date and today > project.end_date:
+    if (
+        project.status == s.ProjectStatus.ONGOING
+        and project.end_date
+        and today > project.end_date
+    ):
         return "Delayed"
 
-    # Default running state
-    return "Active"
+    return "Ongoing"
 
 def compute_milestone_status(milestone):
     today = date.today()
@@ -1080,6 +1082,7 @@ class TasksService:
         return s.TaskOut(
             id=task.id,
             project_id=task.project_id,
+            boq_id=task.boq_id,
             title=task.title,
             description=task.description,
             priority=PRIORITY_MAP.get(task.priority, TaskPriority.MEDIUM),
@@ -4174,6 +4177,14 @@ def update_activity_status(activity):
 # ==============work progress===========================================
 # 1. CREATE ACTIVITY
 
+from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
+from fastapi import HTTPException, Depends
+from decimal import Decimal, ROUND_HALF_UP
+
+# =========================================================
+# CREATE ACTIVITY
+
 
 @work_progress_router.post("/activities")
 async def create_activity(
@@ -4183,6 +4194,59 @@ async def create_activity(
 ):
 
     try:
+
+        # ================= CLEAN ACTIVITY NAME =================
+
+        data.activity_name = data.activity_name.strip()
+
+        # ================= VALIDATE ACTIVITY NAME =================
+
+        if not data.activity_name:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Activity name cannot be empty",
+            )
+
+        # ================= VALIDATE PLANNED QUANTITY =================
+
+        if data.planned_quantity <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Planned quantity must be greater than 0",
+            )
+
+        # ================= VALIDATE DATES =================
+
+        if data.end_date < data.start_date:
+
+            raise HTTPException(
+                status_code=400,
+                detail="End date cannot be before start date",
+            )
+
+        # ================= CHECK DUPLICATE ACTIVITY =================
+
+        duplicate_stmt = select(WorkActivity).where(
+            WorkActivity.project_id == data.project_id,
+            WorkActivity.work_order_id == data.work_order_id,
+            WorkActivity.boq_code == data.boq_code,
+            func.lower(WorkActivity.activity_name) == data.activity_name.lower(),
+        )
+
+        duplicate_result = await db.execute(duplicate_stmt)
+
+        existing_activity = duplicate_result.scalars().first()
+
+        # ================= DUPLICATE FOUND =================
+
+        if existing_activity:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Activity already exists for this BOQ and Work Order",
+            )
 
         # ================= CREATE ACTIVITY =================
 
@@ -4196,7 +4260,11 @@ async def create_activity(
             completion_percentage=Decimal("0.00"),
         )
 
+        # ================= UPDATE STATUS =================
+
         update_activity_status(activity)
+
+        # ================= ADD TO DB =================
 
         db.add(activity)
 
@@ -4222,6 +4290,8 @@ async def create_activity(
 
         await db.commit()
 
+        # ================= REFRESH =================
+
         await db.refresh(activity)
 
         # ================= RESPONSE =================
@@ -4231,7 +4301,15 @@ async def create_activity(
             "data": activity,
         }
 
-    # ================= FOREIGN KEY / CONSTRAINT ERRORS =================
+    # ================= HANDLE CUSTOM VALIDATION ERRORS =================
+
+    except HTTPException:
+
+        await db.rollback()
+
+        raise
+
+    # ================= HANDLE DB CONSTRAINT ERRORS =================
 
     except IntegrityError as e:
 
@@ -4241,10 +4319,10 @@ async def create_activity(
 
         raise HTTPException(
             status_code=400,
-            detail=str(e),
+            detail="Duplicate or invalid database entry",
         )
 
-    # ================= INTERNAL SERVER ERROR =================
+    # ================= HANDLE UNKNOWN ERRORS =================
 
     except Exception as e:
 
@@ -4254,12 +4332,18 @@ async def create_activity(
 
         raise HTTPException(
             status_code=500,
-            detail=str(e),
+            detail="Something went wrong",
         )
 
 
 # =========================================================
 # 2. LIST ACTIVITIES
+
+from sqlalchemy import select, func
+from fastapi import Query, Depends, HTTPException
+
+# =========================================================
+# LIST ACTIVITIES
 
 
 @work_progress_router.get("/activities")
@@ -4267,52 +4351,109 @@ async def list_activities(
     project_id: int | None = None,
     status: WorkActivityStatus | None = None,
     engineer_id: int | None = None,
-    # Pagination
+    search: str | None = None,
+    # ================= PAGINATION =================
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    stmt = select(WorkActivity)
+    try:
 
-    # ================= FILTERS =================
+        # ================= BASE QUERY =================
 
-    if project_id:
-        stmt = stmt.where(WorkActivity.project_id == project_id)
+        stmt = select(WorkActivity)
 
-    if status:
-        stmt = stmt.where(WorkActivity.status == status)
+        count_stmt = select(func.count()).select_from(WorkActivity)
 
-    if engineer_id:
-        stmt = stmt.where(WorkActivity.engineer_id == engineer_id)
+        # ================= FILTER : PROJECT =================
 
-    # ================= ORDERING =================
+        if project_id is not None:
 
-    stmt = stmt.order_by(WorkActivity.created_at.desc())
+            stmt = stmt.where(WorkActivity.project_id == project_id)
 
-    # ================= PAGINATION =================
+            count_stmt = count_stmt.where(WorkActivity.project_id == project_id)
 
-    stmt = stmt.offset(offset).limit(limit)
+        # ================= FILTER : STATUS =================
 
-    # ================= EXECUTE =================
+        if status is not None:
 
-    result = await db.execute(stmt)
+            stmt = stmt.where(WorkActivity.status == status)
 
-    activities = result.scalars().all()
+            count_stmt = count_stmt.where(WorkActivity.status == status)
 
-    # ================= RESPONSE =================
+        # ================= FILTER : ENGINEER =================
 
-    return {
-        "limit": limit,
-        "offset": offset,
-        "page_count": len(activities),
-        "data": activities,
-    }
+        if engineer_id is not None:
+
+            stmt = stmt.where(WorkActivity.engineer_id == engineer_id)
+
+            count_stmt = count_stmt.where(WorkActivity.engineer_id == engineer_id)
+
+        # ================= SEARCH : ACTIVITY NAME =================
+
+        if search:
+
+            search = search.strip()
+
+            stmt = stmt.where(WorkActivity.activity_name.ilike(f"%{search}%"))
+
+            count_stmt = count_stmt.where(
+                WorkActivity.activity_name.ilike(f"%{search}%")
+            )
+
+        # ================= ORDERING =================
+
+        stmt = stmt.order_by(WorkActivity.created_at.desc())
+
+        # ================= PAGINATION =================
+
+        stmt = stmt.offset(offset).limit(limit)
+
+        # ================= EXECUTE ACTIVITY QUERY =================
+
+        result = await db.execute(stmt)
+
+        activities = result.scalars().all()
+
+        # ================= EXECUTE COUNT QUERY =================
+
+        total_result = await db.execute(count_stmt)
+
+        total_count = total_result.scalar()
+
+        # ================= RESPONSE =================
+
+        return {
+            "success": True,
+            "limit": limit,
+            "offset": offset,
+            "page_count": len(activities),
+            "total_count": total_count,
+            "data": activities,
+        }
+
+    # ================= HANDLE ERRORS =================
+
+    except Exception as e:
+
+        print("LIST ACTIVITIES ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
 
 # =========================================================
 # 3. GET SINGLE ACTIVITY
+
+from sqlalchemy import select
+from fastapi import Depends, HTTPException
+
+# =========================================================
+# GET SINGLE ACTIVITY
 
 
 @work_progress_router.get("/activities/{id}")
@@ -4322,176 +4463,73 @@ async def get_activity(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    result = await db.execute(select(WorkActivity).where(WorkActivity.id == id))
-    activity = result.scalars().first()
-
-    # ================= NOT FOUND =================
-
-    if not activity:
-        raise HTTPException(status_code=404, detail="Activity Not Found")
-
-    return activity
-
-
-# =========================================================
-# 4. UPDATE ACTIVITY
-
-@work_progress_router.put("/activities/{id}")
-async def update_activity(
-    id: int,
-    data: s.WorkActivityUpdate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-
-    # ================= GET ACTIVITY =================
-
-    result = await db.execute(select(WorkActivity).where(WorkActivity.id == id))
-
-    activity = result.scalars().first()
-
-    # ================= NOT FOUND =================
-
-    if not activity:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Activity Not Found",
-        )
-
-    # ================= STORE OLD DATA FOR AUDIT =================
-
-    old_data = {
-        "activity_name": activity.activity_name,
-        "planned_quantity": str(activity.planned_quantity),
-        "status": activity.status.value,
-    }
-
-    # ================= VALIDATE DATES =================
-
-    new_start_date = data.start_date or activity.start_date
-
-    new_end_date = data.end_date or activity.end_date
-
-    if new_end_date < new_start_date:
-
-        raise HTTPException(
-            status_code=400,
-            detail="End date cannot be before start date",
-        )
-
-    # ================= VALIDATE PLANNED QUANTITY =================
-
-    if (
-        data.planned_quantity is not None
-        and data.planned_quantity < activity.total_completed
-    ):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Planned quantity cannot be less than completed quantity",
-        )
-
-    # ================= UPDATE FIELDS =================
-
-    update_data = data.dict(exclude_unset=True)
-
-    for key, value in update_data.items():
-
-        setattr(activity, key, value)
-
-    # ================= RECALCULATE VALUES =================
-
-    if activity.planned_quantity > 0:
-
-        # ================= REMAINING QUANTITY =================
-
-        activity.remaining_quantity = (
-            activity.planned_quantity - activity.total_completed
-        ).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_HALF_UP,
-        )
-
-        # ================= COMPLETION PERCENTAGE =================
-
-        percentage = (
-            (activity.total_completed / activity.planned_quantity)
-            * Decimal("100")
-        ).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_HALF_UP,
-        )
-
-        # ================= PREVENT ABOVE 100 =================
-
-        activity.completion_percentage = min(
-            percentage,
-            Decimal("100.00"),
-        )
-
-    else:
-
-        activity.remaining_quantity = Decimal("0.00")
-
-        activity.completion_percentage = Decimal("0.00")
-
-    # ================= STATUS UPDATE =================
-
-    update_activity_status(activity)
-
-    # ================= STORE NEW DATA FOR AUDIT =================
-
-    new_data = {
-        "activity_name": activity.activity_name,
-        "planned_quantity": str(activity.planned_quantity),
-        "status": activity.status.value,
-    }
-
-    # ================= SAVE =================
-
     try:
 
-        # ================= CREATE AUDIT LOG =================
+        # ================= VALIDATE ID =================
 
-        await create_activity_log(
-            db=db,
-            activity_id=activity.id,
-            action="UPDATE",
-            changed_by=current_user.id,
-            old_value=old_data,
-            new_value=new_data,
-        )
+        if id <= 0:
 
-        await db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid activity ID",
+            )
 
-        await db.refresh(activity)
+        # ================= FETCH ACTIVITY =================
 
-    # ================= DB ERROR =================
+        result = await db.execute(select(WorkActivity).where(WorkActivity.id == id))
 
-    except Exception:
+        activity = result.scalars().first()
 
-        await db.rollback()
+        # ================= NOT FOUND =================
+
+        if not activity:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Activity Not Found",
+            )
+
+        # ================= RESPONSE =================
+
+        return {
+            "success": True,
+            "data": activity,
+        }
+
+    # ================= HANDLE CUSTOM ERRORS =================
+
+    except HTTPException:
+
+        raise
+
+    # ================= HANDLE UNKNOWN ERRORS =================
+
+    except Exception as e:
+
+        print("GET ACTIVITY ERROR =>", str(e))
 
         raise HTTPException(
             status_code=500,
             detail="Something went wrong",
         )
 
-    # ================= RESPONSE =================
-
-    return {
-        "message": "Activity Updated",
-        "data": activity,
-    }
 
 # =========================================================
-# 5. DELETE ACTIVITY
+# 4. UPDATE ACTIVITY
+
+from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
+from fastapi import Depends, HTTPException
+from decimal import Decimal, ROUND_HALF_UP
+
+# =========================================================
+# UPDATE ACTIVITY
 
 
-@work_progress_router.delete("/activities/{id}")
-async def delete_activity(
+@work_progress_router.put("/activities/{id}")
+async def update_activity(
     id: int,
+    data: s.WorkActivityUpdate,
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -4511,6 +4549,247 @@ async def delete_activity(
             raise HTTPException(
                 status_code=404,
                 detail="Activity Not Found",
+            )
+
+        # ================= CLEAN ACTIVITY NAME =================
+
+        if data.activity_name is not None:
+
+            data.activity_name = data.activity_name.strip()
+
+            if not data.activity_name:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Activity name cannot be empty",
+                )
+
+        # ================= STORE OLD DATA FOR AUDIT =================
+
+        old_data = {
+            "activity_name": activity.activity_name,
+            "planned_quantity": str(activity.planned_quantity),
+            "status": activity.status.value,
+        }
+
+        # ================= VALIDATE DATES =================
+
+        new_start_date = data.start_date or activity.start_date
+
+        new_end_date = data.end_date or activity.end_date
+
+        if new_end_date < new_start_date:
+
+            raise HTTPException(
+                status_code=400,
+                detail="End date cannot be before start date",
+            )
+
+        # ================= VALIDATE PLANNED QUANTITY =================
+
+        if data.planned_quantity is not None:
+
+            if data.planned_quantity <= 0:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Planned quantity must be greater than 0",
+                )
+
+            if data.planned_quantity < activity.total_completed:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Planned quantity cannot be less than completed quantity",
+                )
+
+        # ================= CHECK DUPLICATE ACTIVITY =================
+
+        duplicate_name = (
+            data.activity_name
+            if data.activity_name is not None
+            else activity.activity_name
+        )
+
+        duplicate_stmt = select(WorkActivity).where(
+            WorkActivity.project_id == activity.project_id,
+            WorkActivity.work_order_id == activity.work_order_id,
+            WorkActivity.boq_code == activity.boq_code,
+            func.lower(WorkActivity.activity_name) == duplicate_name.lower(),
+            WorkActivity.id != activity.id,
+        )
+
+        duplicate_result = await db.execute(duplicate_stmt)
+
+        existing_activity = duplicate_result.scalars().first()
+
+        if existing_activity:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Another activity with same name already exists",
+            )
+
+        # ================= UPDATE FIELDS =================
+
+        update_data = data.model_dump(exclude_unset=True)
+
+        for key, value in update_data.items():
+
+            setattr(activity, key, value)
+
+        # ================= RECALCULATE VALUES =================
+
+        if activity.planned_quantity > 0:
+
+            activity.remaining_quantity = (
+                activity.planned_quantity - activity.total_completed
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+
+            percentage = (
+                (activity.total_completed / activity.planned_quantity) * Decimal("100")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+
+            activity.completion_percentage = min(
+                percentage,
+                Decimal("100.00"),
+            )
+
+        else:
+
+            activity.remaining_quantity = Decimal("0.00")
+
+            activity.completion_percentage = Decimal("0.00")
+
+        # ================= STATUS UPDATE =================
+
+        update_activity_status(activity)
+
+        # ================= STORE NEW DATA FOR AUDIT =================
+
+        new_data = {
+            "activity_name": activity.activity_name,
+            "planned_quantity": str(activity.planned_quantity),
+            "status": activity.status.value,
+        }
+
+        # ================= SAVE =================
+
+        await create_activity_log(
+            db=db,
+            activity_id=activity.id,
+            action="UPDATE",
+            changed_by=current_user.id,
+            old_value=old_data,
+            new_value=new_data,
+        )
+
+        await db.commit()
+
+        await db.refresh(activity)
+
+        # ================= RESPONSE =================
+
+        return {
+            "message": "Activity Updated",
+            "data": activity,
+        }
+
+    # ================= HANDLE VALIDATION ERRORS =================
+
+    except HTTPException:
+
+        await db.rollback()
+
+        raise
+
+    # ================= DB ERROR =================
+
+    except IntegrityError as e:
+
+        await db.rollback()
+
+        print("INTEGRITY ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=400,
+            detail="Database integrity error",
+        )
+
+    # ================= INTERNAL SERVER ERROR =================
+
+    except Exception as e:
+
+        await db.rollback()
+
+        print("UPDATE ACTIVITY ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
+
+
+# =========================================================
+# 5. DELETE ACTIVITY
+
+
+@work_progress_router.delete("/activities/{id}")
+async def delete_activity(
+    id: int,
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    try:
+
+        # ================= VALIDATE ID =================
+
+        if id <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid activity ID",
+            )
+
+        # ================= GET ACTIVITY =================
+
+        result = await db.execute(select(WorkActivity).where(WorkActivity.id == id))
+
+        activity = result.scalars().first()
+
+        # ================= NOT FOUND =================
+
+        if not activity:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Activity Not Found",
+            )
+
+        # ================= CHECK DAILY PROGRESS EXISTS =================
+
+        progress_result = await db.execute(
+            select(DailyProgressEntry).where(
+                DailyProgressEntry.activity_id == activity.id
+            )
+        )
+
+        existing_progress = progress_result.scalars().first()
+
+        # ================= PREVENT DELETE =================
+
+        if existing_progress:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot delete activity with daily progress entries",
             )
 
         # ================= CREATE DELETE AUDIT LOG =================
@@ -4546,13 +4825,26 @@ async def delete_activity(
             "message": "Activity Deleted Successfully",
         }
 
-    # ================= HANDLE HTTP ERRORS =================
+    # ================= HANDLE VALIDATION ERRORS =================
 
     except HTTPException:
 
         await db.rollback()
 
         raise
+
+    # ================= HANDLE DB ERRORS =================
+
+    except IntegrityError as e:
+
+        await db.rollback()
+
+        print("INTEGRITY ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=400,
+            detail="Database integrity error",
+        )
 
     # ================= HANDLE OTHER ERRORS =================
 
@@ -4571,6 +4863,7 @@ async def delete_activity(
 # =========================================================
 # 6. ADD DAILY PROGRESS
 
+
 @work_progress_router.post(
     "/daily-entry",
     response_model=s.DailyProgressWithActivityResponse,
@@ -4581,136 +4874,176 @@ async def add_daily_progress(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    # ================= CHECK ACTIVITY EXISTS =================
+    try:
 
-    result = await db.execute(
-        select(WorkActivity)
-        .where(WorkActivity.id == data.activity_id)
-        .with_for_update()
-    )
+        # ================= VALIDATE ACTIVITY ID =================
 
-    activity = result.scalars().first()
+        if data.activity_id <= 0:
 
-    if not activity:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid activity ID",
+            )
 
-        raise HTTPException(
-            status_code=404,
-            detail="Activity Not Found",
+        # ================= VALIDATE TODAY PROGRESS =================
+
+        if data.today_progress <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Today progress must be greater than 0",
+            )
+
+        # ================= CHECK ACTIVITY EXISTS =================
+
+        result = await db.execute(
+            select(WorkActivity)
+            .where(WorkActivity.id == data.activity_id)
+            .with_for_update()
         )
 
-    # ================= STORE OLD DATA FOR AUDIT =================
+        activity = result.scalars().first()
 
-    old_data = {
-        "total_completed": str(activity.total_completed),
-        "completion_percentage": str(activity.completion_percentage),
-        "status": activity.status.value,
-    }
+        # ================= ACTIVITY NOT FOUND =================
 
-    # ================= DECIMAL CONVERSIONS =================
+        if not activity:
 
-    current_completed = Decimal(str(activity.total_completed or 0))
+            raise HTTPException(
+                status_code=404,
+                detail="Activity Not Found",
+            )
 
-    today_progress = Decimal(str(data.today_progress))
+        # ================= STORE OLD DATA FOR AUDIT =================
 
-    planned_quantity = Decimal(str(activity.planned_quantity or 0))
+        old_data = {
+            "total_completed": str(activity.total_completed),
+            "completion_percentage": str(activity.completion_percentage),
+            "status": activity.status.value,
+        }
 
-    # ================= CALCULATE PROGRESS =================
+        # ================= DECIMAL CONVERSIONS =================
 
-    new_completed = current_completed + today_progress
+        current_completed = Decimal(str(activity.total_completed or 0))
 
-    # ================= VALIDATE OVER PROGRESS =================
+        today_progress = Decimal(str(data.today_progress))
 
-    if new_completed > planned_quantity:
+        planned_quantity = Decimal(str(activity.planned_quantity or 0))
 
-        await db.rollback()
+        # ================= CALCULATE PROGRESS =================
 
-        raise HTTPException(
-            status_code=400,
-            detail="Progress cannot exceed planned quantity",
+        new_completed = current_completed + today_progress
+
+        # ================= VALIDATE OVER PROGRESS =================
+
+        if new_completed > planned_quantity:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Progress cannot exceed planned quantity",
+            )
+
+        # ================= CREATE ENTRY =================
+
+        entry = DailyProgressEntry(
+            activity_id=data.activity_id,
+            entry_date=data.entry_date,
+            today_progress=data.today_progress,
+            remarks=data.remarks,
+            created_by=current_user.id,
         )
 
-    # ================= CREATE ENTRY =================
+        # ================= ADD ENTRY =================
 
-    entry = DailyProgressEntry(
-        activity_id=data.activity_id,
-        entry_date=data.entry_date,
-        today_progress=data.today_progress,
-        remarks=data.remarks,
-        created_by=current_user.id,
-    )
+        db.add(entry)
 
-    db.add(entry)
+        # ================= UPDATE ACTIVITY =================
 
-    # ================= UPDATE ACTIVITY =================
-
-    activity.total_completed = new_completed.quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP,
-    )
-
-    activity.remaining_quantity = (planned_quantity - new_completed).quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP,
-    )
-
-    # ================= COMPLETION PERCENTAGE =================
-
-    if planned_quantity > 0:
-
-        percentage = ((new_completed / planned_quantity) * Decimal("100")).quantize(
+        activity.total_completed = new_completed.quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
 
-        # ================= PREVENT ABOVE 100 =================
-
-        activity.completion_percentage = min(
-            percentage,
-            Decimal("100.00"),
+        activity.remaining_quantity = (planned_quantity - new_completed).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
         )
 
-    else:
+        # ================= COMPLETION PERCENTAGE =================
 
-        activity.completion_percentage = Decimal("0.00")
+        if planned_quantity > 0:
 
-    # ================= STATUS UPDATE =================
+            percentage = ((new_completed / planned_quantity) * Decimal("100")).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
 
-    update_activity_status(activity)
+            # ================= PREVENT ABOVE 100 =================
 
-    # ================= STORE NEW DATA FOR AUDIT =================
+            activity.completion_percentage = min(
+                percentage,
+                Decimal("100.00"),
+            )
 
-    new_data = {
-        "total_completed": str(activity.total_completed),
-        "completion_percentage": str(activity.completion_percentage),
-        "status": activity.status.value,
-    }
+        else:
 
-    # ================= CREATE AUDIT LOG =================
+            activity.completion_percentage = Decimal("0.00")
 
-    await create_activity_log(
-        db=db,
-        activity_id=activity.id,
-        action="DAILY_PROGRESS_ADD",
-        changed_by=current_user.id,
-        old_value=old_data,
-        new_value=new_data,
-    )
+        # ================= STATUS UPDATE =================
 
-    # ================= SAVE TO DB =================
+        update_activity_status(activity)
 
-    try:
+        # ================= STORE NEW DATA FOR AUDIT =================
+
+        new_data = {
+            "total_completed": str(activity.total_completed),
+            "completion_percentage": str(activity.completion_percentage),
+            "status": activity.status.value,
+        }
+
+        # ================= CREATE AUDIT LOG =================
+
+        await create_activity_log(
+            db=db,
+            activity_id=activity.id,
+            action="DAILY_PROGRESS_ADD",
+            changed_by=current_user.id,
+            old_value=old_data,
+            new_value=new_data,
+        )
+
+        # ================= SAVE TO DB =================
 
         await db.commit()
+
+        # ================= REFRESH =================
 
         await db.refresh(entry)
 
         await db.refresh(activity)
 
-    # ================= DUPLICATE ENTRY =================
+        # ================= RESPONSE =================
 
-    except IntegrityError:
+        return {
+            "message": "Progress Added",
+            "progress": entry,
+            "activity": activity,
+        }
+
+    # ================= HANDLE VALIDATION ERRORS =================
+
+    except HTTPException:
 
         await db.rollback()
+
+        raise
+
+    # ================= DUPLICATE ENTRY =================
+
+    except IntegrityError as e:
+
+        await db.rollback()
+
+        print("INTEGRITY ERROR =>", str(e))
 
         raise HTTPException(
             status_code=400,
@@ -4719,74 +5052,115 @@ async def add_daily_progress(
 
     # ================= OTHER ERRORS =================
 
-    except Exception:
+    except Exception as e:
 
         await db.rollback()
+
+        print("ADD DAILY PROGRESS ERROR =>", str(e))
 
         raise HTTPException(
             status_code=500,
             detail="Something went wrong",
         )
 
-    # ================= RESPONSE =================
-
-    return {
-        "message": "Progress Added",
-        "progress": entry,
-        "activity": activity,
-    }
-
-
 
 # =========================================================
 # 7. LIST DAILY ENTRIES
+
 
 @work_progress_router.get("/daily-entry")
 async def list_daily_entries(
     activity_id: int | None = None,
     entry_date: date | None = None,
+    # ================= PAGINATION =================
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    stmt = select(DailyProgressEntry)
+    try:
 
-    # ================= FILTERS =================
+        # ================= BASE QUERY =================
 
-    if activity_id:
-        stmt = stmt.where(DailyProgressEntry.activity_id == activity_id)
+        stmt = select(DailyProgressEntry)
 
-    if entry_date:
-        stmt = stmt.where(DailyProgressEntry.entry_date == entry_date)
+        count_stmt = select(func.count()).select_from(DailyProgressEntry)
 
-    # ================= ORDERING =================
+        # ================= FILTER : ACTIVITY =================
 
-    stmt = stmt.order_by(DailyProgressEntry.entry_date.desc())
+        if activity_id is not None:
 
-    # ================= PAGINATION =================
+            if activity_id <= 0:
 
-    stmt = stmt.offset(offset).limit(limit)
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid activity ID",
+                )
 
-    # ================= EXECUTE =================
+            stmt = stmt.where(DailyProgressEntry.activity_id == activity_id)
 
-    result = await db.execute(stmt)
+            count_stmt = count_stmt.where(DailyProgressEntry.activity_id == activity_id)
 
-    entries = result.scalars().all()
+        # ================= FILTER : ENTRY DATE =================
 
-    # ================= RESPONSE =================
+        if entry_date is not None:
 
-    return {
-        "limit": limit,
-        "offset": offset,
-        "page_count": len(entries),
-        "data": entries,
-    }
+            stmt = stmt.where(DailyProgressEntry.entry_date == entry_date)
+
+            count_stmt = count_stmt.where(DailyProgressEntry.entry_date == entry_date)
+
+        # ================= ORDERING =================
+
+        stmt = stmt.order_by(DailyProgressEntry.entry_date.desc())
+
+        # ================= PAGINATION =================
+
+        stmt = stmt.offset(offset).limit(limit)
+
+        # ================= EXECUTE =================
+
+        result = await db.execute(stmt)
+
+        entries = result.scalars().all()
+
+        # ================= TOTAL COUNT =================
+
+        total_result = await db.execute(count_stmt)
+
+        total_count = total_result.scalar()
+
+        # ================= RESPONSE =================
+
+        return {
+            "limit": limit,
+            "offset": offset,
+            "page_count": len(entries),
+            "total_count": total_count,
+            "data": entries,
+        }
+
+    # ================= HANDLE VALIDATION ERRORS =================
+
+    except HTTPException:
+
+        raise
+
+    # ================= HANDLE OTHER ERRORS =================
+
+    except Exception as e:
+
+        print("LIST DAILY ENTRIES ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
 
 # =========================================================
 # 8. UPDATE DAILY ENTRY
+
 
 @work_progress_router.put("/daily-entry/{id}")
 async def update_daily_entry(
@@ -4798,6 +5172,24 @@ async def update_daily_entry(
 
     try:
 
+        # ================= VALIDATE ID =================
+
+        if id <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid daily entry ID",
+            )
+
+        # ================= VALIDATE TODAY PROGRESS =================
+
+        if data.today_progress is not None and data.today_progress <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Today progress must be greater than 0",
+            )
+
         # ================= LOCK DAILY ENTRY =================
 
         result = await db.execute(
@@ -4807,6 +5199,8 @@ async def update_daily_entry(
         )
 
         entry = result.scalars().first()
+
+        # ================= DAILY ENTRY NOT FOUND =================
 
         if not entry:
 
@@ -4824,6 +5218,8 @@ async def update_daily_entry(
         )
 
         activity = result.scalars().first()
+
+        # ================= ACTIVITY NOT FOUND =================
 
         if not activity:
 
@@ -4850,9 +5246,13 @@ async def update_daily_entry(
 
         # ================= UPDATE ENTRY =================
 
-        for key, value in data.dict(exclude_unset=True).items():
+        update_data = data.model_dump(exclude_unset=True)
+
+        for key, value in update_data.items():
 
             setattr(entry, key, value)
+
+        # ================= NEW PROGRESS =================
 
         new_progress = Decimal(str(entry.today_progress or 0))
 
@@ -4894,9 +5294,7 @@ async def update_daily_entry(
 
         if planned_quantity > 0:
 
-            percentage = (
-                (updated_total / planned_quantity) * Decimal("100")
-            ).quantize(
+            percentage = ((updated_total / planned_quantity) * Decimal("100")).quantize(
                 Decimal("0.01"),
                 rounding=ROUND_HALF_UP,
             )
@@ -4939,6 +5337,8 @@ async def update_daily_entry(
 
         await db.commit()
 
+        # ================= REFRESH =================
+
         await db.refresh(entry)
 
         await db.refresh(activity)
@@ -4951,7 +5351,7 @@ async def update_daily_entry(
             "activity": activity,
         }
 
-    # ================= HANDLE ERRORS =================
+    # ================= HANDLE VALIDATION ERRORS =================
 
     except HTTPException:
 
@@ -4959,15 +5359,31 @@ async def update_daily_entry(
 
         raise
 
-    except Exception:
+    # ================= HANDLE DB ERRORS =================
+
+    except IntegrityError as e:
 
         await db.rollback()
+
+        print("INTEGRITY ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=400,
+            detail="Database integrity error",
+        )
+
+    # ================= HANDLE OTHER ERRORS =================
+
+    except Exception as e:
+
+        await db.rollback()
+
+        print("UPDATE DAILY ENTRY ERROR =>", str(e))
 
         raise HTTPException(
             status_code=500,
             detail="Something went wrong",
         )
-
 
 
 # =========================================================
@@ -4983,6 +5399,15 @@ async def delete_daily_entry(
 
     try:
 
+        # ================= VALIDATE ID =================
+
+        if id <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid daily entry ID",
+            )
+
         # ================= LOCK DAILY ENTRY =================
 
         result = await db.execute(
@@ -4992,6 +5417,8 @@ async def delete_daily_entry(
         )
 
         entry = result.scalars().first()
+
+        # ================= DAILY ENTRY NOT FOUND =================
 
         if not entry:
 
@@ -5009,6 +5436,8 @@ async def delete_daily_entry(
         )
 
         activity = activity_result.scalars().first()
+
+        # ================= ACTIVITY NOT FOUND =================
 
         if not activity:
 
@@ -5116,7 +5545,7 @@ async def delete_daily_entry(
             "activity": activity,
         }
 
-    # ================= ERROR HANDLING =================
+    # ================= HANDLE VALIDATION ERRORS =================
 
     except HTTPException:
 
@@ -5124,9 +5553,26 @@ async def delete_daily_entry(
 
         raise
 
-    except Exception:
+    # ================= HANDLE DB ERRORS =================
+
+    except IntegrityError as e:
 
         await db.rollback()
+
+        print("INTEGRITY ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=400,
+            detail="Database integrity error",
+        )
+
+    # ================= HANDLE OTHER ERRORS =================
+
+    except Exception as e:
+
+        await db.rollback()
+
+        print("DELETE DAILY ENTRY ERROR =>", str(e))
 
         raise HTTPException(
             status_code=500,
@@ -5145,49 +5591,120 @@ async def project_summary(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    # ================= TOTAL ACTIVITIES =================
+    try:
 
-    total_result = await db.execute(
-        select(func.count())
-        .select_from(WorkActivity)
-        .where(WorkActivity.project_id == project_id)
-    )
+        # ================= VALIDATE PROJECT ID =================
 
-    total_activities = total_result.scalar()
+        if project_id <= 0:
 
-    # ================= COMPLETED ACTIVITIES =================
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid project ID",
+            )
 
-    completed_result = await db.execute(
-        select(func.count())
-        .select_from(WorkActivity)
-        .where(
-            WorkActivity.project_id == project_id,
-            WorkActivity.status == WorkActivityStatus.COMPLETED,
+        # ================= TOTAL ACTIVITIES =================
+
+        total_result = await db.execute(
+            select(func.count())
+            .select_from(WorkActivity)
+            .where(WorkActivity.project_id == project_id)
         )
-    )
 
-    completed = completed_result.scalar()
+        total_activities = total_result.scalar() or 0
 
-    # ================= DELAYED ACTIVITIES =================
+        # ================= COMPLETED ACTIVITIES =================
 
-    delayed_result = await db.execute(
-        select(func.count())
-        .select_from(WorkActivity)
-        .where(
-            WorkActivity.project_id == project_id,
-            WorkActivity.status == WorkActivityStatus.DELAY,
+        completed_result = await db.execute(
+            select(func.count())
+            .select_from(WorkActivity)
+            .where(
+                WorkActivity.project_id == project_id,
+                WorkActivity.status == WorkActivityStatus.COMPLETED,
+            )
         )
-    )
 
-    delayed = delayed_result.scalar()
+        completed = completed_result.scalar() or 0
 
-    # ================= RESPONSE =================
+        # ================= DELAYED ACTIVITIES =================
 
-    return {
-        "total_activities": total_activities,
-        "completed_activities": completed,
-        "delayed_activities": delayed,
-    }
+        delayed_result = await db.execute(
+            select(func.count())
+            .select_from(WorkActivity)
+            .where(
+                WorkActivity.project_id == project_id,
+                WorkActivity.status == WorkActivityStatus.DELAY,
+            )
+        )
+
+        delayed = delayed_result.scalar() or 0
+
+        # ================= ON TRACK ACTIVITIES =================
+
+        on_track_result = await db.execute(
+            select(func.count())
+            .select_from(WorkActivity)
+            .where(
+                WorkActivity.project_id == project_id,
+                WorkActivity.status == WorkActivityStatus.ON_TRACK,
+            )
+        )
+
+        on_track = on_track_result.scalar() or 0
+
+        # ================= NOT STARTED ACTIVITIES =================
+
+        not_started_result = await db.execute(
+            select(func.count())
+            .select_from(WorkActivity)
+            .where(
+                WorkActivity.project_id == project_id,
+                WorkActivity.status == WorkActivityStatus.NOT_STARTED,
+            )
+        )
+
+        not_started = not_started_result.scalar() or 0
+
+        # ================= COMPLETION PERCENTAGE =================
+
+        completion_percentage = Decimal("0.00")
+
+        if total_activities > 0:
+
+            completion_percentage = (
+                (Decimal(completed) / Decimal(total_activities)) * Decimal("100")
+            ).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+
+        # ================= RESPONSE =================
+
+        return {
+            "project_id": project_id,
+            "total_activities": total_activities,
+            "completed_activities": completed,
+            "delayed_activities": delayed,
+            "on_track_activities": on_track,
+            "not_started_activities": not_started,
+            "completion_percentage": completion_percentage,
+        }
+
+    # ================= HANDLE VALIDATION ERRORS =================
+
+    except HTTPException:
+
+        raise
+
+    # ================= HANDLE OTHER ERRORS =================
+
+    except Exception as e:
+
+        print("PROJECT SUMMARY ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
 
 # =========================================================
@@ -5196,37 +5713,65 @@ async def project_summary(
 
 @work_progress_router.get("/delay-report")
 async def delay_report(
-    # Pagination
+    # ================= PAGINATION =================
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    # ================= QUERY =================
+    try:
 
-    stmt = (
-        select(WorkActivity)
-        .where(WorkActivity.status == WorkActivityStatus.DELAY)
-        .order_by(WorkActivity.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-    )
+        # ================= TOTAL COUNT QUERY =================
 
-    # ================= EXECUTE =================
+        count_stmt = (
+            select(func.count())
+            .select_from(WorkActivity)
+            .where(WorkActivity.status == WorkActivityStatus.DELAY)
+        )
 
-    result = await db.execute(stmt)
+        # ================= MAIN QUERY =================
 
-    activities = result.scalars().all()
+        stmt = (
+            select(WorkActivity)
+            .where(WorkActivity.status == WorkActivityStatus.DELAY)
+            .order_by(WorkActivity.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
 
-    # ================= RESPONSE =================
+        # ================= EXECUTE MAIN QUERY =================
 
-    return {
-        "limit": limit,
-        "offset": offset,
-        "page_count": len(activities),
-        "data": activities,
-    }
+        result = await db.execute(stmt)
+
+        activities = result.scalars().all()
+
+        # ================= EXECUTE COUNT QUERY =================
+
+        total_result = await db.execute(count_stmt)
+
+        total_count = total_result.scalar() or 0
+
+        # ================= RESPONSE =================
+
+        return {
+            "limit": limit,
+            "offset": offset,
+            "page_count": len(activities),
+            "total_count": total_count,
+            "data": activities,
+        }
+
+    # ================= HANDLE ERRORS =================
+
+    except Exception as e:
+
+        print("DELAY REPORT ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
 
 # =========================================================
@@ -5236,43 +5781,96 @@ async def delay_report(
 @work_progress_router.get("/site-engineer/today-progress")
 async def today_progress(
     engineer_id: int,
+    # ================= PAGINATION =================
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    # ================= QUERY =================
+    try:
 
-    stmt = (
-        select(DailyProgressEntry)
-        .join(
-            WorkActivity,
-            WorkActivity.id == DailyProgressEntry.activity_id,
+        # ================= VALIDATE ENGINEER ID =================
+
+        if engineer_id <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid engineer ID",
+            )
+
+        # ================= TOTAL COUNT QUERY =================
+
+        count_stmt = (
+            select(func.count())
+            .select_from(DailyProgressEntry)
+            .join(
+                WorkActivity,
+                WorkActivity.id == DailyProgressEntry.activity_id,
+            )
+            .where(
+                WorkActivity.engineer_id == engineer_id,
+                DailyProgressEntry.entry_date == date.today(),
+            )
         )
-        .where(
-            WorkActivity.engineer_id == engineer_id,
-            DailyProgressEntry.entry_date == date.today(),
+
+        # ================= MAIN QUERY =================
+
+        stmt = (
+            select(DailyProgressEntry)
+            .join(
+                WorkActivity,
+                WorkActivity.id == DailyProgressEntry.activity_id,
+            )
+            .where(
+                WorkActivity.engineer_id == engineer_id,
+                DailyProgressEntry.entry_date == date.today(),
+            )
+            .order_by(DailyProgressEntry.created_at.desc())
+            .offset(offset)
+            .limit(limit)
         )
-        .order_by(DailyProgressEntry.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-    )
 
-    # ================= EXECUTE =================
+        # ================= EXECUTE MAIN QUERY =================
 
-    result = await db.execute(stmt)
+        result = await db.execute(stmt)
 
-    entries = result.scalars().all()
+        entries = result.scalars().all()
 
-    # ================= RESPONSE =================
+        # ================= EXECUTE COUNT QUERY =================
 
-    return {
-        "limit": limit,
-        "offset": offset,
-        "page_count": len(entries),
-        "data": entries,
-    }
+        total_result = await db.execute(count_stmt)
+
+        total_count = total_result.scalar() or 0
+
+        # ================= RESPONSE =================
+
+        return {
+            "engineer_id": engineer_id,
+            "entry_date": date.today(),
+            "limit": limit,
+            "offset": offset,
+            "page_count": len(entries),
+            "total_count": total_count,
+            "data": entries,
+        }
+
+    # ================= HANDLE VALIDATION ERRORS =================
+
+    except HTTPException:
+
+        raise
+
+    # ================= HANDLE OTHER ERRORS =================
+
+    except Exception as e:
+
+        print("TODAY PROGRESS ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
 
 # =========================================================
@@ -5286,17 +5884,68 @@ async def activity_history(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    result = await db.execute(
-        select(ActivityHistory)
-        .where(ActivityHistory.activity_id == id)
-        .order_by(ActivityHistory.created_at.desc())
-    )
+    try:
 
-    logs = result.scalars().all()
+        # ================= VALIDATE ID =================
 
-    return {
-        "data": logs,
-    }
+        if id <= 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid activity ID",
+            )
+
+        # ================= CHECK ACTIVITY EXISTS =================
+
+        activity_result = await db.execute(
+            select(WorkActivity).where(WorkActivity.id == id)
+        )
+
+        activity = activity_result.scalars().first()
+
+        # ================= ACTIVITY NOT FOUND =================
+
+        if not activity:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Activity Not Found",
+            )
+
+        # ================= FETCH HISTORY =================
+
+        result = await db.execute(
+            select(ActivityHistory)
+            .where(ActivityHistory.activity_id == id)
+            .order_by(ActivityHistory.created_at.desc())
+        )
+
+        logs = result.scalars().all()
+
+        # ================= RESPONSE =================
+
+        return {
+            "activity_id": id,
+            "total_logs": len(logs),
+            "data": logs,
+        }
+
+    # ================= HANDLE VALIDATION ERRORS =================
+
+    except HTTPException:
+
+        raise
+
+    # ================= HANDLE OTHER ERRORS =================
+
+    except Exception as e:
+
+        print("ACTIVITY HISTORY ERROR =>", str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong",
+        )
 
 # ===================== QC =====================
 
@@ -5716,8 +6365,13 @@ async def delete_photo(
 
 # ===================== Drawings & Documents =====================
 
-drawing_router = APIRouter(prefix="/drawings", tags=["Drawings & Documents"])
+drawing_router = APIRouter(
+    prefix="/drawings",
+    tags=["Drawings & Documents"]
+)
 
+
+# ===================== Upload =====================
 
 @drawing_router.post(
     "/upload",
@@ -5735,46 +6389,119 @@ async def upload_drawing(
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # Ensure upload folder exists
     os.makedirs("uploads/drawings", exist_ok=True)
 
-    # TODO: Prefer a unique filename to avoid overwriting
-    file_path = f"uploads/drawings/{file.filename}"
+    validate_drawing_file(file.filename)
 
-    # Save uploaded file
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
+    MAX_DRAWING_SIZE = 20 * 1024 * 1024
 
-    # Create drawing record
-    obj = m.DrawingDocument(
-        project_id=project_id,
-        drawing_name=drawing_name,
-        version=version,
-        date=date,
-        remarks=remarks,
-        file_url=file_path,
-    )
+    content = await file.read()
 
-    db.add(obj)
+    if len(content) > MAX_DRAWING_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="Drawing size cannot exceed 20 MB"
+        )
 
-    # Flush to generate obj.id before creating approval
-    await db.flush()
+    await file.seek(0)
 
-    # Create approval request automatically
-    approval = Approval(
-        entity_type="drawing",
-        entity_id=obj.id,
-        requested_by=current_user.id,
-        remarks=f"Approval requested for drawing: {drawing_name}",
-        status="Pending",
-    )
-    db.add(approval)
+    ext = os.path.splitext(file.filename)[1].lower()
 
-    await db.commit()
-    await db.refresh(obj)
+    unique_name = f"{uuid.uuid4().hex}{ext}"
 
-    return obj
+    file_path = f"uploads/drawings/{unique_name}"
 
+    try:
+
+        # ================= OLD LATEST VERSION FALSE =================
+
+        await db.execute(
+            update(m.DrawingDocument)
+            .where(
+                m.DrawingDocument.project_id == project_id,
+                m.DrawingDocument.drawing_name == drawing_name,
+                m.DrawingDocument.is_latest_version == True,
+            )
+            .values(
+                is_latest_version=False
+            )
+        )
+
+        # ================= SAVE FILE =================
+
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        # ================= GET NEXT REVISION =================
+
+        latest_revision = await db.scalar(
+            select(
+                func.max(m.DrawingDocument.revision_no)
+            )
+            .where(
+                m.DrawingDocument.project_id == project_id,
+                m.DrawingDocument.drawing_name == drawing_name,
+            )
+        )
+
+        next_revision = (latest_revision or 0) + 1
+
+        # ================= CREATE DRAWING =================
+
+        obj = m.DrawingDocument(
+            project_id=project_id,
+            drawing_name=drawing_name,
+            version=version,
+            file_url=file_path,
+            date=date,
+            remarks=remarks,
+
+            approval_status=DocumentStatus.UNDER_REVIEW,
+
+            revision_no=next_revision,
+
+            is_latest_version=True,
+        )
+
+        db.add(obj)
+
+        await db.flush()
+
+        # ================= CREATE APPROVAL =================
+
+        approval = Approval(
+            entity_type="drawing",
+            entity_id=obj.id,
+            requested_by=current_user.id,
+            remarks=f"Approval requested for drawing: {drawing_name}",
+            status="Pending",
+        )
+
+        db.add(approval)
+
+        await db.flush()
+
+        # ================= UPDATE DRAWING APPROVAL REF =================
+
+        obj.approval_id = approval.id
+
+        await db.commit()
+
+        await db.refresh(obj)
+
+        return obj
+
+    except Exception:
+
+        await db.rollback()
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        raise
+
+
+# ===================== Update =====================
 
 @drawing_router.put(
     "/{id}",
@@ -5788,18 +6515,30 @@ async def update_drawing(
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.DrawingDocument, id)
+    obj = await db.get(
+        m.DrawingDocument,
+        id
+    )
 
     if not obj:
         raise NotFoundError("Drawing not found")
 
-    # Update only provided fields
-    update_data = payload.model_dump(exclude_unset=True)
+    # ================= LOCK APPROVED DRAWINGS =================
+
+    if obj.approval_status == DocumentStatus.APPROVED:
+        raise ValidationError(
+            "Approved drawing cannot be edited. Create new revision."
+        )
+
+    update_data = payload.model_dump(
+        exclude_unset=True
+    )
 
     for field, value in update_data.items():
         setattr(obj, field, value)
 
     await db.commit()
+
     await db.refresh(obj)
 
     return obj
@@ -5815,26 +6554,27 @@ async def get_drawing_approval_history(
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # Ensure drawing exists
-    drawing = await db.get(m.DrawingDocument, id)
+    drawing = await db.get(
+        m.DrawingDocument,
+        id
+    )
 
     if not drawing:
         raise NotFoundError("Drawing not found")
 
-    # Get all approvals for this drawing
     result = await db.execute(
         select(Approval)
         .where(
             Approval.entity_type == "drawing",
             Approval.entity_id == id,
         )
-        .order_by(Approval.id.desc())
+        .order_by(
+            Approval.id.desc()
+        )
     )
 
     approvals = result.scalars().all()
 
-    # Return raw approval objects if you already have response_model support,
-    # otherwise return a simplified JSON structure.
     return [
         {
             "id": approval.id,
@@ -5849,6 +6589,7 @@ async def get_drawing_approval_history(
         }
         for approval in approvals
     ]
+
 
 # ===================== Version History =====================
 
@@ -5865,44 +6606,30 @@ async def get_versions(
     skip: int = 0,
     limit: int = 50,
 ):
-    # Fetch all drawing versions for the project
     result = await db.execute(
         select(m.DrawingDocument)
         .where(
             m.DrawingDocument.project_id == project_id
         )
-        .order_by(m.DrawingDocument.id.desc())
+        .order_by(
+            m.DrawingDocument.drawing_name.asc(),
+            m.DrawingDocument.revision_no.desc(),
+            m.DrawingDocument.id.desc(),
+        )
         .offset(skip)
         .limit(limit)
     )
 
     drawings = result.scalars().all()
 
-    # Populate approval_status and approval_id for each drawing
-    for drawing in drawings:
-        approval = await db.scalar(
-            select(Approval)
-            .where(
-                Approval.entity_type == "drawing",
-                Approval.entity_id == drawing.id,
-            )
-            .order_by(Approval.id.desc())
-        )
-
-        if approval:
-            drawing.approval_status = approval.status
-            drawing.approval_id = approval.id
-        else:
-            drawing.approval_status = None
-            drawing.approval_id = None
-
     return drawings
 
-# ===================== Latest Version =====================
+
+# ===================== Latest =====================
 
 @drawing_router.get(
     "/{project_id}/latest",
-    response_model=s.DrawingOut
+    response_model=list[s.DrawingOut]
 )
 async def get_latest(
     project_id: int,
@@ -5911,32 +6638,27 @@ async def get_latest(
         require_roles(DRAWING_READ_ROLES)
     ),
 ):
-    latest = await db.scalar(
+    result = await db.execute(
         select(m.DrawingDocument)
-        .where(m.DrawingDocument.project_id == project_id)
-        .order_by(m.DrawingDocument.created_at.desc())
+        .where(
+            m.DrawingDocument.project_id == project_id,
+            m.DrawingDocument.is_latest_version == True,
+        )
+        .order_by(
+            m.DrawingDocument.drawing_name.asc(),
+            m.DrawingDocument.revision_no.desc(),
+        )
     )
 
-    if not latest:
+    drawings = result.scalars().all()
+
+    if not drawings:
         raise HTTPException(
             status_code=404,
             detail="No drawings found"
         )
 
-    # Fetch approval record
-    approval = await db.scalar(
-        select(Approval).where(
-            Approval.entity_type == "drawing",
-            Approval.entity_id == latest.id,
-        )
-    )
-
-    # Inject dynamic fields for response schema
-    if approval:
-        latest.approval_status = approval.status
-        latest.approval_id = approval.id
-
-    return latest
+    return drawings
 
 
 # ===================== Delete =====================
@@ -5949,16 +6671,17 @@ async def delete_drawing(
         require_roles(DRAWING_DELETE_ROLES)
     ),
 ):
-    obj = await db.get(m.DrawingDocument, id)
+    obj = await db.get(
+        m.DrawingDocument,
+        id
+    )
 
     if not obj:
         raise NotFoundError("Drawing not found")
 
-    # Delete file from disk if it exists
     if obj.file_url and os.path.exists(obj.file_url):
         os.remove(obj.file_url)
 
-    # Optional: delete related approval records
     await db.execute(
         delete(Approval).where(
             Approval.entity_type == "drawing",
@@ -5967,9 +6690,12 @@ async def delete_drawing(
     )
 
     await db.delete(obj)
+
     await db.commit()
 
-    return {"message": "Deleted"}
+    return {
+        "message": "Deleted"
+    }
 
 
 # ===================== Download =====================
@@ -5982,7 +6708,10 @@ async def download_document(
         require_roles(DRAWING_READ_ROLES)
     ),
 ):
-    doc = await db.get(m.DrawingDocument, id)
+    doc = await db.get(
+        m.DrawingDocument,
+        id
+    )
 
     if not doc:
         raise NotFoundError("Document not found")
@@ -6007,7 +6736,10 @@ async def view_document(
         require_roles(DRAWING_READ_ROLES)
     ),
 ):
-    doc = await db.get(m.DrawingDocument, id)
+    doc = await db.get(
+        m.DrawingDocument,
+        id
+    )
 
     if not doc:
         raise NotFoundError("Document not found")
@@ -6015,7 +6747,9 @@ async def view_document(
     if not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
-    media_type, _ = mimetypes.guess_type(doc.file_url)
+    media_type, _ = mimetypes.guess_type(
+        doc.file_url
+    )
 
     return FileResponse(
         path=doc.file_url,
@@ -6025,7 +6759,6 @@ async def view_document(
             "Content-Disposition": "inline"
         },
     )
-
 
 # ===================== Site Requests =====================
 

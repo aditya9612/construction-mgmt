@@ -15,48 +15,11 @@ from app.schemas.user import UserAuditOut, UserOut, UserCreatePayload, UserUpdat
 from app.utils.helpers import AppError, ConflictError, NotFoundError
 from app.core.logger import logger
 from fastapi import Depends, File, Request, UploadFile, Query, APIRouter
-import os, shutil
+import os
 from uuid import uuid4
-
-MAX_IMAGE_SIZE = 5 * 1024 * 1024
-
-UPLOAD_DIR = "uploads/profile"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-
-def save_profile_image(file: UploadFile) -> str:
-    ext = file.filename.split(".")[-1].lower()
-    filename = f"{uuid4()}.{ext}"
-
-    path = os.path.join(UPLOAD_DIR, filename)
-
-    with open(path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    #  return URL path instead of system path
-    return f"/uploads/profile/{filename}"
-
-
-async def validate_and_save_image(profile_image: UploadFile) -> str:
-    if not profile_image.content_type.startswith("image/"):
-        raise AppError(status_code=400, message="Only image files allowed")
-
-    if not profile_image.filename or "." not in profile_image.filename:
-        raise AppError(status_code=400, message="Invalid file name")
-
-    allowed_extensions = {"jpg", "jpeg", "png", "webp"}
-    ext = profile_image.filename.split(".")[-1].lower()
-
-    if ext not in allowed_extensions:
-        raise AppError(status_code=400, message="Invalid image format")
-
-    content = await profile_image.read()
-    if len(content) > MAX_IMAGE_SIZE:
-        raise AppError(status_code=400, message="Image too large")
-
-    profile_image.file.seek(0)
-
-    return save_profile_image(profile_image)
+from app.core.validators import (
+    validate_and_save_image,
+)
 
 
 async def get_current_user_optional(
@@ -170,7 +133,11 @@ async def create_user(
         # ------------------------
         image_path = None
         if profile_image:
-            image_path = await validate_and_save_image(profile_image)
+            image_path = await validate_and_save_image(
+                file=profile_image,
+                upload_dir="uploads/profile",
+                prefix="profile"
+            )
 
         # ------------------------
         # NORMALIZATION (KEEP OLD LOGIC SAFE)
@@ -590,7 +557,11 @@ async def update_user(
         # IMAGE
         # ------------------------
         if profile_image:
-            data["profile_image"] = await validate_and_save_image(profile_image)
+            data["profile_image"] = await validate_and_save_image(
+                file=profile_image,
+                upload_dir="uploads/profile",
+                prefix="profile"
+            )
 
         # ------------------------
         # MOBILE

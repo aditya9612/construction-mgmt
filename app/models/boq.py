@@ -1,6 +1,6 @@
 from decimal import Decimal
 from typing import Optional
-
+from sqlalchemy import UniqueConstraint
 from sqlalchemy import DECIMAL, Column, ForeignKey, Integer, String, Text, Index, Boolean, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.request_context import get_current_user_id
@@ -38,7 +38,7 @@ class BOQ(Base, TimestampMixin):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     quantity: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 3), nullable=False, default=0, server_default="0"
+        DECIMAL(18, 3), nullable=False, default=1, server_default="1"
     )
 
     unit: Mapped[str] = mapped_column(
@@ -46,7 +46,7 @@ class BOQ(Base, TimestampMixin):
     )
 
     unit_cost: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 2), nullable=False, default=0, server_default="0"
+        DECIMAL(18, 2), nullable=False, default=1, server_default="1"
     )
 
     total_cost: Mapped[Decimal] = mapped_column(
@@ -77,6 +77,14 @@ class BOQ(Base, TimestampMixin):
         index=True,
     )
 
+    approval_status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="Draft",
+        server_default="Draft",
+        index=True,
+    )
+
     project = relationship("Project")
 
     audit_logs = relationship(
@@ -88,6 +96,14 @@ class BOQ(Base, TimestampMixin):
         Index("idx_boq_group", "boq_group_id"),
         Index("idx_boq_status", "status"),
         Index("idx_boq_latest", "is_latest"),
+
+        UniqueConstraint(
+            "boq_group_id",
+            "version_no",
+            "item_name",
+            "category",
+            name="uq_boq_version_item",
+        ),
     )
 
 

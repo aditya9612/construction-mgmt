@@ -22,13 +22,15 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from decimal import Decimal
 from app.core.enums import (
     AttendanceStatus,
+    ChecklistStatus,
+    DocumentStatus,
     MilestoneStatus,
     SafetyChecklistStatus,
     WorkActivityStatus,
 )
 from app.models.base import Base, TimestampMixin
 from app.models.labour import Labour
-from app.schemas.project import (
+from app.core.enums import (
     IssueCategory,
     IssuePriority,
     IssueStatus,
@@ -159,6 +161,13 @@ class Task(Base):
 
     project_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("projects.id", ondelete="CASCADE")
+    )
+
+    boq_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     title: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -575,7 +584,7 @@ class ChecklistLog(Base):
     project_id = Column(Integer)
     checklist_id = Column(Integer, ForeignKey("checklists.id"))
 
-    status = Column(String(20))
+    status = Column(SAEnum(ChecklistStatus), nullable=False)
     remarks = Column(Text)
 
     checklist = relationship("Checklist", back_populates="logs")
@@ -618,18 +627,124 @@ class DrawingDocument(Base, TimestampMixin):
         index=True,
     )
 
-    drawing_name = Column(String(255), nullable=False)
-    version = Column(String(50), nullable=False)
+    drawing_name = Column(
+        String(255),
+        nullable=False,
+        index=True,
+    )
 
-    file_url = Column(String(500), nullable=False)
+    version = Column(
+        String(50),
+        nullable=False,
+    )
 
-    date = Column(Date, nullable=True)
-    remarks = Column(Text, nullable=True)
+    file_url = Column(
+        String(500),
+        nullable=False,
+    )
+
+    date = Column(
+        Date,
+        nullable=True,
+    )
+
+    remarks = Column(
+        Text,
+        nullable=True,
+    )
+
+    # ================= APPROVAL =================
+
+    approval_status = Column(
+        SAEnum(DocumentStatus),
+        default=DocumentStatus.PENDING,
+        nullable=False,
+        index=True,
+    )
+
+    approval_id = Column(
+        Integer,
+        ForeignKey("approvals.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # ================= VERSION CONTROL =================
+
+    is_latest_version = Column(
+        Boolean,
+        default=True,
+        nullable=False,
+        index=True,
+    )
+
+    revision_no = Column(
+        Integer,
+        default=1,
+        nullable=False,
+    )
+
+    # ================= RELATIONSHIPS =================
 
     project = relationship("Project")
 
+    approval = relationship(
+        "Approval",
+        foreign_keys=[approval_id],
+    )
+
+    # ================= CONSTRAINTS / INDEXES =================
+
     __table_args__ = (
-        Index("idx_drawing_project", "project_id"),
+
+        # ================= UNIQUE CONSTRAINTS =================
+
+        UniqueConstraint(
+            "project_id",
+            "drawing_name",
+            "version",
+            name="uq_project_drawing_version",
+        ),
+
+        UniqueConstraint(
+            "project_id",
+            "drawing_name",
+            "revision_no",
+            name="uq_project_drawing_revision",
+        ),
+
+        # ================= INDEXES =================
+
+        Index(
+            "idx_drawing_project",
+            "project_id",
+        ),
+
+        Index(
+            "idx_drawing_project_status",
+            "project_id",
+            "approval_status",
+        ),
+
+        Index(
+            "idx_drawing_latest",
+            "project_id",
+            "drawing_name",
+            "is_latest_version",
+        ),
+
+        Index(
+            "idx_drawing_revision",
+            "project_id",
+            "drawing_name",
+            "revision_no",
+        ),
+
+        Index(
+            "idx_drawing_approval",
+            "approval_status",
+            "is_latest_version",
+        ),
     )
 
 
@@ -653,6 +768,7 @@ class SiteRequest(Base, TimestampMixin):
 
 
 # =================work progress===========================
+
 
 class WorkActivity(Base, TimestampMixin):
 
@@ -843,16 +959,16 @@ class ActivityHistory(Base):
     )
 
     created_at = Column(
-    TIMESTAMP,
-    server_default=func.now(),
-)
+        TIMESTAMP,
+        server_default=func.now(),
+    )
 
     updated_at = Column(
-    TIMESTAMP,
-    server_default=func.now(),
-    onupdate=func.now(),
-    nullable=False,
-)
+        TIMESTAMP,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
     # ================= RELATIONSHIPS =================
 
