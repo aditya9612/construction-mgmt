@@ -146,6 +146,7 @@ async def get_client_portfolio(
                 linked_project_name=latest_project,
                 pending_billing=pending_val,
                 total_received=received_val,
+                satisfaction_score=score,   # ADD HERE
                 status="ACTIVE" if total_projects and total_projects > 0 else "INACTIVE",
             )
         )

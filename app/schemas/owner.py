@@ -14,7 +14,7 @@ class OwnerCreate(BaseSchema):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     pan: Optional[str] = None
-    satisfaction_score: float = Field( 0.0, ge=0, le=100 )
+    # satisfaction_score: float = Field( 0.0, ge=0, le=100 )
 
     @field_validator("pan")
     @classmethod
@@ -36,7 +36,7 @@ class OwnerUpdate(BaseSchema):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     pan: Optional[str] = None
-    satisfaction_score: float = Field( 0.0, ge=0, le=100 )
+    satisfaction_score: Optional[float] = Field(None, ge=0, le=100)
 
     @field_validator("pan")
     @classmethod
@@ -100,14 +100,16 @@ class ClientPortfolioItem(BaseSchema):
     owner_name: str
     mobile: str
     email: Optional[EmailStr] = None
-    
+
     total_projects: int
     linked_project_name: Optional[str] = None
-    
+
     pending_billing: float
     total_received: float
-    
-    status: str # ACTIVE / INACTIVE
+
+    satisfaction_score: float = 0   # ADD THIS
+
+    status: str  # ACTIVE / INACTIVE
 
     class Config:
         from_attributes = True
