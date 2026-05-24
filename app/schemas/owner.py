@@ -36,7 +36,6 @@ class OwnerUpdate(BaseSchema):
     email: Optional[EmailStr] = None
     address: Optional[str] = Field(None, max_length=255)
     pan: Optional[str] = None
-    satisfaction_score: Optional[float] = Field(None, ge=0, le=100)
 
     @field_validator("pan")
     @classmethod
@@ -60,7 +59,6 @@ class OwnerOut(BaseSchema):
     email: Optional[EmailStr]
     address: Optional[str]
     pan: Optional[str]
-    satisfaction_score: Optional[float] = 0.0
 
     class Config:
         from_attributes = True

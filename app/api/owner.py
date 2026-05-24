@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -107,34 +108,79 @@ async def get_client_portfolio(
     total_outstanding = 0.0
 
     for owner in owners:
+
         # 2. Get project stats for this owner
         project_stats = await db.execute(
             select(func.count(Project.id), func.max(Project.project_name))
             .where(Project.owner_id == owner.id)
         )
+
         total_projects, latest_project = project_stats.one()
 
-        # --- DYNAMIC SATISFACTION CALCULATION ---
-        # Base score is 100. Subtract 10 for each delayed project.
-        score = float(owner.satisfaction_score or 0)
-        if score == 0:
-            delayed_projects = await db.scalar(
-                select(func.count(Project.id))
-                .where(Project.owner_id == owner.id, Project.status == "Delayed")
-            )
-            score = max(50, 100 - (int(delayed_projects or 0) * 10))
-            if not total_projects: score = 0 # No projects = no score
-        
         # 3. Get financial stats for this owner
         financial_stats = await db.execute(
-            select(func.sum(Invoice.pending_amount), func.sum(Invoice.paid_amount))
+            select(
+                func.sum(Invoice.pending_amount),
+                func.sum(Invoice.paid_amount)
+            )
             .where(Invoice.owner_id == owner.id)
         )
+
         pending_billing, total_received = financial_stats.one()
 
         pending_val = float(pending_billing or 0)
         received_val = float(total_received or 0)
+
         total_outstanding += pending_val
+
+        # --- AUTO SATISFACTION CALCULATION ---
+
+        score = 100
+
+        # delayed projects penalty
+        delayed_projects = await db.scalar(
+            select(func.count(Project.id))
+            .where(
+                Project.owner_id == owner.id,
+                Project.status == "Delayed"
+            )
+        )
+
+        score -= int(delayed_projects or 0) * 10
+
+        # overdue payment milestones penalty
+        overdue_payments = await db.scalar(
+            select(func.count(OwnerPaymentSchedule.id))
+            .where(
+                OwnerPaymentSchedule.owner_id == owner.id,
+                OwnerPaymentSchedule.status != "Paid",
+                OwnerPaymentSchedule.due_date < date.today()
+            )
+        )
+
+        score -= int(overdue_payments or 0) * 5
+
+        # completed projects bonus
+        completed_projects = await db.scalar(
+            select(func.count(Project.id))
+            .where(
+                Project.owner_id == owner.id,
+                Project.status == "Completed"
+            )
+        )
+
+        score += int(completed_projects or 0) * 2
+
+        # high pending billing penalty
+        if pending_val > 500000:
+            score -= 10
+
+        # no projects = no score
+        if not total_projects:
+            score = 0
+
+        # clamp final value
+        score = max(0, min(score, 100))
 
         portfolio_items.append(
             ClientPortfolioItem(
@@ -146,14 +192,17 @@ async def get_client_portfolio(
                 linked_project_name=latest_project,
                 pending_billing=pending_val,
                 total_received=received_val,
-                satisfaction_score=score,   # ADD HERE
+                satisfaction_score=score,
                 status="ACTIVE" if total_projects and total_projects > 0 else "INACTIVE",
             )
         )
 
     # 4. Calculate Average Satisfaction
-    total_score = sum(float(o.satisfaction_score or 0) if float(o.satisfaction_score or 0) > 0 else 94.0 for o in owners) # Defaulting to 94 if none
-    avg_satisfaction = (total_score / len(owners)) if owners else 0.0
+    total_score = sum(item.satisfaction_score for item in portfolio_items)
+    avg_satisfaction = (
+        total_score / len(portfolio_items)
+        if portfolio_items else 0.0
+    )
 
     summary = ClientPortfolioSummary(
         total_clients=len(owners),

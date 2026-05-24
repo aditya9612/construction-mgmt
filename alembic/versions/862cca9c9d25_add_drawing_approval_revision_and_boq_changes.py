@@ -18,6 +18,9 @@ depends_on = None
 
 def upgrade():
     # remove approved_by column
+
+    op.drop_column("owners", "satisfaction_score")
+
     op.alter_column(
         "boq_items",
         "quantity",
@@ -65,14 +68,6 @@ def upgrade():
     )
     op.drop_column("drawing_documents", "approved_by")
     op.create_unique_constraint('uq_project_drawing_version', 'drawing_documents', ['project_id', 'drawing_name', 'version'])
-
-    op.alter_column(
-        "owners",
-        "satisfaction_score",
-        existing_type=mysql.DECIMAL(precision=5, scale=2),
-        nullable=False,
-        server_default="0.00",
-    )
 
     # fix invoice status enum to lowercase values
     op.execute("""
@@ -339,12 +334,13 @@ def downgrade():
     )
 
     # revert satisfaction_score changes
-    op.alter_column(
+    op.add_column(
         "owners",
-        "satisfaction_score",
-        existing_type=sa.DECIMAL(precision=5, scale=2),
-        nullable=True,
-        server_default=None,
+        sa.Column(
+            "satisfaction_score",
+            sa.DECIMAL(5, 2),
+            nullable=True
+        )
     )
 
     # revert invoice status enum back to uppercase

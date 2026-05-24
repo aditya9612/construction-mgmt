@@ -17,8 +17,6 @@ class Owner(Base):
     email = Column(String(100), nullable=True)
     address = Column(String(255), nullable=True)
     pan = Column(String(20), nullable=True)
-    satisfaction_score = Column( DECIMAL(5, 2), nullable=False, server_default="0.00" )
-
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
