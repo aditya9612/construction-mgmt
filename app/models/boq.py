@@ -18,7 +18,7 @@ class BOQ(Base, TimestampMixin):
         nullable=False,
     )
 
-    boq_group_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    boq_group_id: Mapped[int] = mapped_column( Integer, ForeignKey("boq_groups.id", ondelete="CASCADE"), nullable=False, index=True, )
 
     version_no: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
@@ -87,6 +87,11 @@ class BOQ(Base, TimestampMixin):
 
     project = relationship("Project")
 
+    boq_group = relationship(
+        "BOQGroup",
+        back_populates="items",
+    )
+
     audit_logs = relationship(
         "BOQAudit", back_populates="boq", cascade="all, delete-orphan"
     )
@@ -106,6 +111,40 @@ class BOQ(Base, TimestampMixin):
         ),
     )
 
+class BOQGroup(Base, TimestampMixin):
+    __tablename__ = "boq_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    project_id = Column(
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    name = Column(String(255), nullable=False)
+
+    current_version = Column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+
+    status = Column(
+        String(50),
+        nullable=False,
+        default="Draft",
+        server_default="Draft",
+    )
+
+    project = relationship("Project")
+    items = relationship(
+        "BOQ",
+        back_populates="boq_group",
+        cascade="all, delete-orphan",
+    )
 
 class BOQAudit(Base, TimestampMixin):
     __tablename__ = "boq_audit_logs"

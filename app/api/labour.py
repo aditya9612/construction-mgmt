@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache import redis as r
 from app.core import dependencies as d
 from app.core.enums import AttendanceStatus, LabourStatus, PayrollStatus
+from app.core.validators import validate_and_save_image
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.contractor import Contractor
@@ -26,14 +27,12 @@ import pandas as pd
 from app.utils.common import assert_project_access, generate_business_id
 from app.models.project import Project, ProjectMember
 from sqlalchemy.exc import IntegrityError
-from app.api.user import validate_and_save_image
 from fastapi import File, UploadFile, Form
 from app.utils.pagination import PaginationParams
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from app.models.invoice import Transaction
 from app.models.accountant import JournalEntry, JournalLine
-
 
 async def get_user_project_ids(db, user):
     if user.role == UserRole.ADMIN.value:
@@ -533,7 +532,11 @@ async def check_in(
     if existing:
         raise ValidationError("Already checked-in today")
 
-    check_in_path = await validate_and_save_image(check_in_image)
+    check_in_path = await validate_and_save_image(
+        check_in_image,
+        "uploads/labour_attendance",
+        "checkin"
+    )
 
     obj = LabourAttendance(
         labour_id=labour_id,
@@ -643,7 +646,11 @@ async def check_out(
     if overtime_rate < 0:
         raise ValidationError("Invalid overtime rate")
 
-    check_out_path = await validate_and_save_image(check_out_image)
+    check_out_path = await validate_and_save_image(
+        check_out_image,
+        "uploads/labour_attendance",
+        "checkout"
+    )
 
     obj.out_time = out_time
     obj.working_hours = working_hours

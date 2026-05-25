@@ -67,7 +67,11 @@ def upgrade():
         ondelete="SET NULL",
     )
     op.drop_column("drawing_documents", "approved_by")
-    op.create_unique_constraint('uq_project_drawing_version', 'drawing_documents', ['project_id', 'drawing_name', 'version'])
+    op.create_unique_constraint(
+        "uq_project_drawing_version",
+        "drawing_documents",
+        ["project_id", "drawing_name", "version"],
+    )
 
     # fix invoice status enum to lowercase values
     op.execute("""
@@ -162,8 +166,7 @@ def upgrade():
 
     # ===================== SAFETY UPDATE FOR EXISTING DATA =====================
 
-    op.execute(
-        """
+    op.execute("""
         UPDATE drawing_documents
         SET
             approval_status = 'PENDING',
@@ -173,8 +176,7 @@ def upgrade():
             approval_status IS NULL
             OR is_latest_version IS NULL
             OR revision_no IS NULL
-        """
-    )
+        """)
 
     # ===================== INDEXES =====================
 
@@ -230,9 +232,83 @@ def upgrade():
         ondelete="SET NULL",
     )
 
+    op.create_table(
+        "boq_groups",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("project_id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("current_version", sa.Integer(), server_default="1", nullable=False),
+        sa.Column(
+            "status", sa.String(length=50), server_default="Draft", nullable=False
+        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(["project_id"], ["projects.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        op.f("ix_boq_groups_project_id"), "boq_groups", ["project_id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_boq_items_boq_group_id"), "boq_items", ["boq_group_id"], unique=False
+    )
+    op.create_foreign_key(
+        "fk_boq_items_group",
+        "boq_items",
+        "boq_groups",
+        ["boq_group_id"],
+        ["id"],
+        ondelete="CASCADE",
+    )
+    op.add_column(
+        "invoices",
+        sa.Column(
+            "source_type",
+            sa.Enum("quotation", "measurement", "manual", name="invoicesourcetype"),
+            nullable=True,
+        ),
+    )
+    op.alter_column(
+        "invoices",
+        "type",
+        existing_type=mysql.VARCHAR(length=50),
+        type_=sa.Enum("owner", "labour", "material", "contractor", name="invoicetype"),
+        existing_nullable=False,
+    )
+    op.create_index(
+        op.f("ix_invoices_reference_id"), "invoices", ["reference_id"], unique=False
+    )
+    op.create_index(
+        op.f("ix_invoices_source_type"), "invoices", ["source_type"], unique=False
+    )
+
 
 def downgrade():
     # restore approved_by
+    op.drop_index(op.f("ix_invoices_source_type"), table_name="invoices")
+
+    op.drop_index(op.f("ix_invoices_reference_id"), table_name="invoices")
+
+    op.alter_column(
+        "invoices",
+        "type",
+        existing_type=sa.Enum(
+            "owner", "labour", "material", "contractor", name="invoicetype"
+        ),
+        type_=mysql.VARCHAR(length=50),
+        existing_nullable=False,
+    )
+
+    op.drop_column("invoices", "source_type")
+
+    sa.Enum(name="invoicesourcetype").drop(op.get_bind(), checkfirst=False)
+
+    sa.Enum(name="invoicetype").drop(op.get_bind(), checkfirst=False)
+
+    op.drop_constraint("fk_boq_items_group", "boq_items", type_="foreignkey")
+    op.drop_index(op.f("ix_boq_items_boq_group_id"), table_name="boq_items")
+    op.drop_index(op.f("ix_boq_groups_project_id"), table_name="boq_groups")
+    op.drop_table("boq_groups")
 
     op.drop_constraint(
         "fk_drawing_documents_approval_id",
@@ -317,16 +393,14 @@ def downgrade():
         server_default="0",
         existing_nullable=False,
     )
-    op.drop_constraint(
-        "fk_tasks_boq_id",
-        "tasks",
-        type_="foreignkey"
-    )
+    op.drop_constraint("fk_tasks_boq_id", "tasks", type_="foreignkey")
     op.drop_index(op.f("ix_tasks_boq_id"), table_name="tasks")
     op.drop_column("tasks", "boq_id")
     op.drop_index(op.f("ix_boq_items_approval_status"), table_name="boq_items")
     op.drop_column("boq_items", "approval_status")
-    op.drop_constraint('uq_project_drawing_version', 'drawing_documents', type_='unique')
+    op.drop_constraint(
+        "uq_project_drawing_version", "drawing_documents", type_="unique"
+    )
 
     op.add_column(
         "drawing_documents",
@@ -335,12 +409,7 @@ def downgrade():
 
     # revert satisfaction_score changes
     op.add_column(
-        "owners",
-        sa.Column(
-            "satisfaction_score",
-            sa.DECIMAL(5, 2),
-            nullable=True
-        )
+        "owners", sa.Column("satisfaction_score", sa.DECIMAL(5, 2), nullable=True)
     )
 
     # revert invoice status enum back to uppercase

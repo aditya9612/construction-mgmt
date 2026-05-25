@@ -1,13 +1,20 @@
 from pydantic import BaseModel
 from typing import Optional
 from datetime import date, datetime
-
 from app.core.enums import InvoiceStatus
+from app.core.enums import (
+    InvoiceStatus,
+    InvoiceType,
+    InvoiceSourceType,
+)
 
 
 class InvoiceBase(BaseModel):
     project_id: int
-    type: str
+
+    type: InvoiceType
+    source_type: Optional[InvoiceSourceType] = None
+
     reference_id: Optional[int] = None
 
     amount: float
@@ -25,13 +32,19 @@ class InvoiceUpdate(BaseModel):
     amount: Optional[float] = None
     gst_percent: Optional[float] = None
     tax_percent: Optional[float] = None
+
+    source_type: Optional[InvoiceSourceType] = None
+
     description: Optional[str] = None
 
 class InvoiceOut(BaseModel):
     id: int
     project_id: int
     owner_id: int
-    type: str
+
+    type: InvoiceType
+    source_type: Optional[InvoiceSourceType] = None
+
     reference_id: Optional[int]
     quotation_id: Optional[int]
 

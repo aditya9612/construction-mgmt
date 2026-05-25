@@ -7,7 +7,12 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.reports import REPORT_READ_ROLES
 from app.core.dependencies import require_roles
-from app.core.enums import InvoiceStatus, PaymentMode
+from app.core.enums import (
+    InvoiceStatus,
+    PaymentMode,
+    InvoiceType,
+    InvoiceSourceType,
+)
 from app.models.expense import Expense
 from app.models.final_measurement import FinalMeasurement
 from app.models.labour import Labour, LabourAttendance
@@ -262,9 +267,9 @@ async def get_client_payment_history(
 
         if payment_method:
 
-            stmt = stmt.where(func.lower(Invoice.type) == payment_method)
+            stmt = stmt.where(Invoice.type == InvoiceType(payment_method))
 
-            count_stmt = count_stmt.where(func.lower(Invoice.type) == payment_method)
+            count_stmt = count_stmt.where(Invoice.type == InvoiceType(payment_method))
 
         # =================================================
         # SEARCH FILTER
@@ -336,7 +341,7 @@ async def get_client_payment_history(
 
             if invoice.type:
 
-                payment_method_value = str(invoice.type).replace("_", " ").upper()
+                payment_method_value = invoice.type.value.replace("_", " ").upper()
 
             if payment_method_value == "OWNER":
 
@@ -521,7 +526,7 @@ async def client_payments_pdf(
 
             if invoice.type:
 
-                payment_method = str(invoice.type).replace("_", " ").upper()
+                payment_method = invoice.type.value.replace("_", " ").upper()
 
             if payment_method == "OWNER":
 
@@ -769,7 +774,7 @@ async def client_payments_pdf(
 
             if invoice.type:
 
-                payment_method = str(invoice.type).replace("_", " ").upper()
+                payment_method = invoice.type.value.replace("_", " ").upper()
 
             if payment_method == "OWNER":
 
@@ -955,7 +960,8 @@ async def create_invoice_from_quotation(
         project_id=quotation.project_id,
         owner_id=project.owner_id,
         quotation_id=quotation.id,
-        type="owner",
+        type=InvoiceType.OWNER,
+        source_type=InvoiceSourceType.QUOTATION,
         reference_id=quotation.id,
         amount=Decimal(quotation.subtotal or 0),
         gst_percent=gst_percent,
@@ -1153,7 +1159,7 @@ async def get_by_project(
 
 @router.get("/type/{type}")
 async def get_by_type(
-    type: str,
+    type: InvoiceType,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
@@ -1251,21 +1257,48 @@ async def generate_invoice_pdf(
     elements = []
 
     # Title
-    elements.append(Paragraph(f"Invoice #{obj.id}", styles["Title"]))
+    elements.append(
+        Paragraph(f"Invoice #{obj.id}", styles["Title"])
+    )
+
     elements.append(Spacer(1, 12))
 
     # Details
-    elements.append(Paragraph(f"Type: {obj.type}", styles["Normal"]))
-    elements.append(Paragraph(f"Amount: ₹{float(obj.amount):,.2f}", styles["Normal"]))
-    elements.append(Paragraph(f"GST: ₹{float(obj.gst_amount):,.2f}", styles["Normal"]))
-    elements.append(Paragraph(f"Tax: ₹{float(obj.tax_amount):,.2f}", styles["Normal"]))
+    elements.append(
+        Paragraph(f"Type: {obj.type.value}", styles["Normal"])
+    )
+
+    if obj.source_type:
+        elements.append(
+            Paragraph(
+                f"Source: {obj.source_type.value}",
+                styles["Normal"]
+            )
+        )
+
+    elements.append(
+        Paragraph(f"Amount: ₹{float(obj.amount):,.2f}", styles["Normal"])
+    )
+    elements.append(Spacer(1, 4))
+    elements.append(
+        Paragraph(f"GST: ₹{float(obj.gst_amount):,.2f}", styles["Normal"])
+    )
+    elements.append(Spacer(1, 4))
+
+    elements.append(
+        Paragraph(f"Tax: ₹{float(obj.tax_amount):,.2f}", styles["Normal"])
+    )
+    elements.append(Spacer(1, 4))
     elements.append(
         Paragraph(f"Total: ₹{float(obj.total_amount):,.2f}", styles["Normal"])
     )
-
-    #  Fixed Status
+    elements.append(Spacer(1, 4))
+    # Status
     elements.append(
-        Paragraph(f"Status: {obj.status.value.capitalize()}", styles["Normal"])
+        Paragraph(
+            f"Status: {obj.status.value.capitalize()}",
+            styles["Normal"]
+        )
     )
 
     doc.build(elements)
@@ -1303,7 +1336,7 @@ async def create_labour_invoice(
     existing_invoice = await db.scalar(
         select(Invoice).where(
             Invoice.project_id == project_id,
-            Invoice.type == "labour",
+            Invoice.type == InvoiceType.LABOUR,
             Invoice.description == description,
         )
     )
@@ -1351,7 +1384,7 @@ async def create_labour_invoice(
         obj = Invoice(
             project_id=project_id,
             owner_id=project.owner_id,
-            type="labour",
+            type=InvoiceType.LABOUR,
             reference_id=None,
             linked_expense_ids=attendance_ids,
             amount=total_amount,
@@ -1421,7 +1454,7 @@ async def create_material_invoice(
         obj = Invoice(
             project_id=project_id,
             owner_id=project.owner_id,
-            type="material",
+            type=InvoiceType.MATERIAL,
             reference_id=None,
             linked_expense_ids=expense_ids,
             amount=total_amount,
@@ -1483,8 +1516,8 @@ async def create_invoice_from_measurement(
     # 3. Check existing owner invoice
     existing_invoice = await db.scalar(
         select(Invoice).where(
-            Invoice.project_id == measurement.project_id,
-            Invoice.type == "owner",
+            Invoice.reference_id == measurement.id,
+            Invoice.source_type == InvoiceSourceType.MEASUREMENT,
         )
     )
     if existing_invoice:
@@ -1497,7 +1530,8 @@ async def create_invoice_from_measurement(
         obj = Invoice(
             project_id=measurement.project_id,
             owner_id=project.owner_id,
-            type="owner",
+            type=InvoiceType.OWNER,
+            source_type=InvoiceSourceType.MEASUREMENT,
             reference_id=measurement.id,  #  link to measurement
             amount=total_amount,
             gst_percent=Decimal(0),
@@ -1582,7 +1616,7 @@ async def analytics_summary(
     total_revenue = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id,
-            Invoice.type == "owner",
+            Invoice.type == InvoiceType.OWNER,
         )
     )
 
@@ -1590,7 +1624,7 @@ async def analytics_summary(
     total_expense = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id,
-            Invoice.type.in_(["labour", "material"]),
+            Invoice.type.in_([InvoiceType.LABOUR,InvoiceType.MATERIAL,]),
         )
     )
 

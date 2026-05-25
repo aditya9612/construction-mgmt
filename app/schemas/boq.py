@@ -40,6 +40,7 @@ class BOQUpdate(BaseSchema):
     unit_cost: Optional[Decimal] = None
     is_completed: Optional[bool] = None
     status: Optional[str] = None
+    activity_type_id: Optional[int] = None
 
     @field_validator("quantity", "unit_cost")
     @classmethod
@@ -86,6 +87,8 @@ class BOQOut(BaseSchema):
     actual_quantity: float
     actual_cost: float
     variance_cost: float
+
+    activity_type_id: Optional[int]
 
     is_completed: bool
     status: str

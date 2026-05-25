@@ -243,14 +243,28 @@ async def export_material_excel(
     ws.title = "Materials"
 
     # Headers
-    ws.append(["Name", "Quantity", "Unit"])
+    ws.append([
+        "Material Name",
+        "Category",
+        "Unit",
+        "Purchased Qty",
+        "Used Qty",
+        "Remaining Stock",
+        "Purchase Rate",
+        "Total Amount",
+    ])
 
     # Data
     for mat in materials:
         ws.append([
-            mat.material_name,
-            float(mat.quantity),
-            str(mat.unit)
+            mat.material_name or "",
+            mat.category or "",
+            mat.unit or "",
+            float(mat.quantity_purchased or 0),
+            float(mat.quantity_used or 0),
+            float(mat.remaining_stock or 0),
+            float(mat.purchase_rate or 0),
+            float(mat.total_amount or 0),
         ])
 
     buffer = io.BytesIO()
@@ -264,7 +278,6 @@ async def export_material_excel(
             "Content-Disposition": f"attachment; filename=materials_project_{project_id}.xlsx"
         },
     )
-
 # ===================== ISSUE REPORT =====================
 
 @router.get("/issues")

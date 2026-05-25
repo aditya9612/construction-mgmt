@@ -199,3 +199,14 @@ class DocumentStatus(str, Enum):
 class ChecklistStatus(str, Enum):
     DONE = "DONE"
     PENDING = "PENDING"
+
+class InvoiceSourceType(str, Enum):
+    QUOTATION = "quotation"
+    MEASUREMENT = "measurement"
+    MANUAL = "manual"
+
+class InvoiceType(str, Enum):
+    OWNER = "owner"
+    LABOUR = "labour"
+    MATERIAL = "material"
+    CONTRACTOR = "contractor"

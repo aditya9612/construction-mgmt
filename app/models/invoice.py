@@ -1,6 +1,4 @@
 from datetime import datetime
-import enum
-
 from sqlalchemy import (
     Column,
     Integer,
@@ -13,13 +11,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
-from sqlalchemy import UniqueConstraint
-from app.core.enums import InvoiceStatus
+from app.core.enums import InvoiceSourceType, InvoiceStatus, InvoiceType
 from app.models.base import Base
-
-
-# ===================== ENUM =====================
-
 
 
 # ===================== INVOICE =====================
@@ -30,7 +23,10 @@ class Invoice(Base):
 
     # Relations
     project_id = Column(
-        Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     owner_id = Column(
         Integer, ForeignKey("owners.id", ondelete="CASCADE"), nullable=False, index=True
@@ -40,10 +36,29 @@ class Invoice(Base):
     linked_expense_ids = Column(JSON, nullable=True)
 
     # Type
-    type = Column(String(50), nullable=False)  # owner / labour / material / contractor
-    reference_id = Column(Integer, nullable=True)
+    type = Column(
+        Enum(InvoiceType, values_callable=lambda obj: [e.value for e in obj]),
+        nullable=False,
+    )  # owner / labour / material / contractor
 
-    quotation_id = Column( Integer, ForeignKey("quotation_master.id", ondelete="SET NULL"), nullable=True, index=True, unique=True, )
+    source_type = Column(
+        Enum(
+            InvoiceSourceType,
+            values_callable=lambda obj: [e.value for e in obj]
+        ),
+        nullable=True,
+        index=True,
+    ) # quotation / measurement / manual
+
+    reference_id = Column(Integer, nullable=True, index=True)
+
+    quotation_id = Column(
+        Integer,
+        ForeignKey("quotation_master.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        unique=True,
+    )
 
     # Financials
     amount = Column(DECIMAL(18, 2), nullable=False)
@@ -61,8 +76,11 @@ class Invoice(Base):
     pending_amount = Column(DECIMAL(18, 2), nullable=False)
 
     # Status (ENUM)
-    status = Column( Enum( InvoiceStatus, values_callable=lambda obj: [e.value for e in obj] ), default=InvoiceStatus.PENDING )
-                    
+    status = Column(
+        Enum(InvoiceStatus, values_callable=lambda obj: [e.value for e in obj]),
+        default=InvoiceStatus.PENDING,
+    )
+
     # Meta
     description = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
@@ -84,12 +102,8 @@ class Transaction(Base):
     id = Column(Integer, primary_key=True)
 
     # Relations
-    project_id = Column(
-        Integer, ForeignKey("projects.id"), nullable=False, index=True
-    )
-    invoice_id = Column(
-        Integer, ForeignKey("invoices.id"), nullable=True, index=True
-    )
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
 
     # Type: receipt (incoming) / payment (outgoing)
     type = Column(String(20), nullable=False)

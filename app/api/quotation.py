@@ -74,7 +74,7 @@ def calculate_amount(quantity, rate):
     return quantity * rate
 
 
-def calculate_item(item_type, length, width, height, rate):
+def calculate_item(unit, length, width, height, rate):
 
     cubic_ft = calculate_cubic_feet(length, width, height)
 
@@ -82,22 +82,27 @@ def calculate_item(item_type, length, width, height, rate):
 
     brass = calculate_brass(cubic_ft)
 
-    if item_type == ITEM_PLUM_CONCRETE:
+    unit_lower = (unit or "").lower()
 
-        quantity = cubic_meter
-        formula = "cubic_meter"
-
-    elif item_type in [ITEM_SOLING, ITEM_STONE_WORK]:
-
+    if unit_lower in ["brass"]:
         quantity = brass
         formula = "brass"
 
-    else:
+    elif unit_lower in ["m3", "cum", "cubic meter"]:
+        quantity = cubic_meter
+        formula = "cubic_meter"
 
+    elif unit_lower in ["cft", "ft3", "cubic feet"]:
         quantity = cubic_ft
         formula = "cubic_feet"
 
-    amount = calculate_amount(quantity, rate)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported unit: {unit}"
+        )
+
+    amount = quantity * rate
 
     return {
         "cubic_feet": round(cubic_ft, 2),
@@ -1092,7 +1097,7 @@ async def create_quotation(
         for m in item_data.measurements:
 
             result = calculate_item(
-                item_type=item_data.item_type,
+                unit=item_data.unit,
                 length=m.length or 0,
                 width=m.width or 0,
                 height=m.height or 0,
@@ -1360,7 +1365,7 @@ async def add_quotation_item(
     for m in payload.measurements:
 
         result = calculate_item(
-            item_type=payload.item_type,
+            unit=payload.unit,
             length=m.length or 0,
             width=m.width or 0,
             height=m.height or 0,
@@ -1453,11 +1458,11 @@ async def update_quotation_item(
         for m in payload.measurements:
 
             result = calculate_item(
-                item_type=item.item_type,
+                unit=payload.unit or item.unit,
                 length=m.length or 0,
                 width=m.width or 0,
                 height=m.height or 0,
-                rate=item.rate,
+                rate=payload.rate or item.rate,
             )
 
             measurement = MeasurementDetail(
@@ -1737,149 +1742,149 @@ from app.models.project import Project
 from decimal import Decimal
 
 
-@router.post("/{quotation_id}/convert-to-invoice")
-async def convert_to_invoice(
-    quotation_id: int,
-    db: AsyncSession = Depends(get_db_session)
-):
-    # =====================================================
-    # 1. GET QUOTATION
-    # =====================================================
-    quotation = await get_quotation_or_404(quotation_id, db)
+# @router.post("/{quotation_id}/convert-to-invoice")
+# async def convert_to_invoice(
+#     quotation_id: int,
+#     db: AsyncSession = Depends(get_db_session)
+# ):
+#     # =====================================================
+#     # 1. GET QUOTATION
+#     # =====================================================
+#     quotation = await get_quotation_or_404(quotation_id, db)
 
-    # =====================================================
-    # 2. APPROVAL CHECK
-    # =====================================================
-    if not quotation.is_approved:
-        raise HTTPException(400, "Quotation must be approved first")
+#     # =====================================================
+#     # 2. APPROVAL CHECK
+#     # =====================================================
+#     if not quotation.is_approved:
+#         raise HTTPException(400, "Quotation must be approved first")
 
-    # =====================================================
-    # 3. DUPLICATE CHECK
-    # =====================================================
-    if quotation.converted_to_invoice:
-        raise HTTPException(400, "Already converted to invoice")
+#     # =====================================================
+#     # 3. DUPLICATE CHECK
+#     # =====================================================
+#     if quotation.converted_to_invoice:
+#         raise HTTPException(400, "Already converted to invoice")
 
-    # =====================================================
-    # 4. PROJECT CHECK
-    # =====================================================
-    if not quotation.project_id:
-        raise HTTPException(
-            400,
-            "Quotation is not linked to any project"
-        )
+#     # =====================================================
+#     # 4. PROJECT CHECK
+#     # =====================================================
+#     if not quotation.project_id:
+#         raise HTTPException(
+#             400,
+#             "Quotation is not linked to any project"
+#         )
 
-    # =====================================================
-    # 5. LOAD PROJECT
-    # =====================================================
-    project = await db.get(Project, quotation.project_id)
+#     # =====================================================
+#     # 5. LOAD PROJECT
+#     # =====================================================
+#     project = await db.get(Project, quotation.project_id)
 
-    if not project:
-        raise HTTPException(404, "Project not found")
+#     if not project:
+#         raise HTTPException(404, "Project not found")
 
-    # =====================================================
-    # 6. PREVENT DUPLICATE INVOICE
-    # =====================================================
-    existing_invoice = await db.scalar(
-        select(Invoice).where(
-            Invoice.quotation_id == quotation.id
-        )
-    )
+#     # =====================================================
+#     # 6. PREVENT DUPLICATE INVOICE
+#     # =====================================================
+#     existing_invoice = await db.scalar(
+#         select(Invoice).where(
+#             Invoice.quotation_id == quotation.id
+#         )
+#     )
 
-    if existing_invoice:
-        raise HTTPException(
-            400,
-            "Invoice already exists for this quotation"
-        )
+#     if existing_invoice:
+#         raise HTTPException(
+#             400,
+#             "Invoice already exists for this quotation"
+#         )
 
-    # =====================================================
-    # 7. CALCULATE GST %
-    # =====================================================
-    gst_percent = Decimal(
-        (quotation.cgst_percent or 0)
-        + (quotation.sgst_percent or 0)
-    )
+#     # =====================================================
+#     # 7. CALCULATE GST %
+#     # =====================================================
+#     gst_percent = Decimal(
+#         (quotation.cgst_percent or 0)
+#         + (quotation.sgst_percent or 0)
+#     )
 
-    grand_total = Decimal(str(quotation.grand_total or 0))
+#     grand_total = Decimal(str(quotation.grand_total or 0))
 
-    # =====================================================
-    # 8. CREATE INVOICE
-    # =====================================================
-    invoice = Invoice(
-        project_id=quotation.project_id,
-        owner_id=project.owner_id,
+#     # =====================================================
+#     # 8. CREATE INVOICE
+#     # =====================================================
+#     invoice = Invoice(
+#         project_id=quotation.project_id,
+#         owner_id=project.owner_id,
 
-        quotation_id=quotation.id,
+#         quotation_id=quotation.id,
 
-        type="owner",
-        reference_id=quotation.id,
+#         type="owner",
+#         reference_id=quotation.id,
 
-        amount=Decimal(str(quotation.subtotal or 0)),
+#         amount=Decimal(str(quotation.subtotal or 0)),
 
-        gst_percent=gst_percent,
-        gst_amount=Decimal(str(quotation.gst_amount or 0)),
+#         gst_percent=gst_percent,
+#         gst_amount=Decimal(str(quotation.gst_amount or 0)),
 
-        tax_percent=Decimal(str(quotation.tds_percent or 0)),
-        tax_amount=Decimal(str(quotation.tds_amount or 0)),
+#         tax_percent=Decimal(str(quotation.tds_percent or 0)),
+#         tax_amount=Decimal(str(quotation.tds_amount or 0)),
 
-        total_amount=grand_total,
+#         total_amount=grand_total,
 
-        paid_amount=Decimal("0"),
-        pending_amount=grand_total,
+#         paid_amount=Decimal("0"),
+#         pending_amount=grand_total,
 
-        status="pending",
+#         status="pending",
 
-        description=(
-            f"Invoice generated from quotation "
-            f"{quotation.quotation_no}"
-        ),
-    )
+#         description=(
+#             f"Invoice generated from quotation "
+#             f"{quotation.quotation_no}"
+#         ),
+#     )
 
-    db.add(invoice)
+#     db.add(invoice)
 
-    # Generate invoice.id
-    await db.flush()
+#     # Generate invoice.id
+#     await db.flush()
 
-    # =====================================================
-    # 9. OWNER LEDGER ENTRY
-    # =====================================================
-    owner_txn = OwnerTransaction(
-        owner_id=project.owner_id,
-        project_id=quotation.project_id,
-        type="credit",
-        amount=grand_total,
-        reference_type="invoice",
-        reference_id=invoice.id,
-        description=(
-            f"Invoice generated from quotation "
-            f"{quotation.quotation_no}"
-        ),
-    )
+#     # =====================================================
+#     # 9. OWNER LEDGER ENTRY
+#     # =====================================================
+#     owner_txn = OwnerTransaction(
+#         owner_id=project.owner_id,
+#         project_id=quotation.project_id,
+#         type="credit",
+#         amount=grand_total,
+#         reference_type="invoice",
+#         reference_id=invoice.id,
+#         description=(
+#             f"Invoice generated from quotation "
+#             f"{quotation.quotation_no}"
+#         ),
+#     )
 
-    db.add(owner_txn)
+#     db.add(owner_txn)
 
-    # =====================================================
-    # 10. UPDATE QUOTATION
-    # =====================================================
-    quotation.converted_to_invoice = True
-    quotation.status = QuotationStatus.CONVERTED
+#     # =====================================================
+#     # 10. UPDATE QUOTATION
+#     # =====================================================
+#     quotation.converted_to_invoice = True
+#     quotation.status = QuotationStatus.CONVERTED
 
-    # =====================================================
-    # 11. SAVE
-    # =====================================================
-    await db.commit()
+#     # =====================================================
+#     # 11. SAVE
+#     # =====================================================
+#     await db.commit()
 
-    # Refresh invoice
-    await db.refresh(invoice)
+#     # Refresh invoice
+#     await db.refresh(invoice)
 
-    # =====================================================
-    # 12. RESPONSE
-    # =====================================================
-    return {
-        "message": "Converted to invoice successfully",
-        "invoice_id": invoice.id,
-        "invoice_total": float(invoice.total_amount),
-        "invoice_status": invoice.status,
-    }
+#     # =====================================================
+#     # 12. RESPONSE
+#     # =====================================================
+#     return {
+#         "message": "Converted to invoice successfully",
+#         "invoice_id": invoice.id,
+#         "invoice_total": float(invoice.total_amount),
+#         "invoice_status": invoice.status,
+#     }
 
 # =========================================================
 # CONVERT TO WORK ORDER

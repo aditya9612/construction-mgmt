@@ -3115,7 +3115,21 @@ async def create_dsr(
     try:
         await db.flush()
         await db.refresh(obj)
+
+        # Reload with relationships to avoid async lazy-loading issue
+        result = await db.execute(
+            select(m.DailySiteReport)
+            .options(
+                selectinload(m.DailySiteReport.contractor),
+                selectinload(m.DailySiteReport.created_by),
+            )
+            .where(m.DailySiteReport.id == obj.id)
+        )
+
+        obj = result.scalar_one()
+
         await bump_cache_version(redis, "cache_version:dsr")
+
     except Exception:
         await db.rollback()
         logger.exception("DSR creation failed")

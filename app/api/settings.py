@@ -1,5 +1,4 @@
 import os
-import shutil
 from fastapi import APIRouter, Depends, File, Form , HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -106,6 +105,15 @@ async def update_profile(
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    # =========================================
+    # NORMALIZE EMPTY STRINGS
+    # =========================================
+
+    full_name = full_name or None
+    address = address or None
+    pan_number = pan_number or None
+    aadhaar_number = aadhaar_number or None
+    designation = designation or None
     # =========================================
     # VALIDATE + UPDATE TEXT FIELDS
     # =========================================

@@ -646,7 +646,7 @@ async def update_user(
         # ------------------------
         # CLEAN OLD IMAGE
         # ------------------------
-        if profile_image and old_image_path and old_image_path.startswith("/uploads"):
+        if profile_image and old_image_path and old_image_path.startswith("uploads"):
             old_path = os.path.join(".", old_image_path.lstrip("/"))
             if os.path.exists(old_path) and os.path.isfile(old_path):
                 os.remove(old_path)

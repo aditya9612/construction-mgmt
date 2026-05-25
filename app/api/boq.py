@@ -23,7 +23,7 @@ from app.core.dependencies import (
 )
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
-from app.models.boq import BOQ
+from app.models.boq import BOQ, BOQGroup
 from app.models.master_data import ActivityType
 from app.models.project import Project, Task
 from app.models.user import User, UserRole
@@ -108,33 +108,48 @@ async def create_boq(
 
     try:
 
-        data = payload.model_dump(exclude_unset=True)
-
-        quantity = Decimal(str(data.get("quantity", 0)))
-        unit_cost = Decimal(str(data.get("unit_cost", 0)))
+        quantity = Decimal(str(payload.quantity))
+        unit_cost = Decimal(str(payload.unit_cost))
 
         total_cost, variance = calculate_cost(quantity, unit_cost)
 
-        data.update(
-            {
-                "total_cost": total_cost,
-                "actual_quantity": Decimal(0),
-                "actual_cost": Decimal(0),
-                "variance_cost": variance,
-                "version_no": 1,
-                "is_latest": True,
-                "approval_status": "Draft",
-            }
+        group = BOQGroup(
+            project_id=payload.project_id,
+            name=payload.item_name,
         )
 
-        obj = BOQ(**data)
+        db.add(group)
+
+        await db.flush()
+
+        obj = BOQ(
+            project_id=payload.project_id,
+            boq_group_id=group.id,
+            version_no=1,
+            is_latest=True,
+
+            item_name=payload.item_name,
+            category=payload.category,
+            description=payload.description,
+
+            quantity=quantity,
+            unit=payload.unit,
+            unit_cost=unit_cost,
+
+            total_cost=total_cost,
+            actual_quantity=Decimal(0),
+            actual_cost=Decimal(0),
+            variance_cost=variance,
+
+            status=payload.status,
+            approval_status="Draft",
+
+            activity_type_id=payload.activity_type_id,
+        )
 
         db.add(obj)
 
         await db.flush()
-
-        # stable family/group identity
-        obj.boq_group_id = obj.id
 
         await bump_cache_version(redis, VERSION_KEY)
 
@@ -280,6 +295,12 @@ async def update_boq(
 
     try:
         data = payload.model_dump(exclude_unset=True)
+
+        if payload.activity_type_id is not None:
+            activity = await db.get(ActivityType, payload.activity_type_id)
+
+            if not activity:
+                raise NotFoundError("Invalid activity type")
 
         for k, v in data.items():
             setattr(obj, k, v)
@@ -591,16 +612,22 @@ async def get_boq_by_project(
 # ------------------ ITEMS ------------------
 
 
-@router.post("/{boq_id}/items", response_model=BOQOut)
+@router.post("/groups/{group_id}/items", response_model=BOQOut)
 async def add_item(
-    boq_id: int,
+    group_id: int,
     payload: BOQCreate,
     current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     parent = await db.scalar(
-        select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted")
+        select(BOQ)
+        .where(
+            BOQ.boq_group_id == group_id,
+            BOQ.is_latest == True,
+            BOQ.status != "Deleted",
+        )
+        .order_by(BOQ.id.asc())
     )
 
     if not parent:
@@ -616,6 +643,14 @@ async def add_item(
         raise InvalidStateError(
             "Approved BOQ cannot be modified. Create a new version first."
         )
+
+    activity_type_id = getattr(payload, "activity_type_id", None)
+
+    if activity_type_id is not None:
+        activity = await db.get(ActivityType, activity_type_id)
+
+        if not activity:
+            raise NotFoundError("Invalid activity type")
 
     quantity = Decimal(str(payload.quantity))
     unit_cost = Decimal(str(payload.unit_cost))
@@ -637,6 +672,7 @@ async def add_item(
         variance_cost=variance,
         status=payload.status,
         approval_status="Draft",
+        activity_type_id=payload.activity_type_id,
     )
 
     db.add(obj)
@@ -647,15 +683,17 @@ async def add_item(
     return BOQOut.model_validate(obj)
 
 
-@router.get("/{boq_id}/items", response_model=list[BOQOut])
+@router.get("/groups/{group_id}/items", response_model=list[BOQOut])
 async def get_items(
-    boq_id: int,
+    group_id: int,
     current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     base = await db.scalar(
-        select(BOQ).where(
-            BOQ.id == boq_id,
+        select(BOQ)
+        .where(
+            BOQ.boq_group_id == group_id,
+            BOQ.is_latest == True,
             BOQ.status != "Deleted",
         )
     )
@@ -706,6 +744,12 @@ async def update_item(
 
     data = payload.model_dump(exclude_unset=True)
 
+    if payload.activity_type_id is not None:
+        activity = await db.get(ActivityType, payload.activity_type_id)
+
+        if not activity:
+            raise NotFoundError("Invalid activity type")
+
     for k, v in data.items():
         setattr(obj, k, v)
 
@@ -724,9 +768,9 @@ async def update_item(
     return BOQOut.model_validate(obj)
 
 
-@router.post("/{boq_id}/items/bulk")
+@router.post("/groups/{group_id}/items/bulk")
 async def bulk_add_items(
-    boq_id: int,
+    group_id: int,
     payload: BOQBulkCreate,
     current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
@@ -735,7 +779,13 @@ async def bulk_add_items(
     
     async with db.begin():
         parent = await db.scalar(
-            select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted")
+            select(BOQ)
+            .where(
+                BOQ.boq_group_id == group_id,
+                BOQ.is_latest == True,
+                BOQ.status != "Deleted",
+            )
+            .order_by(BOQ.id.asc())
         )
 
         if not parent:
@@ -754,32 +804,42 @@ async def bulk_add_items(
         created_items = []
 
         for item in payload.items:
-                    quantity = Decimal(str(item.quantity))
-                    unit_cost = Decimal(str(item.unit_cost))
 
-                    total_cost, variance = calculate_cost(quantity, unit_cost)
+            activity_type_id = getattr(item, "activity_type_id", None)
 
-                    obj = BOQ(
-                        project_id=item.project_id,
-                        boq_group_id=parent.boq_group_id,
-                        version_no=parent.version_no,
-                        is_latest=True,
-                        item_name=item.item_name,
-                        category=item.category,
-                        description=item.description,
-                        quantity=quantity,
-                        unit=item.unit,
-                        unit_cost=unit_cost,
-                        total_cost=total_cost,
-                        variance_cost=variance,
-                        status=item.status,
-                        approval_status="Draft",
-                    )
+            if activity_type_id is not None:
+                activity = await db.get(ActivityType, activity_type_id)
 
-                    db.add(obj)
-                    created_items.append(obj)    
+                if not activity:
+                    raise NotFoundError("Invalid activity type")
 
-    await db.flush()
+            quantity = Decimal(str(item.quantity))
+            unit_cost = Decimal(str(item.unit_cost))
+
+            total_cost, variance = calculate_cost(quantity, unit_cost)
+
+            obj = BOQ(
+                project_id=item.project_id,
+                boq_group_id=parent.boq_group_id,
+                version_no=parent.version_no,
+                is_latest=True,
+                item_name=item.item_name,
+                category=item.category,
+                description=item.description,
+                quantity=quantity,
+                unit=item.unit,
+                unit_cost=unit_cost,
+                total_cost=total_cost,
+                variance_cost=variance,
+                status=item.status,
+                approval_status="Draft",
+                activity_type_id=item.activity_type_id,
+            )
+
+            db.add(obj)
+            created_items.append(obj) 
+
+        await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
 
     return {
@@ -822,9 +882,9 @@ async def delete_item(
 # ------------------ CREATE VERSION ------------------
 
 
-@router.post("/{boq_id}/versions")
+@router.post("/groups/{group_id}/versions")
 async def create_version(
-    boq_id: int,
+    group_id: int,
     current_user: User = Depends(require_roles(WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -832,8 +892,10 @@ async def create_version(
     async with db.begin():
 
         base = await db.scalar(
-            select(BOQ).where(
-                BOQ.id == boq_id,
+            select(BOQ)
+            .where(
+                BOQ.boq_group_id == group_id,
+                BOQ.is_latest == True,
                 BOQ.status != "Deleted",
             )
         )
@@ -846,13 +908,15 @@ async def create_version(
                 "Only approved BOQ versions can create a new version."
             )
 
-        max_version = await db.scalar(
-            select(func.max(BOQ.version_no)).where(
-                BOQ.boq_group_id == base.boq_group_id
-            )
-        )
+        group = await db.get(BOQGroup, base.boq_group_id)
 
-        new_version = (max_version or 0) + 1
+        if not group:
+            raise NotFoundError("BOQ group not found")
+
+        new_version = group.current_version + 1
+
+        group.current_version = new_version
+        group.name = base.item_name
 
         await db.execute(
             update(BOQ)
@@ -896,13 +960,13 @@ async def create_version(
                     total_cost=r.total_cost,
                     actual_quantity=Decimal(0),
                     actual_cost=Decimal(0),
-                    variance_cost=r.total_cost,
+                    variance_cost=Decimal(0),
                     status="Active",
                     approval_status="Draft",
                     activity_type_id=r.activity_type_id,
                 )
             )
-    await db.flush()
+        await db.flush()
 
     await bump_cache_version(redis, VERSION_KEY)
 
