@@ -1073,7 +1073,7 @@ from calendar import monthrange
 async def project_report(
     project_id: int,
     type: str,
-    report_date: date | None = None,
+    date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     month: int | None = None,
@@ -1098,10 +1098,10 @@ async def project_report(
             detail="Invalid report type"
         )
 
-    if type == "daily" and not report_date:
+    if type == "daily" and not date:
         raise HTTPException(
             status_code=400,
-            detail="report_date is required for daily report"
+            detail="date is required for daily report"
         )
 
     if type == "weekly" and (not start_date or not end_date):
@@ -1156,8 +1156,8 @@ async def project_report(
         )
 
     if type == "daily":
-        start_date = report_date
-        end_date = report_date
+        start_date = date
+        end_date = date
 
     # =====================================================
     # PROJECT
@@ -1247,7 +1247,7 @@ async def project_report(
     return {
         "project": {
             "id": project.id,
-            "project_name": project.project_name,
+            "name": project.name,
         },
 
         "report_type": type,
@@ -1288,6 +1288,7 @@ async def project_report(
         "generated_at": datetime.utcnow(),
     }
 
+
 # =========================================================
 # EXPORT PDF
 # =========================================================
@@ -1296,24 +1297,23 @@ async def project_report(
 async def export_project_report_pdf(
     project_id: int,
     type: str,
-    report_date: date | None = None,
+    date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     month: int | None = None,
     year: int | None = None,
-    quarter: int | None = None,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+
     response = await project_report(
         project_id=project_id,
         type=type,
-        report_date=report_date,
+        date=date,
         start_date=start_date,
         end_date=end_date,
         month=month,
         year=year,
-        quarter=quarter,
         current_user=current_user,
         db=db,
     )
@@ -1335,9 +1335,11 @@ async def export_project_report_pdf(
 
     content.append(Spacer(1, 20))
 
-    Paragraph(
-        f"Project: {response['project']['project_name']}",
-        styles["Heading2"]
+    content.append(
+        Paragraph(
+            f"Project: {response['project']['name']}",
+            styles["Heading2"]
+        )
     )
 
     content.append(
@@ -1400,12 +1402,11 @@ async def export_project_report_pdf(
 async def export_project_report_excel(
     project_id: int,
     type: str,
-    report_date: date | None = None,
+    date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     month: int | None = None,
     year: int | None = None,
-    quarter: int | None = None,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -1413,12 +1414,11 @@ async def export_project_report_excel(
     response = await project_report(
         project_id=project_id,
         type=type,
-        report_date=report_date,
+        date=date,
         start_date=start_date,
         end_date=end_date,
         month=month,
         year=year,
-        quarter=quarter,
         current_user=current_user,
         db=db,
     )
@@ -1433,7 +1433,7 @@ async def export_project_report_excel(
     # SUMMARY
     # =====================================================
 
-    ws.append(["Project", response["project"]["project_name"]])
+    ws.append(["Project", response["project"]["name"]])
     ws.append(["Report Type", response["report_type"]])
     ws.append([])
 
