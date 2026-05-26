@@ -1629,90 +1629,131 @@ async def adjust_inventory(
     redis=Depends(get_request_redis),
 ):
     import uuid
-    from decimal import Decimal
+    from decimal import Decimal, InvalidOperation
 
     material_id = payload.material_id
-    reason = (payload.reason or "").strip()
+
+    # ================= REASON CLEAN =================
+    reason = " ".join((payload.reason or "").strip().split())
 
     try:
-        new_stock = Decimal(str(payload.new_stock))
-    except:
-        raise HTTPException(400, "Invalid stock value")
+        new_stock = Decimal(str(payload.new_stock)).quantize(
+            Decimal("0.001")
+        )
 
+    except (InvalidOperation, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid stock value",
+        )
+
+    # ================= VALIDATIONS =================
     if new_stock < 0:
-        raise HTTPException(400, "Stock cannot be negative")
+        raise HTTPException(
+            status_code=400,
+            detail="Stock cannot be negative",
+        )
+
+    if new_stock > Decimal("999999999"):
+        raise HTTPException(
+            status_code=400,
+            detail="Stock value too large",
+        )
 
     if not reason:
-        raise HTTPException(400, "Reason is required")
+        raise HTTPException(
+            status_code=400,
+            detail="Reason is required",
+        )
+
+    if len(reason) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail="Reason too long",
+        )
 
     try:
         material = await db.scalar(
             select(Material)
-            .where(Material.id == material_id, Material.is_deleted == False)
+            .where(
+                Material.id == material_id,
+                Material.is_deleted == False,
+            )
             .with_for_update()
         )
 
         if not material:
-            raise HTTPException(404, "Material not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Material not found",
+            )
 
         old_stock = material.remaining_stock or Decimal("0")
+
         diff = new_stock - old_stock
 
+        # ================= SAME STOCK CHECK =================
         if diff == 0:
-            return {
-                "material_id": material_id,
-                "old_stock": float(old_stock),
-                "new_stock": float(old_stock),
-                "difference": 0,
-                "reason": reason,
-            }
+            raise HTTPException(
+                status_code=400,
+                detail="No stock change detected",
+            )
 
         reference = f"ADJ-{uuid.uuid4().hex[:8]}"
 
         qty_purchased = material.quantity_purchased or Decimal("0")
         total_amt = material.total_amount or Decimal("0")
 
-        # ✅ SAFE avg_rate
+        # ================= SAFE AVG RATE =================
         avg_rate = (
             total_amt / qty_purchased
             if qty_purchased and qty_purchased > 0
             else (material.purchase_rate or Decimal("0"))
         )
 
-        # ===== STOCK + COST UPDATE =====
+        # ================= STOCK + COST UPDATE =================
+        # ⚠ KEEPING OLD LOGIC SAFE (NO BREAKING)
+
         if diff > 0:
             # Stock increase
             material.quantity_purchased += diff
 
-            # Cost increase (OK)
+            # Cost increase
             material.total_amount += diff * avg_rate
 
         else:
             # Stock decrease
             decrease_qty = abs(diff)
+
             material.quantity_used += decrease_qty
 
-            # ⚠️ IMPORTANT FIX:
-            # DO NOT reduce total_amount (this was breaking avg_rate)
-            cost_reduction = decrease_qty * avg_rate  # kept for logging/debug only
+            # IMPORTANT:
+            # keeping old behavior safe without deducting total_amount
+            cost_reduction = decrease_qty * avg_rate
 
-            # Keep structure but skip deduction
-            if material.total_amount <= 0:
+            if material.total_amount < 0:
                 material.total_amount = Decimal("0")
 
-        # ✅ Recalculate derived fields
+        # ================= FINAL STOCK UPDATE =================
+        material.remaining_stock = new_stock
+
+        # ================= UPDATE DERIVED FIELDS =================
         update_material_fields(material)
 
-        audit_remark = f"Stock adjusted: {old_stock} → {new_stock} | {reason}"
+        audit_remark = (
+            f"Stock adjusted: {old_stock} → {new_stock} | {reason}"
+        )
 
-        # ===== TRANSACTION =====
+        adjustment_total = abs(diff) * avg_rate
+
+        # ================= TRANSACTION =================
         db.add(
             MaterialTransaction(
                 material_id=material.id,
                 type=DBTransactionType.ADJUSTMENT,
                 quantity=diff,
                 rate=avg_rate,
-                total_amount=abs(diff) * avg_rate if diff > 0 else 0,
+                total_amount=adjustment_total,
                 amount_paid=0,
                 payment_pending=0,
                 issue_type=IssueType.SYSTEM,
@@ -1722,14 +1763,14 @@ async def adjust_inventory(
             )
         )
 
-        # ===== LEDGER =====
+        # ================= LEDGER =================
         db.add(
             MaterialLedger(
                 material_id=material.id,
                 type=DBTransactionType.ADJUSTMENT,
                 quantity=diff,
                 rate=avg_rate,
-                total_amount=abs(diff) * avg_rate if diff > 0 else 0,
+                total_amount=adjustment_total,
                 amount_paid=0,
                 payment_pending=0,
                 project_id=material.project_id,
@@ -1740,10 +1781,15 @@ async def adjust_inventory(
 
         await db.commit()
 
+    except HTTPException:
+        await db.rollback()
+        raise
+
     except Exception:
         await db.rollback()
         raise
 
+    # ================= CACHE =================
     await bump_cache_version(redis, VERSION_KEY)
 
     return {
@@ -1754,7 +1800,6 @@ async def adjust_inventory(
         "reason": reason,
         "reference_id": reference,
     }
-
 
 # ===============get_all_inventory===========================
 

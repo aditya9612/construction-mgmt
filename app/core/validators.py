@@ -7,6 +7,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
+from pydantic import field_validator
 
 # ================= CREATE USER =================
 
@@ -251,8 +252,6 @@ def validate_start_end_dates(start_date, end_date):
     return end_date
 
 
-
-
 ALLOWED_DRAWING_EXTENSIONS = {
     ".pdf",
     ".dwg",
@@ -268,7 +267,55 @@ def validate_drawing_file(filename: str):
     ext = os.path.splitext(filename)[1].lower()
 
     if ext not in ALLOWED_DRAWING_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported drawing file type"
-        )
+        raise HTTPException(status_code=400, detail="Unsupported drawing file type")
+
+
+# ================= MATERIAL VALIDATORS =================
+
+
+def validate_material_name(v):
+
+    if v is None:
+        return v
+
+    if not v.strip():
+        raise ValueError("Material name required")
+
+    v = " ".join(v.strip().split())
+
+    if len(v) < 2:
+        raise ValueError("Material name too short")
+
+    if not re.match(r"^[A-Za-z0-9\s\-/()]+$", v):
+        raise ValueError("Invalid material name")
+
+    return v.title()
+
+
+def validate_material_string(v):
+
+    if v is None:
+        return v
+
+    if not v.strip():
+        raise ValueError("Field required")
+
+    return " ".join(v.strip().split()).title()
+
+
+def validate_material_number(v, field_name=None):
+
+    if v is None:
+        return v
+
+    if field_name == "purchase_rate":
+
+        if v <= 0:
+            raise ValueError("Purchase rate must be > 0")
+
+    else:
+
+        if v < 0:
+            raise ValueError("Negative value not allowed")
+
+    return v
