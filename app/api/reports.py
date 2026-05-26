@@ -1293,7 +1293,6 @@ async def project_report(
 # =========================================================
 
 @router.get("/project/export/pdf")
-@router.get("/project/export/pdf")
 async def export_project_report_pdf(
     project_id: int,
     type: str,
