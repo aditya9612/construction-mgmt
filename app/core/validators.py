@@ -319,3 +319,171 @@ def validate_material_number(v, field_name=None):
             raise ValueError("Negative value not allowed")
 
     return v
+
+# ================= EQUIPMENT VALIDATORS =================
+
+
+def validate_equipment_name(v):
+
+    if v is None:
+        return v
+
+    if not v.strip():
+        raise ValueError("Equipment name required")
+
+    v = " ".join(v.strip().split())
+
+    if len(v) < 2:
+        raise ValueError("Equipment name too short")
+
+    if not re.match(r"^[A-Za-z0-9\s\-/()]+$", v):
+        raise ValueError("Invalid equipment name")
+
+    return v.title()
+
+
+def validate_equipment_code(v):
+
+    if v is None:
+        return v
+
+    if not v.strip():
+        raise ValueError("Equipment code required")
+
+    v = v.strip().upper()
+
+    if not re.match(r"^[A-Z0-9\-_]+$", v):
+        raise ValueError("Invalid equipment code")
+
+    return v
+
+
+def validate_operator_name(v):
+
+    if v is None:
+        return v
+
+    v = " ".join(v.strip().split())
+
+    if not re.match(r"^[A-Za-z. ]+$", v):
+        raise ValueError("Invalid operator name")
+
+    return v.title()
+
+
+def validate_equipment_description(v):
+
+    if v is None:
+        return v
+
+    if not v.strip():
+        raise ValueError("Description required")
+
+    return " ".join(v.strip().split())
+
+
+def validate_client_name(v):
+
+    if v is None:
+        return v
+
+    if not v.strip():
+        raise ValueError("Client name required")
+
+    v = " ".join(v.strip().split())
+
+    if len(v) < 2:
+        raise ValueError("Client name too short")
+
+    if not re.match(r"^[A-Za-z0-9. &()-]+$", v):
+        raise ValueError("Invalid client name")
+
+    return v.title()
+
+
+def validate_notes(v):
+
+    if v is None:
+        return v
+
+    return " ".join(v.strip().split())
+
+
+def validate_equipment_date(v, field_name="Date"):
+
+    if v is None:
+        return v
+
+    if v.year < 2000:
+        raise ValueError(f"Invalid {field_name.lower()}")
+
+    return v
+
+
+def validate_usage_date(v):
+
+    if v is None:
+        return v
+
+    if v > date.today():
+        raise ValueError("Usage date cannot be future")
+
+    if v.year < 2000:
+        raise ValueError("Invalid usage date")
+
+    return v
+
+
+def validate_maintenance_date(v):
+
+    if v is None:
+        return v
+
+    if v > date.today():
+        raise ValueError("Maintenance date cannot be future")
+
+    if v.year < 2000:
+        raise ValueError("Invalid maintenance date")
+
+    return v    
+
+def validate_pan(v):
+
+    if v is None:
+        return v
+
+    v = v.strip().upper()
+
+    if not re.match(r"^[A-Z]{5}[0-9]{4}[A-Z]$", v):
+        raise ValueError("Invalid PAN format")
+
+    return v
+
+
+def validate_aadhaar(v):
+
+    if v is None:
+        return v
+
+    v = v.replace(" ", "").strip()
+
+    if not re.match(r"^[0-9]{12}$", v):
+        raise ValueError("Aadhaar must be 12 digits")
+
+    return v
+
+
+def validate_mobile(v):
+
+    if v is None:
+        return v
+
+    digits = "".join(c for c in v if c.isdigit())
+
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+
+    if not re.match(r"^[6-9][0-9]{9}$", digits):
+        raise ValueError("Invalid mobile number")
+
+    return digits
