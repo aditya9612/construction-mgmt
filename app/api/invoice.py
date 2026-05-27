@@ -195,9 +195,13 @@ async def get_client_payment_history(
         # GET CLIENT PROJECT IDS FROM INVOICES
         # =================================================
 
-        project_result = await db.execute(select(Invoice.project_id).distinct())
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
 
-        project_ids = project_result.scalars().all()
+        project_ids = [project_id]
 
         # =================================================
         # NO PROJECTS FOUND
@@ -458,21 +462,11 @@ async def client_payments_pdf(
         # VALIDATE PROJECT ACCESS USING INVOICE TABLE
         # =================================================
 
-        project_access_result = await db.execute(
-            select(Invoice.id).where(
-                Invoice.project_id == project_id,
-            )
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
         )
-
-        project_access = project_access_result.scalar_one_or_none()
-
-        if not project_access:
-
-            raise HTTPException(
-                status_code=403,
-                detail="Project access denied",
-            )
-
         # =================================================
         # PDF SETUP
         # =================================================

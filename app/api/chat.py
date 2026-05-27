@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import case, select, func, update
 from datetime import datetime
 from datetime import timedelta
 from app.db.session import get_db_session
-from app.models.chat import ChatSession, ChatMember, MemberRole, ChatMessage, MessageReaction, MessageRead, ChatType
-from app.schemas.chat import SendMessage
+from app.models.chat import ChatSession, ChatMember, MemberRole, ChatMessage, MessageReaction, MessageRead, ChatType, MessageStatus
+from app.schemas.chat import ChatInfoOut, ChatListOut, CreateGroup, MessageOut, ReplyOut, SendMessage
 from app.models.user import User
 from app.core.dependencies import get_current_user
 
@@ -32,6 +32,14 @@ async def validate_admin(chat_id: int, user_id: int, db: AsyncSession):
 
     if not member or member.role != MemberRole.ADMIN:
         raise HTTPException(403, "Admin access required")
+    
+async def validate_group(chat_id: int, db: AsyncSession):
+    chat = await db.get(ChatSession, chat_id)
+
+    if not chat or chat.type != ChatType.GROUP:
+        raise HTTPException(400, "Group chat required")
+
+    return chat
 
 router = APIRouter(prefix="/chats", tags=["Chat"])
 
@@ -54,7 +62,18 @@ async def create_private_chat(
     #     )
     # )
 
-    from sqlalchemy import func, case
+    if user_id == current_user.id:
+        raise HTTPException(
+            400,
+            "Cannot create chat with yourself"
+        )
+
+    # CHECK TARGET USER EXISTS
+    target = await db.get(User, user_id)
+
+    if not target:
+        raise HTTPException(404, "User not found")
+
 
     existing = await db.execute(
         select(ChatSession)
@@ -101,6 +120,7 @@ async def send_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    import re
     await validate_membership(chat_id, current_user.id, db)
 
     #  2. VALIDATE PARENT MESSAGE CHAT
@@ -111,18 +131,46 @@ async def send_message(
             raise HTTPException(400, "Invalid parent message")
 
     #  3. LIMIT MESSAGE SIZE
-    if payload.message and len(payload.message) > 2000:
+    # EMPTY MESSAGE VALIDATION
+    if (
+        (not payload.message or not payload.message.strip())
+        and not payload.attachment_url
+    ):
+        raise HTTPException(400, "Message required")
+
+    # MESSAGE LENGTH
+    if payload.message and len(payload.message.strip()) > 2000:
         raise HTTPException(400, "Message too long")
 
     #  8. VALIDATE ATTACHMENT URL
     if payload.attachment_url and not payload.attachment_url.startswith("http"):
         raise HTTPException(400, "Invalid attachment URL")
+    
+    # MENTION DETECTION
+    mentions = re.findall(
+        r'@([A-Za-z0-9_.]+)',
+        payload.message or ""
+    )
+
+    mentioned_users = []
+
+    if mentions:
+
+        users = await db.execute(
+            select(User).where(
+                User.full_name.in_(mentions)
+            )
+        )
+
+        mentioned_users = users.scalars().all()
 
     #  7. RATE LIMIT (requires redis)
     try:
         redis = request.app.state.redis
+
         if redis:
             key = f"user:{current_user.id}:msg_rate"
+
             count = await redis.incr(key)
 
             if count == 1:
@@ -130,8 +178,12 @@ async def send_message(
 
             if count > 10:
                 raise HTTPException(429, "Too many messages")
+
+    except HTTPException:
+        raise
+
     except Exception:
-        pass  # don't block request if redis fails
+        pass
 
     msg = ChatMessage(
         chat_id=chat_id,
@@ -169,6 +221,9 @@ async def send_message(
                     "message": payload.message,
                     "sender": current_user.id,
                     "message_id": msg.id,
+                    "mentions": [
+                        u.id for u in mentioned_users
+                    ],
                     "parent_id": payload.parent_id,
                     "attachment_url": payload.attachment_url,
                     "status": "sent"
@@ -177,12 +232,62 @@ async def send_message(
     except Exception:
         pass
 
+    await db.refresh(msg)
     return msg
 
 
+
+@router.post("/messages/{message_id}/delivered")
+async def mark_delivered(
+    request: Request,
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    msg = await db.get(ChatMessage, message_id)
+
+    if not msg:
+        raise HTTPException(404, "Message not found")
+
+    await validate_membership(
+        msg.chat_id,
+        current_user.id,
+        db
+    )
+
+    # sender cannot mark own message delivered
+    if msg.sender_id == current_user.id:
+        return {"status": "ignored"}
+
+    # already read means already delivered
+    if msg.status == MessageStatus.READ:
+        return {"status": "already read"}
+
+    msg.status = MessageStatus.DELIVERED
+
+    await db.commit()
+
+    # websocket event
+    try:
+        redis = request.app.state.redis
+
+        if redis:
+            await redis.publish(
+                f"chat:{msg.chat_id}",
+                json.dumps({
+                    "type": "delivered",
+                    "message_id": msg.id,
+                    "user_id": current_user.id
+                })
+            )
+    except Exception:
+        pass
+
+    return {"status": "delivered"}
+
 from sqlalchemy.orm import aliased
 
-@router.get("/{chat_id}/messages")
+@router.get("/{chat_id}/messages",response_model=list[MessageOut])
 async def get_messages(
     request: Request,
     chat_id: int,
@@ -226,9 +331,11 @@ async def get_messages(
             "parent_id": msg.parent_id,
             "chat_id": msg.chat_id,
 
+            "sender_id": msg.sender_id,
+
             "sender": {
                 "id": user.id,
-                "name": user.name
+                "name": user.full_name
             },
 
             "parent": {
@@ -240,17 +347,28 @@ async def get_messages(
             "is_pinned": msg.is_pinned,
             "is_edited": getattr(msg, "is_edited", False),
             "attachment_url": msg.attachment_url,
-
+            "attachments": [],
+            "reactions": [],
             "read_by": []
         })
 
-    # mark messages as read
+    # AUTO READ WHEN OPENING CHAT
+    # inside get_messages()
+
     message_ids = [
         msg.id for msg in message_objects
         if msg.sender_id != current_user.id
     ][:50]
 
     if message_ids:
+
+        # mark message status as READ
+        await db.execute(
+            update(ChatMessage)
+            .where(ChatMessage.id.in_(message_ids))
+            .values(status=MessageStatus.READ)
+        )
+
         existing_reads = await db.execute(
             select(MessageRead.message_id).where(
                 MessageRead.user_id == current_user.id,
@@ -308,13 +426,67 @@ async def get_messages(
             read_map.setdefault(mid, []).append(uid)
 
     # inject read_by
+    # batch reactions
+    reaction_map = {}
+
+    if message_objects:
+        reactions = await db.execute(
+            select(
+                MessageReaction.message_id,
+                MessageReaction.user_id,
+                MessageReaction.reaction
+            ).where(
+                MessageReaction.message_id.in_(
+                    [m.id for m in message_objects]
+                )
+            )
+        )
+
+        for mid, uid, reaction in reactions.all():
+            reaction_map.setdefault(mid, []).append({
+                "user_id": uid,
+                "reaction": reaction,
+                "is_reacted_by_me": uid == current_user.id
+            })
+
+    # batch reply counts
+    reply_map = {}
+
+    if message_objects:
+
+        reply_counts = await db.execute(
+            select(
+                ChatMessage.parent_id,
+                func.count(ChatMessage.id)
+            )
+            .where(
+                ChatMessage.parent_id.in_(
+                    [m.id for m in message_objects]
+                )
+            )
+            .group_by(ChatMessage.parent_id)
+        )
+
+        for pid, count in reply_counts.all():
+            reply_map[pid] = count
+
     for item in messages:
         item["read_by"] = read_map.get(item["id"], [])
+
+        item["reactions"] = reaction_map.get(item["id"], [])
+
+        item["reply_count"] = reply_map.get(
+            item["id"],
+            0
+        )
 
     return messages
 
 
-@router.get("/messages/{message_id}/replies")
+@router.get(
+    "/messages/{message_id}/replies",
+    response_model=list[ReplyOut]
+)
 async def get_replies(
     message_id: int,
     current_user: User = Depends(get_current_user),
@@ -351,7 +523,7 @@ async def get_replies(
             "created_at": msg.created_at,
             "sender": {
                 "id": user.id,
-                "name": user.name
+                "name": user.full_name
             },
             "attachment_url": msg.attachment_url,
             "is_deleted": msg.is_deleted,
@@ -389,13 +561,33 @@ async def unread_count(
 
 @router.post("/group")
 async def create_group(
-    name: str,
-    member_ids: list[int],
+    payload: CreateGroup,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+
+    member_ids = payload.member_ids
+    name = payload.name
+
     if current_user.id not in member_ids:
         member_ids.append(current_user.id)
+
+    # VALIDATE USERS EXIST
+    users = await db.execute(
+        select(User.id).where(
+            User.id.in_(member_ids)
+        )
+    )
+
+    valid_ids = set(users.scalars().all())
+
+    invalid = set(member_ids) - valid_ids
+
+    if invalid:
+        raise HTTPException(
+            400,
+            f"Invalid users: {list(invalid)}"
+        )
 
     chat = ChatSession(
         type=ChatType.GROUP,
@@ -407,13 +599,19 @@ async def create_group(
     await db.flush()
 
     for uid in set(member_ids):
-        role = MemberRole.ADMIN if uid == current_user.id else MemberRole.MEMBER
+        role = (
+            MemberRole.ADMIN
+            if uid == current_user.id
+            else MemberRole.MEMBER
+        )
 
         db.add(ChatMember(
             chat_id=chat.id,
             user_id=uid,
             role=role
         ))
+
+    await db.commit()
 
     return {"chat_id": chat.id}
 
@@ -425,7 +623,14 @@ async def add_member(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await validate_group(chat_id, db)
+
     await validate_admin(chat_id, current_user.id, db)
+
+    target = await db.get(User, user_id)
+
+    if not target:
+        raise HTTPException(404, "User not found")
 
     existing = await db.execute(
         select(ChatMember).where(
@@ -454,6 +659,17 @@ async def remove_member(
     db: AsyncSession = Depends(get_db_session),
 ):
     #  only admin can remove
+    await validate_group(chat_id, db)
+
+    chat = await db.get(ChatSession, chat_id)
+
+    if user_id == chat.created_by:
+        raise HTTPException(
+            400,
+            "Cannot remove group creator"
+        )
+
+    # only admin can remove
     await validate_admin(chat_id, current_user.id, db)
 
     #  prevent admin removing themselves via this API
@@ -471,9 +687,202 @@ async def remove_member(
     if not member:
         raise HTTPException(404, "Member not found")
 
+    # PREVENT REMOVING LAST ADMIN
+    if member.role == MemberRole.ADMIN:
+
+        admins = await db.execute(
+            select(ChatMember).where(
+                ChatMember.chat_id == chat_id,
+                ChatMember.role == MemberRole.ADMIN
+            )
+        )
+
+        admin_list = admins.scalars().all()
+
+        if len(admin_list) == 1:
+            raise HTTPException(
+                400,
+                "Cannot remove last admin"
+            )
+
     await db.delete(member)
 
     return {"status": "removed"}
+
+
+@router.get("/group/{chat_id}/members")
+async def group_members(
+    chat_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await validate_group(chat_id, db)
+
+    await validate_membership(
+        chat_id,
+        current_user.id,
+        db
+    )
+
+    result = await db.execute(
+        select(ChatMember, User)
+        .join(User, ChatMember.user_id == User.id)
+        .where(ChatMember.chat_id == chat_id)
+        .order_by(ChatMember.joined_at.asc())
+    )
+
+    rows = result.all()
+
+    members = []
+
+    for member, user in rows:
+        members.append({
+            "user_id": user.id,
+            "name": user.full_name,
+            "role": member.role.value,
+            "joined_at": member.joined_at
+        })
+
+    return members
+
+
+@router.put("/group/{chat_id}")
+async def update_group(
+    chat_id: int,
+    name: str | None = None,
+    avatar_url: str | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await validate_group(chat_id, db)
+
+    await validate_admin(
+        chat_id,
+        current_user.id,
+        db
+    )
+
+    chat = await db.get(ChatSession, chat_id)
+
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+
+    if name:
+        chat.name = name.strip()
+
+    if avatar_url:
+        chat.avatar_url = avatar_url
+
+    await db.commit()
+
+    return {"status": "updated"}
+
+
+@router.get(
+    "/{chat_id}",
+    response_model=ChatInfoOut
+)
+async def get_chat_info(
+    chat_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await validate_membership(
+        chat_id,
+        current_user.id,
+        db
+    )
+
+    chat = await db.get(ChatSession, chat_id)
+
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+
+    member_count = await db.scalar(
+        select(func.count())
+        .select_from(ChatMember)
+        .where(ChatMember.chat_id == chat_id)
+    )
+
+    member = await db.execute(
+        select(ChatMember).where(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == current_user.id
+        )
+    )
+
+    current_member = member.scalar()
+
+    return {
+        "id": chat.id,
+        "type": chat.type.value,
+        "name": chat.name,
+        "avatar_url": chat.avatar_url,
+        "created_by": chat.created_by,
+        "created_at": chat.created_at,
+        "member_count": member_count,
+        "last_message": chat.last_message,
+        "last_message_at": chat.last_message_at,
+        "is_muted": current_member.is_muted,
+        "is_archived": current_member.is_archived
+    }
+
+@router.post("/{chat_id}/mute")
+async def mute_chat(
+    chat_id: int,
+    muted: bool,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    member = await db.execute(
+        select(ChatMember).where(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == current_user.id
+        )
+    )
+
+    obj = member.scalar()
+
+    if not obj:
+        raise HTTPException(404, "Not part of chat")
+
+    obj.is_muted = muted
+
+    await db.commit()
+
+    return {
+        "status": "updated",
+        "is_muted": muted
+    }
+
+
+@router.post("/{chat_id}/archive")
+async def archive_chat(
+    chat_id: int,
+    archived: bool,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    member = await db.execute(
+        select(ChatMember).where(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == current_user.id
+        )
+    )
+
+    obj = member.scalar()
+
+    if not obj:
+        raise HTTPException(404, "Not part of chat")
+
+    obj.is_archived = archived
+
+    await db.commit()
+
+    return {
+        "status": "updated",
+        "is_archived": archived
+    }
 
 
 @router.post("/{chat_id}/typing")
@@ -485,7 +894,7 @@ async def typing(
     db: AsyncSession = Depends(get_db_session),
 ):
     await validate_membership(chat_id, current_user.id, db)
-    redis = request.app.state.redis
+    redis = getattr(request.app.state, "redis", None)
 
     if redis:
         # store typing with expiry
@@ -510,7 +919,49 @@ async def typing(
     return {"ok": True}
 
 
-@router.get("/")
+@router.get("/{chat_id}/typing-users")
+async def typing_users(
+    chat_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await validate_membership(
+        chat_id,
+        current_user.id,
+        db
+    )
+
+    redis = getattr(request.app.state, "redis", None)
+
+    if not redis:
+        return {"users": []}
+
+    result = await db.execute(
+        select(ChatMember.user_id, User.full_name)
+        .join(User, ChatMember.user_id == User.id)
+        .where(ChatMember.chat_id == chat_id)
+    )
+
+    rows = result.all()
+
+    users = []
+
+    for uid, name in rows:
+
+        typing = await redis.get(
+            f"chat:{chat_id}:typing:{uid}"
+        )
+
+        if typing and uid != current_user.id:
+            users.append({
+                "user_id": uid,
+                "name": name or "Unknown User"
+            })
+
+    return {"users": users}
+
+@router.get("/",response_model=list[ChatListOut])
 async def get_chat_list(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
@@ -547,7 +998,20 @@ async def get_chat_list(
         .order_by(ChatSession.last_message_at.desc())
     )
 
-    return result.all()
+    rows = result.all()
+
+    chats = []
+
+    for row in rows:
+        chats.append({
+            "id": row.id,
+            "name": row.name,
+            "last_message": row.last_message,
+            "last_message_at": row.last_message_at,
+            "unread_count": row.unread_count or 0
+        })
+
+    return chats
 
 @router.post("/group/{chat_id}/kick")
 async def kick_member(
@@ -556,6 +1020,17 @@ async def kick_member(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    
+    await validate_group(chat_id, db)
+
+    chat = await db.get(ChatSession, chat_id)
+
+    if user_id == chat.created_by:
+        raise HTTPException(
+            400,
+            "Cannot remove group creator"
+        )
+
     await validate_admin(chat_id, current_user.id, db)
 
     obj = await db.execute(
@@ -569,6 +1044,24 @@ async def kick_member(
     if not member:
         raise HTTPException(404, "User not in group")
 
+    # PREVENT REMOVING LAST ADMIN
+    if member.role == MemberRole.ADMIN:
+
+        admins = await db.execute(
+            select(ChatMember).where(
+                ChatMember.chat_id == chat_id,
+                ChatMember.role == MemberRole.ADMIN
+            )
+        )
+
+        admin_list = admins.scalars().all()
+
+        if len(admin_list) == 1:
+            raise HTTPException(
+                400,
+                "Cannot remove last admin"
+            )
+
     await db.delete(member)
 
     return {"status": "kicked"}
@@ -580,6 +1073,8 @@ async def leave_group(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    
+    await validate_group(chat_id, db)
     obj = await db.execute(
         select(ChatMember).where(
             ChatMember.chat_id == chat_id,
@@ -640,6 +1135,7 @@ async def transfer_admin(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await validate_group(chat_id, db)
     #  ensure current user is admin
     await validate_admin(chat_id, current_user.id, db)
 
@@ -706,9 +1202,9 @@ async def react_message(
     )
     existing = result.scalar()
 
-    if existing:
-        # update reaction (no duplicate row)
-        existing.reaction = reaction
+    if existing and existing.reaction == reaction:
+        await db.delete(existing)
+        return {"status": "removed"}
     else:
         db.add(MessageReaction(
             message_id=message_id,
@@ -748,10 +1244,15 @@ async def edit_message(
     if msg.sender_id != current_user.id:
         raise HTTPException(403, "Not allowed")
 
-    if datetime.utcnow() - msg.created_at > timedelta(minutes=2):
+    # EDIT LIMIT
+    if datetime.utcnow() - msg.created_at > timedelta(minutes=15):
         raise HTTPException(403, "Edit time expired")
+    
+    # EMPTY VALIDATION
+    if not new_text.strip():
+        raise HTTPException(400, "Message required")
 
-    msg.message = new_text
+    msg.message = new_text.strip()
     msg.is_edited = True
 
     #  REAL-TIME edit event
@@ -784,7 +1285,8 @@ async def delete_message(
     if msg.sender_id != current_user.id:
         raise HTTPException(403, "Not allowed")
 
-    if datetime.utcnow() - msg.created_at > timedelta(minutes=5):
+    # DELETE LIMIT
+    if datetime.utcnow() - msg.created_at > timedelta(minutes=60):
         raise HTTPException(403, "Delete time expired")
 
     #  soft delete
@@ -820,11 +1322,14 @@ async def user_status(user_id: int, request: Request):
 
     return {
         "online": bool(online),
-        "last_seen": last_seen.decode() if last_seen else None  # ✅ FIX
+        "last_seen": last_seen.decode() if last_seen else None
     }
 
 
-@router.get("/{chat_id}/search")
+@router.get(
+    "/{chat_id}/search",
+    response_model=list[MessageOut]
+)
 async def search_messages(
     chat_id: int,
     query: str,
@@ -832,16 +1337,63 @@ async def search_messages(
     db: AsyncSession = Depends(get_db_session),
 ):
     await validate_membership(chat_id, current_user.id, db)
+
+    Parent = aliased(ChatMessage)
+
     result = await db.execute(
-        select(ChatMessage)
+        select(ChatMessage, User, Parent)
+        .join(User, ChatMessage.sender_id == User.id)
+        .outerjoin(Parent, ChatMessage.parent_id == Parent.id)
         .where(
             ChatMessage.chat_id == chat_id,
             ChatMessage.message.ilike(f"%{query}%")
         )
+        .order_by(ChatMessage.created_at.desc())
         .limit(50)
     )
 
-    return result.scalars().all()
+    rows = result.all()
+
+    messages = []
+
+    for msg, user, parent in rows:
+
+        messages.append({
+            "id": msg.id,
+            "chat_id": msg.chat_id,
+            "message": "[deleted]" if msg.is_deleted else msg.message,
+            "sender_id": msg.sender_id,
+            "created_at": msg.created_at,
+            "status": msg.status.value if msg.status else None,
+            "parent_id": msg.parent_id,
+
+            "sender": {
+                "id": user.id,
+                "name": user.full_name
+            },
+
+            "parent": {
+                "id": parent.id,
+                "message": (
+                    "[deleted]"
+                    if parent.is_deleted
+                    else parent.message
+                )
+            } if parent else None,
+
+            "is_deleted": msg.is_deleted,
+            "is_edited": msg.is_edited,
+            "is_pinned": msg.is_pinned,
+
+            "attachment_url": msg.attachment_url,
+            "attachments": [],
+            "reply_count": 0,
+
+            "read_by": [],
+            "reactions": []
+        })
+
+    return messages
 
 
 @router.post("/messages/{message_id}/pin")
@@ -855,13 +1407,251 @@ async def pin_message(
     if not msg:
         raise HTTPException(404, "ChatMessage not found")
 
+    await validate_membership(
+        msg.chat_id,
+        current_user.id,
+        db
+    )
+
     # optional but important safety (same pattern as edit/delete)
-    if msg.sender_id != current_user.id:
-        raise HTTPException(403, "Not allowed")
+    chat = await db.get(ChatSession, msg.chat_id)
+
+    if (
+        chat
+        and chat.type == ChatType.GROUP
+    ):
+        await validate_admin(
+            msg.chat_id,
+            current_user.id,
+            db
+        )
+
+    else:
+        if msg.sender_id != current_user.id:
+            raise HTTPException(403, "Not allowed")
+
+    pin_count = await db.scalar(
+        select(func.count())
+        .select_from(ChatMessage)
+        .where(
+            ChatMessage.chat_id == msg.chat_id,
+            ChatMessage.is_pinned == True
+        )
+    )
+
+    if pin_count >= 50:
+        raise HTTPException(
+            400,
+            "Pin limit reached"
+        )
 
     msg.is_pinned = True
 
     return {"status": "pinned"}
+
+
+@router.get(
+    "/{chat_id}/pinned",
+    response_model=list[MessageOut]
+)
+async def pinned_messages(
+    chat_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await validate_membership(
+        chat_id,
+        current_user.id,
+        db
+    )
+
+    result = await db.execute(
+        select(ChatMessage, User)
+        .join(User, ChatMessage.sender_id == User.id)
+        .where(
+            ChatMessage.chat_id == chat_id,
+            ChatMessage.is_pinned == True
+        )
+        .order_by(ChatMessage.created_at.desc())
+    )
+
+    rows = result.all()
+
+    messages = []
+
+    for msg, user in rows:
+        messages.append({
+            "id": msg.id,
+            "chat_id": msg.chat_id,
+
+            "message": (
+                "[deleted]"
+                if msg.is_deleted
+                else msg.message
+            ),
+
+            "sender_id": msg.sender_id,
+
+            "created_at": msg.created_at,
+
+            "status": msg.status.value if msg.status else None,
+
+            "parent_id": msg.parent_id,
+
+            "is_deleted": msg.is_deleted,
+            "is_edited": msg.is_edited,
+            "is_pinned": msg.is_pinned,
+
+            "attachment_url": msg.attachment_url,
+
+            "sender": {
+                "id": user.id,
+                "name": user.full_name or "Unknown User"
+            },
+
+            "parent": None,
+
+            "attachments": [],
+
+            "reactions": [],
+
+            "read_by": [],
+
+            "reply_count": 0
+        })
+
+    return messages
+
+
+@router.post("/messages/{message_id}/unpin")
+async def unpin_message(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    msg = await db.get(ChatMessage, message_id)
+
+    if not msg:
+        raise HTTPException(404, "ChatMessage not found")
+
+    await validate_membership(
+        msg.chat_id,
+        current_user.id,
+        db
+    )
+
+    chat = await db.get(ChatSession, msg.chat_id)
+
+    # group → admin only
+    if (
+        chat
+        and chat.type == ChatType.GROUP
+    ):
+        await validate_admin(
+            msg.chat_id,
+            current_user.id,
+            db
+        )
+
+    # private → sender only
+    else:
+        if msg.sender_id != current_user.id:
+            raise HTTPException(403, "Not allowed")
+
+    msg.is_pinned = False
+
+    await db.commit()
+
+    return {"status": "unpinned"}
+
+
+@router.post("/messages/{message_id}/forward")
+async def forward_message(
+    message_id: int,
+    target_chat_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    # original message
+    original = await db.get(ChatMessage, message_id)
+
+    if not original:
+        raise HTTPException(404, "Original message not found")
+
+    # must belong to source chat
+    await validate_membership(
+        original.chat_id,
+        current_user.id,
+        db
+    )
+
+    # must belong to target chat
+    await validate_membership(
+        target_chat_id,
+        current_user.id,
+        db
+    )
+
+    # cannot forward deleted message
+    if original.is_deleted:
+        raise HTTPException(
+            400,
+            "Cannot forward deleted message"
+        )
+
+    # create forwarded message
+    forwarded = ChatMessage(
+        chat_id=target_chat_id,
+        sender_id=current_user.id,
+        message=original.message,
+        attachment_url=original.attachment_url,
+
+        is_forwarded=True,
+        forwarded_from_message_id=original.id
+    )
+
+    db.add(forwarded)
+    await db.flush()
+
+    # self read
+    db.add(MessageRead(
+        message_id=forwarded.id,
+        user_id=current_user.id
+    ))
+
+    # update chat last message
+    chat = await db.get(ChatSession, target_chat_id)
+
+    if chat:
+        chat.last_message = original.message
+        chat.last_message_at = datetime.utcnow()
+
+    # realtime websocket event
+    redis = request.app.state.redis
+
+    if redis:
+        await redis.publish(
+            f"chat:{target_chat_id}",
+            json.dumps({
+                "type": "forward",
+                "chat_id": target_chat_id,
+                "message_id": forwarded.id,
+                "sender": current_user.id,
+                "forwarded_from_message_id": original.id,
+                "message": original.message,
+                "attachment_url": original.attachment_url
+            })
+        )
+
+    await db.commit()
+
+    return {
+        "status": "forwarded",
+        "message_id": forwarded.id
+    }
 
 
 @router.get("/{chat_id}/active-users")
