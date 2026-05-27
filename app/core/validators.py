@@ -487,3 +487,114 @@ def validate_mobile(v):
         raise ValueError("Invalid mobile number")
 
     return digits
+
+# ================= WORK PROGRESS VALIDATORS =================
+
+
+def validate_activity_name(v):
+
+    if v is None:
+        return v
+
+    if not v.strip():
+        raise ValueError("Activity name required")
+
+    v = " ".join(v.strip().split())
+
+    if len(v) < 3:
+        raise ValueError("Activity name too short")
+
+    if not re.match(r"^[A-Za-z0-9\s\-/()&.]+$", v):
+        raise ValueError("Invalid activity name")
+
+    return v.title()
+
+
+def validate_unit(v):
+
+    if v is None:
+        return v
+
+    if not v.strip():
+        raise ValueError("Unit required")
+
+    v = v.strip().upper()
+
+    allowed_units = {
+        "SQFT",
+        "SQM",
+        "RFT",
+        "M",
+        "KG",
+        "TON",
+        "BAG",
+        "NOS",
+        "CUM",
+        "LTR",
+    }
+
+    if v not in allowed_units:
+        raise ValueError("Invalid unit")
+
+    return v
+
+
+def validate_progress_remarks(v):
+
+    if v is None:
+        return v
+
+    v = " ".join(v.strip().split())
+
+    if len(v) > 500:
+        raise ValueError("Remarks too long")
+
+    if "<script" in v.lower():
+        raise ValueError("Invalid remarks")
+
+    return v
+
+
+# ================= WORK ACTIVITY DATE =================
+
+
+def validate_work_activity_date(v):
+
+    if v is None:
+        return v
+
+    if v.year < 2020:
+        raise ValueError("Invalid activity date")
+
+    return v
+
+
+# ================= DAILY PROGRESS DATE =================
+
+
+def validate_progress_date(v):
+
+    if v is None:
+        return v
+
+    if v > date.today():
+        raise ValueError("Future progress date not allowed")
+
+    if v.year < 2020:
+        raise ValueError("Invalid progress date")
+
+    return v
+
+
+# ================= POSITIVE DECIMAL =================
+
+
+def validate_positive_decimal(v, field_name="Value"):
+
+    if v is None:
+        return v
+
+    if v <= 0:
+        raise ValueError(f"{field_name} must be greater than 0")
+
+    return v

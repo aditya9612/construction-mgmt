@@ -28,6 +28,21 @@ from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
 from datetime import date as dt_date
 from app.core.validators import validate_non_empty_string, validate_start_end_dates
+from typing import Optional, List
+
+from pydantic import (
+    Field,
+    field_validator,
+)
+from app.core.validators import (
+    validate_start_end_dates,
+    validate_activity_name,
+    validate_unit,
+    validate_progress_remarks,
+    validate_work_activity_date,
+    validate_progress_date,
+    validate_non_empty_string,
+)
 
 # ===================== PROJECT =====================
 
@@ -691,62 +706,147 @@ class MessageCreate(BaseSchema):
         return validate_non_empty_string(v)
 
 
-# ========work progress============
-class WorkActivityCreate(BaseModel):
-    project_id: int
-    boq_code: Optional[int] = None
+# =========================================================
+# WORK ACTIVITY CREATE
+
+
+class WorkActivityCreate(BaseSchema):
+
+    project_id: int = Field(gt=0)
+
+    boq_code: Optional[int] = Field(
+        default=None,
+        gt=0,
+    )
+
     activity_name: str
 
-    planned_quantity: Decimal = Field(gt=0)
+    planned_quantity: Decimal = Field(
+        gt=0,
+        max_digits=12,
+        decimal_places=2,
+    )
 
     unit: str
+
     start_date: date
+
     end_date: date
-    work_order_id: int
-    engineer_id: int
+
+    work_order_id: int = Field(gt=0)
+
+    engineer_id: int = Field(gt=0)
+
+    # ================= ACTIVITY NAME =================
+
+    @field_validator("activity_name")
+    def validate_activity(cls, v):
+
+        return validate_activity_name(v)
+
+    # ================= UNIT =================
+
+    @field_validator("unit")
+    def validate_activity_unit(cls, v):
+
+        return validate_unit(v)
+
+    # ================= DATE RANGE =================
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
         return validate_start_end_dates(
             info.data.get("start_date"),
-            v
+            v,
         )
 
+    # ================= DATE VALIDATION =================
 
-class WorkActivityUpdate(BaseModel):
+    @field_validator("start_date", "end_date")
+    def validate_activity_dates(cls, v):
+
+        return validate_work_activity_date(v)
+
+
+# =========================================================
+# WORK ACTIVITY UPDATE
+
+
+class WorkActivityUpdate(BaseSchema):
 
     activity_name: Optional[str] = None
 
     planned_quantity: Optional[Decimal] = Field(
         default=None,
         gt=0,
+        max_digits=12,
+        decimal_places=2,
     )
 
     unit: Optional[str] = None
+
     start_date: Optional[date] = None
+
     end_date: Optional[date] = None
+
+    # ================= ACTIVITY NAME =================
+
+    @field_validator("activity_name")
+    def validate_activity(cls, v):
+
+        return validate_activity_name(v)
+
+    # ================= UNIT =================
+
+    @field_validator("unit")
+    def validate_activity_unit(cls, v):
+
+        return validate_unit(v)
+
+    # ================= DATE RANGE =================
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
         return validate_start_end_dates(
             info.data.get("start_date"),
-            v
+            v,
         )
 
+    # ================= DATE VALIDATION =================
 
-class WorkActivityResponse(BaseModel):
+    @field_validator("start_date", "end_date")
+    def validate_activity_dates(cls, v):
+
+        if v is None:
+            return v
+
+        return validate_work_activity_date(v)
+
+
+# =========================================================
+# WORK ACTIVITY RESPONSE
+
+
+class WorkActivityResponse(BaseSchema):
+
     id: int
+
     project_id: int
+
     boq_code: Optional[int] = None
+
     activity_name: str
+
     planned_quantity: Decimal
+
     unit: str
+
     start_date: date
+
     end_date: date
 
-    # Response will return enum values such as "On Track"
     status: WorkActivityStatus
 
     engineer_id: int
@@ -755,60 +855,156 @@ class WorkActivityResponse(BaseModel):
         from_attributes = True
 
 
-class DailyProgressCreate(BaseModel):
-    activity_id: int
+# =========================================================
+# DAILY PROGRESS CREATE
+
+
+class DailyProgressCreate(BaseSchema):
+
+    activity_id: int = Field(gt=0)
+
     entry_date: date
-    today_progress: Decimal = Field(gt=0)
-    remarks: Optional[str] = None
+
+    today_progress: Decimal = Field(
+        gt=0,
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    remarks: Optional[str] = Field(
+        default=None,
+        max_length=500,
+    )
+
+    # ================= ENTRY DATE =================
+
+    @field_validator("entry_date")
+    def validate_entry_dates(cls, v):
+
+        return validate_progress_date(v)
+
+    # ================= REMARKS =================
+
+    @field_validator("remarks")
+    def validate_remarks(cls, v):
+
+        return validate_progress_remarks(v)
 
 
-class DailyProgressUpdate(BaseModel):
+# =========================================================
+# DAILY PROGRESS UPDATE
+
+
+class DailyProgressUpdate(BaseSchema):
 
     today_progress: Optional[Decimal] = Field(
         default=None,
         gt=0,
+        max_digits=12,
+        decimal_places=2,
     )
 
-    remarks: Optional[str] = None
+    remarks: Optional[str] = Field(
+        default=None,
+        max_length=500,
+    )
+
+    # ================= REMARKS =================
+
+    @field_validator("remarks")
+    def validate_remarks(cls, v):
+
+        return validate_progress_remarks(v)
 
 
-class DailyProgressResponse(BaseModel):
+# =========================================================
+# DAILY PROGRESS RESPONSE
+
+
+class DailyProgressResponse(BaseSchema):
+
     id: int
+
     activity_id: int
+
     entry_date: date
+
     today_progress: Decimal
+
     remarks: Optional[str] = None
+
     created_by: int
 
     class Config:
         from_attributes = True
 
 
-class DailyProgressWithActivityResponse(BaseModel):
+# =========================================================
+# DAILY PROGRESS WITH ACTIVITY RESPONSE
+
+
+class DailyProgressWithActivityResponse(BaseSchema):
 
     message: str
+
     progress: DailyProgressResponse
+
     activity: WorkActivityResponse
 
     class Config:
         from_attributes = True
 
 
-class ProjectsModuleSummary(BaseModel):
+# =========================================================
+# PROJECTS MODULE SUMMARY
+
+
+class ProjectsModuleSummary(BaseSchema):
+
     total_projects: int
+
     ongoing_sites: int
+
     completed_projects: int
+
     delayed_projects: int
 
 
-class ProjectActivityItem(BaseModel):
-    type: str  # task_completion, invoice, photo, issue
+# =========================================================
+# PROJECT ACTIVITY ITEM
+
+
+class ProjectActivityItem(BaseSchema):
+
+    type: str
+
     user_name: str
+
     description: str
+
     project_name: str
+
     timestamp: datetime
 
+    # ================= STRING VALIDATIONS =================
 
-class ProjectsModuleResponse(BaseModel):
+    @field_validator(
+        "type",
+        "user_name",
+        "description",
+        "project_name",
+    )
+    def validate_strings(cls, v):
+
+        return validate_non_empty_string(v)
+
+
+# =========================================================
+# PROJECTS MODULE RESPONSE
+
+
+class ProjectsModuleResponse(BaseSchema):
+
     summary: ProjectsModuleSummary
+
     activities: List[ProjectActivityItem]
