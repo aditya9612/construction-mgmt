@@ -85,6 +85,7 @@ class ProjectStatus(str, Enum):
     ONGOING = "ONGOING"
     COMPLETED = "COMPLETED"
     ON_HOLD = "ON_HOLD"
+    DELAYED = "DELAYED"
 
 
 class IssuePriority(str, Enum):
@@ -210,3 +211,25 @@ class InvoiceType(str, Enum):
     LABOUR = "labour"
     MATERIAL = "material"
     CONTRACTOR = "contractor"
+
+
+class ProjectType(str, Enum):
+    RESIDENTIAL = "RESIDENTIAL"
+    COMMERCIAL = "COMMERCIAL"
+    INDUSTRIAL = "INDUSTRIAL"
+    ROAD = "ROAD"
+    BRIDGE = "BRIDGE"
+    INTERIOR = "INTERIOR"
+    VILLA = "VILLA"
+    APARTMENT = "APARTMENT"
+    TOWNSHIP = "TOWNSHIP"
+    RENOVATION = "RENOVATION"
+
+
+class LocationType(str, Enum):
+    URBAN = "URBAN"
+    RURAL = "RURAL"
+    SEMI_URBAN = "SEMI_URBAN"
+    HIGHWAY = "HIGHWAY"
+    REMOTE = "REMOTE"
+    INDUSTRIAL_ZONE = "INDUSTRIAL_ZONE"

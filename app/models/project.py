@@ -37,6 +37,8 @@ from app.core.enums import (
     ProjectStatus,
     TaskStatus,
     WeatherType,
+    ProjectType,
+    LocationType,
 )
 
 if TYPE_CHECKING:
@@ -67,6 +69,20 @@ class Project(Base, TimestampMixin):
     status: Mapped[ProjectStatus] = mapped_column(
         SAEnum(ProjectStatus), default=ProjectStatus.PLANNED
     )
+
+    type: Mapped[Optional[ProjectType]] = mapped_column(
+        SAEnum(ProjectType), nullable=True
+    )
+    location_type: Mapped[Optional[LocationType]] = mapped_column(
+        SAEnum(LocationType), nullable=True
+    )
+    site_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    country: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pincode: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     owner_id: Mapped[int] = mapped_column(
         ForeignKey("owners.id"), nullable=False, index=True

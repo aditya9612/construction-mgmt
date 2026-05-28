@@ -21,6 +21,8 @@ from app.core.enums import (
     TaskStatus,
     WeatherType,
     WorkActivityStatus,
+    ProjectType,
+    LocationType,
 )
 from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
@@ -38,6 +40,16 @@ class ProjectCreate(BaseSchema):
     end_date: Optional[date] = None
     status: Optional[ProjectStatus] = ProjectStatus.PLANNED
 
+    type: Optional[ProjectType] = None
+    location_type: Optional[LocationType] = None
+    site_address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
+    pincode: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
@@ -53,6 +65,16 @@ class ProjectUpdate(BaseSchema):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     status: Optional[ProjectStatus] = None
+
+    type: Optional[ProjectType] = None
+    location_type: Optional[LocationType] = None
+    site_address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
+    pincode: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
@@ -73,6 +95,16 @@ class ProjectOut(BaseSchema):
     end_date: Optional[date]
     status: str
     completion_percentage: float = 0.0
+
+    type: Optional[str] = None
+    location_type: Optional[str] = None
+    site_address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
+    pincode: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
     @field_validator("business_id")
     def validate_business_id(cls, v):

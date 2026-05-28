@@ -113,11 +113,12 @@ class ChatMessage(Base):
     attachments = relationship(
         "MessageAttachment",
         back_populates="message",
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
+        lazy="selectin"
     )
 
-    chat = relationship("ChatSession")
-    sender = relationship("User")
+    chat = relationship("ChatSession", lazy="selectin")
+    sender = relationship("User", lazy="selectin")
 
 
 class MessageRead(Base):

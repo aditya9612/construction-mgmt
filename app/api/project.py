@@ -574,6 +574,16 @@ class ProjectsService:
             end_date=obj.end_date,
             status=compute_project_status(obj),
             completion_percentage=completion,
+
+            type=obj.type,
+            location_type=obj.location_type,
+            site_address=obj.site_address,
+            city=obj.city,
+            state=obj.state,
+            country=obj.country,
+            pincode=obj.pincode,
+            latitude=obj.latitude,
+            longitude=obj.longitude,
         )
 
     async def list_projects(
@@ -604,8 +614,22 @@ class ProjectsService:
                 m.Project.project_name.ilike(f"%{search.strip()}%")
             )
 
+        today = date.today()
+
         if status:
-            base_query = base_query.where(m.Project.status == status)
+
+            if status == s.ProjectStatus.DELAYED:
+
+                base_query = base_query.where(
+                    m.Project.status == s.ProjectStatus.ONGOING,
+                    m.Project.end_date.is_not(None),
+                    m.Project.end_date < today,
+                )
+
+            else:
+                base_query = base_query.where(
+                    m.Project.status == status
+                )
 
         count_query = select(func.count()).select_from(
             base_query.order_by(None).subquery()
@@ -632,6 +656,16 @@ class ProjectsService:
                 end_date=p.end_date,
                 status=compute_project_status(p),
                 completion_percentage=completion_map.get(p.id, 0.0),
+
+                type=p.type,
+                location_type=p.location_type,
+                site_address=p.site_address,
+                city=p.city,
+                state=p.state,
+                country=p.country,
+                pincode=p.pincode,
+                latitude=p.latitude,
+                longitude=p.longitude,
             )
             for p in rows
         ]
@@ -671,6 +705,16 @@ class ProjectsService:
             end_date=obj.end_date,
             status=compute_project_status(obj),
             completion_percentage=completion,
+
+            type=obj.type,
+            location_type=obj.location_type,
+            site_address=obj.site_address,
+            city=obj.city,
+            state=obj.state,
+            country=obj.country,
+            pincode=obj.pincode,
+            latitude=obj.latitude,
+            longitude=obj.longitude,
         )
 
     async def update_project(
@@ -712,8 +756,17 @@ class ProjectsService:
             end_date=obj.end_date,
             status=compute_project_status(obj),
             completion_percentage=completion,
-        )
 
+            type=obj.type,
+            location_type=obj.location_type,
+            site_address=obj.site_address,
+            city=obj.city,
+            state=obj.state,
+            country=obj.country,
+            pincode=obj.pincode,
+            latitude=obj.latitude,
+            longitude=obj.longitude,
+        )
     async def delete_project(
         self, db: AsyncSession, current_user: User, *, project_id: int
     ) -> None:

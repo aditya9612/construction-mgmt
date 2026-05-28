@@ -482,7 +482,7 @@ async def mark_delivered(
     return {"status": "delivered"}
 
 
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, selectinload
 
 
 @router.get("/{chat_id}/messages", response_model=list[MessageOut])
@@ -500,6 +500,10 @@ async def get_messages(
 
     query = (
         select(ChatMessage, User, Parent)
+
+        # HERE
+        .options(selectinload(ChatMessage.attachments))
+
         .join(User, ChatMessage.sender_id == User.id)
         .outerjoin(Parent, ChatMessage.parent_id == Parent.id)
         .where(ChatMessage.chat_id == chat_id)
@@ -687,6 +691,9 @@ async def get_replies(
 
     result = await db.execute(
         select(ChatMessage, User)
+
+        .options(selectinload(ChatMessage.attachments))
+
         .join(User, ChatMessage.sender_id == User.id)
         .where(ChatMessage.parent_id == message_id)
         .order_by(ChatMessage.created_at.asc())
@@ -1073,12 +1080,24 @@ async def typing_users(
 
     users = []
 
-    for uid, name in rows:
+    pipe = redis.pipeline()
 
-        typing = await redis.get(f"chat:{chat_id}:typing:{uid}")
+    for uid, _ in rows:
+        pipe.get(f"chat:{chat_id}:typing:{uid}")
+
+    typing_results = await pipe.execute()
+
+    for index, (uid, name) in enumerate(rows):
+
+        typing = typing_results[index]
 
         if typing and uid != current_user.id:
-            users.append({"user_id": uid, "name": name or "Unknown User"})
+            users.append(
+                {
+                    "user_id": uid,
+                    "name": name or "Unknown User",
+                }
+            )
 
     return {"users": users}
 
@@ -1313,15 +1332,23 @@ async def react_message(
     )
     existing = result.scalar()
 
-    if existing and existing.reaction == reaction:
-        await db.delete(existing)
-        return {"status": "removed"}
+    if existing:
+        if existing.reaction == reaction:
+            await db.delete(existing)
+            await db.commit()
+            return {"status": "removed"}
+
+        existing.reaction = reaction
     else:
         db.add(
             MessageReaction(
-                message_id=message_id, user_id=current_user.id, reaction=reaction
+                message_id=message_id,
+                user_id=current_user.id,
+                reaction=reaction,
             )
         )
+
+    await db.commit()
 
     # realtime event
     redis = request.app.state.redis
@@ -1400,7 +1427,6 @@ async def delete_message(
 
     #  soft delete
     msg.is_deleted = True
-    msg.message = "[deleted]"
 
     #  REAL-TIME delete event
     redis = request.app.state.redis
@@ -1441,6 +1467,9 @@ async def search_messages(
 
     result = await db.execute(
         select(ChatMessage, User, Parent)
+
+        .options(selectinload(ChatMessage.attachments))
+
         .join(User, ChatMessage.sender_id == User.id)
         .outerjoin(Parent, ChatMessage.parent_id == Parent.id)
         .where(ChatMessage.chat_id == chat_id, ChatMessage.message.ilike(f"%{query}%"))
@@ -1544,11 +1573,13 @@ async def pinned_messages(
 
     result = await db.execute(
         select(ChatMessage, User)
+
+        .options(selectinload(ChatMessage.attachments))
+
         .join(User, ChatMessage.sender_id == User.id)
         .where(ChatMessage.chat_id == chat_id, ChatMessage.is_pinned == True)
         .order_by(ChatMessage.created_at.desc())
     )
-
     rows = result.all()
 
     messages = []
@@ -1630,7 +1661,13 @@ async def forward_message(
 ):
 
     # original message
-    original = await db.get(ChatMessage, message_id)
+    result = await db.execute(
+        select(ChatMessage)
+        .options(selectinload(ChatMessage.attachments))
+        .where(ChatMessage.id == message_id)
+    )
+
+    original = result.scalar_one_or_none()
 
     if not original:
         raise HTTPException(404, "Original message not found")
@@ -1750,9 +1787,19 @@ async def get_user_states(
 
     states = []
 
+    pipe = redis.pipeline()
+
     for uid in user_ids:
-        online = await redis.get(f"user:{uid}:online")
-        last_seen = await redis.get(f"user:{uid}:last_seen")
+        pipe.get(f"user:{uid}:online")
+        pipe.get(f"user:{uid}:last_seen")
+
+    results = await pipe.execute()
+
+    states = []
+
+    for i, uid in enumerate(user_ids):
+        online = results[i * 2]
+        last_seen = results[i * 2 + 1]
 
         states.append(
             {
