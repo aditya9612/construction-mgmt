@@ -110,15 +110,11 @@ class ChatMessage(Base):
         default=MessageStatus.SENT
     )
 
-    attachment_url: Mapped[str | None] = mapped_column(
-        String(500),
-        nullable=True
+    attachments = relationship(
+        "MessageAttachment",
+        back_populates="message",
+        cascade="all, delete-orphan"
     )
-
-    # attachments = relationship(
-    #     "MessageAttachment",
-    #     cascade="all, delete-orphan"
-    # )
 
     chat = relationship("ChatSession")
     sender = relationship("User")
@@ -149,31 +145,32 @@ class MessageReaction(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     message_id: Mapped[int] = mapped_column(ForeignKey("chat_messages.id"))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    reaction: Mapped[str] = mapped_column(String(10))
+    reaction: Mapped[str] = mapped_column(String(20))
 
 
-# class MessageAttachment(Base):
-#     __tablename__ = "message_attachments"
+class MessageAttachment(Base):
+    __tablename__ = "message_attachments"
 
-#     __table_args__ = (
-#         Index("idx_attachment_message", "message_id"),
-#     )
+    __table_args__ = (
+        Index("idx_attachment_message", "message_id"),
+    )
 
-#     id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True)
 
-#     message_id: Mapped[int] = mapped_column(
-#         ForeignKey("chat_messages.id", ondelete="CASCADE")
-#     )
+    message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chat_messages.id", ondelete="CASCADE"),
+        nullable=True
+    )
 
-#     file_url: Mapped[str] = mapped_column(String(500))
+    file_url: Mapped[str] = mapped_column(String(500))
 
-#     file_type: Mapped[str | None] = mapped_column(String(100))
-#     file_name: Mapped[str | None] = mapped_column(String(255))
+    file_type: Mapped[str | None] = mapped_column(String(100))
+    file_name: Mapped[str | None] = mapped_column(String(255))
 
-#     file_size: Mapped[int | None]
+    file_size: Mapped[int | None]
 
-#     thumbnail_url: Mapped[str | None] = mapped_column(String(500))
+    thumbnail_url: Mapped[str | None] = mapped_column(String(500))
 
-#     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
-#     message = relationship("ChatMessage", back_populates="attachments")
+    message = relationship("ChatMessage", back_populates="attachments")

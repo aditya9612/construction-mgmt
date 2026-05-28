@@ -80,6 +80,7 @@ PAYROLL_ROLES = [
     for r in [
         UserRole.ADMIN,
         UserRole.ACCOUNTANT,
+        UserRole.PROJECT_MANAGER,
     ]
 ]
 

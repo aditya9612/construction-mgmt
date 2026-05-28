@@ -12,7 +12,8 @@ class CreateChat(BaseModel):
 class SendMessage(BaseModel):
     message: Optional[str] = None
     parent_id: Optional[int] = None
-    attachment_url: Optional[str] = None
+    attachment_ids: list[int] = Field(default_factory=list)
+
 
 class AttachmentOut(BaseModel):
     id: int
@@ -33,6 +34,7 @@ class SenderOut(BaseModel):
     class Config:
         from_attributes = True
 
+
 class ReactionOut(BaseModel):
     user_id: int
     reaction: str
@@ -51,13 +53,9 @@ class ParentMessageOut(BaseModel):
 
 class MessageOut(BaseModel):
     id: int
-
     chat_id: int
-
     message: str
-
     sender_id: int
-
     created_at: datetime
 
     status: Optional[MessageStatus] = None
@@ -67,8 +65,6 @@ class MessageOut(BaseModel):
     is_deleted: bool = False
     is_edited: bool = False
     is_pinned: bool = False
-
-    attachment_url: Optional[str] = None
 
     sender: Optional[SenderOut] = None
 
@@ -113,7 +109,7 @@ class ReplyOut(BaseModel):
 
     created_at: datetime
 
-    attachment_url: Optional[str] = None
+    attachments: list[AttachmentOut] = Field(default_factory=list)
 
     is_deleted: bool = False
 

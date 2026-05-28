@@ -136,6 +136,13 @@ def create_app() -> FastAPI:
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("uploads/profile", exist_ok=True)
     os.makedirs("uploads/qc", exist_ok=True)
+    
+    # chat uploads
+    os.makedirs("uploads/chats/images", exist_ok=True)
+    os.makedirs("uploads/chats/videos", exist_ok=True)
+    os.makedirs("uploads/chats/files", exist_ok=True)
+    os.makedirs("uploads/chats/voice", exist_ok=True)
+    os.makedirs("uploads/chats/thumbnails", exist_ok=True)
 
     application.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
