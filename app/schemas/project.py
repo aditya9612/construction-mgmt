@@ -841,6 +841,12 @@ class WorkActivityResponse(BaseSchema):
 
     planned_quantity: Decimal
 
+    total_completed: Decimal
+
+    remaining_quantity: Decimal
+
+    completion_percentage: Decimal
+
     unit: str
 
     start_date: date
