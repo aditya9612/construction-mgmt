@@ -146,3 +146,66 @@ class ChatInfoOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ChatUserOut(BaseModel):
+    user_id: int
+
+    full_name: Optional[str] = None
+
+    role: Optional[str] = None
+
+    designation: Optional[str] = None
+
+    profile_image: Optional[str] = None
+
+    mobile_number: Optional[str] = None
+
+    is_online: bool = False
+
+    last_seen: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ChatUserSearchOut(BaseModel):
+    user_id: int
+
+    full_name: Optional[str] = None
+
+    role: Optional[str] = None
+
+    profile_image: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ChatMemberAddPayload(BaseModel):
+    member_ids: list[int] = Field(default_factory=list)
+
+
+class ChatListEnhancedOut(BaseModel):
+    id: int
+
+    type: str
+
+    name: Optional[str] = None
+
+    avatar_url: Optional[str] = None
+
+    other_user_id: Optional[int] = None
+
+    other_user_name: Optional[str] = None
+
+    other_user_avatar: Optional[str] = None
+
+    last_message: Optional[str] = None
+
+    last_message_at: Optional[datetime] = None
+
+    unread_count: int = 0
+
+    class Config:
+        from_attributes = True

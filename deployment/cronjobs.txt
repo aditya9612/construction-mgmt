@@ -1,0 +1,47 @@
+# =========================
+
+# CHAT CLEANUP CRON JOBS
+
+# =========================
+
+# Open cron editor
+
+crontab -e
+
+# =========================
+
+# CLEANUP OLD UPLOAD FILES
+
+# =========================
+
+# Runs daily at 2 AM
+
+0 2 * * * /root/construction-mgmt/venv/bin/python /root/construction-mgmt/app/script/cleanup_uploads.py >> /var/log/upload_cleanup.log 2>&1
+
+# =========================
+
+# CLEANUP OLD CHAT MESSAGES
+
+# =========================
+
+# Runs daily at 3 AM
+
+0 3 * * * /root/construction-mgmt/venv/bin/python /root/construction-mgmt/app/script/cleanup_old_messages.py >> /var/log/chat_cleanup.log 2>&1
+
+# =========================
+
+# USEFUL COMMANDS
+
+# =========================
+
+# View cron jobs
+
+crontab -l
+
+# View upload cleanup logs
+
+tail -f /var/log/upload_cleanup.log
+
+# View message cleanup logs
+
+tail -f /var/log/chat_cleanup.log

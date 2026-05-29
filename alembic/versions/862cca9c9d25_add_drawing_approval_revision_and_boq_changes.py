@@ -8,6 +8,7 @@ Create Date: 2026-05-20 19:14:35
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
+from sqlalchemy import inspect
 
 # revision identifiers, used by Alembic.
 revision = "862cca9c9d25"
@@ -18,8 +19,13 @@ depends_on = None
 
 def upgrade():
     # remove approved_by column
+    conn = op.get_bind()
+    inspector = inspect(conn)
 
-    op.drop_column("owners", "satisfaction_score")
+    owner_columns = [c["name"] for c in inspector.get_columns("owners")]
+
+    if "satisfaction_score" in owner_columns:
+        op.drop_column("owners", "satisfaction_score")
 
     op.alter_column(
         "boq_items",
@@ -36,42 +42,76 @@ def upgrade():
         server_default="1",
         existing_nullable=False,
     )
-    op.add_column(
-        "boq_items",
-        sa.Column(
-            "approval_status",
-            sa.String(length=50),
-            server_default="Draft",
-            nullable=False,
-        ),
-    )
+    boq_columns = [c["name"] for c in inspector.get_columns("boq_items")]
+
+    if "approval_status" not in boq_columns:
+        op.add_column(
+            "boq_items",
+            sa.Column(
+                "approval_status",
+                sa.String(length=50),
+                server_default="Draft",
+                nullable=False,
+            ),
+        )
     op.execute("""
         UPDATE boq_items
         SET approval_status = 'Draft'
         WHERE approval_status IS NULL
     """)
-    op.create_index(
-        op.f("ix_boq_items_approval_status"),
-        "boq_items",
-        ["approval_status"],
-        unique=False,
-    )
-    op.add_column("tasks", sa.Column("boq_id", sa.Integer(), nullable=True))
-    op.create_index(op.f("ix_tasks_boq_id"), "tasks", ["boq_id"], unique=False)
-    op.create_foreign_key(
-        "fk_tasks_boq_id",
-        "tasks",
-        "boq_items",
-        ["boq_id"],
-        ["id"],
-        ondelete="SET NULL",
-    )
-    op.drop_column("drawing_documents", "approved_by")
-    op.create_unique_constraint(
-        "uq_project_drawing_version",
-        "drawing_documents",
-        ["project_id", "drawing_name", "version"],
-    )
+    boq_indexes = [i["name"] for i in inspector.get_indexes("boq_items")]
+
+    if "ix_boq_items_approval_status" not in boq_indexes:
+        op.create_index(
+            op.f("ix_boq_items_approval_status"),
+            "boq_items",
+            ["approval_status"],
+            unique=False,
+        )
+    task_columns = [c["name"] for c in inspector.get_columns("tasks")]
+
+    if "boq_id" not in task_columns:
+        op.add_column("tasks", sa.Column("boq_id", sa.Integer(), nullable=True))
+    task_indexes = [i["name"] for i in inspector.get_indexes("tasks")]
+
+    if "ix_tasks_boq_id" not in task_indexes:
+        op.create_index(
+            op.f("ix_tasks_boq_id"),
+            "tasks",
+            ["boq_id"],
+            unique=False,
+        )
+    task_fks = [fk["name"] for fk in inspector.get_foreign_keys("tasks")]
+
+    if "fk_tasks_boq_id" not in task_fks:
+        op.create_foreign_key(
+            "fk_tasks_boq_id",
+            "tasks",
+            "boq_items",
+            ["boq_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
+
+    drawing_columns = [
+        c["name"] for c in inspector.get_columns("drawing_documents")
+    ]
+
+    if "approved_by" in drawing_columns:
+        op.drop_column("drawing_documents", "approved_by")
+
+
+    drawing_constraints = [
+        c["name"]
+        for c in inspector.get_unique_constraints("drawing_documents")
+    ]
+
+    if "uq_project_drawing_version" not in drawing_constraints:
+        op.create_unique_constraint(
+            "uq_project_drawing_version",
+            "drawing_documents",
+            ["project_id", "drawing_name", "version"],
+        )
 
     # fix invoice status enum to lowercase values
     op.execute("""
@@ -79,12 +119,16 @@ def upgrade():
         MODIFY status ENUM('pending','partial','paid')
         DEFAULT 'pending'
     """)
-
-    op.create_unique_constraint(
-        "uq_boq_version_item",
-        "boq_items",
-        ["boq_group_id", "version_no", "item_name", "category"],
-    )
+    boq_constraints = [
+        c["name"]
+        for c in inspector.get_unique_constraints("boq_items")
+    ]
+    if "uq_boq_version_item" not in boq_constraints:
+        op.create_unique_constraint(
+            "uq_boq_version_item",
+            "boq_items",
+            ["boq_group_id", "version_no", "item_name", "category"],
+        )
     op.alter_column(
         "checklist_logs",
         "status",
@@ -113,56 +157,68 @@ def upgrade():
         existing_type=mysql.VARCHAR(length=500),
         nullable=False,
     )
-    op.create_index(
-        "idx_drawing_project", "drawing_documents", ["project_id"], unique=False
-    )
+    drawing_indexes = [
+        i["name"] for i in inspector.get_indexes("drawing_documents")
+    ]
+
+    if "idx_drawing_project" not in drawing_indexes:
+        op.create_index(
+            "idx_drawing_project",
+            "drawing_documents",
+            ["project_id"],
+            unique=False,
+        )
 
     # ===================== ADD COLUMNS =====================
 
-    op.add_column(
-        "drawing_documents",
-        sa.Column(
-            "approval_status",
-            sa.Enum(
-                "PENDING",
-                "APPROVED",
-                "REJECTED",
-                "UNDER_REVIEW",
-                name="documentstatus",
+    if "approval_status" not in drawing_columns:
+        op.add_column(
+            "drawing_documents",
+            sa.Column(
+                "approval_status",
+                sa.Enum(
+                    "PENDING",
+                    "APPROVED",
+                    "REJECTED",
+                    "UNDER_REVIEW",
+                    name="documentstatus",
+                ),
+                nullable=False,
+                server_default="PENDING",
             ),
-            nullable=False,
-            server_default="PENDING",
-        ),
-    )
+        )
 
-    op.add_column(
-        "drawing_documents",
-        sa.Column(
-            "approval_id",
-            sa.Integer(),
-            nullable=True,
-        ),
-    )
+    if "approval_id" not in drawing_columns:
+        op.add_column(
+            "drawing_documents",
+            sa.Column(
+                "approval_id",
+                sa.Integer(),
+                nullable=True,
+            ),
+        )
 
-    op.add_column(
-        "drawing_documents",
-        sa.Column(
-            "is_latest_version",
-            sa.Boolean(),
-            nullable=False,
-            server_default=sa.text("1"),
-        ),
-    )
+    if "is_latest_version" not in drawing_columns:
+        op.add_column(
+            "drawing_documents",
+            sa.Column(
+                "is_latest_version",
+                sa.Boolean(),
+                nullable=False,
+                server_default=sa.text("1"),
+            ),
+        )
 
-    op.add_column(
-        "drawing_documents",
-        sa.Column(
-            "revision_no",
-            sa.Integer(),
-            nullable=False,
-            server_default="1",
-        ),
-    )
+    if "revision_no" not in drawing_columns:
+        op.add_column(
+            "drawing_documents",
+            sa.Column(
+                "revision_no",
+                sa.Integer(),
+                nullable=False,
+                server_default="1",
+            ),
+        )
 
     # ===================== SAFETY UPDATE FOR EXISTING DATA =====================
 
@@ -178,109 +234,201 @@ def upgrade():
             OR revision_no IS NULL
         """)
 
+    drawing_indexes = [
+        i["name"] for i in inspector.get_indexes("drawing_documents")
+    ]
+
     # ===================== INDEXES =====================
 
-    op.create_index(
-        "idx_drawing_approval",
-        "drawing_documents",
-        ["approval_status", "is_latest_version"],
-        unique=False,
-    )
+    if "idx_drawing_approval" not in drawing_indexes:
+        op.create_index(
+            "idx_drawing_approval",
+            "drawing_documents",
+            ["approval_status", "is_latest_version"],
+            unique=False,
+        )
 
-    op.create_index(
-        "idx_drawing_latest",
-        "drawing_documents",
-        ["project_id", "drawing_name", "is_latest_version"],
-        unique=False,
-    )
+    if "idx_drawing_latest" not in drawing_indexes:
+        op.create_index(
+            "idx_drawing_latest",
+            "drawing_documents",
+            ["project_id", "drawing_name", "is_latest_version"],
+            unique=False,
+        )
 
-    op.create_index(
-        "idx_drawing_project_status",
-        "drawing_documents",
-        ["project_id", "approval_status"],
-        unique=False,
-    )
+    if "idx_drawing_project_status" not in drawing_indexes:
+        op.create_index(
+            "idx_drawing_project_status",
+            "drawing_documents",
+            ["project_id", "approval_status"],
+            unique=False,
+        )
 
-    op.create_index(
-        "idx_drawing_revision",
-        "drawing_documents",
-        ["project_id", "drawing_name", "revision_no"],
-        unique=False,
-    )
+    if "idx_drawing_revision" not in drawing_indexes:
+        op.create_index(
+            "idx_drawing_revision",
+            "drawing_documents",
+            ["project_id", "drawing_name", "revision_no"],
+            unique=False,
+        )
 
-    op.create_index(
-        "ix_drawing_documents_approval_id",
-        "drawing_documents",
-        ["approval_id"],
-        unique=False,
-    )
+    if "ix_drawing_documents_approval_id" not in drawing_indexes:
+        op.create_index(
+            "ix_drawing_documents_approval_id",
+            "drawing_documents",
+            ["approval_id"],
+            unique=False,
+        )
 
     # ===================== CONSTRAINTS =====================
 
-    op.create_unique_constraint(
-        "uq_project_drawing_revision",
-        "drawing_documents",
-        ["project_id", "drawing_name", "revision_no"],
+    if "uq_project_drawing_revision" not in drawing_constraints:
+        op.create_unique_constraint(
+            "uq_project_drawing_revision",
+            "drawing_documents",
+            ["project_id", "drawing_name", "revision_no"],
+        )
+
+    drawing_fks = [
+        fk["name"]
+        for fk in inspector.get_foreign_keys("drawing_documents")
+    ]
+
+    if "fk_drawing_documents_approval_id" not in drawing_fks:
+        op.create_foreign_key(
+            "fk_drawing_documents_approval_id",
+            "drawing_documents",
+            "approvals",
+            ["approval_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
+
+    tables = inspector.get_table_names()
+    if "boq_groups" not in tables:
+        op.create_table(
+            "boq_groups",
+            sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+            sa.Column("project_id", sa.Integer(), nullable=False),
+            sa.Column("name", sa.String(length=255), nullable=False),
+            sa.Column(
+                "current_version",
+                sa.Integer(),
+                server_default="1",
+                nullable=False,
+            ),
+            sa.Column(
+                "status",
+                sa.String(length=50),
+                server_default="Draft",
+                nullable=False,
+            ),
+            sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+            sa.ForeignKeyConstraint(
+                ["project_id"],
+                ["projects.id"],
+                ondelete="CASCADE",
+            ),
+            sa.PrimaryKeyConstraint("id"),
+        )
+
+    boq_indexes = [i["name"] for i in inspector.get_indexes("boq_groups")]
+    if "ix_boq_groups_project_id" not in boq_indexes:
+        op.create_index(
+            op.f("ix_boq_groups_project_id"),
+            "boq_groups",
+            ["project_id"],
+            unique=False,
+        )
+
+    boq_item_indexes = [
+        i["name"] for i in inspector.get_indexes("boq_items")
+    ]
+    if "ix_boq_items_boq_group_id" not in boq_item_indexes:
+        op.create_index(
+            op.f("ix_boq_items_boq_group_id"),
+            "boq_items",
+            ["boq_group_id"],
+            unique=False,
+        )
+    boq_fks = [
+        fk["name"]
+        for fk in inspector.get_foreign_keys("boq_items")
+    ]
+
+    if "fk_boq_items_group" not in boq_fks:
+        op.create_foreign_key(
+            "fk_boq_items_group",
+            "boq_items",
+            "boq_groups",
+            ["boq_group_id"],
+            ["id"],
+            ondelete="CASCADE",
+        )
+    invoice_columns = [
+        c["name"] for c in inspector.get_columns("invoices")
+    ]
+
+    if "source_type" not in invoice_columns:
+        op.add_column(
+            "invoices",
+            sa.Column(
+                "source_type",
+                sa.Enum(
+                    "quotation",
+                    "measurement",
+                    "manual",
+                    name="invoicesourcetype",
+                ),
+                nullable=True,
+            ),
+        )
+    invoice_type_column = next(
+        (
+            c
+            for c in inspector.get_columns("invoices")
+            if c["name"] == "type"
+        ),
+        None,
     )
 
-    op.create_foreign_key(
-        "fk_drawing_documents_approval_id",
-        "drawing_documents",
-        "approvals",
-        ["approval_id"],
-        ["id"],
-        ondelete="SET NULL",
-    )
+    if invoice_type_column:
+        current_type = str(invoice_type_column["type"]).lower()
 
-    op.create_table(
-        "boq_groups",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("project_id", sa.Integer(), nullable=False),
-        sa.Column("name", sa.String(length=255), nullable=False),
-        sa.Column("current_version", sa.Integer(), server_default="1", nullable=False),
-        sa.Column(
-            "status", sa.String(length=50), server_default="Draft", nullable=False
-        ),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(["project_id"], ["projects.id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index(
-        op.f("ix_boq_groups_project_id"), "boq_groups", ["project_id"], unique=False
-    )
-    op.create_index(
-        op.f("ix_boq_items_boq_group_id"), "boq_items", ["boq_group_id"], unique=False
-    )
-    op.create_foreign_key(
-        "fk_boq_items_group",
-        "boq_items",
-        "boq_groups",
-        ["boq_group_id"],
-        ["id"],
-        ondelete="CASCADE",
-    )
-    op.add_column(
-        "invoices",
-        sa.Column(
-            "source_type",
-            sa.Enum("quotation", "measurement", "manual", name="invoicesourcetype"),
-            nullable=True,
-        ),
-    )
-    op.alter_column(
-        "invoices",
-        "type",
-        existing_type=mysql.VARCHAR(length=50),
-        type_=sa.Enum("owner", "labour", "material", "contractor", name="invoicetype"),
-        existing_nullable=False,
-    )
-    op.create_index(
-        op.f("ix_invoices_reference_id"), "invoices", ["reference_id"], unique=False
-    )
-    op.create_index(
-        op.f("ix_invoices_source_type"), "invoices", ["source_type"], unique=False
-    )
+        if "enum" not in current_type:
+            op.alter_column(
+                "invoices",
+                "type",
+                existing_type=mysql.VARCHAR(length=50),
+                type_=sa.Enum(
+                    "owner",
+                    "labour",
+                    "material",
+                    "contractor",
+                    name="invoicetype",
+                ),
+                existing_nullable=False,
+            )
+
+    invoice_indexes = [
+        i["name"] for i in inspector.get_indexes("invoices")
+    ]
+
+    if "ix_invoices_reference_id" not in invoice_indexes:
+        op.create_index(
+            op.f("ix_invoices_reference_id"),
+            "invoices",
+            ["reference_id"],
+            unique=False,
+        )
+    if "ix_invoices_source_type" not in invoice_indexes:
+        op.create_index(
+            op.f("ix_invoices_source_type"),
+            "invoices",
+            ["source_type"],
+            unique=False,
+        )
 
 
 def downgrade():
