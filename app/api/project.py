@@ -586,6 +586,10 @@ class ProjectsService:
             pincode=obj.pincode,
             latitude=obj.latitude,
             longitude=obj.longitude,
+
+            shift_start_time=obj.shift_start_time,
+            shift_end_time=obj.shift_end_time,
+            grace_period_minutes=obj.grace_period_minutes,
         )
 
     async def list_projects(
@@ -668,6 +672,10 @@ class ProjectsService:
                 pincode=p.pincode,
                 latitude=p.latitude,
                 longitude=p.longitude,
+
+                shift_start_time=p.shift_start_time,
+                shift_end_time=p.shift_end_time,
+                grace_period_minutes=p.grace_period_minutes,
             )
             for p in rows
         ]
@@ -717,8 +725,12 @@ class ProjectsService:
             pincode=obj.pincode,
             latitude=obj.latitude,
             longitude=obj.longitude,
-        )
 
+            shift_start_time=obj.shift_start_time,
+            shift_end_time=obj.shift_end_time,
+            grace_period_minutes=obj.grace_period_minutes,
+        )
+    
     async def update_project(
         self,
         db: AsyncSession,
@@ -768,7 +780,12 @@ class ProjectsService:
             pincode=obj.pincode,
             latitude=obj.latitude,
             longitude=obj.longitude,
+
+            shift_start_time=obj.shift_start_time,
+            shift_end_time=obj.shift_end_time,
+            grace_period_minutes=obj.grace_period_minutes,
         )
+    
     async def delete_project(
         self, db: AsyncSession, current_user: User, *, project_id: int
     ) -> None:
