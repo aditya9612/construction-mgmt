@@ -27,7 +27,7 @@ from app.core.enums import (
 from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
 from datetime import date as dt_date
-from app.core.validators import validate_non_empty_string, validate_start_end_dates
+from app.core.validators import validate_activity_name, validate_non_empty_string, validate_progress_date, validate_progress_remarks, validate_start_end_dates, validate_unit, validate_work_activity_date
 
 # ===================== PROJECT =====================
 
@@ -907,10 +907,24 @@ class DailyProgressUpdate(BaseSchema):
         decimal_places=2,
     )
 
-    remarks: Optional[str] = None
+    remarks: Optional[str] = Field(
+        default=None,
+        max_length=500,
+    )
+
+    # ================= REMARKS =================
+
+    @field_validator("remarks")
+    def validate_remarks(cls, v):
+
+        return validate_progress_remarks(v)
 
 
-class DailyProgressResponse(BaseModel):
+# DAILY PROGRESS RESPONSE
+
+
+class DailyProgressResponse(BaseSchema):
+
     id: int
 
     activity_id: int
@@ -927,7 +941,10 @@ class DailyProgressResponse(BaseModel):
         from_attributes = True
 
 
-class DailyProgressWithActivityResponse(BaseModel):
+# DAILY PROGRESS WITH ACTIVITY RESPONSE
+
+
+class DailyProgressWithActivityResponse(BaseSchema):
 
     message: str
 
@@ -939,7 +956,11 @@ class DailyProgressWithActivityResponse(BaseModel):
         from_attributes = True
 
 
-class ProjectsModuleSummary(BaseModel):
+# PROJECTS MODULE SUMMARY
+
+
+class ProjectsModuleSummary(BaseSchema):
+
     total_projects: int
 
     ongoing_sites: int
