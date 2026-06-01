@@ -41,6 +41,7 @@ class LabourOut(BaseModel):
     skill_type: e.SkillType
     daily_wage_rate: Decimal
     contractor_id: Optional[int]
+    contractor_name: Optional[str] = None
     status: e.LabourStatus
     notes: Optional[str] = None
 

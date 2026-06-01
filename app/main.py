@@ -58,6 +58,9 @@ from app.api.chat import router as chats_router
 from app.api.quotation import router as quotation_router
 from app.api.agreement import router as agreement_router
 from app.api.project_visualization import router as visualization_router
+from app.api.attendance import router as attendance_router
+from app.api.voice_task import router as voice_task_router
+from app.api.notification import router as notification_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal
@@ -143,6 +146,11 @@ def create_app() -> FastAPI:
     os.makedirs("uploads/chats/files", exist_ok=True)
     os.makedirs("uploads/chats/voice", exist_ok=True)
     os.makedirs("uploads/chats/thumbnails", exist_ok=True)
+    
+    # voice task assignments
+    os.makedirs("uploads/voice_instructions/raw", exist_ok=True)
+    os.makedirs("uploads/voice_instructions/generated", exist_ok=True)
+    os.makedirs("uploads/task_icons", exist_ok=True)
 
     application.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
@@ -288,7 +296,9 @@ def create_app() -> FastAPI:
     api_router.include_router(settings_router)
     api_router.include_router(agreement_router)
     api_router.include_router(visualization_router)
-
+    api_router.include_router(attendance_router)
+    api_router.include_router(voice_task_router)
+    api_router.include_router(notification_router)
 
 
     application.include_router(api_router, prefix="/api/v1")

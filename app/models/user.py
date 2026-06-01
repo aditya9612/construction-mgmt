@@ -2,7 +2,7 @@ import enum
 from datetime import date
 from typing import Any, Dict, Optional
 
-from sqlalchemy import JSON, VARCHAR, Boolean, Date, Enum, Index, Integer, String, Text
+from sqlalchemy import JSON, VARCHAR, Boolean, Date, Enum, Float, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from datetime import datetime
 from typing import Optional
@@ -21,6 +21,7 @@ ROLES = [
     "Contractor",
     "Accountant",
     "Client",
+    "Labour",
 ]
 
 
@@ -31,6 +32,7 @@ class UserRole(str, enum.Enum):
     CONTRACTOR = "Contractor"
     ACCOUNTANT = "Accountant"
     CLIENT = "Client"
+    LABOUR = "Labour"
 
 
 class User(Base, TimestampMixin):
@@ -71,6 +73,7 @@ class User(Base, TimestampMixin):
     aadhaar_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     profile_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     designation: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    department: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     joining_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
     # -----------------------
@@ -123,3 +126,68 @@ class ActivityLog(Base):
     details: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class UserAttendance(Base, TimestampMixin):
+    __tablename__ = "user_attendance"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+
+    project_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+
+    attendance_date: Mapped[date] = mapped_column(Date, index=True)
+
+    status: Mapped[str] = mapped_column(
+        String(50),
+        default="present"
+    )
+
+    in_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    out_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    check_in_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    check_out_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    working_hours: Mapped[float] = mapped_column(Float, default=0)
+    overtime_hours: Mapped[float] = mapped_column(Float, default=0)
+    overtime_rate: Mapped[float] = mapped_column(Float, default=0)
+
+    check_in_latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    check_in_longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    check_out_latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    check_out_longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    check_in_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    check_out_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    task_id: Mapped[Optional[int]] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    task_description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    remarks: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    is_approved: Mapped[bool] = mapped_column(Boolean, default=False)
+    approved_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    is_outside_geofence: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    is_late: Mapped[bool] = mapped_column(Boolean, default=False)
+    late_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    is_early_departure: Mapped[bool] = mapped_column(Boolean, default=False)
+    early_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    work_location_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    project = relationship("Project")
+    task = relationship("Task")
+    user = relationship("User", backref="attendance_records", foreign_keys=[user_id])
+    approved_by = relationship("User", foreign_keys=[approved_by_id])
+
+Index(
+    "idx_user_attendance_project_date",
+    UserAttendance.project_id,
+    UserAttendance.attendance_date,
+)

@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    Time,
     UniqueConstraint,
     Index,
     Enum as SAEnum,
@@ -83,6 +84,10 @@ class Project(Base, TimestampMixin):
     pincode: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    shift_start_time = mapped_column(Time, nullable=True)
+    shift_end_time = mapped_column(Time, nullable=True)
+    grace_period_minutes: Mapped[int] = mapped_column(Integer, default=15)
 
     owner_id: Mapped[int] = mapped_column(
         ForeignKey("owners.id"), nullable=False, index=True
@@ -204,6 +209,17 @@ class Task(Base):
     )
     completion_percentage: Mapped[float] = mapped_column(Float, default=0)
     discipline: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # --- Voice Task Assignment Fields ---
+    voice_instruction_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    generated_audio_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    original_transcription_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    translated_english_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    language_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    audio_duration: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    task_icon: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    instruction_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # ------------------------------------
 
     # in Task model
 
