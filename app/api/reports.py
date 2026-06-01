@@ -133,14 +133,11 @@ async def labour_report(
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
-        select(
-            m.Labour.skill_type,
-            func.count(func.distinct(m.Labour.id))
-        )
-        .join(LabourAttendance, m.Labour.id == LabourAttendance.labour_id)
+        select(m.Labour.skill_type, func.count(func.distinct(m.Labour.id)))
+        .join(UserAttendance, m.Labour.user_id == UserAttendance.user_id)
         .where(
-            LabourAttendance.project_id == project_id,
-            m.Labour.status == LabourStatus.ACTIVE
+            UserAttendance.project_id == project_id,
+            m.Labour.status == LabourStatus.ACTIVE,
         )
         .group_by(m.Labour.skill_type)
     )
@@ -161,14 +158,11 @@ async def export_labour_excel(
 ):
     #  Correct query (JOIN + GROUP BY)
     result = await db.execute(
-        select(
-            m.Labour.skill_type,
-            func.count(func.distinct(m.Labour.id))
-        )
-        .join(LabourAttendance, m.Labour.id == LabourAttendance.labour_id)
+        select(m.Labour.skill_type, func.count(func.distinct(m.Labour.id)))
+        .join(UserAttendance, m.Labour.user_id == UserAttendance.user_id)
         .where(
-            LabourAttendance.project_id == project_id,
-            m.Labour.status == LabourStatus.ACTIVE
+            UserAttendance.project_id == project_id,
+            m.Labour.status == LabourStatus.ACTIVE,
         )
         .group_by(m.Labour.skill_type)
     )
@@ -797,50 +791,31 @@ async def asset_report(
 # =========================================================
 # FINANCIAL SUMMARY
 # =========================================================
-
-from fastapi import Query
-
-
-# =========================================================
-# FINANCIAL SUMMARY
-# =========================================================
 @router.get("/financial-summary")
 async def financial_summary(
-    project_id: int = Query(..., gt=0),
+    project_id: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
-
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     total_expense = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
-
     total_invoice = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
     )
-
     paid_invoice = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.status == InvoiceStatus.PAID,
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PAID
         )
     )
-
     pending_invoice = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.status == InvoiceStatus.PENDING,
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PENDING
         )
     )
-
     expense_val = round(float(total_expense or 0), 2)
     invoice_val = round(float(total_invoice or 0), 2)
-
     return {
         "project_id": project_id,
         "total_expense": expense_val,
@@ -856,60 +831,41 @@ async def financial_summary(
 # =========================================================
 @router.get("/quarterly-audit-summary")
 async def quarterly_audit_summary(
-    project_id: int = Query(..., gt=0),
-    year: int = Query(..., ge=2020, le=2100),
-    quarter: int = Query(..., ge=1, le=4),
+    project_id: int,
+    year: int,
+    quarter: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     await assert_project_access(db, project_id=project_id, current_user=current_user)
-
     if quarter not in [1, 2, 3, 4]:
-        raise HTTPException(
-            status_code=400,
-            detail="Quarter must be between 1 and 4",
-        )
-
+        raise HTTPException(status_code=400, detail="Quarter must be between 1 and 4")
     quarter_map = {
         1: (1, 3),
         2: (4, 6),
         3: (7, 9),
         4: (10, 12),
     }
-
     start_month, end_month = quarter_map[quarter]
-
     total_expense = await db.scalar(
         select(func.sum(Expense.amount)).where(
             Expense.project_id == project_id,
             func.extract("year", Expense.expense_date) == year,
-            func.extract("month", Expense.expense_date).between(
-                start_month,
-                end_month,
-            ),
+            func.extract("month", Expense.expense_date).between(start_month, end_month),
         )
     )
-
     total_invoice = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id,
             func.extract("year", Invoice.created_at) == year,
-            func.extract("month", Invoice.created_at).between(
-                start_month,
-                end_month,
-            ),
+            func.extract("month", Invoice.created_at).between(start_month, end_month),
         )
     )
-
     completed_tasks = await db.scalar(
         select(func.count())
         .select_from(m.Task)
-        .where(
-            m.Task.project_id == project_id,
-            m.Task.status == TaskStatus.COMPLETED,
-        )
+        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.COMPLETED)
     )
-
     delayed_tasks = await db.scalar(
         select(func.count())
         .select_from(m.Task)
@@ -920,7 +876,6 @@ async def quarterly_audit_summary(
             m.Task.status != TaskStatus.COMPLETED,
         )
     )
-
     return {
         "project_id": project_id,
         "quarter": f"Q{quarter}",
@@ -935,50 +890,26 @@ async def quarterly_audit_summary(
 # =========================================================
 # WORK SUMMARY
 # =========================================================
-from fastapi import Query
-
-
 @router.get("/work-summary")
 async def work_summary(
-    project_id: int = Query(..., gt=0),
+    project_id: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
-
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     result = await db.execute(select(m.Task).where(m.Task.project_id == project_id))
-
     tasks = result.scalars().all()
-
     summary = []
-
     for task in tasks:
-
         actual = round(float(task.completion_percentage or 0), 2)
-
-        # EXTRA SAFETY VALIDATION
-        if actual < 0:
-            actual = 0
-
-        if actual > 100:
-            actual = 100
-
         # Future ready
         planned = 100
-
         if actual >= 90:
             efficiency = "HIGH"
-
         elif actual >= 60:
             efficiency = "MEDIUM"
-
         else:
             efficiency = "LOW"
-
         summary.append(
             {
                 "task_id": task.id,
@@ -989,7 +920,6 @@ async def work_summary(
                 "status": task.status.value if task.status else None,
             }
         )
-
     return {
         "project_id": project_id,
         "total_tasks": len(summary),
@@ -1002,232 +932,139 @@ async def work_summary(
 # =========================================================
 @router.get("/audit-pdf")
 async def audit_pdf(
-    project_id: int = Query(..., gt=0),
+    project_id: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
-
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     # ================= FINANCIAL =================
-
     total_expense = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
-
     total_invoice = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
     )
-
     paid_invoice = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.status == InvoiceStatus.PAID,
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PAID
         )
     )
-
     pending_invoice = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.status == InvoiceStatus.PENDING,
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PENDING
         )
     )
-
     # ================= TASKS =================
-
     total_tasks = await db.scalar(
         select(func.count()).select_from(m.Task).where(m.Task.project_id == project_id)
     )
-
     completed_tasks = await db.scalar(
         select(func.count())
         .select_from(m.Task)
-        .where(
-            m.Task.project_id == project_id,
-            m.Task.status == TaskStatus.COMPLETED,
-        )
+        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.COMPLETED)
     )
-
     in_progress_tasks = await db.scalar(
         select(func.count())
         .select_from(m.Task)
-        .where(
-            m.Task.project_id == project_id,
-            m.Task.status == TaskStatus.IN_PROGRESS,
-        )
+        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.IN_PROGRESS)
     )
-
     # ================= ISSUES =================
-
     open_issues = await db.scalar(
         select(func.count())
         .select_from(m.Issue)
-        .where(
-            m.Issue.project_id == project_id,
-            m.Issue.status == IssueStatus.OPEN,
-        )
+        .where(m.Issue.project_id == project_id, m.Issue.status == IssueStatus.OPEN)
     )
-
     closed_issues = await db.scalar(
         select(func.count())
         .select_from(m.Issue)
-        .where(
-            m.Issue.project_id == project_id,
-            m.Issue.status == IssueStatus.CLOSED,
-        )
+        .where(m.Issue.project_id == project_id, m.Issue.status == IssueStatus.CLOSED)
     )
-
     # ================= PROGRESS =================
-
     progress = await db.scalar(
         select(func.avg(m.Task.completion_percentage)).where(
             m.Task.project_id == project_id
         )
     )
-
     # ================= PDF =================
-
     buffer = io.BytesIO()
-
     doc = SimpleDocTemplate(buffer)
-
     styles = getSampleStyleSheet()
-
     content = []
-
     # TITLE
-
     content.append(Paragraph("Detailed Audit Report", styles["Title"]))
-
     content.append(Spacer(1, 20))
-
     # FINANCIAL
-
     content.append(Paragraph("Financial Summary", styles["Heading1"]))
-
     content.append(
         Paragraph(
             f"Total Expense: Rs. {round(float(total_expense or 0), 2)}",
             styles["Normal"],
         )
     )
-
     content.append(
         Paragraph(
             f"Total Invoice: Rs. {round(float(total_invoice or 0), 2)}",
             styles["Normal"],
         )
     )
-
     content.append(
         Paragraph(
-            f"Paid Invoice: Rs. {round(float(paid_invoice or 0), 2)}",
-            styles["Normal"],
+            f"Paid Invoice: Rs. {round(float(paid_invoice or 0), 2)}", styles["Normal"]
         )
     )
-
     content.append(
         Paragraph(
             f"Pending Invoice: Rs. {round(float(pending_invoice or 0), 2)}",
             styles["Normal"],
         )
     )
-
     content.append(
         Paragraph(
             f"Profit: Rs. {round(float((total_invoice or 0) - (total_expense or 0)), 2)}",
             styles["Normal"],
         )
     )
-
     content.append(Spacer(1, 20))
-
     # WORK
-
     content.append(Paragraph("Work Summary", styles["Heading1"]))
-
+    content.append(Paragraph(f"Total Tasks: {int(total_tasks or 0)}", styles["Normal"]))
     content.append(
-        Paragraph(
-            f"Total Tasks: {int(total_tasks or 0)}",
-            styles["Normal"],
-        )
+        Paragraph(f"Completed Tasks: {int(completed_tasks or 0)}", styles["Normal"])
     )
-
     content.append(
-        Paragraph(
-            f"Completed Tasks: {int(completed_tasks or 0)}",
-            styles["Normal"],
-        )
+        Paragraph(f"In Progress Tasks: {int(in_progress_tasks or 0)}", styles["Normal"])
     )
-
-    content.append(
-        Paragraph(
-            f"In Progress Tasks: {int(in_progress_tasks or 0)}",
-            styles["Normal"],
-        )
-    )
-
     content.append(Spacer(1, 20))
-
     # ISSUES
-
     content.append(Paragraph("Issue Summary", styles["Heading1"]))
-
+    content.append(Paragraph(f"Open Issues: {int(open_issues or 0)}", styles["Normal"]))
     content.append(
-        Paragraph(
-            f"Open Issues: {int(open_issues or 0)}",
-            styles["Normal"],
-        )
+        Paragraph(f"Closed Issues: {int(closed_issues or 0)}", styles["Normal"])
     )
-
-    content.append(
-        Paragraph(
-            f"Closed Issues: {int(closed_issues or 0)}",
-            styles["Normal"],
-        )
-    )
-
     content.append(Spacer(1, 20))
-
     # PROGRESS
-
     content.append(Paragraph("Project Progress", styles["Heading1"]))
-
     content.append(
         Paragraph(
-            f"Overall Progress: {round(float(progress or 0), 2)} %",
-            styles["Normal"],
+            f"Overall Progress: {round(float(progress or 0), 2)} %", styles["Normal"]
         )
     )
-
     content.append(Spacer(1, 20))
-
     # FOOTER
-
     content.append(
         Paragraph(
             f"Generated On: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
             styles["Italic"],
         )
     )
-
     # BUILD
-
     doc.build(content)
-
     buffer.seek(0)
-
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": (
-                f"attachment; filename=audit_report_{project_id}.pdf"
-            )
+            "Content-Disposition": f"attachment; filename=audit_report_{project_id}.pdf"
         },
     )
 
@@ -1249,7 +1086,7 @@ from calendar import monthrange
 async def project_report(
     project_id: int,
     type: str,
-    date: date | None = None,
+    report_date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     month: int | None = None,
@@ -1269,8 +1106,7 @@ async def project_report(
 
     if type == "daily" and not report_date:
         raise HTTPException(
-            status_code=400,
-            detail="report_date is required for daily report"
+            status_code=400, detail="report_date is required for daily report"
         )
 
     if type == "weekly" and (not start_date or not end_date):
@@ -1317,8 +1153,8 @@ async def project_report(
         end_date = date(year, end_month, monthrange(year, end_month)[1])
 
     if type == "daily":
-        start_date = date
-        end_date = date
+        start_date = report_date
+        end_date = report_date
 
     # =====================================================
     # PROJECT
@@ -1391,7 +1227,7 @@ async def project_report(
     return {
         "project": {
             "id": project.id,
-            "name": project.name,
+            "project_name": project.project_name,
         },
         "report_type": type,
         "quarter": f"Q{quarter}" if type == "quarterly" else None,
@@ -1428,28 +1264,29 @@ async def project_report(
 # =========================================================
 
 
-
+@router.get("/project/export/pdf")
 @router.get("/project/export/pdf")
 async def export_project_report_pdf(
     project_id: int,
     type: str,
-    date: date | None = None,
+    report_date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     month: int | None = None,
     year: int | None = None,
+    quarter: int | None = None,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-
     response = await project_report(
         project_id=project_id,
         type=type,
-        date=date,
+        report_date=report_date,
         start_date=start_date,
         end_date=end_date,
         month=month,
         year=year,
+        quarter=quarter,
         current_user=current_user,
         db=db,
     )
@@ -1466,10 +1303,7 @@ async def export_project_report_pdf(
 
     content.append(Spacer(1, 20))
 
-    Paragraph(
-        f"Project: {response['project']['project_name']}",
-        styles["Heading2"]
-    )
+    Paragraph(f"Project: {response['project']['project_name']}", styles["Heading2"])
 
     content.append(
         Paragraph(
@@ -1519,11 +1353,12 @@ async def export_project_report_pdf(
 async def export_project_report_excel(
     project_id: int,
     type: str,
-    date: date | None = None,
+    report_date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     month: int | None = None,
     year: int | None = None,
+    quarter: int | None = None,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -1531,11 +1366,12 @@ async def export_project_report_excel(
     response = await project_report(
         project_id=project_id,
         type=type,
-        date=date,
+        report_date=report_date,
         start_date=start_date,
         end_date=end_date,
         month=month,
         year=year,
+        quarter=quarter,
         current_user=current_user,
         db=db,
     )
@@ -1550,7 +1386,7 @@ async def export_project_report_excel(
     # SUMMARY
     # =====================================================
 
-    ws.append(["Project", response["project"]["name"]])
+    ws.append(["Project", response["project"]["project_name"]])
     ws.append(["Report Type", response["report_type"]])
     ws.append([])
 
@@ -1599,7 +1435,130 @@ async def export_project_report_excel(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition":
-            f"attachment; filename={type}_project_report.xlsx"
+            "Content-Disposition": f"attachment; filename={type}_project_report.xlsx"
         },
     )
+
+
+# ===================== BUSINESS INTELLIGENCE KPIs =====================
+@router.get("/business-intelligence")
+async def business_intelligence_kpis(
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    # Revenue (owner invoices)
+    revenue = await db.scalar(
+        select(func.sum(Invoice.total_amount)).where(
+            Invoice.type == "owner", Invoice.status == InvoiceStatus.PAID
+        )
+    )
+
+    # Expenditure (all expenses)
+    expense = await db.scalar(select(func.sum(Expense.amount)))
+
+    revenue_val = float(revenue or 0)
+    expense_val = float(expense or 0)
+    net_profit = revenue_val - expense_val
+
+    # Activity Log
+    documented_reports = await db.scalar(select(func.count(m.DailySiteReport.id)))
+
+    # Efficiency (Active Sites)
+    active_sites = await db.scalar(
+        select(func.count(m.Project.id)).where(m.Project.status == "Active")
+    )
+
+    return {
+        "revenue_focus": net_profit,
+        "expenditure": expense_val,
+        "activity_log": int(documented_reports or 0),
+        "efficiency": f"Syncing from {active_sites or 0} sites",
+    }
+
+
+# ===================== WORK CATEGORY SUMMARY =====================
+@router.get("/work-category")
+async def work_category_summary(
+    project_id: int,
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    result = await db.execute(
+        select(
+            m.Task.discipline,
+            func.count(m.Task.id).label("total_tasks"),
+            func.sum(case((m.Task.status == TaskStatus.COMPLETED, 1), else_=0)).label(
+                "completed_tasks"
+            ),
+            func.avg(m.Task.completion_percentage).label("avg_progress"),
+        )
+        .where(m.Task.project_id == project_id)
+        .group_by(m.Task.discipline)
+    )
+
+    categories = []
+    for row in result.all():
+        discipline, total_tasks, completed_tasks, avg_progress = row
+        categories.append(
+            {
+                "category": discipline or "General",
+                "total_tasks": int(total_tasks or 0),
+                "completed_tasks": int(completed_tasks or 0),
+                "avg_progress": round(float(avg_progress or 0), 2),
+            }
+        )
+
+    return {"work_categories": categories}
+
+
+# ===================== QUARTERLY AUDIT SUMMARY =====================
+@router.get("/audit-summary")
+async def quarterly_audit_summary(
+    project_id: int,
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    # Calculate current quarter bounds
+    today = date.today()
+    current_quarter = (today.month - 1) // 3 + 1
+    start_month = 3 * current_quarter - 2
+    start_date = date(today.year, start_month, 1)
+
+    # High Priority Issues in Quarter
+    critical_issues = await db.scalar(
+        select(func.count(m.Issue.id)).where(
+            m.Issue.project_id == project_id,
+            m.Issue.priority == "HIGH",
+            m.Issue.created_at >= start_date,
+        )
+    )
+
+    # Audit trail activities
+    audit_logs = await db.scalar(
+        select(func.count(ActivityLog.id)).where(
+            ActivityLog.entity == "project",
+            ActivityLog.entity_id == project_id,
+            ActivityLog.created_at >= start_date,
+        )
+    )
+
+    # Expense Audits
+    quarterly_expenses = await db.scalar(
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id, Expense.expense_date >= start_date
+        )
+    )
+
+    return {
+        "quarter": f"Q{current_quarter} {today.year}",
+        "critical_issues_found": int(critical_issues or 0),
+        "audit_activities_logged": int(audit_logs or 0),
+        "quarterly_expenses_audited": float(quarterly_expenses or 0),
+        "compliance_status": (
+            "Passed" if (critical_issues or 0) < 5 else "Review Needed"
+        ),
+    }
