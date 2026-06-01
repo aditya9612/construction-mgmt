@@ -1,6 +1,9 @@
-from fastapi import APIRouter, Depends
+from http.client import HTTPException
+
+from fastapi import APIRouter, Depends, logger
+from fastapi.params import Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, case
+from sqlalchemy import desc, select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date, datetime, timedelta
 import io
@@ -35,6 +38,10 @@ import pandas as pd
 
 from app.utils.common import assert_project_access
 from app.utils.helpers import NotFoundError
+import logging
+
+logger = logging.getLogger(__name__)
+from fastapi import HTTPException
 
 DASHBOARD_READ_ROLES = [
     r.value
@@ -1565,3 +1572,630 @@ async def project_engineer_dashboard(
         recent_expenses=recent_expenses,
         weather={"condition": "Clear", "temperature": 32}  # Placeholder
     )
+
+
+# =========================================
+# COMMON HELPERS
+# =========================================
+
+def safe_divide(a, b):
+
+    if not b:
+        return 0
+
+    return round(a / b, 2)
+
+
+def validate_percentage(value):
+
+    if value < 0:
+        return 0
+
+    if value > 100:
+        return 100
+
+    return round(value, 2)
+
+
+def success_response(
+    message,
+    data=None
+):
+
+    return {
+        "success": True,
+        "message": message,
+        "data": data
+    }
+
+
+# =========================================
+# ENTERPRISE CLIENT COMMAND CENTER
+# =========================================
+
+@router.get(
+    "/client-command-center",
+    summary="Enterprise Client Dashboard",
+)
+async def client_command_center(
+
+    project_id: int = Query(
+        ...,
+        gt=0,
+        description="Project ID"
+    ),
+
+    current_user: User = Depends(
+        d.require_roles([
+            UserRole.ADMIN.value,
+            UserRole.CLIENT.value,
+            UserRole.PROJECT_MANAGER.value,
+        ])
+    ),
+
+    db: AsyncSession = Depends(
+        get_db_session
+    ),
+
+    redis=Depends(
+        d.get_request_redis
+    ),
+):
+
+    logger.info(
+        f"Dashboard accessed "
+        f"user={current_user.id} "
+        f"project={project_id}"
+    )
+
+    # =========================================
+    # CACHE
+    # =========================================
+
+    cache_key = (
+        f"dashboard:"
+        f"{project_id}:"
+        f"{current_user.id}"
+    )
+
+    try:
+
+        cached = await r.cache_get_json(
+            redis,
+            cache_key
+        )
+
+        if cached:
+            return cached
+
+    except Exception as cache_error:
+
+        logger.warning(
+            f"Cache read failed: "
+            f"{str(cache_error)}"
+        )
+
+    # =========================================
+    # PROJECT VALIDATION
+    # =========================================
+
+    project = await db.get(
+        m.Project,
+        project_id
+    )
+
+    if not project:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found"
+        )
+
+    # =========================================
+    # TASK ANALYTICS
+    # =========================================
+
+    total_tasks = await db.scalar(
+
+        select(
+            func.count(m.Task.id)
+        )
+        .where(
+            m.Task.project_id == project_id
+        )
+
+    ) or 0
+
+    completed_tasks = await db.scalar(
+
+        select(
+            func.count(m.Task.id)
+        )
+        .where(
+            m.Task.project_id == project_id,
+            func.lower(
+                m.Task.status
+            ) == "completed"
+        )
+
+    ) or 0
+
+    pending_tasks = (
+        total_tasks - completed_tasks
+    )
+
+    overall_progress = (
+        validate_percentage(
+            safe_divide(
+                completed_tasks * 100,
+                total_tasks
+            )
+        )
+    )
+
+    # =========================================
+    # MILESTONE ANALYTICS
+    # =========================================
+
+    total_milestones = await db.scalar(
+
+        select(
+            func.count(
+                m.Milestone.id
+            )
+        )
+        .where(
+            m.Milestone.project_id == project_id
+        )
+
+    ) or 0
+
+    completed_milestones = await db.scalar(
+
+        select(
+            func.count(
+                m.Milestone.id
+            )
+        )
+        .where(
+            m.Milestone.project_id == project_id,
+            func.lower(
+                m.Milestone.status
+            ) == "completed"
+        )
+
+    ) or 0
+
+    # =========================================
+    # BUDGET ANALYTICS
+    # =========================================
+
+    total_budget = await db.scalar(
+
+        select(
+            func.sum(
+                BOQ.total_cost
+            )
+        )
+        .where(
+            BOQ.project_id == project_id,
+            BOQ.is_latest == True
+        )
+
+    ) or 0
+
+    total_expense = await db.scalar(
+
+        select(
+            func.sum(
+                Expense.amount
+            )
+        )
+        .where(
+            Expense.project_id == project_id
+        )
+
+    ) or 0
+
+    total_budget = float(
+        total_budget or 0
+    )
+
+    total_expense = float(
+        total_expense or 0
+    )
+
+    remaining_budget = round(
+        total_budget - total_expense,
+        2
+    )
+
+    budget_used_percent = (
+        validate_percentage(
+            safe_divide(
+                total_expense * 100,
+                total_budget
+            )
+        )
+    )
+
+    # =========================================
+    # DAYS REMAINING
+    # =========================================
+
+    from datetime import date
+
+    days_remaining = 0
+
+    if project.end_date:
+
+        days_remaining = (
+            project.end_date - date.today()
+        ).days
+
+        if days_remaining < 0:
+            days_remaining = 0
+
+    # =========================================
+    # ACTIVE TASK
+    # =========================================
+
+    active_task_result = await db.execute(
+
+        select(
+            m.Task.title,
+            m.Task.description,
+            m.Task.status,
+        )
+        .where(
+            m.Task.project_id == project_id
+        )
+        .order_by(
+            desc(m.Task.id)
+        )
+        .limit(1)
+
+    )
+
+    active_task = (
+        active_task_result.first()
+    )
+
+    # =========================================
+    # COMPLETED TASK
+    # =========================================
+
+    completed_task_result = await db.execute(
+
+        select(
+            m.Task.title
+        )
+        .where(
+            m.Task.project_id == project_id,
+            func.lower(
+                m.Task.status
+            ) == "completed"
+        )
+        .order_by(
+            desc(m.Task.id)
+        )
+        .limit(1)
+
+    )
+
+    completed_task = (
+        completed_task_result.scalar()
+    )
+
+    # =========================================
+    # UPCOMING TASK
+    # =========================================
+
+    upcoming_task_result = await db.execute(
+
+        select(
+            m.Task.title
+        )
+        .where(
+            m.Task.project_id == project_id,
+            func.lower(
+                m.Task.status
+            ) != "completed"
+        )
+        .order_by(
+            m.Task.id.asc()
+        )
+        .limit(1)
+
+    )
+
+    upcoming_task = (
+        upcoming_task_result.scalar()
+    )
+
+    # =========================================
+    # WORK PROGRESS
+    # =========================================
+
+    work_progress = {
+
+        "progress_percent":
+            overall_progress,
+
+        "current_task":
+
+            active_task[0]
+            if active_task
+            else None,
+
+        "task_description":
+
+            active_task[1]
+            if active_task
+            else None,
+
+        "task_status":
+
+            str(active_task[2])
+            if active_task
+            else None,
+
+        "last_completed":
+            completed_task,
+
+        "upcoming":
+            upcoming_task,
+    }
+
+    # =========================================
+    # LIVE EXECUTION FEED
+    # =========================================
+
+    activity_result = await db.execute(
+
+        select(
+            ActivityLog.id,
+            ActivityLog.action,
+            ActivityLog.created_at,
+            ActivityLog.entity,
+        )
+        .where(
+            ActivityLog.entity_id == project_id
+        )
+        .order_by(
+            desc(
+                ActivityLog.created_at
+            )
+        )
+        .limit(10)
+
+    )
+
+    activity_rows = (
+        activity_result.all()
+    )
+
+    live_execution_feed = []
+
+    for row in activity_rows:
+
+        live_execution_feed.append({
+
+            "id":
+                row[0],
+
+            "action":
+                row[1],
+
+            "entity":
+                row[3],
+
+            "created_at":
+                row[2],
+        })
+
+    # =========================================
+    # COST MANAGEMENT AUDIT
+    # =========================================
+
+    expense_result = await db.execute(
+
+        select(
+            Expense.category,
+            func.sum(
+                Expense.amount
+            )
+        )
+        .where(
+            Expense.project_id == project_id
+        )
+        .group_by(
+            Expense.category
+        )
+
+    )
+
+    expense_rows = (
+        expense_result.all()
+    )
+
+    cost_management_audit = []
+
+    for row in expense_rows:
+
+        actual = float(
+            row[1] or 0
+        )
+
+        projected = round(
+            actual * 1.1,
+            2
+        )
+
+        variance = round(
+            projected - actual,
+            2
+        )
+
+        cost_management_audit.append({
+
+            "phase":
+                row[0] or "General",
+
+            "actual":
+                actual,
+
+            "projected":
+                projected,
+
+            "variance":
+                variance,
+        })
+
+    # =========================================
+    # PROJECT HEALTH
+    # =========================================
+
+    project_status = (
+
+        project.status.value
+
+        if hasattr(
+            project.status,
+            "value"
+        )
+
+        else str(project.status)
+    )
+
+    project_health = {
+
+        "status":
+            project_status,
+
+        "overall_progress":
+            overall_progress,
+
+        "budget_health":
+
+            "Good"
+            if budget_used_percent < 80
+            else "Warning",
+
+        "schedule_health":
+
+            "On Track"
+            if overall_progress >= 50
+            else "Delayed",
+
+        "task_completion_rate":
+            overall_progress,
+
+        "budget_used_percent":
+            budget_used_percent,
+    }
+
+    # =========================================
+    # RESPONSE
+    # =========================================
+
+    response = success_response(
+
+        "Client command center fetched successfully",
+
+        {
+
+            "project": {
+
+                "id":
+                    project.id,
+
+                "name":
+                    project.project_name,
+
+                "status":
+                    project_status,
+
+                "start_date":
+                    project.start_date,
+
+                "end_date":
+                    project.end_date,
+
+                "days_remaining":
+                    days_remaining,
+            },
+
+            "summary": {
+
+                "overall_progress":
+                    overall_progress,
+
+                "budget_total":
+                    total_budget,
+
+                "total_expense":
+                    total_expense,
+
+                "remaining_budget":
+                    remaining_budget,
+
+                "budget_used_percent":
+                    budget_used_percent,
+
+                "tasks": {
+
+                    "completed":
+                        completed_tasks,
+
+                    "pending":
+                        pending_tasks,
+
+                    "total":
+                        total_tasks,
+                },
+
+                "milestones": {
+
+                    "completed":
+                        completed_milestones,
+
+                    "total":
+                        total_milestones,
+                }
+            },
+
+            "work_progress":
+                work_progress,
+
+            "live_execution_feed":
+                live_execution_feed,
+
+            "cost_management_audit":
+                cost_management_audit,
+
+            "project_health":
+                project_health,
+        }
+    )
+
+    # =========================================
+    # CACHE SAVE
+    # =========================================
+
+    try:
+
+        await r.cache_set_json(
+            redis,
+            cache_key,
+            response
+        )
+
+    except Exception as cache_error:
+
+        logger.warning(
+            f"Cache save failed: "
+            f"{str(cache_error)}"
+        )
+
+    return response

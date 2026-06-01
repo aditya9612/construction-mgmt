@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import case, select, func, update
+from sqlalchemy import case, or_, select, func, update
 from datetime import datetime
 from datetime import timedelta
 from app.db.session import get_db_session
@@ -17,7 +17,11 @@ from app.models.chat import (
 )
 from app.schemas.chat import (
     ChatInfoOut,
+    ChatListEnhancedOut,
     ChatListOut,
+    ChatMemberAddPayload,
+    ChatUserOut,
+    ChatUserSearchOut,
     CreateGroup,
     MessageOut,
     ReplyOut,
@@ -494,6 +498,10 @@ async def get_messages(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    
+    if limit > 100:
+        limit = 100
+
     await validate_membership(chat_id, current_user.id, db)
 
     Parent = aliased(ChatMessage)
@@ -594,6 +602,8 @@ async def get_messages(
         ]
 
         db.add_all(new_reads)
+
+        await db.commit()
 
         # realtime read event
         if new_reads:
@@ -792,6 +802,381 @@ async def create_group(
 
     return {"chat_id": chat.id}
 
+@router.get("/users", response_model=list[ChatUserOut])
+async def get_chat_users(
+    request: Request,
+    search: str | None = None,
+    role: str | None = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    if limit > 100:
+        limit = 100
+
+    query = select(User).where(
+        User.is_deleted == False,
+        User.is_active == True,
+        User.id != current_user.id,
+    )
+
+    if search:
+        like = f"%{search.strip()}%"
+
+        query = query.where(
+            or_(
+                User.full_name.ilike(like),
+                User.mobile.ilike(like),
+                User.email.ilike(like),
+            )
+        )
+
+    if role:
+        query = query.where(User.role == role)
+
+    query = query.order_by(User.full_name.asc()).limit(limit)
+
+    result = await db.execute(query)
+
+    users = result.scalars().all()
+
+    output = []
+
+    redis = getattr(request.app.state, "redis", None)
+
+    for user in users:
+
+        is_online = False
+        last_seen = None
+
+        try:
+            if redis:
+
+                online = await redis.get(f"user:{user.id}:online")
+
+                if online:
+                    is_online = True
+
+                ls = await redis.get(f"user:{user.id}:last_seen")
+
+                if ls:
+                    last_seen = ls.decode()
+
+        except Exception:
+            pass
+
+        output.append(
+            {
+                "user_id": user.id,
+                "full_name": user.full_name,
+                "role": user.role,
+                "designation": user.designation,
+                "profile_image": user.profile_image,
+                "mobile_number": user.mobile,
+                "is_online": is_online,
+                "last_seen": last_seen,
+            }
+        )
+
+    return output
+
+
+@router.get("/search-users", response_model=list[ChatUserSearchOut])
+async def search_chat_users(
+    q: str,
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    
+    if limit > 100:
+        limit = 100
+
+    q = q.strip()
+
+    if len(q) < 1:
+        return []
+
+    like = f"%{q}%"
+
+    result = await db.execute(
+        select(User)
+        .where(
+            User.is_deleted == False,
+            User.is_active == True,
+            User.id != current_user.id,
+            or_(
+                User.full_name.ilike(like),
+                User.mobile.ilike(like),
+                User.email.ilike(like),
+            ),
+        )
+        .order_by(User.full_name.asc())
+        .limit(limit)
+    )
+
+    users = result.scalars().all()
+
+    return [
+        {
+            "user_id": user.id,
+            "full_name": user.full_name,
+            "role": user.role,
+            "profile_image": user.profile_image,
+        }
+        for user in users
+    ]
+
+
+@router.get("/enhanced", response_model=list[ChatListEnhancedOut])
+async def get_enhanced_chat_list(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    result = await db.execute(
+        select(
+            ChatSession.id,
+            ChatSession.type,
+            ChatSession.name,
+            ChatSession.avatar_url,
+            ChatSession.last_message,
+            ChatSession.last_message_at,
+            func.sum(
+                case(
+                    (
+                        (ChatMessage.sender_id != current_user.id)
+                        & (MessageRead.id.is_(None)),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("unread_count"),
+        )
+        .join(ChatMember, ChatMember.chat_id == ChatSession.id)
+        .outerjoin(ChatMessage, ChatMessage.chat_id == ChatSession.id)
+        .outerjoin(
+            MessageRead,
+            (ChatMessage.id == MessageRead.message_id)
+            & (MessageRead.user_id == current_user.id),
+        )
+        .where(ChatMember.user_id == current_user.id)
+        .group_by(ChatSession.id)
+        .order_by(ChatSession.last_message_at.desc())
+    )
+
+    rows = result.all()
+
+    chats = []
+
+    for row in rows:
+
+        other_user_id = None
+        other_user_name = None
+        other_user_avatar = None
+
+        if row.type == ChatType.PRIVATE:
+
+            other = await db.execute(
+                select(User)
+                .join(ChatMember, ChatMember.user_id == User.id)
+                .where(
+                    ChatMember.chat_id == row.id,
+                    User.id != current_user.id,
+                )
+                .limit(1)
+            )
+
+            other_user = other.scalar()
+
+            if other_user:
+                other_user_id = other_user.id
+                other_user_name = other_user.full_name
+                other_user_avatar = other_user.profile_image
+
+        chats.append(
+            {
+                "id": row.id,
+                "type": row.type.value,
+                "name": row.name,
+                "avatar_url": row.avatar_url,
+                "other_user_id": other_user_id,
+                "other_user_name": other_user_name,
+                "other_user_avatar": other_user_avatar,
+                "last_message": row.last_message,
+                "last_message_at": row.last_message_at,
+                "unread_count": row.unread_count or 0,
+            }
+        )
+
+    return chats
+
+
+@router.post("/group/{chat_id}/members")
+async def add_multiple_members(
+    chat_id: int,
+    payload: ChatMemberAddPayload,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    await validate_group(chat_id, db)
+
+    await validate_admin(chat_id, current_user.id, db)
+
+    member_ids = list(set(payload.member_ids))
+
+    if not member_ids:
+        raise HTTPException(400, "member_ids required")
+
+    users = await db.execute(
+        select(User.id).where(
+            User.id.in_(member_ids),
+            User.is_deleted == False,
+            User.is_active == True,
+        )
+    )
+
+    valid_user_ids = set(users.scalars().all())
+
+    invalid_ids = set(member_ids) - valid_user_ids
+
+    if invalid_ids:
+        raise HTTPException(
+            400,
+            f"Invalid users: {list(invalid_ids)}"
+        )
+
+    existing = await db.execute(
+        select(ChatMember.user_id).where(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id.in_(member_ids),
+        )
+    )
+
+    existing_ids = set(existing.scalars().all())
+
+    added = []
+
+    for uid in member_ids:
+
+        if uid in existing_ids:
+            continue
+
+        db.add(
+            ChatMember(
+                chat_id=chat_id,
+                user_id=uid,
+                role=MemberRole.MEMBER,
+            )
+        )
+
+        added.append(uid)
+
+    await db.commit()
+
+    return {
+        "status": "success",
+        "added_members": added,
+        "already_exists": list(existing_ids),
+    }
+
+
+@router.delete("/group/{chat_id}/members")
+async def remove_multiple_members(
+    chat_id: int,
+    payload: ChatMemberAddPayload,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    await validate_group(chat_id, db)
+
+    await validate_admin(chat_id, current_user.id, db)
+
+    removed = []
+
+    for uid in payload.member_ids:
+
+        member_result = await db.execute(
+            select(ChatMember).where(
+                ChatMember.chat_id == chat_id,
+                ChatMember.user_id == uid,
+            )
+        )
+
+        member = member_result.scalar()
+
+        if not member:
+            continue
+
+        if member.role == MemberRole.ADMIN:
+            continue
+
+        await db.delete(member)
+
+        removed.append(uid)
+
+    await db.commit()
+
+    return {
+        "status": "success",
+        "removed_members": removed,
+    }
+
+
+@router.get("/{chat_id}/mention-users")
+async def mention_users(
+    chat_id: int,
+    q: str = "",
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    
+    if limit > 100:
+        limit = 100
+
+    await validate_membership(chat_id, current_user.id, db)
+
+    query = (
+        select(User)
+        .join(ChatMember, ChatMember.user_id == User.id)
+        .where(
+            ChatMember.chat_id == chat_id,
+            User.id != current_user.id,
+        )
+    )
+
+    if q:
+
+        like = f"%{q.strip()}%"
+
+        query = query.where(
+            or_(
+                User.full_name.ilike(like),
+                User.mobile.ilike(like),
+            )
+        )
+
+    query = query.order_by(User.full_name.asc()).limit(limit)
+
+    result = await db.execute(query)
+
+    users = result.scalars().all()
+
+    return {
+        "items": [
+            {
+                "user_id": user.id,
+                "full_name": user.full_name,
+                "profile_image": user.profile_image,
+            }
+            for user in users
+        ]
+    }
+
 
 @router.post("/group/{chat_id}/add")
 async def add_member(
@@ -821,6 +1206,7 @@ async def add_member(
     db.add(ChatMember(chat_id=chat_id, user_id=user_id, role=MemberRole.MEMBER))
 
     return {"status": "added"}
+
 
 
 @router.post("/group/{chat_id}/remove")
@@ -1472,7 +1858,11 @@ async def search_messages(
 
         .join(User, ChatMessage.sender_id == User.id)
         .outerjoin(Parent, ChatMessage.parent_id == Parent.id)
-        .where(ChatMessage.chat_id == chat_id, ChatMessage.message.ilike(f"%{query}%"))
+        .where(
+            ChatMessage.chat_id == chat_id,
+            ChatMessage.message.is_not(None),
+            ChatMessage.message.ilike(f"%{query}%"),
+        )
         .order_by(ChatMessage.created_at.desc())
         .limit(50)
     )
@@ -1702,6 +2092,8 @@ async def forward_message(
             file_size=a.file_size,
             thumbnail_url=a.thumbnail_url,
         )
+
+        db.add(copied)
 
         forwarded.attachments.append(copied)
 
