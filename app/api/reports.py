@@ -32,6 +32,7 @@ router = APIRouter(prefix="/reports", tags=["Reports"])
 
 # ===================== DAILY REPORT =====================
 
+
 @router.get("/daily")
 async def daily_report(
     project_id: int,
@@ -50,6 +51,7 @@ async def daily_report(
 
 
 # ===================== DAILY REPORT PDF =====================
+
 
 @router.get("/daily/export/pdf")
 async def export_daily_pdf(
@@ -92,6 +94,7 @@ async def export_daily_pdf(
 
 # ===================== WEEKLY PROGRESS =====================
 
+
 @router.get("/weekly")
 async def weekly_progress(
     project_id: int,
@@ -101,10 +104,7 @@ async def weekly_progress(
     week_ago = datetime.utcnow() - timedelta(days=7)
 
     result = await db.execute(
-        select(
-            m.Task.id,
-            func.max(m.TaskProgress.percentage)
-        )
+        select(m.Task.id, func.max(m.TaskProgress.percentage))
         .join(m.TaskProgress, m.Task.id == m.TaskProgress.task_id)
         .where(
             m.Task.project_id == project_id,
@@ -117,15 +117,14 @@ async def weekly_progress(
 
     #  safe calculation
     progress = (
-        sum(float(r[1]) for r in rows if r[1] is not None) / len(rows)
-        if rows else 0
+        sum(float(r[1]) for r in rows if r[1] is not None) / len(rows) if rows else 0
     )
 
-    return {
-        "weekly_progress_percent": round(progress, 2),
-        "tasks_count": len(rows) }
+    return {"weekly_progress_percent": round(progress, 2), "tasks_count": len(rows)}
+
 
 # ===================== LABOUR REPORT =====================
+
 
 @router.get("/labour")
 async def labour_report(
@@ -134,31 +133,22 @@ async def labour_report(
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
-        select(
-            m.Labour.skill_type,
-            func.count(func.distinct(m.Labour.id))
-        )
+        select(m.Labour.skill_type, func.count(func.distinct(m.Labour.id)))
         .join(LabourAttendance, m.Labour.id == LabourAttendance.labour_id)
         .where(
             LabourAttendance.project_id == project_id,
-            m.Labour.status == LabourStatus.ACTIVE
+            m.Labour.status == LabourStatus.ACTIVE,
         )
         .group_by(m.Labour.skill_type)
     )
 
     rows = result.all()
 
-    return {
-        "labour_summary": [
-            {
-                "skill_type": r[0],
-                "count": r[1]
-            }
-            for r in rows
-        ]
-    }
+    return {"labour_summary": [{"skill_type": r[0], "count": r[1]} for r in rows]}
+
 
 # ===================== LABOUR EXCEL =====================
+
 
 @router.get("/labour/export/excel")
 async def export_labour_excel(
@@ -168,14 +158,11 @@ async def export_labour_excel(
 ):
     #  Correct query (JOIN + GROUP BY)
     result = await db.execute(
-        select(
-            m.Labour.skill_type,
-            func.count(func.distinct(m.Labour.id))
-        )
+        select(m.Labour.skill_type, func.count(func.distinct(m.Labour.id)))
         .join(LabourAttendance, m.Labour.id == LabourAttendance.labour_id)
         .where(
             LabourAttendance.project_id == project_id,
-            m.Labour.status == LabourStatus.ACTIVE
+            m.Labour.status == LabourStatus.ACTIVE,
         )
         .group_by(m.Labour.skill_type)
     )
@@ -210,15 +197,14 @@ async def export_labour_excel(
 
 # ===================== MATERIAL REPORT =====================
 
+
 @router.get("/material")
 async def material_report(
     project_id: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(
-        select(Material).where(Material.project_id == project_id)
-    )
+    result = await db.execute(select(Material).where(Material.project_id == project_id))
 
     materials = result.scalars().all()
 
@@ -227,15 +213,14 @@ async def material_report(
 
 # ===================== MATERIAL EXCEL =====================
 
+
 @router.get("/material/export/excel")
 async def export_material_excel(
     project_id: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(
-        select(Material).where(Material.project_id == project_id)
-    )
+    result = await db.execute(select(Material).where(Material.project_id == project_id))
     materials = result.scalars().all()
 
     wb = Workbook()
@@ -243,29 +228,33 @@ async def export_material_excel(
     ws.title = "Materials"
 
     # Headers
-    ws.append([
-        "Material Name",
-        "Category",
-        "Unit",
-        "Purchased Qty",
-        "Used Qty",
-        "Remaining Stock",
-        "Purchase Rate",
-        "Total Amount",
-    ])
+    ws.append(
+        [
+            "Material Name",
+            "Category",
+            "Unit",
+            "Purchased Qty",
+            "Used Qty",
+            "Remaining Stock",
+            "Purchase Rate",
+            "Total Amount",
+        ]
+    )
 
     # Data
     for mat in materials:
-        ws.append([
-            mat.material_name or "",
-            mat.category or "",
-            mat.unit or "",
-            float(mat.quantity_purchased or 0),
-            float(mat.quantity_used or 0),
-            float(mat.remaining_stock or 0),
-            float(mat.purchase_rate or 0),
-            float(mat.total_amount or 0),
-        ])
+        ws.append(
+            [
+                mat.material_name or "",
+                mat.category or "",
+                mat.unit or "",
+                float(mat.quantity_purchased or 0),
+                float(mat.quantity_used or 0),
+                float(mat.remaining_stock or 0),
+                float(mat.purchase_rate or 0),
+                float(mat.total_amount or 0),
+            ]
+        )
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -278,7 +267,10 @@ async def export_material_excel(
             "Content-Disposition": f"attachment; filename=materials_project_{project_id}.xlsx"
         },
     )
+
+
 # ===================== ISSUE REPORT =====================
+
 
 @router.get("/issues")
 async def issue_report(
@@ -287,14 +279,18 @@ async def issue_report(
     db: AsyncSession = Depends(get_db_session),
 ):
     open_issues = await db.scalar(
-        select(func.count()).select_from(m.Issue).where(
+        select(func.count())
+        .select_from(m.Issue)
+        .where(
             m.Issue.project_id == project_id,
             m.Issue.status == "Open",
         )
     )
 
     closed_issues = await db.scalar(
-        select(func.count()).select_from(m.Issue).where(
+        select(func.count())
+        .select_from(m.Issue)
+        .where(
             m.Issue.project_id == project_id,
             m.Issue.status == "Closed",
         )
@@ -305,15 +301,14 @@ async def issue_report(
 
 # ===================== ISSUE EXCEL =====================
 
+
 @router.get("/issues/export/excel")
 async def export_issue_excel(
     project_id: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(
-        select(m.Issue).where(m.Issue.project_id == project_id)
-    )
+    result = await db.execute(select(m.Issue).where(m.Issue.project_id == project_id))
     issues = result.scalars().all()
 
     wb = Workbook()
@@ -409,6 +404,7 @@ async def export_issue_excel(
 
 # ===================== FILTERED REPORT DOWNLOAD =====================
 
+
 @router.get("/download")
 async def client_report_download(
     project_id: int,
@@ -476,15 +472,13 @@ async def combined_report(
     #  Financials
     total_paid = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.status == InvoiceStatus.PAID
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PAID
         )
     )
 
     total_pending = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.status == InvoiceStatus.PENDING
+            Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PENDING
         )
     )
 
@@ -512,7 +506,9 @@ async def combined_report(
     content.append(Paragraph("Combined Project Report", styles["Title"]))
     content.append(Spacer(1, 10))
 
-    content.append(Paragraph(f"Date Range: {start_date} to {end_date}", styles["Normal"]))
+    content.append(
+        Paragraph(f"Date Range: {start_date} to {end_date}", styles["Normal"])
+    )
     content.append(Spacer(1, 10))
 
     # Progress
@@ -531,7 +527,9 @@ async def combined_report(
         content.append(Paragraph("No data available", styles["Normal"]))
     else:
         for r in dsr_list:
-            content.append(Paragraph(f"{r.report_date} - {r.work_done}", styles["Normal"]))
+            content.append(
+                Paragraph(f"{r.report_date} - {r.work_done}", styles["Normal"])
+            )
             content.append(Spacer(1, 5))
 
     doc.build(content)
@@ -592,14 +590,16 @@ async def contractor_performance(
         "performance": rating,
     }
 
+
 @router.get("/profit-loss")
-async def profit_loss(db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(REPORT_READ_ROLES))):
+async def profit_loss(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+):
 
     # Income (owner invoices)
     income = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.type == "owner"
-        )
+        select(func.sum(Invoice.total_amount)).where(Invoice.type == "owner")
     )
 
     # Expense (labour + material)
@@ -618,25 +618,24 @@ async def profit_loss(db: AsyncSession = Depends(get_db_session),current_user: U
         "profit": income_val - expense_val,
     }
 
+
 @router.get("/project/{project_id}")
 async def project_report(
     project_id: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     #  Revenue (owner invoices only)
     revenue = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.type == "owner"
+            Invoice.project_id == project_id, Invoice.type == "owner"
         )
     )
 
     #  Expense (labour + material invoices)
     expense = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.type.in_(["labour", "material"])
+            Invoice.project_id == project_id, Invoice.type.in_(["labour", "material"])
         )
     )
 
@@ -650,8 +649,12 @@ async def project_report(
         "profit": revenue_val - expense_val,
     }
 
+
 @router.get("/cashflow")
-async def cashflow(db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(REPORT_READ_ROLES))):
+async def cashflow(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+):
     inflow = await db.scalar(
         select(func.sum(Transaction.amount)).where(Transaction.type == "receipt")
     )
@@ -668,11 +671,15 @@ async def cashflow(db: AsyncSession = Depends(get_db_session),current_user: User
 
 
 @router.get("/assets")
-async def asset_report(db: AsyncSession = Depends(get_db_session),current_user: User = Depends(require_roles(REPORT_READ_ROLES))):
+async def asset_report(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+):
     result = await db.execute(select(FixedAsset))
     assets = result.scalars().all()
 
     return assets
+
 
 # @router.post("/combined/share/email")
 # async def share_combined_report_email(
@@ -787,6 +794,7 @@ async def asset_report(db: AsyncSession = Depends(get_db_session),current_user: 
 
 from fastapi import Query
 
+
 # =========================================================
 # FINANCIAL SUMMARY
 # =========================================================
@@ -803,15 +811,11 @@ async def financial_summary(
     )
 
     total_expense = await db.scalar(
-        select(func.sum(Expense.amount)).where(
-            Expense.project_id == project_id
-        )
+        select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
 
     total_invoice = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id
-        )
+        select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
     )
 
     paid_invoice = await db.scalar(
@@ -940,9 +944,7 @@ async def work_summary(
         current_user=current_user,
     )
 
-    result = await db.execute(
-        select(m.Task).where(m.Task.project_id == project_id)
-    )
+    result = await db.execute(select(m.Task).where(m.Task.project_id == project_id))
 
     tasks = result.scalars().all()
 
@@ -1008,15 +1010,11 @@ async def audit_pdf(
     # ================= FINANCIAL =================
 
     total_expense = await db.scalar(
-        select(func.sum(Expense.amount)).where(
-            Expense.project_id == project_id
-        )
+        select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
 
     total_invoice = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id
-        )
+        select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
     )
 
     paid_invoice = await db.scalar(
@@ -1036,9 +1034,7 @@ async def audit_pdf(
     # ================= TASKS =================
 
     total_tasks = await db.scalar(
-        select(func.count())
-        .select_from(m.Task)
-        .where(m.Task.project_id == project_id)
+        select(func.count()).select_from(m.Task).where(m.Task.project_id == project_id)
     )
 
     completed_tasks = await db.scalar(
@@ -1099,17 +1095,13 @@ async def audit_pdf(
 
     # TITLE
 
-    content.append(
-        Paragraph("Detailed Audit Report", styles["Title"])
-    )
+    content.append(Paragraph("Detailed Audit Report", styles["Title"]))
 
     content.append(Spacer(1, 20))
 
     # FINANCIAL
 
-    content.append(
-        Paragraph("Financial Summary", styles["Heading1"])
-    )
+    content.append(Paragraph("Financial Summary", styles["Heading1"]))
 
     content.append(
         Paragraph(
@@ -1150,9 +1142,7 @@ async def audit_pdf(
 
     # WORK
 
-    content.append(
-        Paragraph("Work Summary", styles["Heading1"])
-    )
+    content.append(Paragraph("Work Summary", styles["Heading1"]))
 
     content.append(
         Paragraph(
@@ -1179,9 +1169,7 @@ async def audit_pdf(
 
     # ISSUES
 
-    content.append(
-        Paragraph("Issue Summary", styles["Heading1"])
-    )
+    content.append(Paragraph("Issue Summary", styles["Heading1"]))
 
     content.append(
         Paragraph(
@@ -1201,9 +1189,7 @@ async def audit_pdf(
 
     # PROGRESS
 
-    content.append(
-        Paragraph("Project Progress", styles["Heading1"])
-    )
+    content.append(Paragraph("Project Progress", styles["Heading1"]))
 
     content.append(
         Paragraph(
@@ -1239,12 +1225,12 @@ async def audit_pdf(
         },
     )
 
+
 # =========================================================
 # UNIFIED PROJECT REPORT
 # =========================================================
 
 from calendar import monthrange
-
 
 # =========================================================
 # UNIFIED PROJECT REPORT
@@ -1266,39 +1252,27 @@ async def project_report(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user
-    )
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     # =====================================================
     # VALIDATION
     # =====================================================
 
     if type not in ["daily", "weekly", "monthly", "quarterly"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid report type"
-        )
+        raise HTTPException(status_code=400, detail="Invalid report type")
 
     if type == "daily" and not date:
-        raise HTTPException(
-            status_code=400,
-            detail="date is required for daily report"
-        )
+        raise HTTPException(status_code=400, detail="date is required for daily report")
 
     if type == "weekly" and (not start_date or not end_date):
         raise HTTPException(
-            status_code=400,
-            detail="start_date and end_date required for weekly report"
+            status_code=400, detail="start_date and end_date required for weekly report"
         )
 
     if type == "monthly":
         if not month or not year:
             raise HTTPException(
-                status_code=400,
-                detail="month and year required for monthly report"
+                status_code=400, detail="month and year required for monthly report"
             )
 
         start_date = date(year, month, 1)
@@ -1312,14 +1286,12 @@ async def project_report(
 
         if not quarter or not year:
             raise HTTPException(
-                status_code=400,
-                detail="quarter and year required for quarterly report"
+                status_code=400, detail="quarter and year required for quarterly report"
             )
 
         if quarter not in [1, 2, 3, 4]:
             raise HTTPException(
-                status_code=400,
-                detail="quarter must be between 1 and 4"
+                status_code=400, detail="quarter must be between 1 and 4"
             )
 
         quarter_map = {
@@ -1333,11 +1305,7 @@ async def project_report(
 
         start_date = date(year, start_month, 1)
 
-        end_date = date(
-            year,
-            end_month,
-            monthrange(year, end_month)[1]
-        )
+        end_date = date(year, end_month, monthrange(year, end_month)[1])
 
     if type == "daily":
         start_date = date
@@ -1347,34 +1315,26 @@ async def project_report(
     # PROJECT
     # =====================================================
 
-    project = await db.scalar(
-        select(m.Project).where(
-            m.Project.id == project_id
-        )
-    )
+    project = await db.scalar(select(m.Project).where(m.Project.id == project_id))
 
     # =====================================================
     # TASK SUMMARY
     # =====================================================
 
     total_tasks = await db.scalar(
-        select(func.count())
-        .select_from(m.Task)
-        .where(m.Task.project_id == project_id)
+        select(func.count()).select_from(m.Task).where(m.Task.project_id == project_id)
     )
 
     completed_tasks = await db.scalar(
         select(func.count())
         .select_from(m.Task)
-        .where(
-            m.Task.project_id == project_id,
-            m.Task.status == TaskStatus.COMPLETED
-        )
+        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.COMPLETED)
     )
 
     progress = await db.scalar(
-        select(func.avg(m.Task.completion_percentage))
-        .where(m.Task.project_id == project_id)
+        select(func.avg(m.Task.completion_percentage)).where(
+            m.Task.project_id == project_id
+        )
     )
 
     # =====================================================
@@ -1382,17 +1342,11 @@ async def project_report(
     # =====================================================
 
     total_invoice = await db.scalar(
-        select(func.sum(Invoice.total_amount))
-        .where(
-            Invoice.project_id == project_id
-        )
+        select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
     )
 
     total_expense = await db.scalar(
-        select(func.sum(Expense.amount))
-        .where(
-            Expense.project_id == project_id
-        )
+        select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
 
     # =====================================================
@@ -1402,10 +1356,7 @@ async def project_report(
     open_issues = await db.scalar(
         select(func.count())
         .select_from(m.Issue)
-        .where(
-            m.Issue.project_id == project_id,
-            m.Issue.status == IssueStatus.OPEN
-        )
+        .where(m.Issue.project_id == project_id, m.Issue.status == IssueStatus.OPEN)
     )
 
     # =====================================================
@@ -1433,32 +1384,23 @@ async def project_report(
             "id": project.id,
             "name": project.name,
         },
-
         "report_type": type,
-
         "quarter": f"Q{quarter}" if type == "quarterly" else None,
-
         "date_range": {
             "start_date": start_date,
             "end_date": end_date,
         },
-
         "summary": {
             "total_tasks": int(total_tasks or 0),
             "completed_tasks": int(completed_tasks or 0),
             "open_issues": int(open_issues or 0),
             "overall_progress": round(float(progress or 0), 2),
         },
-
         "financials": {
             "total_invoice": round(float(total_invoice or 0), 2),
             "total_expense": round(float(total_expense or 0), 2),
-            "profit": round(
-                float((total_invoice or 0) - (total_expense or 0)),
-                2
-            ),
+            "profit": round(float((total_invoice or 0) - (total_expense or 0)), 2),
         },
-
         "daily_reports": [
             {
                 "date": r.report_date,
@@ -1468,7 +1410,6 @@ async def project_report(
             }
             for r in dsr_list
         ],
-
         "generated_at": datetime.utcnow(),
     }
 
@@ -1476,6 +1417,7 @@ async def project_report(
 # =========================================================
 # EXPORT PDF
 # =========================================================
+
 
 @router.get("/project/export/pdf")
 async def export_project_report_pdf(
@@ -1510,59 +1452,39 @@ async def export_project_report_pdf(
 
     content = []
 
-    content.append(
-        Paragraph(
-            f"{type.title()} Project Report",
-            styles["Title"]
-        )
-    )
+    content.append(Paragraph(f"{type.title()} Project Report", styles["Title"]))
 
     content.append(Spacer(1, 20))
 
     content.append(
-        Paragraph(
-            f"Project: {response['project']['name']}",
-            styles["Heading2"]
-        )
+        Paragraph(f"Project: {response['project']['name']}", styles["Heading2"])
     )
 
     content.append(
         Paragraph(
-            f"Progress: {response['summary']['overall_progress']}%",
-            styles["Normal"]
+            f"Progress: {response['summary']['overall_progress']}%", styles["Normal"]
         )
     )
 
     content.append(
         Paragraph(
             f"Completed Tasks: {response['summary']['completed_tasks']}",
-            styles["Normal"]
+            styles["Normal"],
         )
     )
 
     content.append(
         Paragraph(
-            f"Open Issues: {response['summary']['open_issues']}",
-            styles["Normal"]
+            f"Open Issues: {response['summary']['open_issues']}", styles["Normal"]
         )
     )
 
     content.append(Spacer(1, 20))
 
-    content.append(
-        Paragraph(
-            "Daily Work Logs",
-            styles["Heading2"]
-        )
-    )
+    content.append(Paragraph("Daily Work Logs", styles["Heading2"]))
 
     for r in response["daily_reports"]:
-        content.append(
-            Paragraph(
-                f"{r['date']} - {r['work_done']}",
-                styles["Normal"]
-            )
-        )
+        content.append(Paragraph(f"{r['date']} - {r['work_done']}", styles["Normal"]))
 
     doc.build(content)
 
@@ -1572,8 +1494,7 @@ async def export_project_report_pdf(
         buffer,
         media_type="application/pdf",
         headers={
-            "Content-Disposition":
-            f"attachment; filename={type}_project_report.pdf"
+            "Content-Disposition": f"attachment; filename={type}_project_report.pdf"
         },
     )
 
@@ -1581,6 +1502,7 @@ async def export_project_report_pdf(
 # =========================================================
 # EXPORT EXCEL
 # =========================================================
+
 
 @router.get("/project/export/excel")
 async def export_project_report_excel(
@@ -1637,20 +1559,24 @@ async def export_project_report_excel(
     # DSR
     # =====================================================
 
-    ws.append([
-        "Date",
-        "Work Done",
-        "Weather",
-        "Remarks",
-    ])
+    ws.append(
+        [
+            "Date",
+            "Work Done",
+            "Weather",
+            "Remarks",
+        ]
+    )
 
     for r in response["daily_reports"]:
-        ws.append([
-            str(r["date"]),
-            r["work_done"],
-            r["weather"],
-            r["remarks"],
-        ])
+        ws.append(
+            [
+                str(r["date"]),
+                r["work_done"],
+                r["weather"],
+                r["remarks"],
+            ]
+        )
 
     buffer = io.BytesIO()
 
@@ -1662,435 +1588,6 @@ async def export_project_report_excel(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition":
-            f"attachment; filename={type}_project_report.xlsx"
-        },
-    )
-
-# =========================================================
-# UNIFIED PROJECT REPORT
-# =========================================================
-
-from calendar import monthrange
-
-
-# =========================================================
-# UNIFIED PROJECT REPORT
-# =========================================================
-
-from calendar import monthrange
-
-
-@router.get("/project")
-async def project_report(
-    project_id: int,
-    type: str,
-    date: date | None = None,
-    start_date: date | None = None,
-    end_date: date | None = None,
-    month: int | None = None,
-    year: int | None = None,
-    quarter: int | None = None,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user
-    )
-
-    # =====================================================
-    # VALIDATION
-    # =====================================================
-
-    if type not in ["daily", "weekly", "monthly", "quarterly"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid report type"
-        )
-
-    if type == "daily" and not date:
-        raise HTTPException(
-            status_code=400,
-            detail="date is required for daily report"
-        )
-
-    if type == "weekly" and (not start_date or not end_date):
-        raise HTTPException(
-            status_code=400,
-            detail="start_date and end_date required for weekly report"
-        )
-
-    if type == "monthly":
-        if not month or not year:
-            raise HTTPException(
-                status_code=400,
-                detail="month and year required for monthly report"
-            )
-
-        start_date = date(year, month, 1)
-        end_date = date(year, month, monthrange(year, month)[1])
-
-    # =====================================================
-    # QUARTERLY
-    # =====================================================
-
-    if type == "quarterly":
-
-        if not quarter or not year:
-            raise HTTPException(
-                status_code=400,
-                detail="quarter and year required for quarterly report"
-            )
-
-        if quarter not in [1, 2, 3, 4]:
-            raise HTTPException(
-                status_code=400,
-                detail="quarter must be between 1 and 4"
-            )
-
-        quarter_map = {
-            1: (1, 3),
-            2: (4, 6),
-            3: (7, 9),
-            4: (10, 12),
-        }
-
-        start_month, end_month = quarter_map[quarter]
-
-        start_date = date(year, start_month, 1)
-
-        end_date = date(
-            year,
-            end_month,
-            monthrange(year, end_month)[1]
-        )
-
-    if type == "daily":
-        start_date = date
-        end_date = date
-
-    # =====================================================
-    # PROJECT
-    # =====================================================
-
-    project = await db.scalar(
-        select(m.Project).where(
-            m.Project.id == project_id
-        )
-    )
-
-    # =====================================================
-    # TASK SUMMARY
-    # =====================================================
-
-    total_tasks = await db.scalar(
-        select(func.count())
-        .select_from(m.Task)
-        .where(m.Task.project_id == project_id)
-    )
-
-    completed_tasks = await db.scalar(
-        select(func.count())
-        .select_from(m.Task)
-        .where(
-            m.Task.project_id == project_id,
-            m.Task.status == TaskStatus.COMPLETED
-        )
-    )
-
-    progress = await db.scalar(
-        select(func.avg(m.Task.completion_percentage))
-        .where(m.Task.project_id == project_id)
-    )
-
-    # =====================================================
-    # FINANCIALS
-    # =====================================================
-
-    total_invoice = await db.scalar(
-        select(func.sum(Invoice.total_amount))
-        .where(
-            Invoice.project_id == project_id
-        )
-    )
-
-    total_expense = await db.scalar(
-        select(func.sum(Expense.amount))
-        .where(
-            Expense.project_id == project_id
-        )
-    )
-
-    # =====================================================
-    # ISSUES
-    # =====================================================
-
-    open_issues = await db.scalar(
-        select(func.count())
-        .select_from(m.Issue)
-        .where(
-            m.Issue.project_id == project_id,
-            m.Issue.status == IssueStatus.OPEN
-        )
-    )
-
-    # =====================================================
-    # DSR
-    # =====================================================
-
-    dsr_result = await db.execute(
-        select(m.DailySiteReport)
-        .where(
-            m.DailySiteReport.project_id == project_id,
-            m.DailySiteReport.report_date >= start_date,
-            m.DailySiteReport.report_date <= end_date,
-        )
-        .order_by(m.DailySiteReport.report_date.desc())
-    )
-
-    dsr_list = dsr_result.scalars().all()
-
-    # =====================================================
-    # RESPONSE
-    # =====================================================
-
-    return {
-        "project": {
-            "id": project.id,
-            "name": project.name,
-        },
-
-        "report_type": type,
-
-        "quarter": f"Q{quarter}" if type == "quarterly" else None,
-
-        "date_range": {
-            "start_date": start_date,
-            "end_date": end_date,
-        },
-
-        "summary": {
-            "total_tasks": int(total_tasks or 0),
-            "completed_tasks": int(completed_tasks or 0),
-            "open_issues": int(open_issues or 0),
-            "overall_progress": round(float(progress or 0), 2),
-        },
-
-        "financials": {
-            "total_invoice": round(float(total_invoice or 0), 2),
-            "total_expense": round(float(total_expense or 0), 2),
-            "profit": round(
-                float((total_invoice or 0) - (total_expense or 0)),
-                2
-            ),
-        },
-
-        "daily_reports": [
-            {
-                "date": r.report_date,
-                "work_done": r.work_done,
-                "weather": r.weather,
-                "remarks": r.remarks,
-            }
-            for r in dsr_list
-        ],
-
-        "generated_at": datetime.utcnow(),
-    }
-
-
-# =========================================================
-# EXPORT PDF
-# =========================================================
-
-@router.get("/project/export/pdf")
-async def export_project_report_pdf(
-    project_id: int,
-    type: str,
-    date: date | None = None,
-    start_date: date | None = None,
-    end_date: date | None = None,
-    month: int | None = None,
-    year: int | None = None,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-
-    response = await project_report(
-        project_id=project_id,
-        type=type,
-        date=date,
-        start_date=start_date,
-        end_date=end_date,
-        month=month,
-        year=year,
-        current_user=current_user,
-        db=db,
-    )
-
-    buffer = io.BytesIO()
-
-    doc = SimpleDocTemplate(buffer)
-
-    styles = getSampleStyleSheet()
-
-    content = []
-
-    content.append(
-        Paragraph(
-            f"{type.title()} Project Report",
-            styles["Title"]
-        )
-    )
-
-    content.append(Spacer(1, 20))
-
-    content.append(
-        Paragraph(
-            f"Project: {response['project']['name']}",
-            styles["Heading2"]
-        )
-    )
-
-    content.append(
-        Paragraph(
-            f"Progress: {response['summary']['overall_progress']}%",
-            styles["Normal"]
-        )
-    )
-
-    content.append(
-        Paragraph(
-            f"Completed Tasks: {response['summary']['completed_tasks']}",
-            styles["Normal"]
-        )
-    )
-
-    content.append(
-        Paragraph(
-            f"Open Issues: {response['summary']['open_issues']}",
-            styles["Normal"]
-        )
-    )
-
-    content.append(Spacer(1, 20))
-
-    content.append(
-        Paragraph(
-            "Daily Work Logs",
-            styles["Heading2"]
-        )
-    )
-
-    for r in response["daily_reports"]:
-        content.append(
-            Paragraph(
-                f"{r['date']} - {r['work_done']}",
-                styles["Normal"]
-            )
-        )
-
-    doc.build(content)
-
-    buffer.seek(0)
-
-    return StreamingResponse(
-        buffer,
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition":
-            f"attachment; filename={type}_project_report.pdf"
-        },
-    )
-
-
-# =========================================================
-# EXPORT EXCEL
-# =========================================================
-
-@router.get("/project/export/excel")
-async def export_project_report_excel(
-    project_id: int,
-    type: str,
-    date: date | None = None,
-    start_date: date | None = None,
-    end_date: date | None = None,
-    month: int | None = None,
-    year: int | None = None,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-
-    response = await project_report(
-        project_id=project_id,
-        type=type,
-        date=date,
-        start_date=start_date,
-        end_date=end_date,
-        month=month,
-        year=year,
-        current_user=current_user,
-        db=db,
-    )
-
-    wb = Workbook()
-
-    ws = wb.active
-
-    ws.title = "Project Report"
-
-    # =====================================================
-    # SUMMARY
-    # =====================================================
-
-    ws.append(["Project", response["project"]["name"]])
-    ws.append(["Report Type", response["report_type"]])
-    ws.append([])
-
-    ws.append(["Overall Progress", response["summary"]["overall_progress"]])
-    ws.append(["Completed Tasks", response["summary"]["completed_tasks"]])
-    ws.append(["Open Issues", response["summary"]["open_issues"]])
-
-    ws.append([])
-
-    ws.append(["Total Invoice", response["financials"]["total_invoice"]])
-    ws.append(["Total Expense", response["financials"]["total_expense"]])
-    ws.append(["Profit", response["financials"]["profit"]])
-
-    ws.append([])
-
-    # =====================================================
-    # DSR
-    # =====================================================
-
-    ws.append([
-        "Date",
-        "Work Done",
-        "Weather",
-        "Remarks",
-    ])
-
-    for r in response["daily_reports"]:
-        ws.append([
-            str(r["date"]),
-            r["work_done"],
-            r["weather"],
-            r["remarks"],
-        ])
-
-    buffer = io.BytesIO()
-
-    wb.save(buffer)
-
-    buffer.seek(0)
-
-    return StreamingResponse(
-        buffer,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition":
-            f"attachment; filename={type}_project_report.xlsx"
+            "Content-Disposition": f"attachment; filename={type}_project_report.xlsx"
         },
     )
