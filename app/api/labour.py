@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_, select, extract, tuple_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from app.cache import redis as r
 from app.core import dependencies as d
 from app.core.enums import AttendanceStatus, LabourStatus, PayrollStatus
@@ -14,7 +15,9 @@ from app.core.validators import validate_and_save_image
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.contractor import Contractor
-from app.models.labour import Labour, LabourAttendance, LabourPayroll, LabourProject
+from app.models.labour import Labour, LabourPayroll, LabourProject
+from app.models.user import UserAttendance
+from app.schemas.user import UserAttendanceOut
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import labour as s
@@ -81,6 +84,7 @@ PAYROLL_ROLES = [
         UserRole.ADMIN,
         UserRole.ACCOUNTANT,
         UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
     ]
 ]
 
@@ -110,9 +114,23 @@ async def create_labour(
 
     for _ in range(3):
         try:
-            data["worker_code"] = await generate_business_id(
+            worker_code = await generate_business_id(
                 db, Labour, "worker_code", "LAB"
             )
+            data["worker_code"] = worker_code
+
+            # Create User for this labour to allow attendance check-in
+            user = User(
+                email=f"{worker_code.lower()}@labour.local",
+                full_name=payload.labour_name,
+                role=UserRole.LABOUR.value,
+                is_active=True,
+                created_by=current_user.id,
+            )
+            db.add(user)
+            await db.flush()
+            
+            data["user_id"] = user.id
 
             obj = Labour(**data)
             db.add(obj)
@@ -156,7 +174,7 @@ async def list_labour(
     if cached:
         return PaginatedResponse[s.LabourOut].model_validate(cached)
 
-    query = select(Labour).distinct()
+    query = select(Labour).options(selectinload(Labour.contractor)).distinct()
     count_query = select(func.count(func.distinct(Labour.id))).select_from(Labour)
 
     #  Subquery instead of JOIN
@@ -169,8 +187,17 @@ async def list_labour(
         count_query = count_query.where(Labour.id.in_(subq))
 
     if search:
-        query = query.where(Labour.labour_name.ilike(f"%{search}%"))
-        count_query = count_query.where(Labour.labour_name.ilike(f"%{search}%"))
+        query = query.outerjoin(Contractor, Labour.contractor_id == Contractor.id)
+        count_query = count_query.outerjoin(Contractor, Labour.contractor_id == Contractor.id)
+        
+        search_filter = or_(
+            Labour.labour_name.ilike(f"%{search}%"),
+            Labour.worker_code.ilike(f"%{search}%"),
+            Labour.aadhaar_number.ilike(f"%{search}%"),
+            Contractor.name.ilike(f"%{search}%")
+        )
+        query = query.where(search_filter)
+        count_query = count_query.where(search_filter)
 
     if status:
         query = query.where(Labour.status == status)
@@ -482,108 +509,8 @@ async def assign_labour_to_project(
     return s.LabourProjectOut.model_validate(obj)
 
 
-@router.post("/{labour_id}/attendance/check-in", response_model=s.LabourAttendanceOut)
-async def check_in(
-    labour_id: int,
-    project_id: int = Form(...),  #  REQUIRED FIX
-    task_id: int = Form(0),
-    latitude: float = Form(...),
-    longitude: float = Form(...),
-    location_address: str = Form(...),
-    task_description: str = Form(...),
-    check_in_image: UploadFile = File(...),
-    current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(d.get_request_redis),
-):
-    labour = await db.get(Labour, labour_id)
-    if not labour:
-        raise NotFoundError("Labour not found")
-
-    if labour.status != LabourStatus.ACTIVE:
-        raise ValidationError("Inactive labour cannot check-in")
-
-    if task_id == 0:
-        task_id = None
-
-    #  VALIDATE mapping (CRITICAL FIX)
-    mapping = await db.scalar(
-        select(LabourProject).where(
-            LabourProject.labour_id == labour_id,
-            LabourProject.project_id == project_id,
-        )
-    )
-
-    if not mapping:
-        raise ValidationError("Labour not assigned to this project")
-
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    today = now.date()
-
-    existing = await db.scalar(
-        select(LabourAttendance).where(
-            LabourAttendance.labour_id == labour_id,
-            LabourAttendance.project_id == project_id,
-            LabourAttendance.attendance_date == today,
-        )
-    )
-
-    if existing:
-        raise ValidationError("Already checked-in today")
-
-    check_in_path = await validate_and_save_image(
-        check_in_image,
-        "uploads/labour_attendance",
-        "checkin"
-    )
-
-    obj = LabourAttendance(
-        labour_id=labour_id,
-        project_id=project_id,
-        attendance_date=today,
-        in_time=now.time(),
-        check_in_latitude=Decimal(str(latitude)),
-        check_in_longitude=Decimal(str(longitude)),
-        check_in_address=location_address,
-        check_in_image=check_in_path,
-        task_description=task_description,
-        task_id=task_id,
-        working_hours=0,
-        overtime_hours=0,
-        overtime_rate=0,
-    )
-
-    db.add(obj)
-    await db.flush()
-    await db.refresh(obj)
-
-    await r.bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
-
-    return s.LabourAttendanceOut(
-        id=obj.id,
-        labour_id=obj.labour_id,
-        project_id=obj.project_id,
-        attendance_date=obj.attendance_date,
-        status=obj.status,
-        in_time=obj.in_time,
-        out_time=obj.out_time,
-        check_in_image=obj.check_in_image,
-        check_out_image=obj.check_out_image,
-        check_in_address=obj.check_in_address,
-        check_out_address=obj.check_out_address,
-        working_hours=obj.working_hours,
-        overtime_hours=obj.overtime_hours,
-        overtime_rate=obj.overtime_rate,
-        task_id=obj.task_id,
-        task_description=obj.task_description,
-        total_wage=Decimal("0"),
-    )
-
-
 @router.put(
-    "/attendance/{attendance_id}/check-out", response_model=s.LabourAttendanceOut
+    "/attendance/{attendance_id}/check-out", response_model=UserAttendanceOut
 )
 async def check_out(
     attendance_id: int,
@@ -597,11 +524,11 @@ async def check_out(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    obj = await db.get(LabourAttendance, attendance_id)
+    obj = await db.get(UserAttendance, attendance_id)
     if not obj:
         raise NotFoundError("Attendance not found")
 
-    labour = await db.get(Labour, obj.labour_id)
+    labour = await db.scalar(select(Labour).where(Labour.user_id == obj.user_id))
     if not labour:
         raise NotFoundError("Labour not found")
 
@@ -663,6 +590,10 @@ async def check_out(
     obj.check_out_longitude = Decimal(str(longitude))
     obj.check_out_address = location_address
 
+    # Auto-approve attendance upon checkout
+    obj.is_approved = True
+    obj.approved_by_id = current_user.id
+
     await db.flush()
 
     hourly_rate = labour.daily_wage_rate / Decimal("8")
@@ -672,7 +603,7 @@ async def check_out(
     existing_expense = await db.scalar(
         select(Expense).where(
             Expense.project_id == obj.project_id,
-            Expense.labour_id == obj.labour_id,
+            Expense.labour_id == labour.id,
             Expense.category == "Labour",
             Expense.expense_date == obj.attendance_date,
         )
@@ -684,7 +615,7 @@ async def check_out(
     else:
         expense = Expense(
             project_id=obj.project_id,
-            labour_id=obj.labour_id,
+            labour_id=labour.id,
             category="Labour",
             description=f"Labour expense - {obj.attendance_date}",
             amount=total_wage,
@@ -713,186 +644,8 @@ async def check_out(
     await r.bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
     await r.bump_cache_version(redis, "dashboard_version")
 
-    return s.LabourAttendanceOut(
-        id=obj.id,
-        labour_id=obj.labour_id,
-        project_id=obj.project_id,
-        attendance_date=obj.attendance_date,
-        status=obj.status,
-        in_time=obj.in_time,
-        out_time=obj.out_time,
-        check_in_image=obj.check_in_image,
-        check_out_image=obj.check_out_image,
-        check_in_address=obj.check_in_address,
-        check_out_address=obj.check_out_address,
-        working_hours=obj.working_hours,
-        overtime_hours=obj.overtime_hours,
-        overtime_rate=obj.overtime_rate,
-        task_id=obj.task_id,
-        task_description=obj.task_description,
-        total_wage=total_wage,
-    )
-
-
-@router.get("/{labour_id}/attendance", response_model=list[s.LabourAttendanceOut])
-async def get_attendance(
-    labour_id: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(d.get_request_redis),
-):
-    version = await r.get_cache_version(redis, ATTENDANCE_VERSION_KEY)
-    cache_key = f"cache:labour:attendance:{version}:{labour_id}"
-
-    cached = await r.cache_get_json(redis, cache_key)
-    if cached is not None:
-        return [s.LabourAttendanceOut.model_validate(i) for i in cached]
-
-    labour = await db.get(Labour, labour_id)
-    if not labour:
-        raise NotFoundError("Labour not found")
-
-    #  MANY-TO-MANY ACCESS CHECK (ADDED)
-    mapping = await db.scalars(
-        select(LabourProject.project_id).where(LabourProject.labour_id == labour_id)
-    )
-
-    project_ids = mapping.all()
-
-    if not project_ids:
-        raise ValidationError("Labour not assigned")
-
-    allowed = False
-    for pid in project_ids:
-        try:
-            await assert_project_access(db, project_id=pid, current_user=current_user)
-            allowed = True
-            break
-        except Exception:
-            continue
-
-    if not allowed:
-        raise PermissionDeniedError("No access to this labour")
-
-    # EXISTING LOGIC (UNCHANGED)
-    result = await db.execute(
-        select(LabourAttendance)
-        .where(LabourAttendance.labour_id == labour_id)
-        .order_by(LabourAttendance.attendance_date.desc())
-    )
-    rows = result.scalars().all()
-
-    hourly_rate = labour.daily_wage_rate / Decimal("8")
-
-    data = []
-    for row in rows:
-        total_wage = (
-            hourly_rate * row.working_hours + row.overtime_rate * row.overtime_hours
-        )
-
-        data.append(
-            s.LabourAttendanceOut(
-                id=row.id,
-                labour_id=labour_id,
-                project_id=row.project_id,
-                attendance_date=row.attendance_date,
-                status=row.status,
-                in_time=row.in_time,
-                out_time=row.out_time,
-                check_in_image=row.check_in_image,
-                check_out_image=row.check_out_image,
-                check_in_address=row.check_in_address,
-                check_out_address=row.check_out_address,
-                task_id=row.task_id,
-                working_hours=row.working_hours,
-                overtime_hours=row.overtime_hours,
-                overtime_rate=row.overtime_rate,
-                task_description=row.task_description,
-                total_wage=total_wage,
-            ).model_dump()
-        )
-
-    await r.cache_set_json(redis, cache_key, data)
-    return data
-
-
-@router.get("/attendance")
-async def get_attendance_list(
-    project_id: int,
-    from_date: date = Query(...),
-    to_date: date = Query(...),
-    contractor_id: Optional[int] = Query(None),
-    pagination: PaginationParams = Depends(),
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
-):
-
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-    pagination = pagination.normalized()
-
-    query = (
-        select(LabourAttendance, Labour)
-        .join(Labour, Labour.id == LabourAttendance.labour_id)
-        .where(
-            LabourAttendance.project_id == project_id,
-            LabourAttendance.attendance_date.between(from_date, to_date),
-        )
-    )
-
-    #  Contractor filter
-    if contractor_id:
-        query = query.where(Labour.contractor_id == contractor_id)
-
-    #  Search
-    if pagination.search:
-        query = query.where(
-            or_(
-                Labour.labour_name.ilike(f"%{pagination.search}%"),
-                Labour.worker_code.ilike(f"%{pagination.search}%"),
-            )
-        )
-
-    #  Total count
-    total = await db.scalar(select(func.count()).select_from(query.subquery()))
-
-    #  Pagination
-    query = (
-        query.order_by(LabourAttendance.in_time.desc())
-        .offset(pagination.offset)
-        .limit(pagination.limit)
-    )
-
-    result = await db.execute(query)
-    rows = result.all()
-
-    data = []
-
-    for att, labour in rows:
-        data.append(
-            {
-                "labour_id": labour.id,
-                "labour_name": labour.labour_name,
-                "worker_code": labour.worker_code,
-                "attendance_date": att.attendance_date,
-                "in_time": att.in_time,
-                "out_time": att.out_time,
-                "working_hours": float(att.working_hours or 0),
-                "overtime_hours": float(att.overtime_hours or 0),
-                "task_id": att.task_id,
-                "check_in_address": att.check_in_address,
-                "check_out_address": att.check_out_address,
-                "check_in_image": att.check_in_image,
-                "check_out_image": att.check_out_image,
-                "status": att.status.value,
-            }
-        )
-
-    return {
-        "total": total,
-        "limit": pagination.limit,
-        "offset": pagination.offset,
-        "items": data,
-    }
+    await db.refresh(obj)
+    return obj
 
 
 @router.get("/{labour_id}/weekly-report")
@@ -930,24 +683,25 @@ async def weekly_report(
 
     result = await db.execute(
         select(
-            extract("week", LabourAttendance.attendance_date).label("week"),
+            extract("week", UserAttendance.attendance_date).label("week"),
             # total days
-            func.count(LabourAttendance.id).label("total_days"),
+            func.count(UserAttendance.id).label("total_days"),
             # absent days
             func.sum(
-                case((LabourAttendance.status == AttendanceStatus.ABSENT, 1), else_=0)
+                case((UserAttendance.status == AttendanceStatus.ABSENT, 1), else_=0)
             ).label("absent_days"),
             func.sum(
-                case((LabourAttendance.status == AttendanceStatus.HALF_DAY, 1), else_=0)
+                case((UserAttendance.status == AttendanceStatus.HALF_DAY, 1), else_=0)
             ).label("half_days"),
             # existing
-            func.sum(LabourAttendance.working_hours).label("hours"),
-            func.sum(LabourAttendance.overtime_hours).label("ot"),
+            func.sum(UserAttendance.working_hours).label("hours"),
+            func.sum(UserAttendance.overtime_hours).label("ot"),
             func.sum(
-                LabourAttendance.overtime_hours * LabourAttendance.overtime_rate
+                UserAttendance.overtime_hours * UserAttendance.overtime_rate
             ).label("ot_wage"),
         )
-        .where(LabourAttendance.labour_id == labour_id)
+        .join(Labour, Labour.user_id == UserAttendance.user_id)
+        .where(Labour.id == labour_id)
         .group_by("week")
     )
 
@@ -1008,24 +762,25 @@ async def monthly_report(
 
     result = await db.execute(
         select(
-            extract("month", LabourAttendance.attendance_date).label("month"),
+            extract("month", UserAttendance.attendance_date).label("month"),
             # total days
-            func.count(LabourAttendance.id).label("total_days"),
+            func.count(UserAttendance.id).label("total_days"),
             # absent days
             func.sum(
-                case((LabourAttendance.status == AttendanceStatus.ABSENT, 1), else_=0)
+                case((UserAttendance.status == AttendanceStatus.ABSENT, 1), else_=0)
             ).label("absent_days"),
             func.sum(
-                case((LabourAttendance.status == AttendanceStatus.HALF_DAY, 1), else_=0)
+                case((UserAttendance.status == AttendanceStatus.HALF_DAY, 1), else_=0)
             ).label("half_days"),
             # existing
-            func.sum(LabourAttendance.working_hours).label("hours"),
-            func.sum(LabourAttendance.overtime_hours).label("ot"),
+            func.sum(UserAttendance.working_hours).label("hours"),
+            func.sum(UserAttendance.overtime_hours).label("ot"),
             func.sum(
-                LabourAttendance.overtime_hours * LabourAttendance.overtime_rate
+                UserAttendance.overtime_hours * UserAttendance.overtime_rate
             ).label("ot_wage"),
         )
-        .where(LabourAttendance.labour_id == labour_id)
+        .join(Labour, Labour.user_id == UserAttendance.user_id)
+        .where(Labour.id == labour_id)
         .group_by("month")
     )
 
@@ -1082,33 +837,25 @@ async def generate_payroll(
 
     try:
         result = await db.execute(
-            select(LabourAttendance).where(
-                extract("month", LabourAttendance.attendance_date) == payload.month,
-                extract("year", LabourAttendance.attendance_date) == payload.year,
-                LabourAttendance.project_id.in_(project_ids),
+            select(UserAttendance, Labour)
+            .join(Labour, Labour.user_id == UserAttendance.user_id)
+            .where(
+                extract("month", UserAttendance.attendance_date) == payload.month,
+                extract("year", UserAttendance.attendance_date) == payload.year,
+                UserAttendance.project_id.in_(project_ids),
             )
         )
 
-        rows = result.scalars().all()
+        rows = result.all()
         if not rows:
             return []
-
-        labour_ids = list({row.labour_id for row in rows})
-
-        labour_result = await db.execute(
-            select(Labour).where(Labour.id.in_(labour_ids))
-        )
-        labour_map = {l.id: l for l in labour_result.scalars().all()}
 
         payroll_map = {}
 
         # =========================
         # BUILD PAYROLL DATA
         # =========================
-        for row in rows:
-            labour = labour_map.get(row.labour_id)
-            if not labour:
-                continue
+        for row, labour in rows:
 
             hourly_rate = labour.daily_wage_rate / Decimal("8")
 
@@ -1130,7 +877,7 @@ async def generate_payroll(
                     + row.overtime_rate * row.overtime_hours
                 )
 
-            key = (row.labour_id, row.project_id)
+            key = (labour.id, row.project_id)
 
             if key not in payroll_map:
                 payroll_map[key] = {
@@ -1398,11 +1145,11 @@ async def attendance_dashboard(
     # Present
     present_today = await db.scalar(
         select(func.count())
-        .select_from(LabourAttendance)
+        .select_from(UserAttendance)
         .where(
-            LabourAttendance.project_id == project_id,
-            LabourAttendance.attendance_date.between(from_date, to_date),
-            LabourAttendance.status == AttendanceStatus.PRESENT,
+            UserAttendance.project_id == project_id,
+            UserAttendance.attendance_date.between(from_date, to_date),
+            UserAttendance.status == AttendanceStatus.PRESENT,
         )
     )
 
@@ -1423,10 +1170,10 @@ async def dashboard_stats(
 
     total_labour = await db.scalar(
         select(func.count())
-        .select_from(LabourAttendance)
+        .select_from(UserAttendance)
         .where(
-            LabourAttendance.attendance_date == today,
-            LabourAttendance.project_id.in_(project_ids),
+            UserAttendance.attendance_date == today,
+            UserAttendance.project_id.in_(project_ids),
         )
     )
 
@@ -1557,11 +1304,11 @@ async def export_attendance_excel(
     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     query = (
-        select(LabourAttendance, Labour)
-        .join(Labour, Labour.id == LabourAttendance.labour_id)
+        select(UserAttendance, Labour)
+        .join(Labour, Labour.user_id == UserAttendance.user_id)
         .where(
-            LabourAttendance.project_id == project_id,
-            LabourAttendance.attendance_date.between(from_date, to_date),
+            UserAttendance.project_id == project_id,
+            UserAttendance.attendance_date.between(from_date, to_date),
         )
     )
 
@@ -1701,165 +1448,6 @@ async def get_labour(
     return out
 
 
-# ==========================================
-# NEW PAYROLL & FISCAL REPORTING ENDPOINTS
-# ==========================================
-
-
-@router.get("/payroll", response_model=list[s.PayrollDetailsOut])
-async def get_payroll_list(
-    project_id: int,
-    month: int,
-    year: int,
-    contractor_id: Optional[int] = Query(None),
-    search: Optional[str] = Query(None),
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    query = (
-        select(LabourPayroll, Labour)
-        .join(Labour, Labour.id == LabourPayroll.labour_id)
-        .where(
-            LabourPayroll.project_id == project_id,
-            LabourPayroll.month == month,
-            LabourPayroll.year == year,
-        )
-    )
-
-    if contractor_id:
-        query = query.where(Labour.contractor_id == contractor_id)
-
-    if search:
-        query = query.where(
-            or_(
-                Labour.labour_name.ilike(f"%{search}%"),
-                Labour.worker_code.ilike(f"%{search}%"),
-            )
-        )
-
-    result = await db.execute(query)
-    rows = result.all()
-
-    output = []
-    for payroll, labour in rows:
-        output.append(
-            s.PayrollDetailsOut(
-                id=payroll.id,
-                labour_id=payroll.labour_id,
-                project_id=payroll.project_id,
-                month=payroll.month,
-                year=payroll.year,
-                total_working_hours=payroll.total_working_hours,
-                total_overtime_hours=payroll.total_overtime_hours,
-                total_wage=payroll.total_wage,
-                paid_amount=payroll.paid_amount,
-                remaining_amount=payroll.remaining_amount,
-                status=payroll.status,
-                # Enriched properties
-                labour_name=labour.labour_name,
-                worker_code=labour.worker_code,
-                skill_type=labour.skill_type,
-                daily_wage_rate=labour.daily_wage_rate,
-                contractor_id=labour.contractor_id,
-            )
-        )
-    return output
-
-
-@router.get("/payroll/stats", response_model=s.PayrollStatsOut)
-async def get_payroll_stats(
-    project_id: int,
-    month: int,
-    year: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    payroll_sum = await db.execute(
-        select(
-            func.sum(LabourPayroll.paid_amount).label("paid"),
-            func.sum(LabourPayroll.remaining_amount).label("pending"),
-            func.sum(LabourPayroll.total_wage).label("budget"),
-        ).where(
-            LabourPayroll.project_id == project_id,
-            LabourPayroll.month == month,
-            LabourPayroll.year == year,
-        )
-    )
-    res = payroll_sum.first()
-
-    paid = res.paid if res and res.paid is not None else Decimal("0")
-    pending = res.pending if res and res.pending is not None else Decimal("0")
-    budget = res.budget if res and res.budget is not None else Decimal("0")
-
-    advance_count = (
-        await db.scalar(
-            select(func.count(Approval.id)).where(
-                Approval.project_id == project_id,
-                Approval.entity_type == "advance",
-                Approval.status == "Pending",
-            )
-        )
-        or 0
-    )
-
-    return s.PayrollStatsOut(
-        paid_this_month=paid,
-        pending_due=pending,
-        monthly_budget=budget,
-        advance_logs=advance_count,
-    )
-
-
-@router.get(
-    "/payroll/contractor-liability", response_model=list[s.ContractorLiabilityOut]
-)
-async def get_contractor_liability(
-    project_id: int,
-    month: int,
-    year: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    query = (
-        select(
-            Labour.contractor_id,
-            Contractor.name.label("contractor_name"),
-            func.sum(LabourPayroll.total_wage).label("total_wage"),
-            func.sum(LabourPayroll.paid_amount).label("paid_amount"),
-            func.sum(LabourPayroll.remaining_amount).label("remaining_amount"),
-        )
-        .join(Labour, Labour.id == LabourPayroll.labour_id)
-        .outerjoin(Contractor, Contractor.id == Labour.contractor_id)
-        .where(
-            LabourPayroll.project_id == project_id,
-            LabourPayroll.month == month,
-            LabourPayroll.year == year,
-        )
-        .group_by(Labour.contractor_id, Contractor.name)
-    )
-
-    result = await db.execute(query)
-    rows = result.all()
-
-    output = []
-    for r in rows:
-        output.append(
-            s.ContractorLiabilityOut(
-                contractor_id=r.contractor_id,
-                contractor_name=r.contractor_name or "Independent",
-                total_wage=r.total_wage or Decimal("0"),
-                paid_amount=r.paid_amount or Decimal("0"),
-                remaining_amount=r.remaining_amount or Decimal("0"),
-            )
-        )
-    return output
-
 
 @router.get("/payroll/weekly-velocity", response_model=list[s.WeeklyVelocityOut])
 async def get_weekly_velocity(
@@ -1873,18 +1461,18 @@ async def get_weekly_velocity(
 
     query = (
         select(
-            extract("week", LabourAttendance.attendance_date).label("week_number"),
-            func.count(LabourAttendance.id).label("attendance_count"),
+            extract("week", UserAttendance.attendance_date).label("week_number"),
+            func.count(UserAttendance.id).label("attendance_count"),
             func.sum(
-                (Labour.daily_wage_rate / Decimal("8")) * LabourAttendance.working_hours
-                + LabourAttendance.overtime_rate * LabourAttendance.overtime_hours
+                (Labour.daily_wage_rate / Decimal("8")) * UserAttendance.working_hours
+                + UserAttendance.overtime_rate * UserAttendance.overtime_hours
             ).label("total_wage"),
         )
-        .join(Labour, Labour.id == LabourAttendance.labour_id)
+        .join(Labour, Labour.user_id == UserAttendance.user_id)
         .where(
-            LabourAttendance.project_id == project_id,
-            extract("month", LabourAttendance.attendance_date) == month,
-            extract("year", LabourAttendance.attendance_date) == year,
+            UserAttendance.project_id == project_id,
+            extract("month", UserAttendance.attendance_date) == month,
+            extract("year", UserAttendance.attendance_date) == year,
         )
         .group_by("week_number")
         .order_by("week_number")
@@ -2012,11 +1600,14 @@ async def get_fiscal_summary(
 
     ot_count = (
         await db.scalar(
-            select(func.count(func.distinct(LabourAttendance.labour_id))).where(
-                LabourAttendance.project_id == project_id,
-                extract("month", LabourAttendance.attendance_date) == month,
-                extract("year", LabourAttendance.attendance_date) == year,
-                LabourAttendance.overtime_hours > 0,
+            select(func.count(func.distinct(Labour.id)))
+            .select_from(UserAttendance)
+            .join(Labour, Labour.user_id == UserAttendance.user_id)
+            .where(
+                UserAttendance.project_id == project_id,
+                extract("month", UserAttendance.attendance_date) == month,
+                extract("year", UserAttendance.attendance_date) == year,
+                UserAttendance.overtime_hours > 0,
             )
         )
         or 0
@@ -2119,9 +1710,9 @@ async def get_aggregate_report(
     # Determine grouping expression
     # ------------------------------------------------------
     if group_by == "daily":
-        period_expr = LabourAttendance.attendance_date
+        period_expr = UserAttendance.attendance_date
     elif group_by == "weekly":
-        period_expr = extract("week", LabourAttendance.attendance_date)
+        period_expr = extract("week", UserAttendance.attendance_date)
     else:  # monthly
         # Monthly report remains labour-wise summary
         period_expr = None
@@ -2136,18 +1727,18 @@ async def get_aggregate_report(
         Labour.daily_wage_rate.label("daily_wage"),
         func.count(
             case(
-                (LabourAttendance.status == AttendanceStatus.PRESENT, 1),
+                (UserAttendance.status == AttendanceStatus.PRESENT, 1),
                 else_=None,
             )
         ).label("days_present"),
         func.coalesce(
-            func.sum(LabourAttendance.overtime_hours),
+            func.sum(UserAttendance.overtime_hours),
             Decimal("0"),
         ).label("ot_hours"),
         func.coalesce(
             func.sum(
-                (Labour.daily_wage_rate / Decimal("8")) * LabourAttendance.working_hours
-                + LabourAttendance.overtime_rate * LabourAttendance.overtime_hours
+                (Labour.daily_wage_rate / Decimal("8")) * UserAttendance.working_hours
+                + UserAttendance.overtime_rate * UserAttendance.overtime_hours
             ),
             Decimal("0"),
         ).label("total_wage_earned"),
@@ -2165,12 +1756,12 @@ async def get_aggregate_report(
         select(*columns)
         .join(LabourProject, LabourProject.labour_id == Labour.id)
         .outerjoin(
-            LabourAttendance,
+            UserAttendance,
             and_(
-                LabourAttendance.labour_id == Labour.id,
-                LabourAttendance.project_id == project_id,
-                extract("month", LabourAttendance.attendance_date) == month,
-                extract("year", LabourAttendance.attendance_date) == year,
+                Labour.user_id == UserAttendance.user_id,
+                UserAttendance.project_id == project_id,
+                extract("month", UserAttendance.attendance_date) == month,
+                extract("year", UserAttendance.attendance_date) == year,
             ),
         )
         .where(LabourProject.project_id == project_id)

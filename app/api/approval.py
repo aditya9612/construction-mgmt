@@ -10,6 +10,7 @@ from app.models.user import User, UserRole
 from app.core.dependencies import get_current_active_user, require_roles
 
 from app.utils.helpers import NotFoundError, ValidationError
+from app.services.notification_service import create_notification
 
 APPROVAL_ROLES = [role.value for role in UserRole]
 
@@ -131,6 +132,16 @@ async def approve(
 
     await db.flush()
     await db.commit()
+    
+    await create_notification(
+        db,
+        user_id=obj.requested_by,
+        title="Approval Granted",
+        message=f"Your {obj.entity_type} approval request has been Approved.",
+        type="success"
+    )
+    await db.commit()
+    
     return {"message": "Approved"}
 
 
@@ -188,4 +199,14 @@ async def reject(
 
     await db.flush()
     await db.commit()
+    
+    await create_notification(
+        db,
+        user_id=obj.requested_by,
+        title="Approval Rejected",
+        message=f"Your {obj.entity_type} approval request was Rejected.",
+        type="alert"
+    )
+    await db.commit()
+    
     return {"message": "Rejected"}

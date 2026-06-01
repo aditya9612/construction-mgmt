@@ -21,6 +21,8 @@ from app.utils.common import generate_business_id
 from sqlalchemy.orm import selectinload
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
+from app.services.notification_service import create_notification
+from app.models import project as proj_model
 import os
 from app.models.material import (
     Material,
@@ -1445,6 +1447,23 @@ async def usage(
         alert_type = "LOW_STOCK"
     else:
         alert_type = "IN_STOCK"
+
+    if alert_type in ["LOW_STOCK", "OUT_OF_STOCK"]:
+        pm = await db.scalar(
+            select(proj_model.ProjectMember.user_id)
+            .join(User, User.id == proj_model.ProjectMember.user_id)
+            .where(proj_model.ProjectMember.project_id == data.project_id, User.role == UserRole.PROJECT_MANAGER.value)
+            .limit(1)
+        )
+        if pm:
+            await create_notification(
+                db,
+                user_id=pm,
+                title=f"Material Alert: {alert_type.replace('_', ' ')}",
+                message=f"Stock for {obj.material_name} is now {obj.remaining_stock} {obj.unit}.",
+                type="alert"
+            )
+            await db.commit()
 
     return MaterialOut(
         id=obj.id,

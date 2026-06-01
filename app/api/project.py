@@ -13,7 +13,8 @@ from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
 from app.models.approval import Approval
-from app.models.labour import LabourAttendance
+from app.models.labour import Labour
+from app.models.user import UserAttendance
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.cache.redis import (
     bump_cache_version,
@@ -28,6 +29,7 @@ from app.core.dependencies import (
     get_request_redis,
     require_roles,
 )
+from app.services.notification_service import create_notification
 from app.models.contractor import Contractor
 from sqlalchemy import delete, select, func, or_, update
 from app.models import project as m
@@ -1233,6 +1235,15 @@ class TasksService:
                 await db.rollback()
                 raise ConflictError("Task with this title already exists in this project")
 
+            if user_id:
+                await create_notification(
+                    db,
+                    user_id=user_id,
+                    title="New Task Assigned",
+                    message=f"You have been assigned a new task: {obj.title}",
+                    type="info"
+                )
+
             return self._task_to_out(
                 task=obj,
                 is_delayed=self._is_delayed(task=obj, current_date=date.today()),
@@ -1274,6 +1285,15 @@ class TasksService:
             except IntegrityError:
                 await db.rollback()
                 raise ConflictError("Task with this title already exists in this project")
+
+            if user_id:
+                await create_notification(
+                    db,
+                    user_id=user_id,
+                    title="New Task Assigned",
+                    message=f"You have been assigned a new task: {obj.title}",
+                    type="info"
+                )
 
             tasks.append(
                 self._task_to_out(
@@ -3091,9 +3111,9 @@ async def create_dsr(
             m.Labour.skill_type,
             func.count(func.distinct(m.Labour.id)),
         )
-        .join(LabourAttendance, m.Labour.id == LabourAttendance.labour_id)
+        .join(UserAttendance, m.Labour.user_id == UserAttendance.user_id)
         .where(
-            LabourAttendance.project_id == payload.project_id,
+            UserAttendance.project_id == payload.project_id,
             m.Labour.status == LabourStatus.ACTIVE,
         )
         .group_by(m.Labour.skill_type)
@@ -3832,6 +3852,23 @@ async def create_issue(
 
                 db.add(obj)
                 await db.flush()
+
+                if getattr(obj.priority, 'value', str(obj.priority)) == "HIGH":
+                    pm = await db.scalar(
+                        select(m.ProjectMember.user_id)
+                        .join(User, User.id == m.ProjectMember.user_id)
+                        .where(m.ProjectMember.project_id == payload.project_id, User.role == UserRole.PROJECT_MANAGER.value)
+                        .limit(1)
+                    )
+                    if pm:
+                        await create_notification(
+                            db,
+                            user_id=pm,
+                            title="Critical Issue Logged",
+                            message=f"CRITICAL ISSUE: {obj.title} logged at {project.project_name}",
+                            type="alert"
+                        )
+
                 break
 
             except IntegrityError:

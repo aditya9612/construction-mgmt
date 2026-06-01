@@ -15,7 +15,8 @@ from app.core.enums import (
 )
 from app.models.expense import Expense
 from app.models.final_measurement import FinalMeasurement
-from app.models.labour import Labour, LabourAttendance
+from app.models.labour import Labour
+from app.models.user import UserAttendance
 from app.models.project import Project, Task
 from app.db.session import get_db_session
 from app.models.invoice import Invoice, Transaction
@@ -42,7 +43,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dependencies import require_roles
 from app.models.expense import Expense
 from app.models.final_measurement import FinalMeasurement
-from app.models.labour import Labour, LabourAttendance
+from app.models.labour import Labour
+from app.models.user import UserAttendance
 from app.models.project import Project, Task
 from app.db.session import get_db_session
 from app.models.invoice import Invoice, Transaction
@@ -1339,9 +1341,10 @@ async def create_labour_invoice(
 
     # 3. Fetch attendances
     result = await db.execute(
-        select(LabourAttendance).where(
-            LabourAttendance.project_id == project_id,
-            LabourAttendance.attendance_date.between(start_date, end_date),
+        select(UserAttendance).where(
+            UserAttendance.project_id == project_id,
+            UserAttendance.attendance_date.between(start_date, end_date),
+            UserAttendance.status != "ABSENT"
         )
     )
     attendances = result.scalars().all()
@@ -1350,16 +1353,16 @@ async def create_labour_invoice(
         raise NotFoundError("No labour attendance found")
 
     # 4. FIX: Load all labours in ONE query (avoid N+1)
-    labour_ids = list({att.labour_id for att in attendances if att.labour_id})
-    labours_result = await db.execute(select(Labour).where(Labour.id.in_(labour_ids)))
-    labour_map = {l.id: l for l in labours_result.scalars().all()}
+    user_ids = list({att.user_id for att in attendances if att.user_id})
+    labours_result = await db.execute(select(Labour).where(Labour.user_id.in_(user_ids)))
+    labour_map = {l.user_id: l for l in labours_result.scalars().all()}
 
     total_amount = Decimal(0)
     attendance_ids: list[int] = []
 
     # 5. Calculate wages
     for att in attendances:
-        labour = labour_map.get(att.labour_id)
+        labour = labour_map.get(att.user_id)
         if not labour:
             continue
 

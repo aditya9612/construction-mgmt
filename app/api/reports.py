@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date, datetime, timedelta
 import io
@@ -10,7 +10,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from openpyxl import Workbook
 from app.models.contractor import Contractor
 from app.models.invoice import Invoice, Transaction
-from app.models.labour import LabourAttendance
+from app.models.user import UserAttendance
 from app.models.material import Material
 from app.utils.common import assert_project_access
 from app.utils.email import send_email
@@ -20,7 +20,7 @@ from app.db.session import get_db_session
 from app.models import project as m
 from app.models.accountant import FixedAsset
 from app.models.expense import Expense
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, ActivityLog
 from fastapi import BackgroundTasks
 from app.utils.helpers import NotFoundError
 from app.utils.whatsapp import send_report_template
@@ -133,11 +133,14 @@ async def labour_report(
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
-        select(m.Labour.skill_type, func.count(func.distinct(m.Labour.id)))
+        select(
+            m.Labour.skill_type,
+            func.count(func.distinct(m.Labour.id))
+        )
         .join(LabourAttendance, m.Labour.id == LabourAttendance.labour_id)
         .where(
             LabourAttendance.project_id == project_id,
-            m.Labour.status == LabourStatus.ACTIVE,
+            m.Labour.status == LabourStatus.ACTIVE
         )
         .group_by(m.Labour.skill_type)
     )
@@ -158,11 +161,14 @@ async def export_labour_excel(
 ):
     #  Correct query (JOIN + GROUP BY)
     result = await db.execute(
-        select(m.Labour.skill_type, func.count(func.distinct(m.Labour.id)))
+        select(
+            m.Labour.skill_type,
+            func.count(func.distinct(m.Labour.id))
+        )
         .join(LabourAttendance, m.Labour.id == LabourAttendance.labour_id)
         .where(
             LabourAttendance.project_id == project_id,
-            m.Labour.status == LabourStatus.ACTIVE,
+            m.Labour.status == LabourStatus.ACTIVE
         )
         .group_by(m.Labour.skill_type)
     )
@@ -1261,8 +1267,11 @@ async def project_report(
     if type not in ["daily", "weekly", "monthly", "quarterly"]:
         raise HTTPException(status_code=400, detail="Invalid report type")
 
-    if type == "daily" and not date:
-        raise HTTPException(status_code=400, detail="date is required for daily report")
+    if type == "daily" and not report_date:
+        raise HTTPException(
+            status_code=400,
+            detail="report_date is required for daily report"
+        )
 
     if type == "weekly" and (not start_date or not end_date):
         raise HTTPException(
@@ -1419,6 +1428,7 @@ async def project_report(
 # =========================================================
 
 
+
 @router.get("/project/export/pdf")
 async def export_project_report_pdf(
     project_id: int,
@@ -1456,8 +1466,9 @@ async def export_project_report_pdf(
 
     content.append(Spacer(1, 20))
 
-    content.append(
-        Paragraph(f"Project: {response['project']['name']}", styles["Heading2"])
+    Paragraph(
+        f"Project: {response['project']['project_name']}",
+        styles["Heading2"]
     )
 
     content.append(
@@ -1588,6 +1599,7 @@ async def export_project_report_excel(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": f"attachment; filename={type}_project_report.xlsx"
+            "Content-Disposition":
+            f"attachment; filename={type}_project_report.xlsx"
         },
     )

@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import List, Optional, Union
 from enum import Enum
@@ -28,21 +28,6 @@ from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
 from datetime import date as dt_date
 from app.core.validators import validate_non_empty_string, validate_start_end_dates
-from typing import Optional, List
-
-from pydantic import (
-    Field,
-    field_validator,
-)
-from app.core.validators import (
-    validate_start_end_dates,
-    validate_activity_name,
-    validate_unit,
-    validate_progress_remarks,
-    validate_work_activity_date,
-    validate_progress_date,
-    validate_non_empty_string,
-)
 
 # ===================== PROJECT =====================
 
@@ -64,6 +49,10 @@ class ProjectCreate(BaseSchema):
     pincode: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
+    shift_start_time: Optional[time] = None
+    shift_end_time: Optional[time] = None
+    grace_period_minutes: int = 15
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
@@ -90,6 +79,10 @@ class ProjectUpdate(BaseSchema):
     pincode: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
+    shift_start_time: Optional[time] = None
+    shift_end_time: Optional[time] = None
+    grace_period_minutes: Optional[int] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
@@ -120,6 +113,10 @@ class ProjectOut(BaseSchema):
     pincode: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
+    shift_start_time: Optional[time] = None
+    shift_end_time: Optional[time] = None
+    grace_period_minutes: int = 15
 
     @field_validator("business_id")
     def validate_business_id(cls, v):
@@ -910,25 +907,10 @@ class DailyProgressUpdate(BaseSchema):
         decimal_places=2,
     )
 
-    remarks: Optional[str] = Field(
-        default=None,
-        max_length=500,
-    )
-
-    # ================= REMARKS =================
-
-    @field_validator("remarks")
-    def validate_remarks(cls, v):
-
-        return validate_progress_remarks(v)
+    remarks: Optional[str] = None
 
 
-# =========================================================
-# DAILY PROGRESS RESPONSE
-
-
-class DailyProgressResponse(BaseSchema):
-
+class DailyProgressResponse(BaseModel):
     id: int
 
     activity_id: int
@@ -945,11 +927,7 @@ class DailyProgressResponse(BaseSchema):
         from_attributes = True
 
 
-# =========================================================
-# DAILY PROGRESS WITH ACTIVITY RESPONSE
-
-
-class DailyProgressWithActivityResponse(BaseSchema):
+class DailyProgressWithActivityResponse(BaseModel):
 
     message: str
 
@@ -961,12 +939,7 @@ class DailyProgressWithActivityResponse(BaseSchema):
         from_attributes = True
 
 
-# =========================================================
-# PROJECTS MODULE SUMMARY
-
-
-class ProjectsModuleSummary(BaseSchema):
-
+class ProjectsModuleSummary(BaseModel):
     total_projects: int
 
     ongoing_sites: int

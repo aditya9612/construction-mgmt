@@ -53,6 +53,7 @@ class UserCreatePayload(BaseSchema):
     pan_number: Optional[str] = None
     aadhaar_number: Optional[str] = None
     designation: Optional[str] = Field(None, max_length=100)
+    department: Optional[str] = Field(None, max_length=100)
     joining_date: Optional[date] = None
     is_active: bool = True
 
@@ -97,6 +98,7 @@ class UserUpdatePayload(BaseSchema):
     pan_number: Optional[str] = None
     aadhaar_number: Optional[str] = None
     designation: Optional[str] = Field(None, max_length=100)
+    department: Optional[str] = Field(None, max_length=100)
     joining_date: Optional[date] = None
     is_active: Optional[bool] = None
 
@@ -137,6 +139,7 @@ class UserOut(BaseSchema):
     aadhaar_number: Optional[str]
     profile_image: Optional[str]
     designation: Optional[str]
+    department: Optional[str]
     joining_date: Optional[date]
     is_active: bool
 
@@ -155,6 +158,7 @@ class UserOut(BaseSchema):
                 "aadhaar_number": getattr(data, "aadhaar_number", None),
                 "profile_image": getattr(data, "profile_image", None),
                 "designation": getattr(data, "designation", None),
+                "department": getattr(data, "department", None),
                 "joining_date": getattr(data, "joining_date", None),
                 "is_active": data.is_active,
             }
@@ -169,3 +173,35 @@ class UserAuditOut(BaseSchema):
     new_value: Optional[str]
     changed_by: Optional[int]
     changed_at: datetime
+
+
+class UserAttendanceOut(BaseSchema):
+    id: int
+    user_id: int
+    project_id: Optional[int]
+    attendance_date: date
+    status: str
+    in_time: Optional[datetime]
+    out_time: Optional[datetime]
+    working_hours: float
+    overtime_hours: float
+    overtime_rate: float
+    check_in_image: Optional[str]
+    check_out_image: Optional[str]
+    check_in_address: Optional[str]
+    check_in_latitude: Optional[float] = None
+    check_in_longitude: Optional[float] = None
+    check_out_address: Optional[str]
+    check_out_latitude: Optional[float] = None
+    check_out_longitude: Optional[float] = None
+    task_id: Optional[int]
+    task_description: Optional[str]
+    remarks: Optional[str] = None
+    is_approved: bool = False
+    approved_by_id: Optional[int] = None
+    is_outside_geofence: bool = False
+    is_late: bool = False
+    late_minutes: int = 0
+    is_early_departure: bool = False
+    early_minutes: int = 0
+    work_location_type: Optional[str] = None
