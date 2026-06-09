@@ -14,7 +14,7 @@ from sqlalchemy import (
     Date,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from app.core.enums import AttendanceStatus, LabourStatus, PayrollStatus, SkillType
+from app.core.enums import AttendanceStatus, LabourStatus, OTPolicyType, PayrollStatus, SkillType
 from app.models.base import Base, TimestampMixin
 
 
@@ -57,13 +57,37 @@ class Labour(Base, TimestampMixin):
         Integer, ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
     )
 
+    mobile_number: Mapped[Optional[str]] = mapped_column(
+        String(15),unique=True,index=True,nullable=True
+    )
+
+    email: Mapped[Optional[str]] = mapped_column(
+        String(255),nullable=True,unique=True
+    )
+
+    profile_image: Mapped[Optional[str]] = mapped_column(
+        String(500),nullable=True
+    )
+
     aadhaar_number: Mapped[Optional[str]] = mapped_column(String(20), index=True)
 
     labour_name: Mapped[str] = mapped_column(String(255), index=True)
 
-    skill_type: Mapped[SkillType] = mapped_column(SAEnum(SkillType), nullable=False)
+    # skill_type: Mapped[SkillType] = mapped_column(SAEnum(SkillType), nullable=False)
 
-    daily_wage_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
+    # daily_wage_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
+
+    labour_type_id: Mapped[int] = mapped_column(
+        Integer,ForeignKey("labour_types.id"),nullable=True,index=True
+    ) #we need to make it false later
+
+    custom_daily_wage_rate: Mapped[Optional[Decimal]] = mapped_column(
+        DECIMAL(18, 2),nullable=True
+    )
+
+    custom_ot_rate_per_hour: Mapped[Optional[Decimal]] = mapped_column(
+        DECIMAL(18, 2),nullable=True
+    )
 
     contractor_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("contractors.id", ondelete="SET NULL")
@@ -75,14 +99,67 @@ class Labour(Base, TimestampMixin):
 
     notes: Mapped[Optional[str]] = mapped_column(String(500))
 
-    # 🔥 NEW RELATION
+    #  NEW RELATION
     projects = relationship("LabourProject", backref="labour", cascade="all, delete")
     contractor = relationship("Contractor")
+    labour_type = relationship("LabourType")
 
     @property
     def contractor_name(self) -> Optional[str]:
         return self.contractor.name if self.contractor else None
 
+
+    @property
+    def labour_type_name(self):
+
+        return (
+            self.labour_type.name
+            if self.labour_type else None
+        )
+
+
+    @property
+    def skill_category(self):
+
+        return (
+            self.labour_type.skill_category
+            if self.labour_type else None
+        )
+
+
+    @property
+    def effective_daily_wage(self):
+
+        if self.custom_daily_wage_rate:
+            return self.custom_daily_wage_rate
+
+        if self.labour_type:
+            return self.labour_type.default_daily_wage
+
+        return Decimal("0")
+
+
+    @property
+    def effective_ot_rate(self):
+
+        if self.custom_ot_rate_per_hour:
+            return self.custom_ot_rate_per_hour
+
+        if self.labour_type:
+            return (
+                self.labour_type.default_ot_rate_per_hour
+                or Decimal("0")
+            )
+
+        return Decimal("0")
+
+    @property
+    def default_daily_wage(self):
+
+        if self.labour_type:
+            return self.labour_type.default_daily_wage
+
+        return Decimal("0")
 
 # ======================
 # PAYROLL (NO CHANGE)

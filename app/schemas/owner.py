@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 from typing import Optional
 from pydantic import Field, EmailStr, field_validator
 from app.schemas.base import BaseSchema
@@ -73,7 +74,7 @@ class OwnerTransactionOut(BaseSchema):
     owner_id: int
     project_id: int
     type: str
-    amount: float
+    amount: Decimal
     reference_type: str
     reference_id: Optional[int]
     description: Optional[str]
@@ -83,9 +84,9 @@ class OwnerTransactionOut(BaseSchema):
 
 
 class OwnerLedgerResponse(BaseSchema):
-    total_credit: float
-    total_debit: float
-    balance: float
+    total_credit: Decimal
+    total_debit: Decimal
+    balance: Decimal
     transactions: list[OwnerTransactionOut]
 
 
@@ -102,9 +103,8 @@ class ClientPortfolioItem(BaseSchema):
     total_projects: int
     linked_project_name: Optional[str] = None
 
-    pending_billing: float
-    total_received: float
-
+    pending_billing: Decimal
+    total_received: Decimal
     satisfaction_score: float = 0   # ADD THIS
 
     status: str  # ACTIVE / INACTIVE
@@ -115,7 +115,7 @@ class ClientPortfolioItem(BaseSchema):
 
 class ClientPortfolioSummary(BaseSchema):
     total_clients: int
-    total_outstanding_billing: float
+    total_outstanding_billing: Decimal
     average_satisfaction_score: float # Mocked for now
 
 
@@ -133,7 +133,7 @@ class OwnerPaymentScheduleCreate(BaseSchema):
     project_id: int
     milestone_name: str
     due_date: Optional[date] = None
-    amount: float
+    amount: Decimal
     description: Optional[str] = None
     reference_code: Optional[str] = None
 
@@ -144,8 +144,8 @@ class OwnerPaymentScheduleOut(BaseSchema):
     project_id: int
     milestone_name: str
     due_date: Optional[date] = None
-    amount: float
-    paid_amount: float
+    amount: Decimal
+    paid_amount: Decimal
     status: str
     reference_code: Optional[str]
     description: Optional[str]

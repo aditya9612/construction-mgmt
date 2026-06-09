@@ -3,6 +3,7 @@ from datetime import date
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.enums import OwnerReferenceType, OwnerTransactionType
 from app.db.session import get_db_session
 from app.models.expense import Expense
 from app.models.project import Project
@@ -21,7 +22,6 @@ from decimal import Decimal
 
 from app.models.user import User, UserRole
 from app.core.dependencies import require_roles
-
 
 EXPENSE_READ_ROLES = [
     r.value
@@ -95,9 +95,9 @@ async def create_expense(
         owner_transaction = OwnerTransaction(
             owner_id=project.owner_id,
             project_id=obj.project_id,
-            type="debit",
+            type=OwnerTransactionType.DEBIT.value,
             amount=obj.amount,
-            reference_type="expense",
+            reference_type=OwnerReferenceType.EXPENSE.value,
             reference_id=obj.id,
             description="Expense added",
         )
@@ -175,19 +175,38 @@ async def update_expense(
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
+    new_boq_id = obj.boq_item_id
+
+    owner_txn = await db.scalar(
+        select(OwnerTransaction).where(
+            OwnerTransaction.reference_type == OwnerReferenceType.EXPENSE.value,
+            OwnerTransaction.reference_id == obj.id,
+        )
+    )
+
+    if owner_txn:
+
+        owner_txn.amount = obj.amount
+
+        owner_txn.description = obj.description
+
     try:
         await db.flush()
 
-        if old_boq_id:
+        affected_boq_ids = {boq_id for boq_id in [old_boq_id, new_boq_id] if boq_id}
+
+        for boq_id in affected_boq_ids:
+
             total_actual = await db.scalar(
-                select(func.sum(Expense.amount)).where(
-                    Expense.boq_item_id == old_boq_id
-                )
+                select(func.sum(Expense.amount)).where(Expense.boq_item_id == boq_id)
             )
 
-            boq = await db.get(BOQ, old_boq_id)
+            boq = await db.get(BOQ, boq_id)
+
             if boq:
+
                 boq.actual_cost = Decimal(total_actual or 0)
+
                 boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
 
         await db.commit()
@@ -217,6 +236,16 @@ async def delete_expense(
     if not obj:
         logger.warning(f"Expense not found id={id}")
         raise NotFoundError("Expense not found")
+
+    owner_txn = await db.scalar(
+        select(OwnerTransaction).where(
+            OwnerTransaction.reference_type == OwnerReferenceType.EXPENSE.value,
+            OwnerTransaction.reference_id == obj.id,
+        )
+    )
+
+    if owner_txn:
+        await db.delete(owner_txn)
 
     try:
         await db.delete(obj)
@@ -274,7 +303,7 @@ async def summary(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
 
-    return {"project_id": project_id, "total_expense": float(total or 0)}
+    return {"project_id": project_id, "total_expense": total or Decimal("0")}
 
 
 @router.get("/boq-comparison/{project_id}")
@@ -289,5 +318,5 @@ async def boq_comparison(
 
     return {
         "project_id": project_id,
-        "actual_expense": float(total_expense or 0),
+        "actual_expense": total_expense or Decimal("0"),
     }

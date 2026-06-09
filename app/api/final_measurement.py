@@ -1,12 +1,13 @@
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
 from app.models.final_measurement import FinalMeasurement
 from app.models.project import Project
+from app.models.boq import BOQ
 from app.models.user import User
 from app.schemas.final_measurement import (
     FinalMeasurementCreate,
@@ -55,14 +56,25 @@ async def create_measurement(
         logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
 
-    existing = await db.scalar(
-        select(FinalMeasurement).where(
-            FinalMeasurement.project_id == payload.project_id
+    # Add safeguard validation if boq_item_id is provided
+    if payload.boq_item_id:
+        boq_item = await db.get(BOQ, payload.boq_item_id)
+        if not boq_item:
+            raise ValidationError("BOQ Item not found")
+            
+        existing_qty = await db.scalar(
+            select(func.sum(FinalMeasurement.measured_qty)).where(
+                FinalMeasurement.boq_item_id == payload.boq_item_id,
+                FinalMeasurement.status != 'REJECTED'
+            )
         )
-    )
-    if existing:
-        logger.warning(f"Measurement already exists project_id={payload.project_id}")
-        raise ValidationError("Final measurement already exists for this project")
+        existing_qty = float(existing_qty or 0)
+        
+        # We need to make sure measured_qty is safe to evaluate
+        if hasattr(payload, 'measured_qty') and payload.measured_qty:
+            if existing_qty + payload.measured_qty > float(boq_item.quantity):
+                raise ValidationError(f"Measurement exceeds BOQ quantity. Available: {float(boq_item.quantity) - existing_qty}")
+
 
     total_area = payload.final_area + payload.extra_area
     total_amount = (
@@ -227,3 +239,39 @@ async def delete_measurement(
     logger.info(f"Measurement deleted id={id}")
 
     return None
+
+
+from pydantic import BaseModel
+
+class MeasurementStatusUpdate(BaseModel):
+    status: str
+
+@router.put("/{id}/status", response_model=FinalMeasurementOut)
+async def update_measurement_status(
+    id: int,
+    payload: MeasurementStatusUpdate,
+    current_user: User = Depends(d.require_roles(MEASUREMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    logger.info(f"Updating measurement status id={id} to {payload.status}")
+
+    obj = await db.get(FinalMeasurement, id)
+
+    if not obj:
+        raise NotFoundError("Measurement not found")
+
+    valid_statuses = ["DRAFT", "SUBMITTED", "VERIFIED", "APPROVED", "REJECTED", "BILLED"]
+    if payload.status not in valid_statuses:
+        raise ValidationError(f"Invalid status. Must be one of: {valid_statuses}")
+
+    obj.status = payload.status
+
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    await db.refresh(obj)
+    return FinalMeasurementOut.model_validate(obj)
+

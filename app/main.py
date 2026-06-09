@@ -61,6 +61,7 @@ from app.api.project_visualization import router as visualization_router
 from app.api.attendance import router as attendance_router
 from app.api.voice_task import router as voice_task_router
 from app.api.notification import router as notification_router
+from app.api.rbac import router as rbac_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal
@@ -260,6 +261,7 @@ def create_app() -> FastAPI:
 
     api_router.include_router(auth_router)
     api_router.include_router(user_router)
+    api_router.include_router(rbac_router)
     api_router.include_router(project_router)
     api_router.include_router(qc_router)
     api_router.include_router(safety_router)

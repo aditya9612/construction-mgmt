@@ -1,36 +1,120 @@
 from decimal import Decimal
-from typing import Optional, List
+from typing import Optional
 from datetime import date, time, datetime
 from pydantic import BaseModel, field_validator
 from app.core import enums as e
+from pydantic import EmailStr
+from app.core.validators import (
+    validate_aadhaar,
+    validate_mobile,
+    validate_full_name,
+    validate_positive_decimal,
+)
 
 
 # ======================
 # LABOUR (GLOBAL NOW)
 # ======================
 class LabourCreate(BaseModel):
-    aadhaar_number: Optional[str]
+    aadhaar_number: Optional[str] = None
+
     labour_name: str
-    skill_type: e.SkillType
-    daily_wage_rate: Decimal
-    contractor_id: Optional[int]
+
+    mobile_number: str
+
+    email: Optional[EmailStr] = None
+
+    # skill_type: e.SkillType
+
+    # daily_wage_rate: Decimal
+
+    labour_type_id: int
+
+    custom_daily_wage_rate: Optional[Decimal] = None
+
+    custom_ot_rate_per_hour: Optional[Decimal] = None
+
+    contractor_id: Optional[int] = None
+
     status: Optional[e.LabourStatus] = e.LabourStatus.ACTIVE
+
     notes: Optional[str] = None
 
     @field_validator("aadhaar_number")
-    def validate_aadhaar(cls, v):
-        if v and (not v.isdigit() or len(v) != 12):
-            raise ValueError("Aadhaar must be 12 digits")
-        return v
+    def validate_aadhaar_field(cls, v):
+        return validate_aadhaar(v)
 
+    @field_validator("mobile_number")
+    def validate_mobile_field(cls, v):
+        return validate_mobile(v)
+    
+    @field_validator("labour_name")
+    def validate_labour_name(cls, v):
+        return validate_full_name(v)
+    
+    # @field_validator("daily_wage_rate")
+    # def validate_wage(cls, v):
+    #     return validate_positive_decimal(v, "Daily wage")
+
+    @field_validator("custom_daily_wage_rate")
+    def validate_custom_wage(cls, v):
+
+        if v is None:
+            return v
+
+        return validate_positive_decimal(
+            v,
+            "Custom daily wage"
+        )
+
+
+    @field_validator("custom_ot_rate_per_hour")
+    def validate_custom_ot(cls, v):
+
+        if v is None:
+            return v
+
+        return validate_positive_decimal(
+            v,
+            "Custom OT rate"
+        )
 
 class LabourUpdate(BaseModel):
-    labour_name: Optional[str]
-    skill_type: Optional[e.SkillType]
-    daily_wage_rate: Optional[Decimal]
-    contractor_id: Optional[int]
-    status: Optional[e.LabourStatus]
+    aadhaar_number: Optional[str] = None
+
+    labour_name: Optional[str] = None
+
+    mobile_number: Optional[str] = None
+
+    email: Optional[EmailStr] = None
+
+    # skill_type: Optional[e.SkillType] = None
+
+    # daily_wage_rate: Optional[Decimal] = None
+
+    labour_type_id: Optional[int] = None
+
+    custom_daily_wage_rate: Optional[Decimal] = None
+
+    custom_ot_rate_per_hour: Optional[Decimal] = None
+
+    contractor_id: Optional[int] = None
+
+    status: Optional[e.LabourStatus] = None
+
     notes: Optional[str] = None
+
+    @field_validator("aadhaar_number")
+    def validate_aadhaar_field(cls, v):
+        return validate_aadhaar(v)
+
+    @field_validator("mobile_number")
+    def validate_mobile_field(cls, v):
+        return validate_mobile(v)
+    
+    @field_validator("labour_name")
+    def validate_labour_name(cls, v):
+        return validate_full_name(v)
 
 
 class LabourOut(BaseModel):
@@ -38,8 +122,19 @@ class LabourOut(BaseModel):
     worker_code: str
     aadhaar_number: Optional[str]
     labour_name: str
-    skill_type: e.SkillType
-    daily_wage_rate: Decimal
+    mobile_number: Optional[str]
+    email: Optional[str]
+    profile_image: Optional[str]
+    # skill_type: e.SkillType
+    # daily_wage_rate: Decimal
+    labour_type_id: int
+    labour_type_name: Optional[str] = None
+    skill_category: Optional[e.SkillType] = None
+    default_daily_wage: Optional[Decimal] = None
+    custom_daily_wage_rate: Optional[Decimal] = None
+    custom_ot_rate_per_hour: Optional[Decimal] = None
+    effective_daily_wage: Decimal
+    effective_ot_rate: Decimal
     contractor_id: Optional[int]
     contractor_name: Optional[str] = None
     status: e.LabourStatus
@@ -47,10 +142,11 @@ class LabourOut(BaseModel):
 
     class Config:
         from_attributes = True
+        json_encoders = {Decimal: float}
 
 
 # ======================
-# 🔥 NEW: ASSIGN LABOUR TO PROJECT
+#  NEW: ASSIGN LABOUR TO PROJECT
 # ======================
 class LabourAssignProject(BaseModel):
     labour_id: int
@@ -77,7 +173,6 @@ class LabourAttendanceCreate(BaseModel):
     out_time: Optional[time]
     working_hours: Decimal
     overtime_hours: Decimal = Decimal("0")
-    overtime_rate: Decimal
     task_description: str
 
 
@@ -177,7 +272,9 @@ class PayrollDetailsOut(BaseModel):
     # Enriched properties
     labour_name: str
     worker_code: str
-    skill_type: e.SkillType
+    # skill_type: e.SkillType
+    # daily_wage_rate: Decimal
+    skill_category: e.SkillType
     daily_wage_rate: Decimal
     contractor_id: Optional[int] = None
 
@@ -198,7 +295,7 @@ class PayrollStatsOut(BaseModel):
 
 class ContractorLiabilityOut(BaseModel):
     contractor_id: Optional[int] = None
-    contractor_name: str
+    contractor_name: Optional[str] = None
     total_wage: Decimal
     paid_amount: Decimal
     remaining_amount: Decimal
@@ -252,7 +349,8 @@ class PayrollMomentumOut(BaseModel):
 class AggregateReportOut(BaseModel):
     labour_id: int
     labour_name: str
-    skill_type: e.SkillType
+    # skill_type: e.SkillType
+    skill_category: e.SkillType
     daily_wage: Decimal
     days_present: int
     ot_hours: Decimal

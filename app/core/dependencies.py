@@ -10,6 +10,7 @@ from app.core.security import decode_access_token
 from app.db.session import get_db_session
 from app.models.user import User, UserRole
 from app.core.request_context import set_current_user_id
+from app.models.rbac import Permission, RolePermission
 
 security = HTTPBearer()
 
@@ -157,6 +158,65 @@ def require_roles(allowed_roles: Iterable[str]):
         return current_user
 
     _dependency.__name__ = "role_dependency"
+    return _dependency
+
+
+def require_permissions(required_permissions: list[str]):
+
+    async def _dependency(
+        current_user: User = Depends(get_current_active_user),
+        db: AsyncSession = Depends(get_db_session),
+    ) -> User:
+
+        # -------------------------------------------------
+        # ADMIN BYPASS
+        # -------------------------------------------------
+
+        if current_user.role == UserRole.ADMIN.value:
+            return current_user
+
+        # -------------------------------------------------
+        # FETCH USER ROLE PERMISSIONS
+        # -------------------------------------------------
+
+        result = await db.execute(
+            select(Permission.code)
+            .join(
+                RolePermission,
+                RolePermission.permission_id == Permission.id
+            )
+            .where(
+                RolePermission.role == current_user.role
+            )
+        )
+
+        user_permissions = set(result.scalars().all())
+
+        # -------------------------------------------------
+        # CHECK REQUIRED PERMISSIONS
+        # -------------------------------------------------
+
+        missing_permissions = [
+            permission
+            for permission in required_permissions
+            if permission not in user_permissions
+        ]
+
+        if missing_permissions:
+
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "message": "Insufficient permissions",
+                    "required": required_permissions,
+                    "missing": missing_permissions,
+                },
+            )
+
+        return current_user
+
+    _dependency.__name__ = "permission_dependency"
+
     return _dependency
 
 

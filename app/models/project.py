@@ -19,13 +19,14 @@ from sqlalchemy import (
     Enum as SAEnum,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
 from decimal import Decimal
 from app.core.enums import (
     AttendanceStatus,
     ChecklistStatus,
     DocumentStatus,
     MilestoneStatus,
+    OTPolicyType,
     SafetyChecklistStatus,
     WorkActivityStatus,
 )
@@ -99,9 +100,14 @@ class Project(Base, TimestampMixin):
         "ProjectMember", back_populates="project", cascade="all, delete-orphan"
     )
     milestones = relationship(
-        "Milestone", back_populates="project", cascade="all, delete-orphan"
+        "Milestone",back_populates="project",
+        cascade="all, delete-orphan",lazy="selectin",
     )
-    tasks = relationship("Task", back_populates="project", cascade="all, delete-orphan")
+
+    tasks = relationship(
+        "Task",back_populates="project",
+        cascade="all, delete-orphan",lazy="selectin",
+    )
     dsr_entries = relationship(
         "DailySiteReport", back_populates="project", cascade="all, delete-orphan"
     )
@@ -114,6 +120,52 @@ class Project(Base, TimestampMixin):
     )
     safety_incidents = relationship("SafetyIncident", back_populates="project")
     checklists = relationship("Checklist", back_populates="project")
+
+    ot_policy = relationship(
+        "ProjectOTPolicy",
+        uselist=False,
+        back_populates="project",
+        cascade="all, delete-orphan"
+    )
+
+    @property
+    def total_milestones(self) -> int:
+        milestones = self.__dict__.get("milestones", [])
+        return len(milestones)
+
+    @property
+    def total_tasks(self) -> int:
+        tasks = self.__dict__.get("tasks", [])
+        return len(tasks)
+
+    @property
+    def completed_tasks(self) -> int:
+        tasks = self.__dict__.get("tasks", [])
+        if not tasks:
+            return 0
+        from app.core.enums import TaskStatus
+
+        return sum(1 for t in tasks if t.status == TaskStatus.COMPLETED)
+
+    @property
+    def delayed_tasks(self) -> int:
+        tasks = self.__dict__.get("tasks", [])
+        if not tasks:
+            return 0
+        return sum(1 for t in tasks if getattr(t, "is_delayed", False))
+
+    @property
+    def execution_completion_percentage(self) -> float:
+        milestones = self.__dict__.get("milestones", [])
+        tasks = self.__dict__.get("tasks", [])
+
+        if milestones:
+            return sum(m.completion_percentage for m in milestones) / len(milestones)
+
+        if tasks:
+            return sum(t.completion_percentage or 0 for t in tasks) / len(tasks)
+
+        return 0.0
 
     __table_args__ = (
         CheckConstraint(
@@ -164,8 +216,57 @@ class Milestone(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    actual_start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    actual_end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     status = mapped_column(SAEnum(MilestoneStatus), default=MilestoneStatus.PLANNED)
     project: Mapped["Project"] = relationship("Project", back_populates="milestones")
+
+    @property
+    def total_tasks(self) -> int:
+        tasks = self.__dict__.get("tasks", [])
+        return len(tasks)
+
+    @property
+    def completed_tasks(self) -> int:
+        tasks = self.__dict__.get("tasks", [])
+        if not tasks:
+            return 0
+        from app.core.enums import TaskStatus
+
+        return sum(1 for t in tasks if t.status == TaskStatus.COMPLETED)
+
+    @property
+    def pending_tasks(self) -> int:
+        return self.total_tasks - self.completed_tasks
+
+    @property
+    def is_delayed(self) -> bool:
+        from datetime import date
+
+        today = date.today()
+        if self.end_date and self.end_date < today and self.completion_percentage < 100:
+            return True
+        return False
+
+    @property
+    def execution_completion_percentage(self) -> float:
+        return self.completion_percentage
+
+    @property
+    def delayed_tasks(self) -> int:
+        tasks = self.__dict__.get("tasks", [])
+        if not tasks:
+            return 0
+        return sum(1 for t in tasks if getattr(t, "is_delayed", False))
+
+    @property
+    def completion_percentage(self) -> float:
+        tasks = self.__dict__.get("tasks", [])
+
+        if not tasks:
+            return 0.0
+
+        return sum(t.completion_percentage or 0 for t in tasks) / len(tasks)
 
     __table_args__ = (
         UniqueConstraint("project_id", "title", name="uq_milestone_project_title"),
@@ -182,6 +283,17 @@ class Task(Base):
 
     project_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("projects.id", ondelete="CASCADE")
+    )
+
+    milestone_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("milestones.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    milestone: Mapped[Optional["Milestone"]] = relationship(
+        "Milestone",
+        backref=backref("tasks", lazy="selectin"),
     )
 
     boq_id: Mapped[Optional[int]] = mapped_column(
@@ -203,6 +315,8 @@ class Task(Base):
 
     start_date: Mapped[Optional[date]] = mapped_column(Date)
     end_date: Mapped[Optional[date]] = mapped_column(Date)
+    actual_start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    actual_end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
     assigned_user_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("users.id")
@@ -210,10 +324,54 @@ class Task(Base):
     completion_percentage: Mapped[float] = mapped_column(Float, default=0)
     discipline: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
+    @property
+    def planned_cost(self) -> float:
+        # Simplistic mapping for now: if linked to a boq_item, use its total_cost.
+        # Ideally, this should be pro-rated by task if multiple tasks map to same BOQ item.
+        return 0.0
+
+    @property
+    def actual_cost(self) -> float:
+        # Aggregated actual cost (labour + material + equipment + billing)
+        return 0.0
+
+    @property
+    def is_delayed(self) -> bool:
+        from datetime import date
+
+        today = date.today()
+        if self.end_date and today > self.end_date and self.completion_percentage < 100:
+            return True
+        return False
+
+    @property
+    def execution_duration(self) -> int:
+        if self.actual_start_date:
+            from datetime import date
+
+            end = self.actual_end_date or date.today()
+            return (end - self.actual_start_date).days
+        return 0
+
+    @property
+    def delay_days(self) -> int:
+        if self.is_delayed and self.end_date:
+            from datetime import date
+
+            today = date.today()
+            return (today - self.end_date).days
+        return 0
+
     # --- Voice Task Assignment Fields ---
-    voice_instruction_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    generated_audio_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    original_transcription_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    voice_instruction_url: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True
+    )
+    generated_audio_url: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True
+    )
+    original_transcription_text: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
     translated_english_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     language_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     audio_duration: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -317,6 +475,11 @@ class DailySiteReport(Base, TimestampMixin):
         index=True,
     )
 
+    task_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    task: Mapped[Optional["Task"]] = relationship("Task")
+
     created_by_id: Mapped[Optional[int]] = mapped_column(
         Integer,
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -395,6 +558,11 @@ class DSRLabour(Base):
         index=True,
         nullable=False,
     )
+
+    task_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    task: Mapped[Optional["Task"]] = relationship("Task")
 
     labour_id: Mapped[int] = mapped_column(
         ForeignKey("labour.id", ondelete="CASCADE"),
@@ -559,6 +727,11 @@ class SafetyIncident(Base, TimestampMixin):
 
     project_id = Column(Integer, ForeignKey("projects.id"))
 
+    task_id = Column(
+        Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    task = relationship("Task")
+
     date = Column(Date)
 
     safety_checklist_status = Column(SAEnum(SafetyChecklistStatus), nullable=False)
@@ -634,6 +807,15 @@ class SitePhoto(Base, TimestampMixin):
 
     project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
     task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True)
+    dsr_id = Column(
+        Integer,
+        ForeignKey("daily_site_reports.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    task = relationship("Task")
+    dsr = relationship("DailySiteReport")
 
     photo_url = Column(String(500), nullable=False)
 
@@ -728,50 +910,41 @@ class DrawingDocument(Base, TimestampMixin):
     # ================= CONSTRAINTS / INDEXES =================
 
     __table_args__ = (
-
         # ================= UNIQUE CONSTRAINTS =================
-
         UniqueConstraint(
             "project_id",
             "drawing_name",
             "version",
             name="uq_project_drawing_version",
         ),
-
         UniqueConstraint(
             "project_id",
             "drawing_name",
             "revision_no",
             name="uq_project_drawing_revision",
         ),
-
         # ================= INDEXES =================
-
         Index(
             "idx_drawing_project",
             "project_id",
         ),
-
         Index(
             "idx_drawing_project_status",
             "project_id",
             "approval_status",
         ),
-
         Index(
             "idx_drawing_latest",
             "project_id",
             "drawing_name",
             "is_latest_version",
         ),
-
         Index(
             "idx_drawing_revision",
             "project_id",
             "drawing_name",
             "revision_no",
         ),
-
         Index(
             "idx_drawing_approval",
             "approval_status",
@@ -1023,3 +1196,36 @@ class ActivityHistory(Base):
             "changed_by",
         ),
     )
+
+
+from sqlalchemy import DECIMAL, Enum as SAEnum
+from app.core.enums import OTPolicyType
+
+
+class ProjectOTPolicy(Base, TimestampMixin):
+    __tablename__ = "project_ot_policy"
+
+    id = Column(Integer, primary_key=True)
+
+    project_id = Column(
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+
+    policy_type = Column(
+        SAEnum(OTPolicyType),
+        nullable=False,
+        default=OTPolicyType.MULTIPLIER,
+    )
+
+    normal_day_multiplier = Column(DECIMAL(5, 2), default=1.5)
+
+    sunday_multiplier = Column(DECIMAL(5, 2), default=2.0)
+
+    holiday_multiplier = Column(DECIMAL(5, 2), default=3.0)
+
+    fixed_ot_rate = Column(DECIMAL(10, 2), nullable=True)
+
+    project = relationship("Project", back_populates="ot_policy")

@@ -1261,6 +1261,7 @@ async def export_boq_logs_csv(
 @router.post("/{boq_id}/generate-tasks")
 async def generate_tasks_from_boq(
     boq_id: int,
+    milestone_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(WRITE_ROLES)),
 ):
@@ -1290,6 +1291,16 @@ async def generate_tasks_from_boq(
         select(Task).where(Task.boq_id == boq.id)
     )
 
+    if milestone_id:
+        from app.models.project import Milestone
+        milestone = await db.scalar(
+            select(Milestone).where(Milestone.id == milestone_id)
+        )
+        if not milestone:
+            raise NotFoundError("Milestone not found")
+        if milestone.project_id != boq.project_id:
+            raise ValidationError("Milestone does not belong to the same project as the BOQ")
+
     if existing_task:
         return {
             "message": "Task already exists for this BOQ",
@@ -1299,6 +1310,7 @@ async def generate_tasks_from_boq(
     task = Task(
         project_id=boq.project_id,
         boq_id=boq.id,
+        milestone_id=milestone_id,
         activity_type_id=boq.activity_type_id,
         title=boq.item_name,
         description=boq.description,
@@ -1316,4 +1328,5 @@ async def generate_tasks_from_boq(
     return {
         "message": "Task created from BOQ",
         "task_id": task.id,
+        "milestone_id": milestone_id,
     }

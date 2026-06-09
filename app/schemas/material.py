@@ -28,9 +28,7 @@ from app.core.validators import (
 class BaseSchema(BaseModel):
     model_config = ConfigDict(
         from_attributes=True,
-        json_encoders={
-            Decimal: lambda v: round(float(v), 2)
-        },
+        json_encoders={Decimal: lambda v: round(float(v), 2)},
     )
 
 
@@ -238,9 +236,7 @@ class PurchaseMaterial(BaseSchema):
     def quantity_positive(cls, v):
 
         if v <= 0:
-            raise ValueError(
-                "Quantity must be > 0"
-            )
+            raise ValueError("Quantity must be > 0")
 
         return v
 
@@ -248,9 +244,7 @@ class PurchaseMaterial(BaseSchema):
     def amount_valid(cls, v):
 
         if v < 0:
-            raise ValueError(
-                "Payment cannot be negative"
-            )
+            raise ValueError("Payment cannot be negative")
 
         return v
 
@@ -269,6 +263,7 @@ class UsageMaterial(BaseSchema):
         ...,
         gt=0,
     )
+    task_id: Optional[int] = None
 
     issue_type: Optional[IssueType] = None
 
@@ -276,9 +271,7 @@ class UsageMaterial(BaseSchema):
     def positive(cls, v):
 
         if v <= 0:
-            raise ValueError(
-                "Must be greater than 0"
-            )
+            raise ValueError("Must be greater than 0")
 
         return v
 
@@ -316,9 +309,7 @@ class SupplierCreate(BaseSchema):
     def validate_name(cls, v):
 
         if not v or len(v.strip()) < 3:
-            raise ValueError(
-                "Supplier name must be at least 3 characters"
-            )
+            raise ValueError("Supplier name must be at least 3 characters")
 
         v = " ".join(v.strip().split())
 
@@ -326,9 +317,7 @@ class SupplierCreate(BaseSchema):
             r"^[A-Za-z0-9\s&.,()-]+$",
             v,
         ):
-            raise ValueError(
-                "Invalid supplier name"
-            )
+            raise ValueError("Invalid supplier name")
 
         return v.title()
 
@@ -344,9 +333,7 @@ class SupplierCreate(BaseSchema):
             r"^[A-Za-z. ]+$",
             v,
         ):
-            raise ValueError(
-                "Invalid contact person name"
-            )
+            raise ValueError("Invalid contact person name")
 
         return v.title()
 
@@ -364,9 +351,7 @@ class SupplierCreate(BaseSchema):
                 r"[6-9]\d{9}",
                 v,
             ):
-                raise ValueError(
-                    "Invalid phone number"
-                )
+                raise ValueError("Invalid phone number")
 
         return v
 
@@ -382,9 +367,7 @@ class SupplierCreate(BaseSchema):
             r"\d{2}[A-Z]{5}\d{4}[A-Z]\d[Z][A-Z\d]",
             v,
         ):
-            raise ValueError(
-                "Invalid GST number format"
-            )
+            raise ValueError("Invalid GST number format")
 
         return v
 
@@ -394,9 +377,7 @@ class SupplierCreate(BaseSchema):
         if v is None:
             return v
 
-        return " ".join(
-            v.strip().split()
-        )
+        return " ".join(v.strip().split())
 
 
 class SupplierOut(BaseSchema):
@@ -445,9 +426,7 @@ class PurchaseOrderCreate(BaseSchema):
     def positive(cls, v):
 
         if v <= 0:
-            raise ValueError(
-                "Must be greater than 0"
-            )
+            raise ValueError("Must be greater than 0")
 
         return v
 
@@ -511,9 +490,7 @@ class TransferCreate(BaseSchema):
     def positive(cls, v):
 
         if v <= 0:
-            raise ValueError(
-                "Must be greater than 0"
-            )
+            raise ValueError("Must be greater than 0")
 
         return v
 
@@ -524,17 +501,10 @@ class TransferCreate(BaseSchema):
         info,
     ):
 
-        from_project_id = info.data.get(
-            "from_project_id"
-        )
+        from_project_id = info.data.get("from_project_id")
 
-        if (
-            from_project_id
-            and from_project_id == v
-        ):
-            raise ValueError(
-                "From and To project cannot be same"
-            )
+        if from_project_id and from_project_id == v:
+            raise ValueError("From and To project cannot be same")
 
         return v
 
@@ -543,25 +513,17 @@ class TransferOut(BaseSchema):
 
     id: int
 
-    material: Optional[
-        TransferMaterial
-    ] = None
+    material: Optional[TransferMaterial] = None
 
-    from_project: Optional[
-        TransferProject
-    ] = None
+    from_project: Optional[TransferProject] = None
 
-    to_project: Optional[
-        TransferProject
-    ] = None
+    to_project: Optional[TransferProject] = None
 
     quantity: float
 
     status: str
 
-    created_at: Optional[
-        datetime
-    ] = None
+    created_at: Optional[datetime] = None
 
 
 # ================= INVENTORY =================
@@ -589,13 +551,9 @@ class InventoryAdjustRequest(BaseSchema):
     def validate_reason(cls, v):
 
         if not v or not v.strip():
-            raise ValueError(
-                "Reason required"
-            )
+            raise ValueError("Reason required")
 
-        return " ".join(
-            v.strip().split()
-        )
+        return " ".join(v.strip().split())
 
 
 class InventoryOut(BaseSchema):
@@ -630,10 +588,9 @@ class MaterialLogOut(BaseSchema):
     issue_type: Optional[str] = None
 
     project_id: Optional[int] = None
+    task_id: Optional[int] = None
 
-    created_at: Optional[
-        datetime
-    ] = None
+    created_at: Optional[datetime] = None
 
 
 # ================= SUMMARY =================
@@ -650,17 +607,54 @@ class SummaryOut(BaseSchema):
 class MaterialReport(BaseSchema):
 
     material_id: int
+    material_code: Optional[str] = None
 
     material_name: str
+    category: str
+
+    supplier_id: Optional[int] = None
+    supplier_name: Optional[str] = None
+
+    project_id: int
 
     total_purchased: float
     total_used: float
-
     remaining_stock: float
 
-    total_cost: float
+    avg_rate: float
+    stock_value: float
 
+    payment_given: float
     payment_pending: float
+
+    minimum_stock_level: float
+
+    alert_type: str
+
+
+class MaterialReportSummary(BaseSchema):
+
+    total_materials: int
+
+    total_purchased: float
+    total_used: float
+    total_remaining: float
+
+    total_stock_value: float
+
+    total_payment_given: float
+    total_payment_pending: float
+
+    in_stock_count: int
+    low_stock_count: int
+    out_of_stock_count: int
+
+
+class MaterialReportResponse(BaseSchema):
+
+    summary: MaterialReportSummary
+
+    materials: list[MaterialReport]
 
 
 # ================= PRICE HISTORY =================

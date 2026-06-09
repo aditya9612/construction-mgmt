@@ -243,6 +243,79 @@ async def validate_and_save_image(
     return file_path
 
 
+
+async def validate_and_save_document(
+    file: UploadFile,
+    upload_dir: str,
+    prefix: str,
+) -> str:
+
+    # =====================================
+    # ENSURE DIRECTORY EXISTS
+    # =====================================
+
+    os.makedirs(upload_dir, exist_ok=True)
+
+    # =====================================
+    # ALLOWED EXTENSIONS
+    # =====================================
+
+    allowed_extensions = {".pdf"}
+
+    ext = os.path.splitext(file.filename)[1].lower()
+
+    if ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files allowed."
+        )
+
+    # =====================================
+    # MIME TYPE VALIDATION
+    # =====================================
+
+    allowed_content_types = {"application/pdf"}
+
+    if file.content_type not in allowed_content_types:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PDF file type."
+        )
+
+    # =====================================
+    # FILE SIZE VALIDATION (10 MB)
+    # =====================================
+
+    MAX_FILE_SIZE = 10 * 1024 * 1024
+
+    content = await file.read()
+
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="PDF size cannot exceed 10 MB."
+        )
+
+    await file.seek(0)
+
+    # =====================================
+    # UNIQUE SAFE FILE NAME
+    # =====================================
+
+    filename = f"{prefix}_{uuid.uuid4().hex}{ext}"
+
+    file_path = f"{upload_dir}/{filename}"
+
+    # =====================================
+    # SAVE FILE
+    # =====================================
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return file_path
+
+
 def validate_start_end_dates(start_date, end_date):
 
     if start_date and end_date and end_date < start_date:
