@@ -32,6 +32,18 @@ async def assert_project_access(
         raise PermissionDeniedError("User is not part of this project")
 
 
+async def assert_task_project(db: AsyncSession, task_id: int | None, project_id: int):
+    if not task_id:
+        return
+    task = await db.get(m.Task, task_id)
+    if not task:
+        from app.utils.helpers import ValidationError
+        raise ValidationError("Task not found")
+    if task.project_id != project_id:
+        from app.utils.helpers import ValidationError
+        raise ValidationError("Task does not belong to the specified project")
+
+
 async def validate_contractor_access(
     db,
     contractor_id: int,

@@ -2,8 +2,6 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 
-from app.models.chat import MessageStatus
-
 
 class CreateChat(BaseModel):
     user_id: int
@@ -13,6 +11,8 @@ class SendMessage(BaseModel):
     message: Optional[str] = None
     parent_id: Optional[int] = None
     attachment_ids: list[int] = Field(default_factory=list)
+
+    mention_user_ids: list[int] = Field(default_factory=list)
 
 
 class AttachmentOut(BaseModel):
@@ -38,6 +38,7 @@ class SenderOut(BaseModel):
 class ReactionOut(BaseModel):
     user_id: int
     reaction: str
+    is_reacted_by_me: bool = False
 
     class Config:
         from_attributes = True
@@ -45,7 +46,7 @@ class ReactionOut(BaseModel):
 
 class ParentMessageOut(BaseModel):
     id: int
-    message: str
+    message: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -54,11 +55,13 @@ class ParentMessageOut(BaseModel):
 class MessageOut(BaseModel):
     id: int
     chat_id: int
-    message: str
+    message: Optional[str] = None
     sender_id: int
     created_at: datetime
 
-    status: Optional[MessageStatus] = None
+    is_delivered: bool = False
+
+    is_read: bool = False
 
     parent_id: Optional[int] = None
 
@@ -93,6 +96,8 @@ class ChatListOut(BaseModel):
 
     unread_count: int = 0
 
+    is_pinned: bool = False
+
     class Config:
         from_attributes = True
 
@@ -105,7 +110,7 @@ class CreateGroup(BaseModel):
 class ReplyOut(BaseModel):
     id: int
 
-    message: str
+    message: Optional[str] = None
 
     created_at: datetime
 
@@ -143,6 +148,8 @@ class ChatInfoOut(BaseModel):
     is_muted: bool = False
 
     is_archived: bool = False
+
+    is_pinned: bool = False
 
     class Config:
         from_attributes = True
@@ -206,6 +213,40 @@ class ChatListEnhancedOut(BaseModel):
     last_message_at: Optional[datetime] = None
 
     unread_count: int = 0
+
+    is_pinned: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class MessageReadUserOut(BaseModel):
+    user_id: int
+
+    full_name: Optional[str] = None
+
+    profile_image: Optional[str] = None
+
+    read_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MentionMessageOut(BaseModel):
+    id: int
+
+    chat_id: int
+
+    message: Optional[str] = None
+
+    sender_id: int
+
+    created_at: datetime
+
+    sender: Optional[SenderOut] = None
+
+    attachments: list[AttachmentOut] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

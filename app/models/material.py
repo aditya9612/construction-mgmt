@@ -98,44 +98,42 @@ class Material(Base, TimestampMixin):
 
     # NEW: Correct avg_rate calculation
 
-@property
-def avg_rate(self):
-    if self.quantity_purchased and self.quantity_purchased > Decimal("0"):
-        return self.total_amount / self.quantity_purchased
+    @property
+    def avg_rate(self):
+        if self.quantity_purchased and self.quantity_purchased > Decimal("0"):
+            return self.total_amount / self.quantity_purchased
 
-    return Decimal("0.00")
+        return Decimal("0.00")
 
+    @property
+    def alert_type(self):
+        if self.remaining_stock <= Decimal("0"):
+            return "OUT_OF_STOCK"
 
-@property
-def alert_type(self):
-    if self.remaining_stock <= Decimal("0"):
-        return "OUT_OF_STOCK"
+        if self.remaining_stock <= self.minimum_stock_level:
+            return "LOW_STOCK"
 
-    if self.remaining_stock <= self.minimum_stock_level:
-        return "LOW_STOCK"
+        return "IN_STOCK"
 
-    return "IN_STOCK"
-
-
-__table_args__ = (
-    Index("idx_material_project", "project_id"),
-    Index("idx_material_deleted", "is_deleted"),
-    Index("idx_material_supplier", "supplier_id"),
-    UniqueConstraint(
-        "project_id",
-        "material_name",
-        "supplier_id",
-        name="unique_material_per_project_supplier",
-    ),
-    CheckConstraint(
-        "remaining_stock >= 0",
-        name="check_stock_not_negative",
-    ),
-    CheckConstraint(
-        "minimum_stock_level >= 0",
-        name="check_min_stock_not_negative",
-    ),
-)
+    __table_args__ = (
+        Index("idx_material_project", "project_id"),
+        Index("idx_material_deleted", "is_deleted"),
+        Index("idx_material_supplier", "supplier_id"),
+        UniqueConstraint(
+            "project_id",
+            "material_name",
+            "supplier_id",
+            name="unique_material_per_project_supplier",
+        ),
+        CheckConstraint(
+            "remaining_stock >= 0",
+            name="check_stock_not_negative",
+        ),
+        CheckConstraint(
+            "minimum_stock_level >= 0",
+            name="check_min_stock_not_negative",
+        ),
+    )
 
 
 # ================= MATERIAL USAGE =================
@@ -150,6 +148,11 @@ class MaterialUsage(Base, TimestampMixin):
     material = relationship("Material", back_populates="usages")
 
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+
+    task_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    task = relationship("Task")
 
     quantity_used: Mapped[Decimal] = mapped_column(DECIMAL(18, 3), nullable=False)
 
@@ -174,6 +177,11 @@ class MaterialTransaction(Base, TimestampMixin):
     project_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("projects.id"), nullable=True
     )
+
+    task_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    task = relationship("Task")
 
     type: Mapped[TransactionType] = mapped_column(
         SqlEnum(

@@ -31,10 +31,16 @@ class LabourStatus(str, Enum):
     ACTIVE = "Active"
     INACTIVE = "Inactive"
 
+class OTPolicyType(str, Enum):
+    MULTIPLIER = "Multiplier"
+    FIXED_RATE = "FixedRate"
+
 
 class SkillType(str, Enum):
     SKILLED = "Skilled"
+    SEMI_SKILLED = "SemiSkilled"
     UNSKILLED = "Unskilled"
+
 
 
 class TransactionType(str, Enum):
@@ -233,3 +239,26 @@ class LocationType(str, Enum):
     HIGHWAY = "HIGHWAY"
     REMOTE = "REMOTE"
     INDUSTRIAL_ZONE = "INDUSTRIAL_ZONE"
+
+
+class VoiceLanguage(str, Enum):
+    AUTO = "auto"
+    MARATHI = "mr"
+    HINDI = "hi"
+    ENGLISH = "en"
+
+
+class OwnerTransactionType(str, Enum):
+    CREDIT = "credit"
+    DEBIT = "debit"
+
+
+class OwnerReferenceType(str, Enum):
+    EXPENSE = "expense"
+    MATERIAL = "material"
+    INVOICE = "invoice"
+    PAYROLL = "payroll"
+    LABOUR = "labour"
+    ADVANCE = "advance"
+    CONTRACTOR = "contractor"
+    RA_BILL = "ra_bill"

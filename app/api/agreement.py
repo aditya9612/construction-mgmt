@@ -5,7 +5,7 @@ import os
 import uuid
 from datetime import datetime
 from typing import List, Optional
-
+from app.models.user import User
 from app.db.session import get_db_session
 from app.models.agreement import Agreement
 from app.models.project import Project
@@ -27,6 +27,11 @@ async def list_agreements(
     project_id: Optional[int] = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(
+        d.require_permissions(
+            ["agreements.view"]
+        )
+    ),
     db: AsyncSession = Depends(get_db_session),
 ):
     query = (
@@ -63,6 +68,11 @@ async def upload_agreement(
     type: str = Form(...),
     project_id: Optional[int] = Form(None),
     file: UploadFile = File(...),
+    current_user: User = Depends(
+        d.require_permissions(
+            ["agreements.create"]
+        )
+    ),
     db: AsyncSession = Depends(get_db_session),
 ):
     # 1. Generate Unique ID
@@ -96,7 +106,13 @@ async def upload_agreement(
 
 
 @router.get("/stats", response_model=AgreementStats)
-async def get_agreement_stats(db: AsyncSession = Depends(get_db_session)):
+async def get_agreement_stats(
+    current_user: User = Depends(
+        d.require_permissions(
+            ["agreements.view"]
+        )
+    ),
+    db: AsyncSession = Depends(get_db_session)):
     today = datetime.utcnow()
     first_of_month = datetime(today.year, today.month, 1)
 

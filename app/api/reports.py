@@ -1562,3 +1562,67 @@ async def quarterly_audit_summary(
             "Passed" if (critical_issues or 0) < 5 else "Review Needed"
         ),
     }
+
+# ===================== COMMERCIAL & BOQ EXECUTION ======================
+@router.get("/commercial-execution")
+async def commercial_execution_analytics(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+):
+    from app.models.boq import BOQ
+    from app.models.final_measurement import FinalMeasurement
+
+    boq_items = (await db.execute(select(BOQ).where(BOQ.project_id == project_id))).scalars().all()
+    
+    # BOQ vs Actual Analysis
+    boq_total_planned_cost = sum([float(b.total_amount) for b in boq_items])
+    
+    measurements = (await db.execute(
+        select(FinalMeasurement)
+        .where(FinalMeasurement.project_id == project_id, FinalMeasurement.status.in_(["VERIFIEE", "APPROVED", "BILLED"]))
+    )).scalars().all()
+    
+    # Assuming actual_cost can be derived roughly from certified_qty * boq.rate or from FinalMeasurement total_amount
+    actual_certified_amount = sum([float(m.total_amount) for m in measurements])
+    
+    return {
+        "project_id": project_id,
+        "boq_total_planned_cost": boq_total_planned_cost,
+        "actual_certified_amount": actual_certified_amount,
+        "variance": boq_total_planned_cost - actual_certified_amount,
+        "billing_efficiency": round((actual_certified_amount / boq_total_planned_cost * 100) if boq_total_planned_cost else 0, 2)
+    }
+
+# ===================== CONTRACTOR EXECUTION =====================
+@router.get("/contractor-execution")
+async def contractor_execution_analytics(
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+):
+    from app.models.billing import RABill
+    
+    bills = (await db.execute(
+        select(RABill).where(RABill.project_id == project_id)
+    )).scalars().all()
+    
+    contractor_stats = {}
+    for bill in bills:
+        cid = bill.contractor_id
+        if cid not in contractor_stats:
+            contractor_stats[cid] = {
+                "total_billed": 0,
+                "paid_amount": 0,
+                "bill_count": 0
+            }
+            
+        contractor_stats[cid]["total_billed"] += float(bill.gross_amount)
+        contractor_stats[cid]["bill_count"] += 1
+        if bill.status == "Paid":
+            contractor_stats[cid]["paid_amount"] += float(bill.net_amount)
+            
+    return {
+        "project_id": project_id,
+        "contractor_stats": contractor_stats
+    }

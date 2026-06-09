@@ -119,6 +119,11 @@ async def create_user(
     try:
         # role = UserRole(payload.role)
         role = UserRole(payload.role).value
+        if role == UserRole.LABOUR.value:
+            raise AppError(
+                422,
+                "Use /labour API to create labour users"
+            )
     except ValueError:
         raise AppError(422, f"Invalid role. Use one of: {ROLES}")
 

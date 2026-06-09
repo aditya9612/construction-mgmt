@@ -3,11 +3,22 @@ from datetime import date, datetime
 import json
 import mimetypes
 import pathlib, re, io, os, uuid
+from ezdxf import colors
 from openpyxl import Workbook
 from typing import Annotated, List, Optional, Union
 from fastapi import APIRouter, Depends, Query, Request, Form
+from openpyxl.styles import Alignment, Font, PatternFill
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.enums import PRIORITY_MAP, REVERSE_PRIORITY_MAP, DocumentStatus, LabourStatus, MilestoneStatus, SkillType, TaskPriority, WorkActivityStatus
+from app.core.enums import (
+    PRIORITY_MAP,
+    REVERSE_PRIORITY_MAP,
+    DocumentStatus,
+    LabourStatus,
+    MilestoneStatus,
+    SkillType,
+    TaskPriority,
+    WorkActivityStatus,
+)
 from app.core.validators import validate_drawing_file
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
@@ -38,11 +49,18 @@ from app.models.user import User, UserRole
 from app.models.owner import Owner
 from app.models.expense import Expense
 from app.models.invoice import Invoice
+from app.models.master_data import ActivityType
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import project as s
 from app.core.logger import logger
 from fastapi.responses import FileResponse, StreamingResponse
-from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.platypus import (
+    PageBreak,
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    TableStyle,
+)
 from reportlab.lib.styles import getSampleStyleSheet
 from sqlalchemy.exc import IntegrityError
 from fastapi import UploadFile, File
@@ -56,7 +74,11 @@ from app.utils.helpers import (
     ValidationError,
 )
 from app.utils.pagination import PaginationParams
-from app.utils.common import assert_project_access, generate_business_id
+from app.utils.common import (
+    assert_project_access,
+    generate_business_id,
+    assert_task_project,
+)
 
 
 def compute_project_status(project):
@@ -80,6 +102,7 @@ def compute_project_status(project):
 
     return "Ongoing"
 
+
 def compute_milestone_status(milestone):
     today = date.today()
 
@@ -93,6 +116,7 @@ def compute_milestone_status(milestone):
         return "Delayed"
 
     return "In Progress"
+
 
 def get_pagination(
     limit: int = Query(20, ge=1, le=100),
@@ -162,6 +186,7 @@ DRAWING_DELETE_ROLES = [
     UserRole.PROJECT_MANAGER.value,
 ]
 
+
 class ProjectsRepository:
     async def create_project(self, db: AsyncSession, data: dict) -> m.Project:
         obj = m.Project(**data)
@@ -172,7 +197,14 @@ class ProjectsRepository:
     async def get_project(
         self, db: AsyncSession, project_id: int
     ) -> Optional[m.Project]:
-        return await db.scalar(select(m.Project).where(m.Project.id == project_id))
+        return await db.scalar(
+            select(m.Project)
+            .options(
+                selectinload(m.Project.milestones).selectinload(m.Milestone.tasks),
+                selectinload(m.Project.tasks),
+            )
+            .where(m.Project.id == project_id)
+        )
 
     async def list_projects(
         self,
@@ -183,7 +215,10 @@ class ProjectsRepository:
         search: Optional[str] = None,
         status: Optional[s.ProjectStatus] = None,
     ) -> tuple[list[m.Project], int]:
-        query = select(m.Project)
+        query = select(m.Project).options(
+            selectinload(m.Project.milestones).selectinload(m.Milestone.tasks),
+            selectinload(m.Project.tasks),
+        )
         count_query = select(func.count()).select_from(m.Project)
 
         if search:
@@ -298,10 +333,12 @@ class MilestonesRepository:
     async def get_milestone(
         self, db: AsyncSession, *, project_id: int, milestone_id: int
     ) -> Optional[m.Milestone]:
+        from sqlalchemy.orm import selectinload
+
         return await db.scalar(
-            select(m.Milestone).where(
-                m.Milestone.project_id == project_id, m.Milestone.id == milestone_id
-            )
+            select(m.Milestone)
+            .where(m.Milestone.project_id == project_id, m.Milestone.id == milestone_id)
+            .options(selectinload(m.Milestone.tasks))
         )
 
     async def list_milestones(
@@ -315,12 +352,15 @@ class MilestonesRepository:
 
         count_query = select(func.count()).where(m.Milestone.project_id == project_id)
 
+        from sqlalchemy.orm import selectinload
+
         query = (
             select(m.Milestone)
             .where(m.Milestone.project_id == project_id)
             .order_by(m.Milestone.id.desc())
             .limit(limit)
             .offset(offset)
+            .options(selectinload(m.Milestone.tasks))
         )
 
         total = await db.scalar(count_query)
@@ -576,7 +616,6 @@ class ProjectsService:
             end_date=obj.end_date,
             status=compute_project_status(obj),
             completion_percentage=completion,
-
             type=obj.type,
             location_type=obj.location_type,
             site_address=obj.site_address,
@@ -586,7 +625,6 @@ class ProjectsService:
             pincode=obj.pincode,
             latitude=obj.latitude,
             longitude=obj.longitude,
-
             shift_start_time=obj.shift_start_time,
             shift_end_time=obj.shift_end_time,
             grace_period_minutes=obj.grace_period_minutes,
@@ -633,16 +671,24 @@ class ProjectsService:
                 )
 
             else:
-                base_query = base_query.where(
-                    m.Project.status == status
-                )
+                base_query = base_query.where(m.Project.status == status)
 
         count_query = select(func.count()).select_from(
             base_query.order_by(None).subquery()
         )
         total = await db.scalar(count_query)
 
-        query = base_query.order_by(m.Project.id.desc()).limit(limit).offset(offset)
+        from sqlalchemy.orm import selectinload
+
+        query = (
+            base_query.order_by(m.Project.id.desc())
+            .limit(limit)
+            .offset(offset)
+            .options(
+                selectinload(m.Project.milestones).selectinload(m.Milestone.tasks),
+                selectinload(m.Project.tasks),
+            )
+        )
 
         rows = (await db.execute(query)).scalars().all()
 
@@ -662,7 +708,11 @@ class ProjectsService:
                 end_date=p.end_date,
                 status=compute_project_status(p),
                 completion_percentage=completion_map.get(p.id, 0.0),
-
+                execution_completion_percentage=p.execution_completion_percentage,
+                total_milestones=p.total_milestones,
+                total_tasks=p.total_tasks,
+                completed_tasks=p.completed_tasks,
+                delayed_tasks=p.delayed_tasks,
                 type=p.type,
                 location_type=p.location_type,
                 site_address=p.site_address,
@@ -672,7 +722,6 @@ class ProjectsService:
                 pincode=p.pincode,
                 latitude=p.latitude,
                 longitude=p.longitude,
-
                 shift_start_time=p.shift_start_time,
                 shift_end_time=p.shift_end_time,
                 grace_period_minutes=p.grace_period_minutes,
@@ -715,7 +764,11 @@ class ProjectsService:
             end_date=obj.end_date,
             status=compute_project_status(obj),
             completion_percentage=completion,
-
+            execution_completion_percentage=obj.execution_completion_percentage,
+            total_milestones=obj.total_milestones,
+            total_tasks=obj.total_tasks,
+            completed_tasks=obj.completed_tasks,
+            delayed_tasks=obj.delayed_tasks,
             type=obj.type,
             location_type=obj.location_type,
             site_address=obj.site_address,
@@ -725,12 +778,11 @@ class ProjectsService:
             pincode=obj.pincode,
             latitude=obj.latitude,
             longitude=obj.longitude,
-
             shift_start_time=obj.shift_start_time,
             shift_end_time=obj.shift_end_time,
             grace_period_minutes=obj.grace_period_minutes,
         )
-    
+
     async def update_project(
         self,
         db: AsyncSession,
@@ -747,8 +799,15 @@ class ProjectsService:
         if "project_name" in data and data["project_name"] is None:
             raise ValidationError("project_name cannot be null")
         if "status" in data:
-            if data["status"] != s.ProjectStatus.COMPLETED:
-                data.pop("status")
+            allowed_statuses = [
+                s.ProjectStatus.PLANNED,
+                s.ProjectStatus.ONGOING,
+                s.ProjectStatus.ON_HOLD,
+                s.ProjectStatus.COMPLETED,
+            ]
+
+            if data["status"] not in allowed_statuses:
+                raise ValidationError("Invalid project status")
         try:
             await self.projects_repo.update_project(db, obj, data)
             await db.refresh(obj)
@@ -770,7 +829,6 @@ class ProjectsService:
             end_date=obj.end_date,
             status=compute_project_status(obj),
             completion_percentage=completion,
-
             type=obj.type,
             location_type=obj.location_type,
             site_address=obj.site_address,
@@ -780,12 +838,11 @@ class ProjectsService:
             pincode=obj.pincode,
             latitude=obj.latitude,
             longitude=obj.longitude,
-
             shift_start_time=obj.shift_start_time,
             shift_end_time=obj.shift_end_time,
             grace_period_minutes=obj.grace_period_minutes,
         )
-    
+
     async def delete_project(
         self, db: AsyncSession, current_user: User, *, project_id: int
     ) -> None:
@@ -967,7 +1024,16 @@ class MilestonesService:
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
+            actual_start_date=obj.actual_start_date,
+            actual_end_date=obj.actual_end_date,
             status=compute_milestone_status(obj),  # IMPORTANT
+            total_tasks=0,
+            completed_tasks=0,
+            pending_tasks=0,
+            delayed_tasks=0,
+            is_delayed=False,
+            completion_percentage=0.0,
+            execution_completion_percentage=0.0,
         )
 
     async def list_milestones(
@@ -1027,6 +1093,15 @@ class MilestonesService:
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
+            actual_start_date=obj.actual_start_date,
+            actual_end_date=obj.actual_end_date,
+            total_tasks=obj.total_tasks,
+            completed_tasks=obj.completed_tasks,
+            pending_tasks=obj.pending_tasks,
+            delayed_tasks=obj.delayed_tasks,
+            is_delayed=obj.is_delayed,
+            completion_percentage=obj.completion_percentage,
+            execution_completion_percentage=obj.execution_completion_percentage,
         )
 
     async def update_milestone(
@@ -1070,6 +1145,15 @@ class MilestonesService:
             description=obj.description,
             start_date=obj.start_date,
             end_date=obj.end_date,
+            actual_start_date=obj.actual_start_date,
+            actual_end_date=obj.actual_end_date,
+            total_tasks=obj.total_tasks,
+            completed_tasks=obj.completed_tasks,
+            pending_tasks=obj.pending_tasks,
+            delayed_tasks=obj.delayed_tasks,
+            is_delayed=obj.is_delayed,
+            completion_percentage=obj.completion_percentage,
+            execution_completion_percentage=obj.execution_completion_percentage,
         )
 
     async def delete_milestone(
@@ -1154,6 +1238,7 @@ class TasksService:
         return s.TaskOut(
             id=task.id,
             project_id=task.project_id,
+            milestone_id=task.milestone_id,
             boq_id=task.boq_id,
             title=task.title,
             description=task.description,
@@ -1166,7 +1251,6 @@ class TasksService:
             completion_percentage=task.completion_percentage,
             is_delayed=is_delayed,
         )
-
 
     async def create_task(
         self,
@@ -1193,7 +1277,7 @@ class TasksService:
         # MASTER DATA VALIDATION
         # =========================
         if payload.activity_type_id is not None:
-            activity = await db.get(m.ActivityType, payload.activity_type_id)
+            activity = await db.get(ActivityType, payload.activity_type_id)
             if not activity:
                 raise NotFoundError("Invalid activity type")
 
@@ -1225,9 +1309,7 @@ class TasksService:
             user_id = data.get("assigned_user_id")
 
             if user_id is not None:
-                assigned_user = await db.scalar(
-                    select(User).where(User.id == user_id)
-                )
+                assigned_user = await db.scalar(select(User).where(User.id == user_id))
                 if assigned_user is None:
                     raise NotFoundError("User not found")
 
@@ -1250,7 +1332,9 @@ class TasksService:
                 )
             except IntegrityError:
                 await db.rollback()
-                raise ConflictError("Task with this title already exists in this project")
+                raise ConflictError(
+                    "Task with this title already exists in this project"
+                )
 
             if user_id:
                 await create_notification(
@@ -1258,7 +1342,7 @@ class TasksService:
                     user_id=user_id,
                     title="New Task Assigned",
                     message=f"You have been assigned a new task: {obj.title}",
-                    type="info"
+                    type="info",
                 )
 
             return self._task_to_out(
@@ -1274,9 +1358,7 @@ class TasksService:
         for user_id in assigned_ids:
 
             if user_id is not None:
-                assigned_user = await db.scalar(
-                    select(User).where(User.id == user_id)
-                )
+                assigned_user = await db.scalar(select(User).where(User.id == user_id))
                 if assigned_user is None:
                     raise NotFoundError("User not found")
 
@@ -1301,7 +1383,9 @@ class TasksService:
                 )
             except IntegrityError:
                 await db.rollback()
-                raise ConflictError("Task with this title already exists in this project")
+                raise ConflictError(
+                    "Task with this title already exists in this project"
+                )
 
             if user_id:
                 await create_notification(
@@ -1309,7 +1393,7 @@ class TasksService:
                     user_id=user_id,
                     title="New Task Assigned",
                     message=f"You have been assigned a new task: {obj.title}",
-                    type="info"
+                    type="info",
                 )
 
             tasks.append(
@@ -1373,7 +1457,9 @@ class TasksService:
 
         if view == "created":
             query = query.where(m.Task.created_by_user_id == current_user.id)
-            count_query = count_query.where(m.Task.created_by_user_id == current_user.id)
+            count_query = count_query.where(
+                m.Task.created_by_user_id == current_user.id
+            )
 
         elif view == "received":
             query = query.where(m.Task.assigned_user_id == current_user.id)
@@ -1468,7 +1554,6 @@ class TasksService:
                 except ValueError:
                     raise ValidationError("Invalid priority value")
 
-
         if "title" in data and data["title"] is None:
             raise ValidationError("title cannot be null")
 
@@ -1559,7 +1644,7 @@ class TasksService:
             task=obj,
             is_delayed=self._is_delayed(task=obj, current_date=date.today()),
         )
-    
+
     async def update_task_status(
         self,
         db: AsyncSession,
@@ -2059,16 +2144,26 @@ class ReportsService:
         if not project:
             raise NotFoundError("Project not found")
 
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
 
         owner = None
         if getattr(project, "owner_id", None):
             owner = await db.scalar(select(Owner).where(Owner.id == project.owner_id))
 
         # Financials
-        total_boq = await db.scalar(select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id))
-        total_invoiced = await db.scalar(select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id))
-        total_expenses = await db.scalar(select(func.sum(Expense.amount)).where(Expense.project_id == project_id))
+        total_boq = await db.scalar(
+            select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id)
+        )
+        total_invoiced = await db.scalar(
+            select(func.sum(Invoice.total_amount)).where(
+                Invoice.project_id == project_id
+            )
+        )
+        total_expenses = await db.scalar(
+            select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
+        )
 
         boq_val = float(total_boq or 0)
         invoiced_val = float(total_invoiced or 0)
@@ -2077,32 +2172,79 @@ class ReportsService:
         outstanding = boq_val - invoiced_val
 
         # Tasks
-        tasks = (await db.execute(select(m.Task).where(m.Task.project_id == project_id))).scalars().all()
+        tasks = (
+            (await db.execute(select(m.Task).where(m.Task.project_id == project_id)))
+            .scalars()
+            .all()
+        )
         total_tasks = len(tasks)
-        completed_tasks = sum(1 for t in tasks if str(t.status) == "Completed" or (hasattr(t.status, "value") and t.status.value == "Completed"))
-        pending_tasks = sum(1 for t in tasks if str(t.status) in ["Pending", "In Progress"] or (hasattr(t.status, "value") and t.status.value in ["Pending", "In Progress"]))
-        delayed_tasks = sum(1 for t in tasks if str(t.status) == "Delayed" or (hasattr(t.status, "value") and t.status.value == "Delayed"))
-        avg_progress = sum(getattr(t, "completion_percentage", 0) for t in tasks) / total_tasks if total_tasks else 0
+        completed_tasks = sum(
+            1
+            for t in tasks
+            if str(t.status) == "Completed"
+            or (hasattr(t.status, "value") and t.status.value == "Completed")
+        )
+        pending_tasks = sum(
+            1
+            for t in tasks
+            if str(t.status) in ["Pending", "In Progress"]
+            or (
+                hasattr(t.status, "value")
+                and t.status.value in ["Pending", "In Progress"]
+            )
+        )
+        delayed_tasks = sum(
+            1
+            for t in tasks
+            if str(t.status) == "Delayed"
+            or (hasattr(t.status, "value") and t.status.value == "Delayed")
+        )
+        avg_progress = (
+            sum(getattr(t, "completion_percentage", 0) for t in tasks) / total_tasks
+            if total_tasks
+            else 0
+        )
 
         # Milestones
-        milestones = (await db.execute(select(m.Milestone).where(m.Milestone.project_id == project_id))).scalars().all()
+        milestones = (
+            (
+                await db.execute(
+                    select(m.Milestone).where(m.Milestone.project_id == project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         total_milestones = len(milestones)
-        completed_milestones = sum(1 for m_obj in milestones if str(m_obj.status) == "Completed" or (hasattr(m_obj.status, "value") and m_obj.status.value == "Completed"))
+        completed_milestones = sum(
+            1
+            for m_obj in milestones
+            if str(m_obj.status) == "Completed"
+            or (hasattr(m_obj.status, "value") and m_obj.status.value == "Completed")
+        )
 
         # Members
-        members_query = select(UserModel).join(m.ProjectMember, m.ProjectMember.user_id == UserModel.id).where(m.ProjectMember.project_id == project_id)
+        members_query = (
+            select(UserModel)
+            .join(m.ProjectMember, m.ProjectMember.user_id == UserModel.id)
+            .where(m.ProjectMember.project_id == project_id)
+        )
         members_result = await db.execute(members_query)
         members_list = []
         manager = "N/A"
         supervisor = "N/A"
         for user in members_result.scalars().all():
-            role_str = user.role.value if hasattr(user.role, "value") else str(user.role)
-            members_list.append({
-                "name": user.full_name,
-                "role": role_str,
-                "phone": getattr(user, 'phone', 'N/A'),
-                "email": user.email
-            })
+            role_str = (
+                user.role.value if hasattr(user.role, "value") else str(user.role)
+            )
+            members_list.append(
+                {
+                    "name": user.full_name,
+                    "role": role_str,
+                    "phone": getattr(user, "phone", "N/A"),
+                    "email": user.email,
+                }
+            )
             if role_str == UserRole.PROJECT_MANAGER.value:
                 manager = user.full_name
             elif role_str == UserRole.SITE_ENGINEER.value:
@@ -2114,12 +2256,16 @@ class ReportsService:
                 "code": project.business_id,
                 "client": owner.owner_name if owner else "N/A",
                 "type": getattr(project, "type", "Residential"),
-                "location": getattr(project, 'location', getattr(project, 'address', "Ranchi, Jharkhand")),
+                "location": getattr(
+                    project,
+                    "location",
+                    getattr(project, "address", "Ranchi, Jharkhand"),
+                ),
                 "start_date": project.start_date,
                 "end_date": project.end_date,
                 "status": "In Progress" if avg_progress < 100 else "Completed",
                 "manager": manager,
-                "supervisor": supervisor
+                "supervisor": supervisor,
             },
             "summary": {
                 "progress": round(avg_progress),
@@ -2134,23 +2280,49 @@ class ReportsService:
                 "invoiced": invoiced_val,
                 "expenses": expense_val,
                 "net_profit": profit,
-                "outstanding": outstanding
+                "outstanding": outstanding,
             },
-            "tasks": [{
-                "name": t.title,
-                "assignee": str(t.assigned_user_id) if t.assigned_user_id else "Unassigned",
-                "start_date": t.start_date,
-                "end_date": t.end_date,
-                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
-                "progress": getattr(t, "completion_percentage", 0)
-            } for t in tasks],
-            "milestones": [{
-                "name": ms.title,
-                "end_date": ms.end_date,
-                "status": ms.status.value if hasattr(ms.status, "value") else str(ms.status),
-                "completion": ms.completion_percentage if hasattr(ms, 'completion_percentage') else (100 if (hasattr(ms.status, "value") and ms.status.value == 'Completed') or str(ms.status) == 'Completed' else 0)
-            } for ms in milestones],
-            "members": members_list
+            "tasks": [
+                {
+                    "name": t.title,
+                    "assignee": (
+                        str(t.assigned_user_id) if t.assigned_user_id else "Unassigned"
+                    ),
+                    "start_date": t.start_date,
+                    "end_date": t.end_date,
+                    "status": (
+                        t.status.value if hasattr(t.status, "value") else str(t.status)
+                    ),
+                    "progress": getattr(t, "completion_percentage", 0),
+                }
+                for t in tasks
+            ],
+            "milestones": [
+                {
+                    "name": ms.title,
+                    "end_date": ms.end_date,
+                    "status": (
+                        ms.status.value
+                        if hasattr(ms.status, "value")
+                        else str(ms.status)
+                    ),
+                    "completion": (
+                        ms.completion_percentage
+                        if hasattr(ms, "completion_percentage")
+                        else (
+                            100
+                            if (
+                                hasattr(ms.status, "value")
+                                and ms.status.value == "Completed"
+                            )
+                            or str(ms.status) == "Completed"
+                            else 0
+                        )
+                    ),
+                }
+                for ms in milestones
+            ],
+            "members": members_list,
         }
 
         buffer = generate_project_report_pdf(data)
@@ -2158,7 +2330,9 @@ class ReportsService:
         return StreamingResponse(
             buffer,
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=Project_Report_{project.business_id}.pdf"},
+            headers={
+                "Content-Disposition": f"attachment; filename=Project_Report_{project.business_id}.pdf"
+            },
         )
 
 
@@ -2205,18 +2379,23 @@ async def projects_module_summary(
 
     # 1. Summary
     total = await db.scalar(select(func.count(m.Project.id)))
-    ongoing = await db.scalar(select(func.count(m.Project.id)).where(m.Project.status == "ONGOING"))
-    completed = await db.scalar(select(func.count(m.Project.id)).where(m.Project.status == "COMPLETED"))
+    ongoing = await db.scalar(
+        select(func.count(m.Project.id)).where(m.Project.status == "ONGOING")
+    )
+    completed = await db.scalar(
+        select(func.count(m.Project.id)).where(m.Project.status == "COMPLETED")
+    )
     delayed = await db.scalar(
-        select(func.count(m.Project.id))
-        .where(m.Project.status == "ONGOING", m.Project.end_date < today)
+        select(func.count(m.Project.id)).where(
+            m.Project.status == "ONGOING", m.Project.end_date < today
+        )
     )
 
     summary = s.ProjectsModuleSummary(
         total_projects=total or 0,
         ongoing_sites=ongoing or 0,
         completed_projects=completed or 0,
-        delayed_projects=delayed or 0
+        delayed_projects=delayed or 0,
     )
 
     # 2. Activities (Aggregated Feed)
@@ -2232,13 +2411,15 @@ async def projects_module_summary(
         .limit(5)
     )
     for row in task_p.all():
-        activities.append(s.ProjectActivityItem(
-            type="task_completion",
-            user_name=row[3],
-            description=f"updated progress on {row[1]} to {row[0].percentage}%",
-            project_name=row[2],
-            timestamp=row[0].created_at
-        ))
+        activities.append(
+            s.ProjectActivityItem(
+                type="task_completion",
+                user_name=row[3],
+                description=f"updated progress on {row[1]} to {row[0].percentage}%",
+                project_name=row[2],
+                timestamp=row[0].created_at,
+            )
+        )
 
     # b. Invoices
     invoices = await db.execute(
@@ -2248,13 +2429,15 @@ async def projects_module_summary(
         .limit(5)
     )
     for row in invoices.all():
-        activities.append(s.ProjectActivityItem(
-            type="invoice",
-            user_name="Financial Team",
-            description=f"submitted Invoice #{row[0].id} for {row[0].total_amount}",
-            project_name=row[1],
-            timestamp=row[0].created_at
-        ))
+        activities.append(
+            s.ProjectActivityItem(
+                type="invoice",
+                user_name="Financial Team",
+                description=f"submitted Invoice #{row[0].id} for {row[0].total_amount}",
+                project_name=row[1],
+                timestamp=row[0].created_at,
+            )
+        )
 
     # c. Site Photos
     photos = await db.execute(
@@ -2264,13 +2447,15 @@ async def projects_module_summary(
         .limit(5)
     )
     for row in photos.all():
-        activities.append(s.ProjectActivityItem(
-            type="photo",
-            user_name="Site Bot",
-            description="uploaded a new site photo",
-            project_name=row[1],
-            timestamp=row[0].created_at
-        ))
+        activities.append(
+            s.ProjectActivityItem(
+                type="photo",
+                user_name="Site Bot",
+                description="uploaded a new site photo",
+                project_name=row[1],
+                timestamp=row[0].created_at,
+            )
+        )
 
     # d. Issues
     issues = await db.execute(
@@ -2280,21 +2465,20 @@ async def projects_module_summary(
         .limit(5)
     )
     for row in issues.all():
-        activities.append(s.ProjectActivityItem(
-            type="issue",
-            user_name="Site Manager",
-            description=f"reported {row[0].priority} issue: {row[0].title}",
-            project_name=row[1],
-            timestamp=row[0].created_at
-        ))
+        activities.append(
+            s.ProjectActivityItem(
+                type="issue",
+                user_name="Site Manager",
+                description=f"reported {row[0].priority} issue: {row[0].title}",
+                project_name=row[1],
+                timestamp=row[0].created_at,
+            )
+        )
 
     # Sort and return
     activities.sort(key=lambda x: x.timestamp, reverse=True)
-    
-    return s.ProjectsModuleResponse(
-        summary=summary,
-        activities=activities[:15]
-    )
+
+    return s.ProjectsModuleResponse(summary=summary, activities=activities[:15])
 
 
 @router.post("", response_model=s.ProjectOut)
@@ -2635,6 +2819,56 @@ async def get_project_photos(
     ]
 
 
+@router.put(
+    "/{project_id}/ot-policy",
+    response_model=s.ProjectOTPolicyOut,
+)
+async def create_or_update_ot_policy(
+    project_id: int,
+    payload: s.ProjectOTPolicyCreate,
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    # CHECK PROJECT
+    project = await db.scalar(select(m.Project).where(m.Project.id == project_id))
+
+    if not project:
+        raise NotFoundError("Project not found")
+
+    # ACCESS CHECK
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
+
+    # EXISTING POLICY
+    policy = await db.scalar(
+        select(m.ProjectOTPolicy).where(m.ProjectOTPolicy.project_id == project_id)
+    )
+
+    data = payload.model_dump(exclude_unset=True)
+
+    # UPDATE
+    if policy:
+
+        for k, v in data.items():
+            setattr(policy, k, v)
+
+    # CREATE
+    else:
+
+        policy = m.ProjectOTPolicy(project_id=project_id, **data)
+
+        db.add(policy)
+
+    await db.flush()
+    await db.refresh(policy)
+
+    return s.ProjectOTPolicyOut.model_validate(policy, from_attributes=True)
+
+
 milestones_router = APIRouter(
     prefix="",
     tags=["project_management"],
@@ -2671,10 +2905,7 @@ async def create_milestone(
         )
 
         # This will return the actual error message in the API response
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
     logger.info(f"Milestone created id={out.id}")
 
@@ -2774,7 +3005,9 @@ async def delete_milestone(
     }
 
 
-@tasks_router.post("/{project_id}/tasks", response_model=Union[s.TaskOut, List[s.TaskOut]])
+@tasks_router.post(
+    "/{project_id}/tasks", response_model=Union[s.TaskOut, List[s.TaskOut]]
+)
 async def create_task(
     project_id: int,
     payload: s.TaskCreate,
@@ -2808,7 +3041,7 @@ async def list_tasks(
     status: Optional[s.TaskStatus] = Query(None),
     assigned_user_id: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
-    view: Optional[str] = Query(None),           
+    view: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
@@ -2823,12 +3056,14 @@ async def list_tasks(
         assigned_user_id=assigned_user_id,
         limit=limit,
         offset=offset,
-        search=search,    
+        search=search,
         view=view,
     )
 
 
-@tasks_router.get("/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]])
+@tasks_router.get(
+    "/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]]
+)
 async def get_task(
     project_id: int,
     task_id: int,
@@ -2842,7 +3077,9 @@ async def get_task(
     )
 
 
-@tasks_router.put("/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]])
+@tasks_router.put(
+    "/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]]
+)
 async def update_task(
     project_id: int,
     task_id: int,
@@ -2866,6 +3103,7 @@ async def update_task(
     logger.info(f"Task updated id={task_id}")
 
     return out
+
 
 @tasks_router.patch("/{project_id}/tasks/{task_id}/status")
 async def update_status(
@@ -2901,6 +3139,7 @@ async def pass_task(
         task_id=task_id,
         new_user_id=payload.new_user_id,
     )
+
 
 @tasks_router.delete("/{project_id}/tasks/{task_id}")
 async def delete_task(
@@ -3177,7 +3416,7 @@ async def create_dsr(
     if photos:
         upload_dir = "uploads/dsr"
         os.makedirs(upload_dir, exist_ok=True)
-        
+
         file = photos
         if file.content_type and file.content_type.startswith("image/"):
             content = await file.read()
@@ -3185,18 +3424,18 @@ async def create_dsr(
                 try:
                     img = Image.open(io.BytesIO(content))
                     img.verify()
-                    
+
                     safe_name = pathlib.Path(file.filename or "file").name
                     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_name)
-                    
+
                     ext = pathlib.Path(safe_name).suffix.lower().replace(".", "")
                     if ext in {"jpg", "jpeg", "png"}:
                         filename = f"{uuid.uuid4()}_{safe_name}"
                         path = os.path.join(upload_dir, filename).replace("\\", "/")
-                        
+
                         with open(path, "wb") as f:
                             f.write(content)
-                        
+
                         photo = m.DSRPhoto(dsr_id=obj.id, file_url=path)
                         db.add(photo)
                 except Exception:
@@ -3235,7 +3474,9 @@ async def create_dsr(
 
     # Add photo URLs to output
     base_url = str(request.base_url).rstrip("/")
-    result_photos = await db.execute(select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == obj.id))
+    result_photos = await db.execute(
+        select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == obj.id)
+    )
     dsr_out.photos = [f"{base_url}/{p.file_url}" for p in result_photos.scalars().all()]
 
     return dsr_out
@@ -3450,8 +3691,6 @@ async def update_dsr(
         dsr_out.created_by_name = obj.created_by.full_name
 
     return dsr_out
-
-
 
 
 @dsr_router.get("/project/{project_id}/map")
@@ -3870,11 +4109,14 @@ async def create_issue(
                 db.add(obj)
                 await db.flush()
 
-                if getattr(obj.priority, 'value', str(obj.priority)) == "HIGH":
+                if getattr(obj.priority, "value", str(obj.priority)) == "HIGH":
                     pm = await db.scalar(
                         select(m.ProjectMember.user_id)
                         .join(User, User.id == m.ProjectMember.user_id)
-                        .where(m.ProjectMember.project_id == payload.project_id, User.role == UserRole.PROJECT_MANAGER.value)
+                        .where(
+                            m.ProjectMember.project_id == payload.project_id,
+                            User.role == UserRole.PROJECT_MANAGER.value,
+                        )
                         .limit(1)
                     )
                     if pm:
@@ -3883,7 +4125,7 @@ async def create_issue(
                             user_id=pm,
                             title="Critical Issue Logged",
                             message=f"CRITICAL ISSUE: {obj.title} logged at {project.project_name}",
-                            type="alert"
+                            type="alert",
                         )
 
                 break
@@ -3918,6 +4160,7 @@ async def list_issues(
     status: Optional[s.IssueStatus] = Query(None),
     priority: Optional[s.IssuePriority] = Query(None),
     assigned_to: Optional[int] = Query(None),
+    project_id: Optional[int] = Query(None),  # Added
     category: Optional[s.IssueCategory] = Query(None),
     search: Optional[str] = Query(None),
     sort_by: Optional[str] = Query("id"),
@@ -3938,6 +4181,10 @@ async def list_issues(
         )
 
         base_query = select(m.Issue).where(m.Issue.project_id.in_(subquery))
+
+    # Project Filter
+    if project_id is not None:
+        base_query = base_query.where(m.Issue.project_id == project_id)
 
     if status is not None:
         base_query = base_query.where(m.Issue.status == status)
@@ -3967,7 +4214,10 @@ async def list_issues(
         "status": m.Issue.status,
     }
 
-    sort_column = sort_mapping.get(sort_by, m.Issue.id)
+    sort_column = sort_mapping.get(
+        sort_by,
+        m.Issue.id,
+    )
 
     if order.lower() == "asc":
         base_query = base_query.order_by(sort_column.asc())
@@ -3975,13 +4225,59 @@ async def list_issues(
         base_query = base_query.order_by(sort_column.desc())
 
     count_query = select(func.count()).select_from(base_query.order_by(None).subquery())
+
     total = await db.scalar(count_query)
 
     query = base_query.offset(pagination.offset).limit(pagination.limit)
 
     rows = (await db.execute(query)).scalars().all()
 
-    items = [s.IssueOut.model_validate(r) for r in rows]
+    items = [s.IssueOut.model_validate(row) for row in rows]
+
+    return PaginatedResponse(
+        items=items,
+        meta=PaginationMeta(
+            total=int(total or 0),
+            limit=pagination.limit,
+            offset=pagination.offset,
+        ),
+    )
+
+
+@issues_router.get(
+    "/project/{project_id}", response_model=PaginatedResponse[s.IssueOut]
+)
+async def get_issues_by_project(
+    project_id: int,
+    pagination: PaginationParams = Depends(),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
+
+    pagination = pagination.normalized()
+
+    total = await db.scalar(
+        select(func.count())
+        .select_from(m.Issue)
+        .where(m.Issue.project_id == project_id)
+    )
+
+    query = (
+        select(m.Issue)
+        .where(m.Issue.project_id == project_id)
+        .order_by(m.Issue.id.desc())
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+    )
+
+    rows = (await db.execute(query)).scalars().all()
+
+    items = [s.IssueOut.model_validate(row) for row in rows]
 
     return PaginatedResponse(
         items=items,
@@ -4208,6 +4504,7 @@ async def issue_analytics(
     }
 
 
+# =======================work_progress===================================
 
 work_progress_router = APIRouter(
     prefix="/work-progress",
@@ -4298,13 +4595,18 @@ def update_activity_status(activity):
 # ==============work progress===========================================
 # 1. CREATE ACTIVITY
 
-from sqlalchemy import select, func
-from sqlalchemy.exc import IntegrityError
-from fastapi import HTTPException, Depends
 from decimal import Decimal, ROUND_HALF_UP
 
-# =========================================================
-# CREATE ACTIVITY
+from fastapi import Depends, HTTPException
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.session import get_db_session
+from app.models.project import Project, ProjectMember
+from app.models.user import User
+from app.models.work_order import WorkOrder
+from app.models.project import WorkActivity
 
 
 @work_progress_router.post("/activities")
@@ -4313,7 +4615,6 @@ async def create_activity(
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-
     try:
 
         # ================= CLEAN ACTIVITY NAME =================
@@ -4347,6 +4648,34 @@ async def create_activity(
                 detail="End date cannot be before start date",
             )
 
+        # ================= VALIDATE PROJECT =================
+
+        project = await db.get(
+            Project,
+            data.project_id,
+        )
+
+        if not project:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found",
+            )
+
+        # ================= VALIDATE WORK ORDER =================
+
+        work_order = await db.get(
+            WorkOrder,
+            data.work_order_id,
+        )
+
+        if not work_order:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Work order not found",
+            )
+
         # ================= CHECK DUPLICATE ACTIVITY =================
 
         duplicate_stmt = select(WorkActivity).where(
@@ -4368,6 +4697,40 @@ async def create_activity(
                 status_code=400,
                 detail="Activity already exists for this BOQ and Work Order",
             )
+
+        # ================= VALIDATE ENGINEER =================
+
+        if data.engineer_id is not None:
+
+            engineer = await db.get(
+                User,
+                data.engineer_id,
+            )
+
+            if not engineer:
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Engineer not found",
+                )
+
+            # ================= CHECK ENGINEER ASSIGNED TO PROJECT =================
+
+            member_stmt = select(ProjectMember).where(
+                ProjectMember.project_id == data.project_id,
+                ProjectMember.user_id == data.engineer_id,
+            )
+
+            member_result = await db.execute(member_stmt)
+
+            member = member_result.scalar_one_or_none()
+
+            if not member:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Engineer is not assigned to this project",
+                )
 
         # ================= CREATE ACTIVITY =================
 
@@ -4404,6 +4767,7 @@ async def create_activity(
                 "activity_name": activity.activity_name,
                 "planned_quantity": str(activity.planned_quantity),
                 "status": activity.status.value,
+                "engineer_id": activity.engineer_id,
             },
         )
 
@@ -4436,7 +4800,10 @@ async def create_activity(
 
         await db.rollback()
 
-        print("INTEGRITY ERROR =>", str(e))
+        print(
+            "INTEGRITY ERROR =>",
+            str(e),
+        )
 
         raise HTTPException(
             status_code=400,
@@ -4449,7 +4816,10 @@ async def create_activity(
 
         await db.rollback()
 
-        print("ERROR =>", str(e))
+        print(
+            "ERROR =>",
+            str(e),
+        )
 
         raise HTTPException(
             status_code=500,
@@ -4473,7 +4843,6 @@ async def list_activities(
     status: WorkActivityStatus | None = None,
     engineer_id: int | None = None,
     search: str | None = None,
-    # ================= PAGINATION =================
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
@@ -4482,13 +4851,41 @@ async def list_activities(
 
     try:
 
-        # ================= BASE QUERY =================
+        # =====================================================
+        # REALTIME STATUS REFRESH FIRST
+        # =====================================================
+
+        activity_result = await db.execute(select(WorkActivity))
+
+        all_activities = activity_result.scalars().all()
+
+        status_changed = False
+
+        for activity in all_activities:
+
+            old_status = activity.status
+
+            update_activity_status(activity)
+
+            if old_status != activity.status:
+
+                status_changed = True
+
+        if status_changed:
+
+            await db.commit()
+
+        # =====================================================
+        # BASE QUERY
+        # =====================================================
 
         stmt = select(WorkActivity)
 
         count_stmt = select(func.count()).select_from(WorkActivity)
 
-        # ================= FILTER : PROJECT =================
+        # =====================================================
+        # PROJECT FILTER
+        # =====================================================
 
         if project_id is not None:
 
@@ -4496,7 +4893,9 @@ async def list_activities(
 
             count_stmt = count_stmt.where(WorkActivity.project_id == project_id)
 
-        # ================= FILTER : STATUS =================
+        # =====================================================
+        # STATUS FILTER
+        # =====================================================
 
         if status is not None:
 
@@ -4504,7 +4903,9 @@ async def list_activities(
 
             count_stmt = count_stmt.where(WorkActivity.status == status)
 
-        # ================= FILTER : ENGINEER =================
+        # =====================================================
+        # ENGINEER FILTER
+        # =====================================================
 
         if engineer_id is not None:
 
@@ -4512,7 +4913,9 @@ async def list_activities(
 
             count_stmt = count_stmt.where(WorkActivity.engineer_id == engineer_id)
 
-        # ================= SEARCH : ACTIVITY NAME =================
+        # =====================================================
+        # SEARCH
+        # =====================================================
 
         if search:
 
@@ -4524,27 +4927,37 @@ async def list_activities(
                 WorkActivity.activity_name.ilike(f"%{search}%")
             )
 
-        # ================= ORDERING =================
+        # =====================================================
+        # ORDERING
+        # =====================================================
 
         stmt = stmt.order_by(WorkActivity.created_at.desc())
 
-        # ================= PAGINATION =================
+        # =====================================================
+        # PAGINATION
+        # =====================================================
 
         stmt = stmt.offset(offset).limit(limit)
 
-        # ================= EXECUTE ACTIVITY QUERY =================
+        # =====================================================
+        # EXECUTE QUERY
+        # =====================================================
 
         result = await db.execute(stmt)
 
         activities = result.scalars().all()
 
-        # ================= EXECUTE COUNT QUERY =================
+        # =====================================================
+        # TOTAL COUNT
+        # =====================================================
 
         total_result = await db.execute(count_stmt)
 
-        total_count = total_result.scalar()
+        total_count = total_result.scalar() or 0
 
-        # ================= RESPONSE =================
+        # =====================================================
+        # RESPONSE
+        # =====================================================
 
         return {
             "success": True,
@@ -4555,11 +4968,14 @@ async def list_activities(
             "data": activities,
         }
 
-    # ================= HANDLE ERRORS =================
-
     except Exception as e:
 
-        print("LIST ACTIVITIES ERROR =>", str(e))
+        await db.rollback()
+
+        print(
+            "LIST ACTIVITIES ERROR =>",
+            str(e),
+        )
 
         raise HTTPException(
             status_code=500,
@@ -4610,6 +5026,20 @@ async def get_activity(
                 detail="Activity Not Found",
             )
 
+        # ================= REALTIME STATUS UPDATE =================
+
+        old_status = activity.status
+
+        update_activity_status(activity)
+
+        # ================= SAVE IF STATUS CHANGED =================
+
+        if old_status != activity.status:
+
+            await db.commit()
+
+            await db.refresh(activity)
+
         # ================= RESPONSE =================
 
         return {
@@ -4626,6 +5056,8 @@ async def get_activity(
     # ================= HANDLE UNKNOWN ERRORS =================
 
     except Exception as e:
+
+        await db.rollback()
 
         print("GET ACTIVITY ERROR =>", str(e))
 
@@ -4691,6 +5123,7 @@ async def update_activity(
             "activity_name": activity.activity_name,
             "planned_quantity": str(activity.planned_quantity),
             "status": activity.status.value,
+            "engineer_id": activity.engineer_id,
         }
 
         # ================= VALIDATE DATES =================
@@ -4751,13 +5184,51 @@ async def update_activity(
                 detail="Another activity with same name already exists",
             )
 
+        # ================= VALIDATE ENGINEER =================
+
+        if data.engineer_id is not None:
+
+            engineer = await db.get(
+                User,
+                data.engineer_id,
+            )
+
+            if not engineer:
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Engineer not found",
+                )
+
+            # ================= CHECK ENGINEER ASSIGNED TO PROJECT =================
+
+            member_stmt = select(ProjectMember).where(
+                ProjectMember.project_id == activity.project_id,
+                ProjectMember.user_id == data.engineer_id,
+            )
+
+            member_result = await db.execute(member_stmt)
+
+            member = member_result.scalar_one_or_none()
+
+            if not member:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Engineer is not assigned to this project",
+                )
+
         # ================= UPDATE FIELDS =================
 
         update_data = data.model_dump(exclude_unset=True)
 
         for key, value in update_data.items():
 
-            setattr(activity, key, value)
+            setattr(
+                activity,
+                key,
+                value,
+            )
 
         # ================= RECALCULATE VALUES =================
 
@@ -4798,9 +5269,10 @@ async def update_activity(
             "activity_name": activity.activity_name,
             "planned_quantity": str(activity.planned_quantity),
             "status": activity.status.value,
+            "engineer_id": activity.engineer_id,
         }
 
-        # ================= SAVE =================
+        # ================= AUDIT LOG =================
 
         await create_activity_log(
             db=db,
@@ -4810,6 +5282,8 @@ async def update_activity(
             old_value=old_data,
             new_value=new_data,
         )
+
+        # ================= SAVE =================
 
         await db.commit()
 
@@ -4830,26 +5304,32 @@ async def update_activity(
 
         raise
 
-    # ================= DB ERROR =================
+    # ================= HANDLE DB ERRORS =================
 
     except IntegrityError as e:
 
         await db.rollback()
 
-        print("INTEGRITY ERROR =>", str(e))
+        print(
+            "INTEGRITY ERROR =>",
+            str(e),
+        )
 
         raise HTTPException(
             status_code=400,
             detail="Database integrity error",
         )
 
-    # ================= INTERNAL SERVER ERROR =================
+    # ================= HANDLE OTHER ERRORS =================
 
     except Exception as e:
 
         await db.rollback()
 
-        print("UPDATE ACTIVITY ERROR =>", str(e))
+        print(
+            "UPDATE ACTIVITY ERROR =>",
+            str(e),
+        )
 
         raise HTTPException(
             status_code=500,
@@ -5034,7 +5514,32 @@ async def add_daily_progress(
                 detail="Activity Not Found",
             )
 
-        # ================= STORE OLD DATA FOR AUDIT =================
+        # ================= VALIDATE ENTRY DATE =================
+
+        if data.entry_date < activity.start_date:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Progress date cannot be before activity start date",
+            )
+
+        if activity.end_date and data.entry_date > activity.end_date:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Progress date cannot be after activity end date",
+            )
+
+        # ================= CHECK COMPLETED ACTIVITY =================
+
+        if activity.completion_percentage >= Decimal("100"):
+
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot add progress to completed activity",
+            )
+
+        # ================= STORE OLD DATA =================
 
         old_data = {
             "total_completed": str(activity.total_completed),
@@ -5042,7 +5547,7 @@ async def add_daily_progress(
             "status": activity.status.value,
         }
 
-        # ================= DECIMAL CONVERSIONS =================
+        # ================= DECIMAL VALUES =================
 
         current_completed = Decimal(str(activity.total_completed or 0))
 
@@ -5050,11 +5555,11 @@ async def add_daily_progress(
 
         planned_quantity = Decimal(str(activity.planned_quantity or 0))
 
-        # ================= CALCULATE PROGRESS =================
+        # ================= CALCULATE NEW COMPLETION =================
 
         new_completed = current_completed + today_progress
 
-        # ================= VALIDATE OVER PROGRESS =================
+        # ================= VALIDATE OVER COMPLETION =================
 
         if new_completed > planned_quantity:
 
@@ -5072,8 +5577,6 @@ async def add_daily_progress(
             remarks=data.remarks,
             created_by=current_user.id,
         )
-
-        # ================= ADD ENTRY =================
 
         db.add(entry)
 
@@ -5098,8 +5601,6 @@ async def add_daily_progress(
                 rounding=ROUND_HALF_UP,
             )
 
-            # ================= PREVENT ABOVE 100 =================
-
             activity.completion_percentage = min(
                 percentage,
                 Decimal("100.00"),
@@ -5109,11 +5610,11 @@ async def add_daily_progress(
 
             activity.completion_percentage = Decimal("0.00")
 
-        # ================= STATUS UPDATE =================
+        # ================= UPDATE STATUS =================
 
         update_activity_status(activity)
 
-        # ================= STORE NEW DATA FOR AUDIT =================
+        # ================= STORE NEW DATA =================
 
         new_data = {
             "total_completed": str(activity.total_completed),
@@ -5121,7 +5622,7 @@ async def add_daily_progress(
             "status": activity.status.value,
         }
 
-        # ================= CREATE AUDIT LOG =================
+        # ================= AUDIT LOG =================
 
         await create_activity_log(
             db=db,
@@ -5132,7 +5633,7 @@ async def add_daily_progress(
             new_value=new_data,
         )
 
-        # ================= SAVE TO DB =================
+        # ================= SAVE =================
 
         await db.commit()
 
@@ -5145,20 +5646,16 @@ async def add_daily_progress(
         # ================= RESPONSE =================
 
         return {
-            "message": "Progress Added",
+            "message": "Progress Added Successfully",
             "progress": entry,
             "activity": activity,
         }
-
-    # ================= HANDLE VALIDATION ERRORS =================
 
     except HTTPException:
 
         await db.rollback()
 
         raise
-
-    # ================= DUPLICATE ENTRY =================
 
     except IntegrityError as e:
 
@@ -5170,8 +5667,6 @@ async def add_daily_progress(
             status_code=400,
             detail="Progress entry already exists for this activity on this date",
         )
-
-    # ================= OTHER ERRORS =================
 
     except Exception as e:
 
@@ -5193,7 +5688,6 @@ async def add_daily_progress(
 async def list_daily_entries(
     activity_id: int | None = None,
     entry_date: date | None = None,
-    # ================= PAGINATION =================
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
@@ -5233,13 +5727,16 @@ async def list_daily_entries(
 
         # ================= ORDERING =================
 
-        stmt = stmt.order_by(DailyProgressEntry.entry_date.desc())
+        stmt = stmt.order_by(
+            DailyProgressEntry.entry_date.desc(),
+            DailyProgressEntry.id.desc(),
+        )
 
         # ================= PAGINATION =================
 
         stmt = stmt.offset(offset).limit(limit)
 
-        # ================= EXECUTE =================
+        # ================= EXECUTE QUERY =================
 
         result = await db.execute(stmt)
 
@@ -5249,11 +5746,12 @@ async def list_daily_entries(
 
         total_result = await db.execute(count_stmt)
 
-        total_count = total_result.scalar()
+        total_count = total_result.scalar() or 0
 
         # ================= RESPONSE =================
 
         return {
+            "success": True,
             "limit": limit,
             "offset": offset,
             "page_count": len(entries),
@@ -5261,13 +5759,9 @@ async def list_daily_entries(
             "data": entries,
         }
 
-    # ================= HANDLE VALIDATION ERRORS =================
-
     except HTTPException:
 
         raise
-
-    # ================= HANDLE OTHER ERRORS =================
 
     except Exception as e:
 
@@ -5711,17 +6205,61 @@ async def project_summary(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-
     try:
 
         # ================= VALIDATE PROJECT ID =================
 
         if project_id <= 0:
-
             raise HTTPException(
                 status_code=400,
                 detail="Invalid project ID",
             )
+
+        # ================= CHECK PROJECT EXISTS =================
+
+        project = await db.get(Project, project_id)
+
+        if not project:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found",
+            )
+
+        # ================= LOAD ONLY REQUIRED COLUMNS =================
+
+        activity_result = await db.execute(
+            select(
+                WorkActivity.id,
+                WorkActivity.end_date,
+                WorkActivity.completion_percentage,
+                WorkActivity.status,
+            ).where(WorkActivity.project_id == project_id)
+        )
+
+        activities = activity_result.all()
+
+        status_changed = False
+
+        # ================= REALTIME STATUS UPDATE =================
+
+        for activity_row in activities:
+
+            activity_id = activity_row.id
+
+            activity = await db.get(
+                WorkActivity,
+                activity_id,
+            )
+
+            old_status = activity.status
+
+            update_activity_status(activity)
+
+            if old_status != activity.status:
+                status_changed = True
+
+        if status_changed:
+            await db.commit()
 
         # ================= TOTAL ACTIVITIES =================
 
@@ -5733,7 +6271,7 @@ async def project_summary(
 
         total_activities = total_result.scalar() or 0
 
-        # ================= COMPLETED ACTIVITIES =================
+        # ================= COMPLETED =================
 
         completed_result = await db.execute(
             select(func.count())
@@ -5746,7 +6284,7 @@ async def project_summary(
 
         completed = completed_result.scalar() or 0
 
-        # ================= DELAYED ACTIVITIES =================
+        # ================= DELAYED =================
 
         delayed_result = await db.execute(
             select(func.count())
@@ -5759,7 +6297,7 @@ async def project_summary(
 
         delayed = delayed_result.scalar() or 0
 
-        # ================= ON TRACK ACTIVITIES =================
+        # ================= ON TRACK =================
 
         on_track_result = await db.execute(
             select(func.count())
@@ -5772,7 +6310,7 @@ async def project_summary(
 
         on_track = on_track_result.scalar() or 0
 
-        # ================= NOT STARTED ACTIVITIES =================
+        # ================= NOT STARTED =================
 
         not_started_result = await db.execute(
             select(func.count())
@@ -5785,7 +6323,7 @@ async def project_summary(
 
         not_started = not_started_result.scalar() or 0
 
-        # ================= COMPLETION PERCENTAGE =================
+        # ================= COMPLETION % =================
 
         completion_percentage = Decimal("0.00")
 
@@ -5810,15 +6348,12 @@ async def project_summary(
             "completion_percentage": completion_percentage,
         }
 
-    # ================= HANDLE VALIDATION ERRORS =================
-
     except HTTPException:
-
         raise
 
-    # ================= HANDLE OTHER ERRORS =================
-
     except Exception as e:
+
+        await db.rollback()
 
         print("PROJECT SUMMARY ERROR =>", str(e))
 
@@ -5834,7 +6369,7 @@ async def project_summary(
 
 @work_progress_router.get("/delay-report")
 async def delay_report(
-    # ================= PAGINATION =================
+    project_id: int | None = None,
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
@@ -5842,6 +6377,51 @@ async def delay_report(
 ):
 
     try:
+
+        # ================= VALIDATE PROJECT =================
+
+        if project_id is not None:
+
+            project = await db.get(Project, project_id)
+
+            if not project:
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Project not found",
+                )
+
+        # ================= REFRESH NON-COMPLETED ACTIVITY STATUS =================
+
+        activity_stmt = select(WorkActivity).where(
+            WorkActivity.status != WorkActivityStatus.COMPLETED
+        )
+
+        if project_id is not None:
+
+            activity_stmt = activity_stmt.where(WorkActivity.project_id == project_id)
+
+        activity_result = await db.execute(activity_stmt)
+
+        all_activities = activity_result.scalars().all()
+
+        status_changed = False
+
+        for activity in all_activities:
+
+            old_status = activity.status
+
+            update_activity_status(activity)
+
+            if old_status != activity.status:
+
+                status_changed = True
+
+        # ================= SAVE STATUS CHANGES =================
+
+        if status_changed:
+
+            await db.commit()
 
         # ================= TOTAL COUNT QUERY =================
 
@@ -5853,21 +6433,29 @@ async def delay_report(
 
         # ================= MAIN QUERY =================
 
-        stmt = (
-            select(WorkActivity)
-            .where(WorkActivity.status == WorkActivityStatus.DELAY)
-            .order_by(WorkActivity.created_at.desc())
-            .offset(offset)
-            .limit(limit)
+        stmt = select(WorkActivity).where(
+            WorkActivity.status == WorkActivityStatus.DELAY
         )
 
-        # ================= EXECUTE MAIN QUERY =================
+        # ================= PROJECT FILTER =================
+
+        if project_id is not None:
+
+            count_stmt = count_stmt.where(WorkActivity.project_id == project_id)
+
+            stmt = stmt.where(WorkActivity.project_id == project_id)
+
+        # ================= PAGINATION + ORDERING =================
+
+        stmt = stmt.order_by(WorkActivity.created_at.desc()).offset(offset).limit(limit)
+
+        # ================= EXECUTE QUERY =================
 
         result = await db.execute(stmt)
 
         activities = result.scalars().all()
 
-        # ================= EXECUTE COUNT QUERY =================
+        # ================= TOTAL COUNT =================
 
         total_result = await db.execute(count_stmt)
 
@@ -5876,6 +6464,8 @@ async def delay_report(
         # ================= RESPONSE =================
 
         return {
+            "success": True,
+            "project_id": project_id,
             "limit": limit,
             "offset": offset,
             "page_count": len(activities),
@@ -5883,11 +6473,18 @@ async def delay_report(
             "data": activities,
         }
 
-    # ================= HANDLE ERRORS =================
+    except HTTPException:
+
+        raise
 
     except Exception as e:
 
-        print("DELAY REPORT ERROR =>", str(e))
+        await db.rollback()
+
+        print(
+            "DELAY REPORT ERROR =>",
+            str(e),
+        )
 
         raise HTTPException(
             status_code=500,
@@ -6068,6 +6665,820 @@ async def activity_history(
             detail="Something went wrong",
         )
 
+
+# 14.==================== WORK PROGRESS LOGS=================
+
+from datetime import date
+from sqlalchemy import select, func
+from fastapi import Depends, HTTPException, Query
+
+
+@work_progress_router.get("/logs")
+async def get_work_progress_logs(
+    activity_id: int | None = None,
+    changed_by: int | None = None,
+    action: str | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
+    limit: int = Query(
+        default=20,
+        ge=1,
+        le=100,
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+    ),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    try:
+
+        # =====================
+        # VALIDATIONS
+        # =====================
+
+        if activity_id is not None and activity_id <= 0:
+
+            raise HTTPException(status_code=400, detail="Invalid activity id")
+
+        if changed_by is not None and changed_by <= 0:
+
+            raise HTTPException(status_code=400, detail="Invalid user id")
+
+        if from_date and to_date and from_date > to_date:
+
+            raise HTTPException(
+                status_code=400, detail="From date cannot be greater than To date"
+            )
+
+        # =====================
+        # BASE QUERY
+        # =====================
+
+        stmt = select(ActivityHistory)
+
+        count_stmt = select(func.count()).select_from(ActivityHistory)
+
+        # =====================
+        # FILTER ACTIVITY
+        # =====================
+
+        if activity_id:
+
+            stmt = stmt.where(ActivityHistory.activity_id == activity_id)
+
+            count_stmt = count_stmt.where(ActivityHistory.activity_id == activity_id)
+
+        # =====================
+        # FILTER USER
+        # =====================
+
+        if changed_by:
+
+            stmt = stmt.where(ActivityHistory.changed_by == changed_by)
+
+            count_stmt = count_stmt.where(ActivityHistory.changed_by == changed_by)
+
+        # =====================
+        # FILTER ACTION
+        # =====================
+
+        if action:
+
+            stmt = stmt.where(ActivityHistory.action == action)
+
+            count_stmt = count_stmt.where(ActivityHistory.action == action)
+
+        # =====================
+        # DATE FILTER
+        # =====================
+
+        if from_date:
+
+            stmt = stmt.where(func.date(ActivityHistory.created_at) >= from_date)
+
+            count_stmt = count_stmt.where(
+                func.date(ActivityHistory.created_at) >= from_date
+            )
+
+        if to_date:
+
+            stmt = stmt.where(func.date(ActivityHistory.created_at) <= to_date)
+
+            count_stmt = count_stmt.where(
+                func.date(ActivityHistory.created_at) <= to_date
+            )
+
+        # =====================
+        # ORDERING
+        # =====================
+
+        stmt = stmt.order_by(ActivityHistory.created_at.desc())
+
+        # =====================
+        # PAGINATION
+        # =====================
+
+        stmt = stmt.offset(offset).limit(limit)
+
+        # =====================
+        # EXECUTE QUERY
+        # =====================
+
+        result = await db.execute(stmt)
+
+        logs = result.scalars().all()
+
+        # =====================
+        # TOTAL COUNT
+        # =====================
+
+        total_result = await db.execute(count_stmt)
+
+        total_count = total_result.scalar()
+
+        # =====================
+        # RESPONSE
+        # =====================
+
+        return {
+            "success": True,
+            "limit": limit,
+            "offset": offset,
+            "page_count": len(logs),
+            "total_count": total_count,
+            "data": logs,
+        }
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        print("WORK PROGRESS LOG ERROR =>", str(e))
+
+        raise HTTPException(status_code=500, detail="Something went wrong")
+
+
+# 15.======work progress pdf report ============
+
+import io
+from decimal import Decimal
+from datetime import datetime
+
+from fastapi import Depends, HTTPException
+from fastapi.responses import StreamingResponse
+
+from sqlalchemy import select
+
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table as PdfTable,
+    TableStyle,
+    PageBreak,
+)
+
+from reportlab.lib import colors as pdf_colors
+from reportlab.lib.styles import getSampleStyleSheet
+
+
+@work_progress_router.get("/reports/pdf")
+async def work_progress_pdf_report(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    try:
+
+        # ==================================
+        # VALIDATE PROJECT
+        # ==================================
+
+        if project_id <= 0:
+            raise HTTPException(status_code=400, detail="Invalid project id")
+
+        project_result = await db.execute(
+            select(Project).where(Project.id == project_id)
+        )
+
+        project = project_result.scalars().first()
+
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        # ==================================
+        # GET ACTIVITIES
+        # ==================================
+
+        activity_result = await db.execute(
+            select(WorkActivity)
+            .where(WorkActivity.project_id == project_id)
+            .order_by(WorkActivity.created_at.desc())
+        )
+
+        activities = activity_result.scalars().all()
+
+        # ==================================
+        # PDF BUFFER
+        # ==================================
+
+        buffer = io.BytesIO()
+
+        doc = SimpleDocTemplate(
+            buffer,
+            rightMargin=20,
+            leftMargin=20,
+            topMargin=20,
+            bottomMargin=20,
+        )
+
+        styles = getSampleStyleSheet()
+
+        elements = []
+
+        # ==================================
+        # PROJECT NAME SAFE
+        # ==================================
+
+        project_name = (
+            getattr(project, "project_name", None)
+            or getattr(project, "name", None)
+            or getattr(project, "title", None)
+            or f"Project-{project.id}"
+        )
+
+        # ==================================
+        # HEADER
+        # ==================================
+
+        elements.append(Paragraph("WORK PROGRESS REPORT", styles["Title"]))
+
+        elements.append(Spacer(1, 10))
+
+        elements.append(Paragraph(f"Project : {project_name}", styles["Heading2"]))
+
+        elements.append(Paragraph(f"Project ID : {project.id}", styles["Normal"]))
+
+        elements.append(
+            Paragraph(
+                f"Generated On : {datetime.now().strftime('%d-%m-%Y %H:%M')}",
+                styles["Normal"],
+            )
+        )
+
+        elements.append(Spacer(1, 20))
+
+        # ==================================
+        # TABLE HEADER
+        # ==================================
+
+        table_data = [["Activity", "Planned", "Completed", "Remaining", "%", "Status"]]
+
+        total_planned = Decimal("0")
+        total_completed = Decimal("0")
+
+        delayed_activities = []
+
+        # ==================================
+        # LOOP
+        # ==================================
+
+        for activity in activities:
+
+            planned_qty = Decimal(str(activity.planned_quantity or 0))
+
+            completed_qty = Decimal(str(activity.total_completed or 0))
+
+            remaining_qty = Decimal(str(activity.remaining_quantity or 0))
+
+            completion_pct = Decimal(str(activity.completion_percentage or 0))
+
+            status_value = (
+                activity.status.value
+                if hasattr(activity.status, "value")
+                else str(activity.status or "UNKNOWN")
+            )
+
+            total_planned += planned_qty
+            total_completed += completed_qty
+
+            table_data.append(
+                [
+                    str(activity.activity_name or ""),
+                    str(planned_qty),
+                    str(completed_qty),
+                    str(remaining_qty),
+                    str(completion_pct),
+                    status_value,
+                ]
+            )
+
+            if status_value == "DELAY":
+                delayed_activities.append(activity)
+
+        # ==================================
+        # MAIN TABLE
+        # ==================================
+
+        table = PdfTable(table_data)
+
+        table.setStyle(
+            TableStyle(
+                [
+                    (
+                        "BACKGROUND",
+                        (0, 0),
+                        (-1, 0),
+                        pdf_colors.HexColor("#1F4E78"),
+                    ),
+                    (
+                        "TEXTCOLOR",
+                        (0, 0),
+                        (-1, 0),
+                        pdf_colors.white,
+                    ),
+                    (
+                        "GRID",
+                        (0, 0),
+                        (-1, -1),
+                        1,
+                        pdf_colors.black,
+                    ),
+                    (
+                        "FONTNAME",
+                        (0, 0),
+                        (-1, 0),
+                        "Helvetica-Bold",
+                    ),
+                    (
+                        "FONTSIZE",
+                        (0, 0),
+                        (-1, -1),
+                        9,
+                    ),
+                ]
+            )
+        )
+
+        elements.append(table)
+
+        elements.append(Spacer(1, 20))
+
+        # ==================================
+        # SUMMARY
+        # ==================================
+
+        overall_completion = Decimal("0")
+
+        if total_planned > 0:
+
+            overall_completion = (total_completed / total_planned) * Decimal("100")
+
+        elements.append(Paragraph("PROJECT SUMMARY", styles["Heading2"]))
+
+        elements.append(
+            Paragraph(f"Total Activities : {len(activities)}", styles["Normal"])
+        )
+
+        elements.append(
+            Paragraph(f"Total Planned Quantity : {total_planned}", styles["Normal"])
+        )
+
+        elements.append(
+            Paragraph(f"Total Completed Quantity : {total_completed}", styles["Normal"])
+        )
+
+        elements.append(
+            Paragraph(
+                f"Overall Completion : {round(float(overall_completion),2)}%",
+                styles["Normal"],
+            )
+        )
+
+        # ==================================
+        # DELAY PAGE
+        # ==================================
+
+        elements.append(PageBreak())
+
+        elements.append(Paragraph("DELAYED ACTIVITIES", styles["Heading1"]))
+
+        delay_table = [
+            [
+                "Activity",
+                "End Date",
+                "Completion %",
+            ]
+        ]
+
+        for item in delayed_activities:
+
+            delay_table.append(
+                [
+                    str(item.activity_name),
+                    str(item.end_date),
+                    str(item.completion_percentage),
+                ]
+            )
+
+        if len(delay_table) > 1:
+
+            dt = PdfTable(delay_table)
+
+            dt.setStyle(
+                TableStyle(
+                    [
+                        (
+                            "BACKGROUND",
+                            (0, 0),
+                            (-1, 0),
+                            pdf_colors.lightgrey,
+                        ),
+                        (
+                            "GRID",
+                            (0, 0),
+                            (-1, -1),
+                            1,
+                            pdf_colors.black,
+                        ),
+                        (
+                            "FONTNAME",
+                            (0, 0),
+                            (-1, 0),
+                            "Helvetica-Bold",
+                        ),
+                    ]
+                )
+            )
+
+            elements.append(dt)
+
+        else:
+
+            elements.append(Paragraph("No delayed activities found.", styles["Normal"]))
+
+        # ==================================
+        # BUILD PDF
+        # ==================================
+
+        doc.build(elements)
+
+        buffer.seek(0)
+
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename=work_progress_{project_id}.pdf"
+            },
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        import traceback
+
+        traceback.print_exc()
+
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
+
+
+# 16. ===========work progress excel report========
+
+import io
+
+from fastapi import Depends, HTTPException
+from fastapi.responses import StreamingResponse
+
+from sqlalchemy import select
+
+from openpyxl import Workbook
+from openpyxl.styles import (
+    Font,
+    PatternFill,
+    Alignment,
+)
+
+from openpyxl.utils import get_column_letter
+
+
+@work_progress_router.get("/reports/excel")
+async def work_progress_excel_report(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    try:
+
+        # =====================================
+        # VALIDATE PROJECT
+        # =====================================
+
+        if project_id <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid project id",
+            )
+
+        # =====================================
+        # GET PROJECT
+        # =====================================
+
+        project_result = await db.execute(
+            select(Project).where(Project.id == project_id)
+        )
+
+        project = project_result.scalars().first()
+
+        if not project:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found",
+            )
+
+        # =====================================
+        # PROJECT NAME SAFE
+        # =====================================
+
+        project_name = (
+            getattr(project, "project_name", None)
+            or getattr(project, "name", None)
+            or getattr(project, "title", None)
+            or f"Project-{project.id}"
+        )
+
+        # =====================================
+        # GET ACTIVITIES
+        # =====================================
+
+        result = await db.execute(
+            select(WorkActivity)
+            .where(WorkActivity.project_id == project_id)
+            .order_by(WorkActivity.created_at.desc())
+        )
+
+        activities = result.scalars().all()
+
+        # =====================================
+        # WORKBOOK
+        # =====================================
+
+        wb = Workbook()
+
+        # =====================================
+        # SHEET 1 : ACTIVITIES
+        # =====================================
+
+        ws = wb.active
+        ws.title = "Activities"
+
+        headers = [
+            "Activity Name",
+            "Planned Qty",
+            "Completed Qty",
+            "Remaining Qty",
+            "Completion %",
+            "Status",
+            "Start Date",
+            "End Date",
+        ]
+
+        header_fill = PatternFill(
+            start_color="1F4E78",
+            end_color="1F4E78",
+            fill_type="solid",
+        )
+
+        header_font = Font(
+            bold=True,
+            color="FFFFFF",
+        )
+
+        for col_num, header in enumerate(headers, start=1):
+
+            cell = ws.cell(
+                row=1,
+                column=col_num,
+            )
+
+            cell.value = header
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+        row = 2
+
+        for activity in activities:
+
+            status_value = (
+                activity.status.value
+                if hasattr(activity.status, "value")
+                else str(activity.status or "")
+            )
+
+            ws.cell(
+                row=row,
+                column=1,
+            ).value = (
+                activity.activity_name or ""
+            )
+
+            ws.cell(
+                row=row,
+                column=2,
+            ).value = float(activity.planned_quantity or 0)
+
+            ws.cell(
+                row=row,
+                column=3,
+            ).value = float(activity.total_completed or 0)
+
+            ws.cell(
+                row=row,
+                column=4,
+            ).value = float(activity.remaining_quantity or 0)
+
+            ws.cell(
+                row=row,
+                column=5,
+            ).value = float(activity.completion_percentage or 0)
+
+            ws.cell(
+                row=row,
+                column=6,
+            ).value = status_value
+
+            ws.cell(
+                row=row,
+                column=7,
+            ).value = (
+                activity.start_date.strftime("%d-%m-%Y") if activity.start_date else ""
+            )
+
+            ws.cell(
+                row=row,
+                column=8,
+            ).value = (
+                activity.end_date.strftime("%d-%m-%Y") if activity.end_date else ""
+            )
+
+            row += 1
+
+        # =====================================
+        # SHEET 2 : SUMMARY
+        # =====================================
+
+        summary_sheet = wb.create_sheet(title="Summary")
+
+        total_activities = len(activities)
+
+        total_planned = sum(float(x.planned_quantity or 0) for x in activities)
+
+        total_completed = sum(float(x.total_completed or 0) for x in activities)
+
+        total_remaining = sum(float(x.remaining_quantity or 0) for x in activities)
+
+        total_delayed = len(
+            [
+                x
+                for x in activities
+                if (hasattr(x.status, "value") and x.status.value == "DELAY")
+            ]
+        )
+
+        completion_percentage = 0
+
+        if total_planned > 0:
+            completion_percentage = round(
+                (total_completed / total_planned) * 100,
+                2,
+            )
+
+        summary_sheet.append(["Project Name", project_name])
+
+        summary_sheet.append(["Project ID", project.id])
+
+        summary_sheet.append(["Total Activities", total_activities])
+
+        summary_sheet.append(["Total Planned Qty", total_planned])
+
+        summary_sheet.append(["Total Completed Qty", total_completed])
+
+        summary_sheet.append(["Total Remaining Qty", total_remaining])
+
+        summary_sheet.append(["Completion %", completion_percentage])
+
+        summary_sheet.append(["Delayed Activities", total_delayed])
+
+        # =====================================
+        # SHEET 3 : DELAY REPORT
+        # =====================================
+
+        delay_sheet = wb.create_sheet(title="Delayed Activities")
+
+        delay_sheet.append(
+            [
+                "Activity",
+                "End Date",
+                "Completion %",
+                "Status",
+            ]
+        )
+
+        for item in activities:
+
+            status_value = (
+                item.status.value
+                if hasattr(item.status, "value")
+                else str(item.status or "")
+            )
+
+            if status_value == "DELAY":
+
+                delay_sheet.append(
+                    [
+                        item.activity_name or "",
+                        (item.end_date.strftime("%d-%m-%Y") if item.end_date else ""),
+                        float(item.completion_percentage or 0),
+                        status_value,
+                    ]
+                )
+
+        # =====================================
+        # AUTO WIDTH ALL SHEETS
+        # =====================================
+
+        for sheet in wb.worksheets:
+
+            for column in sheet.columns:
+
+                max_length = 0
+
+                column_letter = get_column_letter(column[0].column)
+
+                for cell in column:
+
+                    try:
+
+                        if cell.value:
+
+                            max_length = max(
+                                max_length,
+                                len(str(cell.value)),
+                            )
+
+                    except Exception:
+                        pass
+
+                sheet.column_dimensions[column_letter].width = max_length + 5
+
+        # =====================================
+        # SAVE EXCEL
+        # =====================================
+
+        output = io.BytesIO()
+
+        wb.save(output)
+
+        output.seek(0)
+
+        # =====================================
+        # RESPONSE
+        # =====================================
+
+        return StreamingResponse(
+            output,
+            media_type=(
+                "application/vnd.openxmlformats-" "officedocument.spreadsheetml.sheet"
+            ),
+            headers={
+                "Content-Disposition": f"attachment; filename=work_progress_{project_id}.xlsx"
+            },
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        import traceback
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(e).__name__}: {str(e)}",
+        )
+
+
 # ===================== QC =====================
 
 from fastapi import Form, File, UploadFile, Depends, HTTPException
@@ -6125,6 +7536,7 @@ async def create_qc(
         file_url = await validate_and_save_qc_file(report_file)
 
     obj = m.QCRecord(**payload.model_dump(), report_file_url=file_url)
+    await assert_task_project(db, payload.task_id, payload.project_id)
 
     db.add(obj)
     await db.commit()
@@ -6208,6 +7620,7 @@ async def create_incident(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
+    await assert_task_project(db, data.task_id, data.project_id)
     obj = m.SafetyIncident(**data.dict())
     db.add(obj)
     await db.commit()
@@ -6383,6 +7796,8 @@ site_photo_router = APIRouter(prefix="/site-photos", tags=["Site Photos"])
 @site_photo_router.post("/upload", response_model=s.SitePhotoOut)
 async def upload_photo(
     project_id: int = Form(...),
+    task_id: Optional[int] = Form(None),
+    dsr_id: Optional[int] = Form(None),
     file: UploadFile = File(...),
     date: Optional[date] = Form(None),
     activity_tag: Optional[str] = Form(None),
@@ -6392,6 +7807,7 @@ async def upload_photo(
     db: AsyncSession = Depends(get_db_session),
 ):
     #  Validate file type
+    await assert_task_project(db, task_id, project_id)
     ext = file.filename.split(".")[-1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, "Invalid file type")
@@ -6416,6 +7832,8 @@ async def upload_photo(
 
     obj = m.SitePhoto(
         project_id=project_id,
+        task_id=task_id,
+        dsr_id=dsr_id,
         photo_url=file_url,
         date=date,
         activity_tag=activity_tag,
@@ -6486,18 +7904,13 @@ async def delete_photo(
 
 # ===================== Drawings & Documents =====================
 
-drawing_router = APIRouter(
-    prefix="/drawings",
-    tags=["Drawings & Documents"]
-)
+drawing_router = APIRouter(prefix="/drawings", tags=["Drawings & Documents"])
 
 
 # ===================== Upload =====================
 
-@drawing_router.post(
-    "/upload",
-    response_model=s.DrawingOut
-)
+
+@drawing_router.post("/upload", response_model=s.DrawingOut)
 async def upload_drawing(
     project_id: int = Form(...),
     drawing_name: str = Form(...),
@@ -6505,9 +7918,7 @@ async def upload_drawing(
     date: Optional[date] = Form(None),
     remarks: Optional[str] = Form(None),
     file: UploadFile = File(...),
-    current_user: User = Depends(
-        require_roles(DRAWING_WRITE_ROLES)
-    ),
+    current_user: User = Depends(require_roles(DRAWING_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     os.makedirs("uploads/drawings", exist_ok=True)
@@ -6519,10 +7930,7 @@ async def upload_drawing(
     content = await file.read()
 
     if len(content) > MAX_DRAWING_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail="Drawing size cannot exceed 20 MB"
-        )
+        raise HTTPException(status_code=400, detail="Drawing size cannot exceed 20 MB")
 
     await file.seek(0)
 
@@ -6543,9 +7951,7 @@ async def upload_drawing(
                 m.DrawingDocument.drawing_name == drawing_name,
                 m.DrawingDocument.is_latest_version == True,
             )
-            .values(
-                is_latest_version=False
-            )
+            .values(is_latest_version=False)
         )
 
         # ================= SAVE FILE =================
@@ -6556,10 +7962,7 @@ async def upload_drawing(
         # ================= GET NEXT REVISION =================
 
         latest_revision = await db.scalar(
-            select(
-                func.max(m.DrawingDocument.revision_no)
-            )
-            .where(
+            select(func.max(m.DrawingDocument.revision_no)).where(
                 m.DrawingDocument.project_id == project_id,
                 m.DrawingDocument.drawing_name == drawing_name,
             )
@@ -6576,11 +7979,8 @@ async def upload_drawing(
             file_url=file_path,
             date=date,
             remarks=remarks,
-
             approval_status=DocumentStatus.UNDER_REVIEW,
-
             revision_no=next_revision,
-
             is_latest_version=True,
         )
 
@@ -6624,22 +8024,15 @@ async def upload_drawing(
 
 # ===================== Update =====================
 
-@drawing_router.put(
-    "/{id}",
-    response_model=s.DrawingOut
-)
+
+@drawing_router.put("/{id}", response_model=s.DrawingOut)
 async def update_drawing(
     id: int,
     payload: s.DrawingUpdate,
-    current_user: User = Depends(
-        require_roles(DRAWING_WRITE_ROLES)
-    ),
+    current_user: User = Depends(require_roles(DRAWING_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(
-        m.DrawingDocument,
-        id
-    )
+    obj = await db.get(m.DrawingDocument, id)
 
     if not obj:
         raise NotFoundError("Drawing not found")
@@ -6647,13 +8040,9 @@ async def update_drawing(
     # ================= LOCK APPROVED DRAWINGS =================
 
     if obj.approval_status == DocumentStatus.APPROVED:
-        raise ValidationError(
-            "Approved drawing cannot be edited. Create new revision."
-        )
+        raise ValidationError("Approved drawing cannot be edited. Create new revision.")
 
-    update_data = payload.model_dump(
-        exclude_unset=True
-    )
+    update_data = payload.model_dump(exclude_unset=True)
 
     for field, value in update_data.items():
         setattr(obj, field, value)
@@ -6667,18 +8056,14 @@ async def update_drawing(
 
 # ===================== Approval History =====================
 
+
 @drawing_router.get("/{id}/approval-history")
 async def get_drawing_approval_history(
     id: int,
-    current_user: User = Depends(
-        require_roles(DRAWING_READ_ROLES)
-    ),
+    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    drawing = await db.get(
-        m.DrawingDocument,
-        id
-    )
+    drawing = await db.get(m.DrawingDocument, id)
 
     if not drawing:
         raise NotFoundError("Drawing not found")
@@ -6689,9 +8074,7 @@ async def get_drawing_approval_history(
             Approval.entity_type == "drawing",
             Approval.entity_id == id,
         )
-        .order_by(
-            Approval.id.desc()
-        )
+        .order_by(Approval.id.desc())
     )
 
     approvals = result.scalars().all()
@@ -6714,24 +8097,18 @@ async def get_drawing_approval_history(
 
 # ===================== Version History =====================
 
-@drawing_router.get(
-    "/{project_id}/versions",
-    response_model=list[s.DrawingOut]
-)
+
+@drawing_router.get("/{project_id}/versions", response_model=list[s.DrawingOut])
 async def get_versions(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(
-        require_roles(DRAWING_READ_ROLES)
-    ),
+    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
     skip: int = 0,
     limit: int = 50,
 ):
     result = await db.execute(
         select(m.DrawingDocument)
-        .where(
-            m.DrawingDocument.project_id == project_id
-        )
+        .where(m.DrawingDocument.project_id == project_id)
         .order_by(
             m.DrawingDocument.drawing_name.asc(),
             m.DrawingDocument.revision_no.desc(),
@@ -6748,16 +8125,12 @@ async def get_versions(
 
 # ===================== Latest =====================
 
-@drawing_router.get(
-    "/{project_id}/latest",
-    response_model=list[s.DrawingOut]
-)
+
+@drawing_router.get("/{project_id}/latest", response_model=list[s.DrawingOut])
 async def get_latest(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(
-        require_roles(DRAWING_READ_ROLES)
-    ),
+    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
 ):
     result = await db.execute(
         select(m.DrawingDocument)
@@ -6774,28 +8147,21 @@ async def get_latest(
     drawings = result.scalars().all()
 
     if not drawings:
-        raise HTTPException(
-            status_code=404,
-            detail="No drawings found"
-        )
+        raise HTTPException(status_code=404, detail="No drawings found")
 
     return drawings
 
 
 # ===================== Delete =====================
 
+
 @drawing_router.delete("/{id}")
 async def delete_drawing(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(
-        require_roles(DRAWING_DELETE_ROLES)
-    ),
+    current_user: User = Depends(require_roles(DRAWING_DELETE_ROLES)),
 ):
-    obj = await db.get(
-        m.DrawingDocument,
-        id
-    )
+    obj = await db.get(m.DrawingDocument, id)
 
     if not obj:
         raise NotFoundError("Drawing not found")
@@ -6814,25 +8180,19 @@ async def delete_drawing(
 
     await db.commit()
 
-    return {
-        "message": "Deleted"
-    }
+    return {"message": "Deleted"}
 
 
 # ===================== Download =====================
+
 
 @drawing_router.get("/documents/download/{id}")
 async def download_document(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(
-        require_roles(DRAWING_READ_ROLES)
-    ),
+    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
 ):
-    doc = await db.get(
-        m.DrawingDocument,
-        id
-    )
+    doc = await db.get(m.DrawingDocument, id)
 
     if not doc:
         raise NotFoundError("Document not found")
@@ -6849,18 +8209,14 @@ async def download_document(
 
 # ===================== View =====================
 
+
 @drawing_router.get("/documents/view/{id}")
 async def view_document(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(
-        require_roles(DRAWING_READ_ROLES)
-    ),
+    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
 ):
-    doc = await db.get(
-        m.DrawingDocument,
-        id
-    )
+    doc = await db.get(m.DrawingDocument, id)
 
     if not doc:
         raise NotFoundError("Document not found")
@@ -6868,18 +8224,15 @@ async def view_document(
     if not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
-    media_type, _ = mimetypes.guess_type(
-        doc.file_url
-    )
+    media_type, _ = mimetypes.guess_type(doc.file_url)
 
     return FileResponse(
         path=doc.file_url,
         filename=os.path.basename(doc.file_url),
         media_type=media_type or "application/octet-stream",
-        headers={
-            "Content-Disposition": "inline"
-        },
+        headers={"Content-Disposition": "inline"},
     )
+
 
 # ===================== Site Requests =====================
 
@@ -6952,6 +8305,7 @@ communication_router = APIRouter(prefix="/communication", tags=["Communication"]
 
 # ===================== 1. SEND MESSAGE =====================
 
+
 @communication_router.post("/{project_id}/messages")
 async def send_message(
     request: Request,
@@ -6967,15 +8321,12 @@ async def send_message(
     if payload.parent_id:
         parent = await db.get(Message, payload.parent_id)
         if not parent:
-            raise HTTPException(
-                status_code=400,
-                detail="Parent message not found"
-            )
+            raise HTTPException(status_code=400, detail="Parent message not found")
 
     obj = Message(
         project_id=project_id,
         message=payload.message,
-        parent_id=parent.id if parent else None,   #  FIXED
+        parent_id=parent.id if parent else None,  #  FIXED
         attachment_url=payload.attachment_url,
         created_by=current_user.id,
         status=MessageStatus.SENT,
@@ -6994,7 +8345,7 @@ async def send_message(
                 {
                     "id": obj.id,
                     "message": obj.message,
-                    "parent_id": obj.parent_id,   # added (helpful)
+                    "parent_id": obj.parent_id,  # added (helpful)
                     "user": current_user.id,
                     "created_at": obj.created_at.isoformat(),
                     "status": obj.status.value,
@@ -7007,6 +8358,7 @@ async def send_message(
 
 
 # ===================== 2. GET MESSAGES =====================
+
 
 @communication_router.get("/{project_id}/messages")
 async def get_messages(
@@ -7030,6 +8382,7 @@ async def get_messages(
 
 
 # ===================== 3. GET REPLIES =====================
+
 
 @communication_router.get("/messages/{message_id}/replies")
 async def get_replies(
@@ -7056,6 +8409,7 @@ async def get_replies(
 
 
 # ===================== 4. MARK AS READ =====================
+
 
 @communication_router.put("/messages/{id}/read")
 async def mark_read(
@@ -7096,6 +8450,7 @@ async def mark_read(
 
 # ===================== 5. MARK AS DELIVERED =====================
 
+
 @communication_router.put("/messages/{id}/delivered")
 async def mark_delivered(
     request: Request,
@@ -7135,6 +8490,7 @@ async def mark_delivered(
 
 # ===================== 6. UNREAD COUNT =====================
 
+
 @communication_router.get("/{project_id}/messages/unread-count")
 async def unread_count(
     project_id: int,
@@ -7154,6 +8510,7 @@ async def unread_count(
 
 # ===================== 7. DELETE MESSAGE =====================
 
+
 @communication_router.delete("/messages/{id}")
 async def delete_message(
     id: int,
@@ -7172,9 +8529,7 @@ async def delete_message(
     if obj.created_by != current_user.id:
         raise ValidationError("Not allowed")
 
-    result = await db.execute(
-        select(Message).where(Message.parent_id == id)
-    )
+    result = await db.execute(select(Message).where(Message.parent_id == id))
     child = result.scalars().first()
 
     if child:
@@ -7188,6 +8543,7 @@ async def delete_message(
 
 # ===================== 8. UPDATE MESSAGE =====================
 
+
 @communication_router.put("/messages/{id}")
 async def update_message(
     id: int,
@@ -7195,7 +8551,7 @@ async def update_message(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(Message, id) 
+    obj = await db.get(Message, id)
 
     if not obj:
         raise NotFoundError("Message not found")

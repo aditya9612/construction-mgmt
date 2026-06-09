@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import List, Optional, Union
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import Annotated
 from app.core.enums import (
     ChecklistStatus,
@@ -12,6 +12,7 @@ from app.core.enums import (
     IssuePriority,
     IssueStatus,
     MilestoneStatus,
+    OTPolicyType,
     ProjectStatus,
     QCStatus,
     SafetyChecklistStatus,
@@ -27,7 +28,16 @@ from app.core.enums import (
 from app.schemas.base import BaseSchema
 from pydantic_core.core_schema import ValidationInfo
 from datetime import date as dt_date
-from app.core.validators import validate_activity_name, validate_non_empty_string, validate_progress_date, validate_progress_remarks, validate_start_end_dates, validate_unit, validate_work_activity_date
+from app.core.validators import (
+    validate_activity_name,
+    validate_non_empty_string,
+    validate_progress_date,
+    validate_progress_remarks,
+    validate_start_end_dates,
+    validate_unit,
+    validate_work_activity_date,
+)
+from pydantic import Field
 
 # ===================== PROJECT =====================
 
@@ -57,10 +67,7 @@ class ProjectCreate(BaseSchema):
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        return validate_start_end_dates(
-            info.data.get("start_date"),
-            v
-        )
+        return validate_start_end_dates(info.data.get("start_date"), v)
 
 
 class ProjectUpdate(BaseSchema):
@@ -87,10 +94,7 @@ class ProjectUpdate(BaseSchema):
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        return validate_start_end_dates(
-            info.data.get("start_date"),
-            v
-        )
+        return validate_start_end_dates(info.data.get("start_date"), v)
 
 
 class ProjectOut(BaseSchema):
@@ -103,6 +107,11 @@ class ProjectOut(BaseSchema):
     end_date: Optional[date]
     status: str
     completion_percentage: float = 0.0
+    execution_completion_percentage: float = 0.0
+    total_milestones: int = 0
+    total_tasks: int = 0
+    completed_tasks: int = 0
+    delayed_tasks: int = 0
 
     type: Optional[str] = None
     location_type: Optional[str] = None
@@ -152,10 +161,7 @@ class MilestoneCreate(BaseSchema):
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        return validate_start_end_dates(
-            info.data.get("start_date"),
-            v
-        )
+        return validate_start_end_dates(info.data.get("start_date"), v)
 
 
 class MilestoneUpdate(BaseSchema):
@@ -168,10 +174,7 @@ class MilestoneUpdate(BaseSchema):
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        return validate_start_end_dates(
-            info.data.get("start_date"),
-            v
-        )
+        return validate_start_end_dates(info.data.get("start_date"), v)
 
 
 class MilestoneOut(BaseSchema):
@@ -181,7 +184,16 @@ class MilestoneOut(BaseSchema):
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    actual_start_date: Optional[date] = None
+    actual_end_date: Optional[date] = None
     status: MilestoneStatus
+    total_tasks: int = 0
+    completed_tasks: int = 0
+    pending_tasks: int = 0
+    delayed_tasks: int = 0
+    is_delayed: bool = False
+    completion_percentage: float = 0.0
+    execution_completion_percentage: float = 0.0
 
 
 # ===================== TASK =====================
@@ -196,14 +208,13 @@ class TaskCreate(BaseSchema):
     end_date: Optional[date] = None
     assigned_user_ids: Optional[list[int]] = None
     activity_type_id: Optional[int] = None
+    milestone_id: Optional[int] = None
+    boq_id: Optional[int] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        return validate_start_end_dates(
-            info.data.get("start_date"),
-            v
-        )
+        return validate_start_end_dates(info.data.get("start_date"), v)
 
 
 class TaskUpdate(BaseSchema):
@@ -212,19 +223,23 @@ class TaskUpdate(BaseSchema):
     priority: Optional[Union[int, TaskPriority]] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+
     assigned_user_id: Optional[int] = None
+
+    activity_type_id: Optional[int] = None
+    milestone_id: Optional[int] = None
+    boq_id: Optional[int] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        return validate_start_end_dates(
-            info.data.get("start_date"),
-            v
-        )
+        return validate_start_end_dates(info.data.get("start_date"), v)
+
 
 class TaskOut(BaseSchema):
     id: int
     project_id: int
+    milestone_id: Optional[int] = None
     boq_id: Optional[int] = None
     title: str
     description: Optional[str] = None
@@ -232,10 +247,16 @@ class TaskOut(BaseSchema):
     status: TaskStatus
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    actual_start_date: Optional[date] = None
+    actual_end_date: Optional[date] = None
     created_by_user_id: int
     assigned_user_id: Optional[int]
     completion_percentage: float
     is_delayed: bool
+    execution_duration: int = 0
+    delay_days: int = 0
+    actual_cost: float = 0.0
+    planned_cost: float = 0.0
 
 
 class TaskProgressUpdate(BaseSchema):
@@ -279,7 +300,9 @@ class CommentOut(BaseSchema):
 
 class DSRBase(BaseSchema):
     project_id: int
+    task_id: Optional[int] = None
     report_date: date
+    # report_date: date = Field(default_factory=date.today)
 
     site_location: Optional[str] = None
 
@@ -529,6 +552,7 @@ class QCOut(QCCreate):
 
 class SafetyCreate(BaseSchema):
     project_id: int
+    task_id: Optional[int] = None
     date: date
     safety_checklist_status: SafetyChecklistStatus
     ppe_compliance: bool = True
@@ -543,14 +567,12 @@ class SafetyCreate(BaseSchema):
         if not v.strip():
             raise ValueError("Field cannot be empty")
         return v
-    
+
     @field_validator("date")
     def validate_date(cls, v):
 
         if v > date.today():
-            raise ValueError(
-                "Future date not allowed"
-            )
+            raise ValueError("Future date not allowed")
 
         return v
 
@@ -608,6 +630,7 @@ class ChecklistLogOut(BaseModel):
 class SitePhotoCreate(BaseSchema):
     project_id: int
     task_id: Optional[int] = None
+    dsr_id: Optional[int] = None
     date: Optional[dt_date] = None
     activity_tag: Optional[str] = None
     location_tag: Optional[str] = None
@@ -654,6 +677,7 @@ class DrawingOut(DrawingCreate):
 
     class Config:
         from_attributes = True
+
 
 # ===================== CREATE =====================
 
@@ -716,7 +740,10 @@ class WorkActivityCreate(BaseSchema):
         gt=0,
     )
 
-    activity_name: str
+    activity_name: str = Field(
+        min_length=1,
+        max_length=255,
+    )
 
     planned_quantity: Decimal = Field(
         gt=0,
@@ -724,7 +751,10 @@ class WorkActivityCreate(BaseSchema):
         decimal_places=2,
     )
 
-    unit: str
+    unit: str = Field(
+        min_length=1,
+        max_length=50,
+    )
 
     start_date: date
 
@@ -732,7 +762,10 @@ class WorkActivityCreate(BaseSchema):
 
     work_order_id: int = Field(gt=0)
 
-    engineer_id: int = Field(gt=0)
+    engineer_id: Optional[int] = Field(
+        default=None,
+        gt=0,
+    )
 
     # ================= ACTIVITY NAME =================
 
@@ -787,6 +820,11 @@ class WorkActivityUpdate(BaseSchema):
 
     end_date: Optional[date] = None
 
+    engineer_id: Optional[int] = Field(
+        default=None,
+        gt=0,
+    )
+
     # ================= ACTIVITY NAME =================
 
     @field_validator("activity_name")
@@ -832,9 +870,14 @@ class WorkActivityResponse(BaseSchema):
 
     project_id: int
 
+    work_order_id: int
+
     boq_code: Optional[int] = None
 
-    activity_name: str
+    activity_name: str = Field(
+        min_length=1,
+        max_length=255,
+    )
 
     planned_quantity: Decimal
 
@@ -844,7 +887,10 @@ class WorkActivityResponse(BaseSchema):
 
     completion_percentage: Decimal
 
-    unit: str
+    unit: str = Field(
+        min_length=1,
+        max_length=50,
+    )
 
     start_date: date
 
@@ -852,7 +898,11 @@ class WorkActivityResponse(BaseSchema):
 
     status: WorkActivityStatus
 
-    engineer_id: int
+    engineer_id: Optional[int] = None
+
+    discipline: Optional[str] = None
+
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -896,8 +946,6 @@ class DailyProgressCreate(BaseSchema):
 
 # =========================================================
 # DAILY PROGRESS UPDATE
-
-
 class DailyProgressUpdate(BaseSchema):
 
     today_progress: Optional[Decimal] = Field(
@@ -920,9 +968,8 @@ class DailyProgressUpdate(BaseSchema):
         return validate_progress_remarks(v)
 
 
+# =========================================================
 # DAILY PROGRESS RESPONSE
-
-
 class DailyProgressResponse(BaseSchema):
 
     id: int
@@ -935,15 +982,16 @@ class DailyProgressResponse(BaseSchema):
 
     remarks: Optional[str] = None
 
-    created_by: int
+    created_by: Optional[int] = None
+
+    created_at: datetime
 
     class Config:
         from_attributes = True
 
 
+# =========================================================
 # DAILY PROGRESS WITH ACTIVITY RESPONSE
-
-
 class DailyProgressWithActivityResponse(BaseSchema):
 
     message: str
@@ -956,6 +1004,7 @@ class DailyProgressWithActivityResponse(BaseSchema):
         from_attributes = True
 
 
+# =========================================================
 # PROJECTS MODULE SUMMARY
 
 
@@ -1008,3 +1057,39 @@ class ProjectsModuleResponse(BaseSchema):
     summary: ProjectsModuleSummary
 
     activities: List[ProjectActivityItem]
+
+
+# =======================PROJECTS ot-policy==================================
+
+
+class ProjectOTPolicyCreate(BaseModel):
+
+    policy_type: OTPolicyType
+
+    normal_day_multiplier: Optional[Decimal] = Decimal("1.5")
+
+    sunday_multiplier: Optional[Decimal] = Decimal("2.0")
+
+    holiday_multiplier: Optional[Decimal] = Decimal("3.0")
+
+    fixed_ot_rate: Optional[Decimal] = None
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+
+        if self.policy_type == OTPolicyType.FIXED_RATE and self.fixed_ot_rate is None:
+            raise ValueError("fixed_ot_rate required for FixedRate policy")
+
+        return self
+
+
+class ProjectOTPolicyOut(ProjectOTPolicyCreate):
+
+    id: int
+
+    project_id: int
+
+    class Config:
+        from_attributes = True
+
+        json_encoders = {Decimal: float}

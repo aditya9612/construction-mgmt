@@ -23,6 +23,13 @@ class RABill(Base, TimestampMixin):
         index=True,
     )
 
+    measurement_id = Column(
+        Integer,
+        ForeignKey("final_measurements.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     bill_number = Column(String(100), nullable=False, unique=True, index=True)
 
     work_description = Column(String(255), nullable=False)

@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -6,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.enums import OwnerTransactionType
 from app.db.session import get_db_session
 from app.models.owner import Owner, OwnerTransaction, OwnerPaymentSchedule
 from app.models.project import Project
@@ -25,7 +27,7 @@ from app.schemas.owner import (
 )
 from app.utils.helpers import NotFoundError, ValidationError
 from fastapi.responses import StreamingResponse
-from io import BytesIO , StringIO
+from io import BytesIO, StringIO
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -105,14 +107,15 @@ async def get_client_portfolio(
     owners = owners_result.scalars().all()
 
     portfolio_items = []
-    total_outstanding = 0.0
+    total_outstanding = Decimal("0")
 
     for owner in owners:
 
         # 2. Get project stats for this owner
         project_stats = await db.execute(
-            select(func.count(Project.id), func.max(Project.project_name))
-            .where(Project.owner_id == owner.id)
+            select(func.count(Project.id), func.max(Project.project_name)).where(
+                Project.owner_id == owner.id
+            )
         )
 
         total_projects, latest_project = project_stats.one()
@@ -120,16 +123,14 @@ async def get_client_portfolio(
         # 3. Get financial stats for this owner
         financial_stats = await db.execute(
             select(
-                func.sum(Invoice.pending_amount),
-                func.sum(Invoice.paid_amount)
-            )
-            .where(Invoice.owner_id == owner.id)
+                func.sum(Invoice.pending_amount), func.sum(Invoice.paid_amount)
+            ).where(Invoice.owner_id == owner.id)
         )
 
         pending_billing, total_received = financial_stats.one()
 
-        pending_val = float(pending_billing or 0)
-        received_val = float(total_received or 0)
+        pending_val = Decimal(pending_billing or 0)
+        received_val = Decimal(total_received or 0)
 
         total_outstanding += pending_val
 
@@ -139,10 +140,8 @@ async def get_client_portfolio(
 
         # delayed projects penalty
         delayed_projects = await db.scalar(
-            select(func.count(Project.id))
-            .where(
-                Project.owner_id == owner.id,
-                Project.status == "Delayed"
+            select(func.count(Project.id)).where(
+                Project.owner_id == owner.id, Project.status == "Delayed"
             )
         )
 
@@ -150,11 +149,10 @@ async def get_client_portfolio(
 
         # overdue payment milestones penalty
         overdue_payments = await db.scalar(
-            select(func.count(OwnerPaymentSchedule.id))
-            .where(
+            select(func.count(OwnerPaymentSchedule.id)).where(
                 OwnerPaymentSchedule.owner_id == owner.id,
                 OwnerPaymentSchedule.status != "Paid",
-                OwnerPaymentSchedule.due_date < date.today()
+                OwnerPaymentSchedule.due_date < date.today(),
             )
         )
 
@@ -162,10 +160,8 @@ async def get_client_portfolio(
 
         # completed projects bonus
         completed_projects = await db.scalar(
-            select(func.count(Project.id))
-            .where(
-                Project.owner_id == owner.id,
-                Project.status == "Completed"
+            select(func.count(Project.id)).where(
+                Project.owner_id == owner.id, Project.status == "Completed"
             )
         )
 
@@ -193,16 +189,15 @@ async def get_client_portfolio(
                 pending_billing=pending_val,
                 total_received=received_val,
                 satisfaction_score=score,
-                status="ACTIVE" if total_projects and total_projects > 0 else "INACTIVE",
+                status=(
+                    "ACTIVE" if total_projects and total_projects > 0 else "INACTIVE"
+                ),
             )
         )
 
     # 4. Calculate Average Satisfaction
     total_score = sum(item.satisfaction_score for item in portfolio_items)
-    avg_satisfaction = (
-        total_score / len(portfolio_items)
-        if portfolio_items else 0.0
-    )
+    avg_satisfaction = total_score / len(portfolio_items) if portfolio_items else 0.0
 
     summary = ClientPortfolioSummary(
         total_clients=len(owners),
@@ -216,6 +211,7 @@ async def get_client_portfolio(
 # =========================
 # PAYMENT TRACKER (NEW)
 # =========================
+
 
 @router.get("/payment-tracker", response_model=list[OwnerPaymentScheduleOut])
 async def get_all_payments_tracker(
@@ -237,10 +233,10 @@ async def get_all_payments_tracker(
         query = query.where(OwnerPaymentSchedule.status == status)
 
     query = query.order_by(OwnerPaymentSchedule.due_date.asc())
-    
+
     result = await db.execute(query)
     rows = result.scalars().all()
-    
+
     return [OwnerPaymentScheduleOut.model_validate(r) for r in rows]
 
 
@@ -318,9 +314,24 @@ async def delete_owner(
         logger.warning(f"Owner not found id={owner_id}")
         raise NotFoundError("Owner not found")
 
+    # Prevent deletion if projects are linked
+    project_count = await db.scalar(
+        select(func.count(Project.id)).where(Project.owner_id == owner_id)
+    )
+
+    if project_count > 0:
+        logger.warning(
+            f"Owner delete blocked id={owner_id}, linked_projects={project_count}"
+        )
+
+        raise ValidationError(
+            f"Owner cannot be deleted because {project_count} project(s) are assigned to this owner. Reassign or delete the projects first."
+        )
+
     try:
         await db.delete(obj)
         await db.flush()
+
     except Exception:
         await db.rollback()
         logger.exception(f"Owner delete failed id={owner_id}")
@@ -362,8 +373,17 @@ async def get_owner_ledger(
     )
     transactions = result.scalars().all()
 
-    total_credit = sum(float(t.amount) for t in transactions if t.type == "credit")
-    total_debit = sum(float(t.amount) for t in transactions if t.type == "debit")
+    total_credit = sum(
+        (t.amount or Decimal("0"))
+        for t in transactions
+        if t.type == OwnerTransactionType.CREDIT.value
+    )
+
+    total_debit = sum(
+        (t.amount or Decimal("0"))
+        for t in transactions
+        if t.type == OwnerTransactionType.DEBIT.value
+    )
 
     return OwnerLedgerResponse(
         total_credit=total_credit,
@@ -393,8 +413,17 @@ async def export_owner_ledger_pdf(
         )
         transactions = result.scalars().all()
 
-        total_credit = sum(float(t.amount) for t in transactions if t.type == "credit")
-        total_debit = sum(float(t.amount) for t in transactions if t.type == "debit")
+        total_credit = sum(
+            (t.amount or Decimal("0"))
+            for t in transactions
+            if t.type == OwnerTransactionType.CREDIT.value
+        )
+
+        total_debit = sum(
+            (t.amount or Decimal("0"))
+            for t in transactions
+            if t.type == OwnerTransactionType.DEBIT.value
+        )
 
         buffer = BytesIO()
 
@@ -411,27 +440,35 @@ async def export_owner_ledger_pdf(
 
         elements.append(Paragraph(f"Total Credit: {total_credit}", styles["Normal"]))
         elements.append(Paragraph(f"Total Debit: {total_debit}", styles["Normal"]))
-        elements.append(Paragraph(f"Balance: {total_credit - total_debit}", styles["Normal"]))
+        elements.append(
+            Paragraph(f"Balance: {total_credit - total_debit}", styles["Normal"])
+        )
         elements.append(Spacer(1, 15))
 
         data = [["Date", "Type", "Amount", "Reference", "Description"]]
 
         for t in transactions:
-            data.append([
-                str(t.created_at),
-                t.type,
-                float(t.amount),
-                f"{t.reference_type} ({t.reference_id})",
-                t.description or ""
-            ])
+            data.append(
+                [
+                    str(t.created_at),
+                    t.type,
+                    f"{(t.amount or Decimal('0')):.2f}",
+                    f"{t.reference_type} ({t.reference_id})",
+                    t.description or "",
+                ]
+            )
 
         table = Table(data)
 
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("GRID", (0, 0), (-1, -1), 1, colors.black),
-        ]))
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ]
+            )
+        )
 
         elements.append(table)
 
@@ -452,6 +489,7 @@ async def export_owner_ledger_pdf(
             "Content-Disposition": f"attachment; filename=owner_ledger_{owner_id}.pdf"
         },
     )
+
 
 @router.get("/{owner_id}/ledger/excel")
 async def export_owner_ledger_excel(
@@ -476,24 +514,21 @@ async def export_owner_ledger_excel(
         string_buffer = StringIO()
         writer = csv.writer(string_buffer)
 
-        writer.writerow([
-            "Date",
-            "Type",
-            "Amount",
-            "Reference Type",
-            "Reference ID",
-            "Description"
-        ])
+        writer.writerow(
+            ["Date", "Type", "Amount", "Reference Type", "Reference ID", "Description"]
+        )
 
         for t in transactions:
-            writer.writerow([
-                str(t.created_at),
-                t.type,
-                float(t.amount),
-                t.reference_type,
-                t.reference_id,
-                t.description or "",
-            ])
+            writer.writerow(
+                [
+                    str(t.created_at),
+                    t.type,
+                    f"{(t.amount or Decimal('0')):.2f}",
+                    t.reference_type,
+                    t.reference_id,
+                    t.description or "",
+                ]
+            )
 
         byte_buffer = BytesIO()
         byte_buffer.write(string_buffer.getvalue().encode("utf-8"))

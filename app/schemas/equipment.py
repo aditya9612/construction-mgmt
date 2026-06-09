@@ -169,10 +169,14 @@ class EquipmentUpdate(BaseSchema):
         return v
 
 
+from app.core.enums import EquipmentStatus
+
+
 class EquipmentOut(BaseSchema):
 
     id: int
     project_id: Optional[int]
+
     equipment_name: str
     equipment_code: str
     operator_name: Optional[str]
@@ -181,6 +185,8 @@ class EquipmentOut(BaseSchema):
     fuel_used: Optional[float]
 
     condition: Optional[EquipmentCondition]
+
+    status: EquipmentStatus
 
     rental_cost: Optional[float]
 
@@ -289,14 +295,8 @@ class EquipmentMaintenanceCreate(BaseSchema):
 
         maintenance_date = values.get("maintenance_date")
 
-        if (
-            v
-            and maintenance_date
-            and v < maintenance_date
-        ):
-            raise ValueError(
-                "Next maintenance date cannot be before maintenance date"
-            )
+        if v and maintenance_date and v < maintenance_date:
+            raise ValueError("Next maintenance date cannot be before maintenance date")
 
         if v and v.year < 2000:
             raise ValueError("Invalid next maintenance date")
@@ -368,14 +368,8 @@ class EquipmentRentalCreate(BaseSchema):
 
         start_date = values.get("start_date")
 
-        if (
-            v
-            and start_date
-            and v < start_date
-        ):
-            raise ValueError(
-                "End date cannot be before start date"
-            )
+        if v and start_date and v < start_date:
+            raise ValueError("End date cannot be before start date")
 
         if v and v.year < 2000:
             raise ValueError("Invalid end date")
@@ -490,3 +484,46 @@ class MaintenanceAlertItem(BaseSchema):
     maintenance_date: date
     days_until: int
     status: str
+
+
+# ================= BULK ALLOCATION SCHEMAS =================
+
+from typing import List
+from pydantic import Field
+
+
+class EquipmentAllocateRequest(BaseSchema):
+    equipment_ids: List[int] = Field(
+        ...,
+        min_length=1,
+        description="Single or multiple equipment ids",
+    )
+
+    project_id: int = Field(
+        ...,
+        gt=0,
+    )
+
+
+class EquipmentDeallocateRequest(BaseSchema):
+    equipment_ids: List[int] = Field(
+        ...,
+        min_length=1,
+        description="Single or multiple equipment ids",
+    )
+
+
+class EquipmentAllocateResponse(BaseSchema):
+    equipment_ids: List[int]
+    project_id: int
+    success_count: int
+    failed_count: int
+    allocated_ids: List[int]
+    failed: List[dict] = []
+
+
+class EquipmentDeallocateResponse(BaseSchema):
+    success_count: int
+    failed_count: int
+    deallocated_ids: List[int]
+    failed: List[dict] = []

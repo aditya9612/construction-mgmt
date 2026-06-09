@@ -58,13 +58,17 @@ from app.models.project import Project
 from app.models.user import User, UserRole
 
 # Internal - Enums
-from app.core.enums import EquipmentCondition
+from app.core.enums import EquipmentCondition, EquipmentStatus
 from openpyxl.cell.cell import MergedCell
 
 # Internal - Schemas
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.equipment import (
+    EquipmentAllocateRequest,
+    EquipmentAllocateResponse,
     EquipmentCreate,
+    EquipmentDeallocateRequest,
+    EquipmentDeallocateResponse,
     EquipmentUpdate,
     EquipmentOut,
     EquipmentUsageCreate,
@@ -118,6 +122,7 @@ router = APIRouter(
 )
 
 VERSION_KEY = "cache_version:equipment"
+
 
 # === UTILITY FUNCTIONS ===
 async def get_active_equipment_or_404(db: AsyncSession, equipment_id: int):
@@ -225,9 +230,10 @@ async def maintenance_alerts(
         .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
         .where(
             and_(
-                EquipmentMaintenance.next_maintenance_date.isnot(None),  # 🔥 SAFE
+                EquipmentMaintenance.next_maintenance_date.isnot(None),
                 Equipment.is_deleted == False,
-                or_(  #  include overdue + upcoming
+                Equipment.status == EquipmentStatus.MAINTENANCE,
+                or_(
                     EquipmentMaintenance.next_maintenance_date < today,
                     EquipmentMaintenance.next_maintenance_date <= upcoming_date,
                 ),
@@ -343,6 +349,330 @@ async def availability_report(
     return response
 
 
+# ========== ALLOCATION ===========
+@router.post(
+    "/allocate",
+    response_model=EquipmentAllocateResponse,
+)
+async def allocate_equipment(
+    payload: EquipmentAllocateRequest,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    today = date.today()
+
+    project = await db.get(
+        Project,
+        payload.project_id,
+    )
+
+    if not project:
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found",
+        )
+
+    # Prevent allocation to completed project
+    if project.end_date and project.end_date < today:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot allocate equipment to completed project",
+        )
+
+    allocated_ids = []
+    failed = []
+
+    for equipment_id in payload.equipment_ids:
+
+        obj = await db.scalar(
+            select(Equipment).where(
+                Equipment.id == equipment_id,
+                Equipment.is_deleted == False,
+            )
+        )
+
+        if not obj:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Equipment not found",
+                }
+            )
+            continue
+
+        # ================= DAMAGED CHECK =================
+
+        if obj.condition == EquipmentCondition.DAMAGED:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Damaged equipment",
+                }
+            )
+            continue
+
+        # ================= RENTAL CHECK =================
+
+        rental_exists = await db.scalar(
+            select(
+                exists().where(
+                    EquipmentRental.equipment_id == equipment_id,
+                    or_(
+                        # Active rental
+                        and_(
+                            EquipmentRental.start_date <= today,
+                            or_(
+                                EquipmentRental.end_date.is_(None),
+                                EquipmentRental.end_date >= today,
+                            ),
+                        ),
+                        # Future rental
+                        EquipmentRental.start_date > today,
+                    ),
+                )
+            )
+        )
+
+        if rental_exists:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Equipment rented or reserved",
+                }
+            )
+            continue
+
+        # ================= MAINTENANCE CHECK =================
+
+        maintenance_exists = await db.scalar(
+            select(
+                exists().where(
+                    EquipmentMaintenance.equipment_id == equipment_id,
+                    EquipmentMaintenance.maintenance_date >= today,
+                )
+            )
+        )
+
+        if maintenance_exists:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Maintenance scheduled",
+                }
+            )
+            continue
+
+        # ================= SAME PROJECT =================
+
+        if obj.project_id == payload.project_id:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Already allocated to same project",
+                }
+            )
+            continue
+
+        # ================= EXISTING PROJECT =================
+
+        if obj.project_id is not None:
+
+            old_project = await db.get(
+                Project,
+                obj.project_id,
+            )
+
+            if old_project and old_project.end_date and old_project.end_date < today:
+                old_project_id = obj.project_id
+
+                obj.project_id = None
+                obj.status = EquipmentStatus.AVAILABLE
+
+                await create_audit_log(
+                    db=db,
+                    equipment_id=obj.id,
+                    action="AUTO_DEALLOCATE",
+                    old_values={
+                        "project_id": old_project_id,
+                        "status": EquipmentStatus.IN_PROJECT.value,
+                    },
+                    new_values={
+                        "project_id": None,
+                        "status": EquipmentStatus.AVAILABLE.value,
+                    },
+                    user_id=current_user.id,
+                    request=request,
+                )
+
+                await db.flush()
+
+            else:
+                failed.append(
+                    {
+                        "equipment_id": equipment_id,
+                        "reason": "Already allocated",
+                    }
+                )
+                continue
+
+        # ================= ALLOCATE =================
+
+        old_values = {
+            "project_id": obj.project_id,
+            "status": obj.status.value if obj.status else None,
+        }
+
+        obj.project_id = payload.project_id
+        obj.status = EquipmentStatus.IN_PROJECT
+
+        await create_audit_log(
+            db=db,
+            equipment_id=obj.id,
+            action="ALLOCATE",
+            old_values=old_values,
+            new_values={
+                "project_id": payload.project_id,
+                "status": EquipmentStatus.IN_PROJECT.value,
+            },
+            user_id=current_user.id,
+            request=request,
+        )
+
+        allocated_ids.append(obj.id)
+
+    await db.commit()
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return EquipmentAllocateResponse(
+        equipment_ids=payload.equipment_ids,
+        project_id=payload.project_id,
+        success_count=len(allocated_ids),
+        failed_count=len(failed),
+        allocated_ids=allocated_ids,
+        failed=failed,
+    )
+
+
+# ================== DEALLOCATE ==================
+
+
+@router.put(
+    "/deallocate",
+    response_model=EquipmentDeallocateResponse,
+)
+async def deallocate_equipment(
+    payload: EquipmentDeallocateRequest,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    deallocated_ids = []
+    failed = []
+
+    today = date.today()
+
+    for equipment_id in payload.equipment_ids:
+
+        obj = await db.scalar(
+            select(Equipment).where(
+                Equipment.id == equipment_id,
+                Equipment.is_deleted == False,
+            )
+        )
+
+        if not obj:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Equipment not found",
+                }
+            )
+            continue
+
+        if obj.project_id is None:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Equipment not allocated",
+                }
+            )
+            continue
+
+        old_values = {
+            "project_id": obj.project_id,
+            "status": obj.status.value,
+        }
+
+        obj.project_id = None
+
+        future_rental = await db.scalar(
+            select(
+                exists().where(
+                    EquipmentRental.equipment_id == equipment_id,
+                    EquipmentRental.start_date > today,
+                )
+            )
+        )
+
+        if future_rental:
+            obj.status = EquipmentStatus.IDLE
+        else:
+            obj.status = EquipmentStatus.AVAILABLE
+
+        await create_audit_log(
+            db=db,
+            equipment_id=obj.id,
+            action="DEALLOCATE",
+            old_values=old_values,
+            new_values={
+                "project_id": None,
+                "status": obj.status.value,
+            },
+            user_id=current_user.id,
+            request=request,
+        )
+
+        deallocated_ids.append(obj.id)
+
+    await db.commit()
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return EquipmentDeallocateResponse(
+        success_count=len(deallocated_ids),
+        failed_count=len(failed),
+        deallocated_ids=deallocated_ids,
+        failed=failed,
+    )
+
+
+# ================== GET ALLOCATION STATUS ==================
+
+
+@router.get("/{equipment_id}/allocation", response_model=AllocationOut)
+async def get_allocation(
+    equipment_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+):
+    obj = await get_active_equipment_or_404(db, equipment_id)
+    return AllocationOut(
+        equipment_id=obj.id,
+        project_id=obj.project_id,
+        allocated=obj.project_id is not None,
+    )
+
+
 # =========== EQUIPMENT CRUD ====================
 
 
@@ -380,8 +710,8 @@ async def create_equipment(
         db, obj.id, "CREATE", new_values=jsonable_encoder(payload.model_dump())
     )
 
-    await bump_cache_version(redis, VERSION_KEY)
     await db.commit()
+    await bump_cache_version(redis, VERSION_KEY)
     await db.refresh(obj)
     return EquipmentOut.model_validate(obj)
 
@@ -528,6 +858,9 @@ async def update_equipment(
     return EquipmentOut.model_validate(obj)
 
 
+# ================== SOFT DELETE ==================
+
+
 @router.delete("/{equipment_id}", status_code=204)
 async def soft_delete_equipment(
     equipment_id: int,
@@ -535,9 +868,59 @@ async def soft_delete_equipment(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    obj = await get_active_equipment_or_404(db, equipment_id)
+    obj = await get_active_equipment_or_404(
+        db,
+        equipment_id,
+    )
 
-    # old values (serialize safe)
+    today = date.today()
+
+    # ================= PROJECT VALIDATION =================
+
+    if obj.project_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete allocated equipment",
+        )
+
+    # ================= MAINTENANCE VALIDATION =================
+
+    if obj.status == EquipmentStatus.MAINTENANCE:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete equipment under maintenance",
+        )
+
+    # ================= RENTAL VALIDATION =================
+
+    rental_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment_id,
+                or_(
+                    # Future rental
+                    EquipmentRental.start_date > today,
+                    # Active rental
+                    and_(
+                        EquipmentRental.start_date <= today,
+                        or_(
+                            EquipmentRental.end_date.is_(None),
+                            EquipmentRental.end_date >= today,
+                        ),
+                    ),
+                ),
+            )
+        )
+    )
+
+    if rental_exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete rented or reserved equipment",
+        )
+
+    # ================= AUDIT OLD VALUES =================
+
     old_values = serialize(
         {
             "is_deleted": obj.is_deleted,
@@ -546,12 +929,14 @@ async def soft_delete_equipment(
         }
     )
 
-    # perform soft delete
+    # ================= SOFT DELETE =================
+
     obj.is_deleted = True
     obj.deleted_at = date.today()
     obj.deleted_by = current_user.id
 
-    # new values (serialize safe)
+    # ================= AUDIT NEW VALUES =================
+
     new_values = serialize(
         {
             "is_deleted": obj.is_deleted,
@@ -561,178 +946,25 @@ async def soft_delete_equipment(
     )
 
     await create_audit_log(
-        db,
-        obj.id,
-        "SOFT_DELETE",
-        old_values=old_values,
-        new_values=new_values,
-        user_id=current_user.id,
-    )
-
-    await bump_cache_version(redis, VERSION_KEY)
-    await db.commit()
-
-
-# ========== ALLOCATION ===========
-@router.post("/{equipment_id}/allocate", response_model=AllocationOut)
-async def allocate_equipment(
-    equipment_id: int,
-    project_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    request: Request = None,
-):
-    obj = await get_active_equipment_or_404(db, equipment_id)
-
-    # 🔹 project check
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(404, "Project not found")
-
-    today = date.today()
-
-    #  condition check
-    if obj.condition == "DAMAGED":
-        raise HTTPException(400, "Damaged equipment cannot be allocated")
-
-    #  rental check (current + future)
-    rental_exists = await db.scalar(
-        select(
-            exists().where(
-                EquipmentRental.equipment_id == equipment_id,
-                or_(
-                    and_(
-                        EquipmentRental.start_date <= today,
-                        or_(
-                            EquipmentRental.end_date == None,
-                            EquipmentRental.end_date >= today,
-                        ),
-                    ),
-                    EquipmentRental.start_date > today,
-                ),
-            )
-        )
-    )
-
-    if rental_exists:
-        raise HTTPException(400, "Equipment is rented or reserved")
-
-    #  maintenance check (only active)
-    maintenance_exists = await db.scalar(
-        select(
-            exists().where(
-                EquipmentMaintenance.equipment_id == equipment_id,
-                EquipmentMaintenance.maintenance_date == today,
-            )
-        )
-    )
-
-    if maintenance_exists:
-        raise HTTPException(400, "Equipment is under maintenance today")
-
-    # 🔹 same project check FIRST
-    if obj.project_id == project_id:
-        raise HTTPException(400, "Already allocated to this project")
-
-    # 🔹 existing allocation
-    if obj.project_id is not None:
-        old_project = await db.get(Project, obj.project_id)
-
-        if old_project and old_project.end_date and old_project.end_date < today:
-            # auto deallocate
-            await create_audit_log(
-                db,
-                obj.id,
-                "AUTO_DEALLOCATE",
-                old_values={"project_id": obj.project_id},
-                new_values={"project_id": None},
-                user_id=current_user.id,
-                request=request,
-            )
-            obj.project_id = None
-            await db.flush()
-        else:
-            raise HTTPException(400, "Equipment already allocated to active project")
-
-    #  allocate
-    old_values = {"project_id": obj.project_id}
-    obj.project_id = project_id
-
-    await db.flush()
-
-    await create_audit_log(
-        db,
-        obj.id,
-        "ALLOCATE",
-        old_values=old_values,
-        new_values={"project_id": project_id},
-        user_id=current_user.id,
-        request=request,
-    )
-
-    await db.commit()
-
-    return AllocationOut(
-        equipment_id=equipment_id,
-        project_id=project_id,
-        allocated=True,
-    )
-
-
-@router.get("/{equipment_id}/allocation", response_model=AllocationOut)
-async def get_allocation(
-    equipment_id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
-):
-    obj = await get_active_equipment_or_404(db, equipment_id)
-    return AllocationOut(
+        db=db,
         equipment_id=obj.id,
-        project_id=obj.project_id,
-        allocated=obj.project_id is not None,
-    )
-
-
-@router.put("/{equipment_id}/deallocate", response_model=AllocationOut)
-async def deallocate_equipment(
-    equipment_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    request: Request = None,
-):
-    obj = await get_active_equipment_or_404(db, equipment_id)
-
-    # validation
-    if obj.project_id is None:
-        raise HTTPException(400, "Equipment is already not allocated")
-
-    # audit old values
-    old_values = {"project_id": obj.project_id}
-
-    # deallocate
-    obj.project_id = None
-
-    # audit new values
-    new_values = {"project_id": None}
-
-    await db.flush()
-
-    await create_audit_log(
-        db,
-        obj.id,
-        "DEALLOCATE",
+        action="SOFT_DELETE",
         old_values=old_values,
         new_values=new_values,
         user_id=current_user.id,
-        request=request,
     )
 
     await db.commit()
 
-    return AllocationOut(equipment_id=equipment_id, project_id=None, allocated=False)
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
 
 
-# ========================== USAGE ===========================
+# ========================= CREATE USAGE===========================
+
+
 @router.post(
     "/{equipment_id}/usage",
     response_model=EquipmentUsageOut,
@@ -743,30 +975,61 @@ async def create_usage(
     payload: EquipmentUsageCreate,
     current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
+
     equipment = await get_active_equipment_or_404(db, equipment_id)
 
     today = date.today()
 
     if equipment.project_id is None:
-        raise HTTPException(400, "Equipment is not allocated to any project")
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is not allocated to any project",
+        )
 
     if payload.working_hours <= 0 and payload.fuel_used <= 0:
-        raise HTTPException(400, "Usage cannot be zero")
+        raise HTTPException(
+            status_code=400,
+            detail="Usage cannot be zero",
+        )
 
     if payload.usage_date > today:
-        raise HTTPException(400, "Usage date cannot be in future")
+        raise HTTPException(
+            status_code=400,
+            detail="Usage date cannot be in future",
+        )
 
     if equipment.condition == EquipmentCondition.DAMAGED:
-        raise HTTPException(400, "Equipment is damaged and cannot be used")
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is damaged and cannot be used",
+        )
 
+    # Duplicate usage validation (same equipment + same usage_date)
+    usage_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentUsage.equipment_id == equipment_id,
+                EquipmentUsage.usage_date == payload.usage_date,
+            )
+        )
+    )
+
+    if usage_exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Usage already exists for this date",
+        )
+
+    # Rental validation
     rental_active = await db.scalar(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment_id,
                 EquipmentRental.start_date <= payload.usage_date,
                 or_(
-                    EquipmentRental.end_date == None,
+                    EquipmentRental.end_date.is_(None),
                     EquipmentRental.end_date >= payload.usage_date,
                 ),
             )
@@ -774,67 +1037,114 @@ async def create_usage(
     )
 
     if rental_active:
-        raise HTTPException(400, "Equipment is rented. Cannot log usage")
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is rented. Cannot log usage",
+        )
 
+    # Maintenance validation
     maintenance_active = await db.scalar(
         select(
             exists().where(
                 EquipmentMaintenance.equipment_id == equipment_id,
-                EquipmentMaintenance.next_maintenance_date != None,
-                EquipmentMaintenance.next_maintenance_date >= payload.usage_date,
+                EquipmentMaintenance.maintenance_date == payload.usage_date,
             )
         )
     )
 
     if maintenance_active:
-        raise HTTPException(400, "Equipment is under maintenance")
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is under maintenance",
+        )
 
-    obj = EquipmentUsage(equipment_id=equipment_id, **payload.model_dump())
+    obj = EquipmentUsage(
+        equipment_id=equipment_id,
+        **payload.model_dump(),
+    )
 
     db.add(obj)
 
-    equipment.working_hours += payload.working_hours
-    equipment.fuel_used += payload.fuel_used
+    old_hours = equipment.working_hours or Decimal("0")
+    old_fuel = equipment.fuel_used or Decimal("0")
 
-    equipment.is_in_use = True
+    equipment.working_hours = old_hours + payload.working_hours
+    equipment.fuel_used = old_fuel + payload.fuel_used
+
+    # Equipment already allocated
+    equipment.status = EquipmentStatus.IN_PROJECT
 
     await db.flush()
-    await db.refresh(obj)
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="USAGE_CREATE",
+        old_values={
+            "working_hours": float(old_hours),
+            "fuel_used": float(old_fuel),
+        },
+        new_values={
+            "working_hours": float(equipment.working_hours),
+            "fuel_used": float(equipment.fuel_used),
+            "usage_hours_added": float(payload.working_hours),
+            "fuel_added": float(payload.fuel_used),
+            "usage_date": str(payload.usage_date),
+        },
+        user_id=current_user.id,
+    )
+
     await db.commit()
+
+    await bump_cache_version(redis, VERSION_KEY)
+
+    await db.refresh(obj)
 
     return EquipmentUsageOut.model_validate(obj)
 
 
-@router.get("/{equipment_id}/usage", response_model=List[EquipmentUsageOut])
+# ========================= LIST USAGE===========================
+
+
+@router.get(
+    "/{equipment_id}/usage",
+    response_model=List[EquipmentUsageOut],
+)
 async def list_usage(
     equipment_id: int,
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await get_active_equipment_or_404(db, equipment_id)
+    await get_active_equipment_or_404(
+        db,
+        equipment_id,
+    )
 
     stmt = (
         select(EquipmentUsage)
-        .where(EquipmentUsage.equipment_id == equipment_id)
-        .order_by(EquipmentUsage.usage_date.desc())
+        .where(
+            EquipmentUsage.equipment_id == equipment_id,
+        )
+        .order_by(
+            EquipmentUsage.usage_date.desc(),
+        )
     )
 
     result = await db.execute(stmt)
-    rows = result.scalars().all()
 
-    # safe conversion (no lazy load issues)
+    usages = result.scalars().all()
+
     return [
         EquipmentUsageOut(
             id=row.id,
             equipment_id=row.equipment_id,
-            working_hours=float(row.working_hours),
-            fuel_used=float(row.fuel_used),
+            working_hours=float(row.working_hours or 0),
+            fuel_used=float(row.fuel_used or 0),
             usage_date=row.usage_date,
             notes=row.notes,
             created_at=row.created_at,
-            updated_at=row.updated_at,
         )
-        for row in rows
+        for row in usages
     ]
 
 
@@ -889,10 +1199,15 @@ async def create_maintenance(
     request: Request,
     current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
-    await get_active_equipment_or_404(db, equipment_id)
+    equipment = await get_active_equipment_or_404(
+        db,
+        equipment_id,
+    )
 
-    #  Date validation FIX
+    # ================= DATE VALIDATION =================
+
     if (
         payload.next_maintenance_date
         and payload.next_maintenance_date <= payload.maintenance_date
@@ -902,48 +1217,130 @@ async def create_maintenance(
             detail="Next maintenance date must be after maintenance date",
         )
 
-    #  Create object
+    today = date.today()
+
+    # ================= PROJECT CHECK =================
+
+    if equipment.project_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is currently allocated to a project",
+        )
+
+    # ================= STATUS CHECK =================
+
+    if equipment.status == EquipmentStatus.MAINTENANCE:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is already under maintenance",
+        )
+
+    # ================= RENTAL VALIDATION =================
+
+    rental_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment_id,
+                EquipmentRental.start_date <= payload.maintenance_date,
+                or_(
+                    EquipmentRental.end_date.is_(None),
+                    EquipmentRental.end_date >= payload.maintenance_date,
+                ),
+            )
+        )
+    )
+
+    if rental_exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is currently rented",
+        )
+
+    # ================= DUPLICATE MAINTENANCE =================
+
+    maintenance_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentMaintenance.equipment_id == equipment_id,
+                EquipmentMaintenance.maintenance_date == payload.maintenance_date,
+            )
+        )
+    )
+
+    if maintenance_exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Maintenance already exists for this date",
+        )
+
+    # ================= CREATE MAINTENANCE =================
+
+    old_status = equipment.status
+
     obj = EquipmentMaintenance(
         **payload.model_dump(),
         equipment_id=equipment_id,
     )
 
     db.add(obj)
-    await db.flush()
-    await db.refresh(obj)
 
-    #  Audit log safe
+    # Status update
+    equipment.status = EquipmentStatus.MAINTENANCE
+
+    await db.flush()
+
+    # ================= AUDIT LOG =================
+
     await create_audit_log(
         db=db,
         equipment_id=equipment_id,
         action="MAINTENANCE_CREATE",
-        old_values=None,
+        old_values={
+            "status": old_status.value if old_status else None,
+            "project_id": equipment.project_id,
+        },
         new_values={
             "description": payload.description,
             "cost": float(payload.cost or 0),
             "maintenance_date": str(payload.maintenance_date),
-            "next_maintenance_date": str(payload.next_maintenance_date),
+            "next_maintenance_date": (
+                str(payload.next_maintenance_date)
+                if payload.next_maintenance_date
+                else None
+            ),
+            "status": EquipmentStatus.MAINTENANCE.value,
         },
         user_id=current_user.id,
         request=request,
     )
 
+    # ================= COMMIT =================
+
     await db.commit()
 
-    #  STATUS CALCULATION (MAIN FIX)
-    today = date.today()
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    await db.refresh(obj)
+
+    # ================= RESPONSE STATUS =================
 
     if obj.next_maintenance_date:
+
         if obj.next_maintenance_date < today:
             status = "OVERDUE"
+
         elif obj.next_maintenance_date == today:
             status = "TODAY"
+
         else:
             status = "UPCOMING"
+
     else:
         status = "NO_SCHEDULE"
 
-    #  FINAL RESPONSE
     return EquipmentMaintenanceOut(
         id=obj.id,
         equipment_id=obj.equipment_id,
@@ -954,6 +1351,110 @@ async def create_maintenance(
         created_at=obj.created_at,
         status=status,
     )
+
+
+# ===================== COMPLETE MAINTENANCE =====================
+from datetime import date
+
+
+@router.put(
+    "/maintenance/{maintenance_id}/complete",
+    response_model=EquipmentMaintenanceOut,
+)
+async def complete_maintenance(
+    maintenance_id: int,
+    request: Request,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+    maintenance = await db.get(
+        EquipmentMaintenance,
+        maintenance_id,
+    )
+
+    if not maintenance:
+        raise HTTPException(
+            status_code=404,
+            detail="Maintenance record not found",
+        )
+
+    equipment = await get_active_equipment_or_404(
+        db,
+        maintenance.equipment_id,
+    )
+
+    # Equipment must currently be under maintenance
+    if equipment.status != EquipmentStatus.MAINTENANCE:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is not under maintenance",
+        )
+
+    today = date.today()
+
+    # Check future rentals
+    future_rental_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.start_date > today,
+            )
+        )
+    )
+
+    old_status = equipment.status
+
+    # Restore proper equipment status
+    if equipment.project_id:
+        restored_status = EquipmentStatus.IN_PROJECT
+
+    elif future_rental_exists:
+        restored_status = EquipmentStatus.IDLE
+
+    else:
+        restored_status = EquipmentStatus.AVAILABLE
+
+    equipment.status = restored_status
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="MAINTENANCE_COMPLETE",
+        old_values={
+            "status": old_status.value,
+        },
+        new_values={
+            "status": restored_status.value,
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+
+    await db.refresh(equipment)
+    await db.refresh(maintenance)
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    # Return completed status explicitly
+    return EquipmentMaintenanceOut(
+        id=maintenance.id,
+        equipment_id=maintenance.equipment_id,
+        description=maintenance.description,
+        maintenance_date=maintenance.maintenance_date,
+        cost=float(maintenance.cost or 0),
+        next_maintenance_date=maintenance.next_maintenance_date,
+        created_at=maintenance.created_at,
+        status="COMPLETED",
+    )
+
+
+# ===================== LIST MAINTENANCE HISTORY =====================
 
 
 @router.get("/{equipment_id}/maintenance", response_model=List[EquipmentMaintenanceOut])
@@ -975,6 +1476,15 @@ async def list_maintenance(
 
     today = date.today()
 
+    def status_from_next(next_dt):
+        if next_dt is None:
+            return "NO_SCHEDULE"
+        if next_dt < today:
+            return "OVERDUE"
+        if next_dt == today:
+            return "TODAY"
+        return "UPCOMING"
+
     return [
         EquipmentMaintenanceOut(
             id=row.id,
@@ -984,11 +1494,7 @@ async def list_maintenance(
             cost=float(row.cost or 0),
             next_maintenance_date=row.next_maintenance_date,
             created_at=row.created_at,
-            status=(
-                "OVERDUE"
-                if row.maintenance_date < today
-                else "TODAY" if row.maintenance_date == today else "UPCOMING"
-            ),
+            status=status_from_next(row.next_maintenance_date),
         )
         for row in rows
     ]
@@ -1008,179 +1514,302 @@ async def create_rental(
     request: Request,
     current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
-    equipment = await get_active_equipment_or_404(db, equipment_id)
+    equipment = await get_active_equipment_or_404(
+        db,
+        equipment_id,
+    )
 
-    # 🔹 Date validation
-    if payload.end_date and payload.end_date < payload.start_date:
-        raise HTTPException(400, "End date cannot be before start date")
+    today = date.today()
 
     start_date = payload.start_date
     end_date = payload.end_date or payload.start_date
 
-    # 🔹 Cost validation
+    # ================= DATE VALIDATION =================
+
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="End date cannot be before start date",
+        )
+
+    # ================= RENTAL COST =================
+
     if payload.rental_cost <= 0:
-        raise HTTPException(400, "Rental cost must be greater than 0")
+        raise HTTPException(
+            status_code=400,
+            detail="Rental cost must be greater than 0",
+        )
 
-    #  UPDATED PROJECT CHECK (MAIN FIX)
+    # ================= DAMAGED CHECK =================
+
+    if equipment.condition == EquipmentCondition.DAMAGED:
+        raise HTTPException(
+            status_code=400,
+            detail="Damaged equipment cannot be rented",
+        )
+
+    # ================= MAINTENANCE STATUS CHECK =================
+
+    if equipment.status == EquipmentStatus.MAINTENANCE:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment is under maintenance",
+        )
+
+    # ================= MAINTENANCE OVERLAP =================
+
+    maintenance_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentMaintenance.equipment_id == equipment_id,
+                EquipmentMaintenance.maintenance_date >= start_date,
+                EquipmentMaintenance.maintenance_date <= end_date,
+            )
+        )
+    )
+
+    if maintenance_exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment maintenance scheduled during rental period",
+        )
+
+    # ================= PROJECT ALLOCATION CHECK =================
+
     if equipment.project_id is not None:
-        project = await db.get(Project, equipment.project_id)
 
-        if project and project.end_date:
-            #  Project completed → auto deallocate
-            if project.end_date < date.today():
+        project = await db.get(
+            Project,
+            equipment.project_id,
+        )
+
+        if project:
+
+            if project.end_date and project.end_date < today:
+
+                old_project_id = equipment.project_id
+
                 equipment.project_id = None
+                equipment.status = EquipmentStatus.AVAILABLE
+
+                await create_audit_log(
+                    db=db,
+                    equipment_id=equipment.id,
+                    action="AUTO_DEALLOCATE",
+                    old_values={
+                        "project_id": old_project_id,
+                        "status": EquipmentStatus.IN_PROJECT.value,
+                    },
+                    new_values={
+                        "project_id": None,
+                        "status": EquipmentStatus.AVAILABLE.value,
+                    },
+                    user_id=current_user.id,
+                    request=request,
+                )
+
                 await db.flush()
+
             else:
-                #  Active project
                 raise HTTPException(
                     status_code=400,
                     detail="Equipment is currently allocated to an active project",
                 )
+
         else:
             raise HTTPException(
                 status_code=400,
                 detail="Equipment is allocated to a project",
             )
 
-    #  Overlap check
-    stmt = select(EquipmentRental.id).where(
-        EquipmentRental.equipment_id == equipment_id,
-        or_(
-            EquipmentRental.end_date.is_(None),
-            and_(
+    # ================= RENTAL OVERLAP CHECK =================
+
+    overlap_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment_id,
                 EquipmentRental.start_date <= end_date,
-                EquipmentRental.end_date >= start_date,
-            ),
-        ),
+                or_(
+                    EquipmentRental.end_date.is_(None),
+                    EquipmentRental.end_date >= start_date,
+                ),
+            )
+        )
     )
 
-    result = await db.execute(stmt)
-    exists = result.scalars().first()
-
-    if exists:
+    if overlap_exists:
         raise HTTPException(
             status_code=400,
-            detail="Equipment already rented in this period",
+            detail="Equipment already rented during this period",
         )
 
-    #  Create rental
-    data = payload.model_dump()
-    data["end_date"] = end_date
+    # ================= CREATE RENTAL =================
 
-    obj = EquipmentRental(
-        **data,
+    rental = EquipmentRental(
         equipment_id=equipment_id,
+        start_date=start_date,
+        end_date=end_date,
+        rental_cost=payload.rental_cost,
+        client_name=payload.client_name,
+        notes=payload.notes,
     )
 
-    db.add(obj)
-    await db.flush()
-    await db.refresh(obj)
+    db.add(rental)
 
-    #  Audit log
+    old_status = equipment.status
+
+    # ================= STATUS UPDATE =================
+
+    if start_date <= today <= end_date:
+        equipment.status = EquipmentStatus.RENTED
+
+    elif start_date > today:
+        equipment.status = EquipmentStatus.IDLE
+
+    elif equipment.project_id:
+        equipment.status = EquipmentStatus.IN_PROJECT
+
+    else:
+        equipment.status = EquipmentStatus.AVAILABLE
+
+    await db.flush()
+
+    # ================= AUDIT LOG =================
+
     await create_audit_log(
         db=db,
-        equipment_id=equipment_id,
+        equipment_id=equipment.id,
         action="RENTAL_CREATE",
-        old_values=None,
-        new_values=jsonable_encoder(
-            {
-                "start_date": start_date,
-                "end_date": end_date,
-                "rental_cost": payload.rental_cost,
-                "client_name": payload.client_name,
-            }
-        ),
+        old_values={
+            "status": old_status.value if old_status else None,
+        },
+        new_values={
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "rental_cost": float(payload.rental_cost),
+            "client_name": payload.client_name,
+            "status": equipment.status.value,
+        },
         user_id=current_user.id,
         request=request,
     )
 
     await db.commit()
 
-    #  Response logic
-    today = date.today()
-    final_end = obj.end_date or obj.start_date
+    # ================= CACHE VERSION =================
 
-    if obj.start_date > today:
-        status = "UPCOMING"
-    elif final_end < today:
-        status = "COMPLETED"
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    await db.refresh(rental)
+
+    # ================= RESPONSE STATUS =================
+
+    if start_date > today:
+        rental_status = "UPCOMING"
+
+    elif end_date < today:
+        rental_status = "COMPLETED"
+
     else:
-        status = "ACTIVE"
+        rental_status = "ACTIVE"
 
-    duration = (final_end - obj.start_date).days + 1
-    per_day_cost = float(obj.rental_cost) / duration if duration else 0
+    duration = (end_date - start_date).days + 1
+
+    per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
 
     return EquipmentRentalOut(
-        id=obj.id,
-        equipment_id=obj.equipment_id,
-        start_date=obj.start_date,
-        end_date=obj.end_date,
-        rental_cost=float(obj.rental_cost),
-        client_name=obj.client_name,
-        notes=obj.notes,
-        created_at=obj.created_at,
-        status=status,
+        id=rental.id,
+        equipment_id=rental.equipment_id,
+        start_date=rental.start_date,
+        end_date=rental.end_date,
+        rental_cost=float(rental.rental_cost),
+        client_name=rental.client_name,
+        notes=rental.notes,
+        created_at=rental.created_at,
+        status=rental_status,
         duration=duration,
         per_day_cost=round(per_day_cost, 2),
     )
 
 
-@router.get("/{equipment_id}/rental", response_model=List[EquipmentRentalOut])
+# ========================== RENTAL LIST ===========================
+
+
+@router.get(
+    "/{equipment_id}/rental",
+    response_model=List[EquipmentRentalOut],
+)
 async def list_rental(
     equipment_id: int,
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await get_active_equipment_or_404(db, equipment_id)
+    await get_active_equipment_or_404(
+        db,
+        equipment_id,
+    )
 
     stmt = (
         select(EquipmentRental)
-        .where(EquipmentRental.equipment_id == equipment_id)
-        .order_by(EquipmentRental.start_date.desc())
+        .where(
+            EquipmentRental.equipment_id == equipment_id,
+        )
+        .order_by(
+            EquipmentRental.start_date.desc(),
+        )
     )
 
     result = await db.execute(stmt)
-    rows = result.scalars().all()
+
+    rentals = result.scalars().all()
 
     today = date.today()
+
     response = []
 
-    for row in rows:
-        # normalize end_date
-        end_date = row.end_date or row.start_date
+    for rental in rentals:
 
-        # status logic
-        if row.start_date > today:
-            status = "UPCOMING"
+        end_date = rental.end_date or rental.start_date
+
+        # Rental Status
+        if rental.start_date > today:
+            rental_status = "UPCOMING"
+
         elif end_date < today:
-            status = "COMPLETED"
+            rental_status = "COMPLETED"
+
         else:
-            status = "ACTIVE"
+            rental_status = "ACTIVE"
 
-        # duration
-        duration = (end_date - row.start_date).days + 1
+        duration = (end_date - rental.start_date).days + 1
 
-        #  per day cost
-        per_day_cost = float(row.rental_cost or 0) / duration if duration else 0
+        per_day_cost = float(rental.rental_cost or 0) / duration if duration > 0 else 0
 
         response.append(
             EquipmentRentalOut(
-                id=row.id,
-                equipment_id=row.equipment_id,
-                start_date=row.start_date,
-                end_date=row.end_date,
-                rental_cost=float(row.rental_cost or 0),
-                client_name=row.client_name,
-                notes=row.notes,
-                created_at=row.created_at,
-                status=status,
+                id=rental.id,
+                equipment_id=rental.equipment_id,
+                start_date=rental.start_date,
+                end_date=rental.end_date,
+                rental_cost=float(rental.rental_cost or 0),
+                client_name=rental.client_name,
+                notes=rental.notes,
+                created_at=rental.created_at,
+                status=rental_status,
                 duration=duration,
                 per_day_cost=round(per_day_cost, 2),
             )
         )
 
     return response
+
+
+# ========================== COST REPORT ===========================
 
 
 @router.get("/cost/report", response_model=List[CostReportItem])
@@ -1193,19 +1822,32 @@ async def cost_report(
             EquipmentRental.equipment_id,
             Equipment.equipment_code,
             func.sum(EquipmentRental.rental_cost).label("total_cost"),
-            func.count().label("rental_count"),
+            func.count(EquipmentRental.id).label("rental_count"),
             func.sum(
-                func.coalesce(
-                    func.datediff(EquipmentRental.end_date, EquipmentRental.start_date),
-                    0,
+                (
+                    func.coalesce(
+                        EquipmentRental.end_date,
+                        EquipmentRental.start_date,
+                    )
+                    - EquipmentRental.start_date
+                    + 1
                 )
-                + 1
             ).label("total_days"),
         )
-        .join(Equipment)
-        .where(Equipment.is_deleted == False)
-        .group_by(EquipmentRental.equipment_id, Equipment.equipment_code)
-        .order_by(func.sum(EquipmentRental.rental_cost).desc())
+        .join(
+            Equipment,
+            Equipment.id == EquipmentRental.equipment_id,
+        )
+        .where(
+            Equipment.is_deleted == False,
+        )
+        .group_by(
+            EquipmentRental.equipment_id,
+            Equipment.equipment_code,
+        )
+        .order_by(
+            func.sum(EquipmentRental.rental_cost).desc(),
+        )
     )
 
     result = await db.execute(stmt)
@@ -1213,18 +1855,20 @@ async def cost_report(
     response = []
 
     for row in result.all():
+
         total_cost = float(row.total_cost or 0)
         rental_count = int(row.rental_count or 0)
         total_days = int(row.total_days or 0)
 
         avg_cost = total_cost / rental_count if rental_count else 0
+
         revenue_per_day = total_cost / total_days if total_days else 0
 
         response.append(
             CostReportItem(
                 equipment_id=row.equipment_id,
                 equipment_code=row.equipment_code,
-                total_cost=total_cost,
+                total_cost=round(total_cost, 2),
                 rental_count=rental_count,
                 avg_cost=round(avg_cost, 2),
                 total_days=total_days,
@@ -1411,6 +2055,7 @@ async def get_audit_logs(
 
 # ======================== REPORTS ========================
 
+
 @router.get("/reports/pdf")
 async def equipment_full_pdf_report(
     db: AsyncSession = Depends(get_db_session),
@@ -1528,9 +2173,7 @@ async def equipment_full_pdf_report(
         # ================= STORY =================
         story = []
 
-        story.append(
-            Paragraph("Equipment Management Report", title_style)
-        )
+        story.append(Paragraph("Equipment Management Report", title_style))
 
         story.append(Spacer(1, 6))
 
@@ -1557,10 +2200,7 @@ async def equipment_full_pdf_report(
             except Exception:
                 return ""
 
-        good_count = sum(
-            1 for e in equipments
-            if safe_condition(e) == "GOOD"
-        )
+        good_count = sum(1 for e in equipments if safe_condition(e) == "GOOD")
 
         summary_data = [
             [
@@ -1602,9 +2242,7 @@ async def equipment_full_pdf_report(
         story.append(Spacer(1, 20))
 
         # ================= EQUIPMENT TABLE =================
-        eq_data = [
-            ["#", "ID", "Code", "Name", "Condition", "Project"]
-        ]
+        eq_data = [["#", "ID", "Code", "Name", "Condition", "Project"]]
 
         for i, e in enumerate(equipments, 1):
 
@@ -1766,16 +2404,12 @@ async def equipment_full_pdf_report(
 
         buffer.seek(0)
 
-        filename = (
-            f"equipment_report_{datetime.now().strftime('%Y%m%d')}.pdf"
-        )
+        filename = f"equipment_report_{datetime.now().strftime('%Y%m%d')}.pdf"
 
         return StreamingResponse(
             buffer,
             media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}"
-            },
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
     except Exception as e:
@@ -1791,6 +2425,7 @@ async def equipment_full_pdf_report(
 
 
 # ================================excel report==========================
+
 
 @router.get("/reports/excel")
 async def equipment_excel_report(
@@ -1879,9 +2514,7 @@ async def equipment_excel_report(
 
         def safe_condition(e):
             try:
-                return str(
-                    getattr(e.condition, "value", e.condition or "")
-                ).upper()
+                return str(getattr(e.condition, "value", e.condition or "")).upper()
             except Exception:
                 return ""
 
@@ -1919,15 +2552,9 @@ async def equipment_excel_report(
         ws_sum["A2"].alignment = align()
 
         # ================= SUMMARY DATA =================
-        good_count = sum(
-            1 for e in equipments
-            if safe_condition(e) == "GOOD"
-        )
+        good_count = sum(1 for e in equipments if safe_condition(e) == "GOOD")
 
-        damaged_count = sum(
-            1 for e in equipments
-            if safe_condition(e) == "DAMAGED"
-        )
+        damaged_count = sum(1 for e in equipments if safe_condition(e) == "DAMAGED")
 
         summary_headers = [
             "Total Equipment",
@@ -2010,11 +2637,7 @@ async def equipment_excel_report(
 
             cond = safe_condition(e)
 
-            status = (
-                "Maintenance"
-                if cond == "DAMAGED"
-                else "Active"
-            )
+            status = "Maintenance" if cond == "DAMAGED" else "Active"
 
             values = [
                 i - 1,
@@ -2222,18 +2845,12 @@ async def equipment_excel_report(
 
         output.seek(0)
 
-        filename = (
-            f"equipment_report_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        )
+        filename = f"equipment_report_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": (
-                    f"attachment; filename={filename}"
-                )
-            },
+            headers={"Content-Disposition": (f"attachment; filename={filename}")},
         )
 
     except Exception as e:

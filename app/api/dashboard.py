@@ -25,6 +25,10 @@ from app.models.project import (
     QCRecord,
     SafetyIncident,
 )
+from fastapi import APIRouter, Depends, HTTPException, Query
+import logging
+
+logger = logging.getLogger(__name__)
 from app.models.approval import Approval
 from app.models.user import User, UserRole, ActivityLog
 from app.cache import redis as r
@@ -921,6 +925,7 @@ async def export_dashboard(
 
 @router.get("/client")
 async def client_dashboard(
+    project_id: int,
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
@@ -943,9 +948,7 @@ async def client_dashboard(
                 m.Project.status,
                 m.Project.start_date,
                 m.Project.end_date,
-            )
-            .where(m.Project.id.in_(project_ids))
-            .limit(1)
+            ).where(m.Project.id == project_id, m.Project.id.in_(project_ids))
         )
 
         project = project.first()
@@ -953,14 +956,14 @@ async def client_dashboard(
         if not project:
             return {"error": "No project found"}
 
-        project_id, status, start_date, end_date = project
+        db_project_id, status, start_date, end_date = project
 
         # ========================
         # PROGRESS
         # ========================
         progress = await db.scalar(
             select(func.avg(m.Task.completion_percentage)).where(
-                m.Task.project_id == project_id
+                m.Task.project_id == db_project_id
             )
         )
 
@@ -969,7 +972,7 @@ async def client_dashboard(
         # ========================
         budget_total = await db.scalar(
             select(func.sum(BOQ.total_cost)).where(
-                BOQ.project_id == project_id,
+                BOQ.project_id == db_project_id,
                 BOQ.is_latest == True,
             )
         )
@@ -978,7 +981,7 @@ async def client_dashboard(
         # EXPENSE
         # ========================
         total_expense = await db.scalar(
-            select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
+            select(func.sum(Expense.amount)).where(Expense.project_id == db_project_id)
         )
 
         budget_val = float(budget_total or 0)
@@ -993,13 +996,13 @@ async def client_dashboard(
         # ========================
         milestones_total = await db.scalar(
             select(func.count(m.Milestone.id)).where(
-                m.Milestone.project_id == project_id
+                m.Milestone.project_id == db_project_id
             )
         )
 
         milestones_completed = await db.scalar(
             select(func.count(m.Milestone.id)).where(
-                m.Milestone.project_id == project_id,
+                m.Milestone.project_id == db_project_id,
                 m.Milestone.status == "Completed",
             )
         )
@@ -1008,12 +1011,12 @@ async def client_dashboard(
         # TASKS
         # ========================
         tasks_total = await db.scalar(
-            select(func.count(m.Task.id)).where(m.Task.project_id == project_id)
+            select(func.count(m.Task.id)).where(m.Task.project_id == db_project_id)
         )
 
         tasks_completed = await db.scalar(
             select(func.count(m.Task.id)).where(
-                m.Task.project_id == project_id,
+                m.Task.project_id == db_project_id,
                 m.Task.status == "Completed",
             )
         )
@@ -1030,7 +1033,7 @@ async def client_dashboard(
         # RESPONSE
         # ========================
         return {
-            "project_id": project_id,
+            "project_id": db_project_id,
             "status": status,
             "progress_percent": round(progress or 0, 2),
             "budget_total": budget_val,
@@ -1050,7 +1053,7 @@ async def client_dashboard(
 
     return await cache_get_set(
         redis,
-        f"client_dashboard:{current_user.id}",
+        f"client_dashboard:{current_user.id}:{project_id}",
         version,
         logic,
     )
