@@ -40,6 +40,9 @@ from app.core.dependencies import (
     get_request_redis,
     require_roles,
 )
+import shutil
+import uuid
+import os
 from app.services.notification_service import create_notification
 from app.models.contractor import Contractor
 from sqlalchemy import delete, select, func, or_, update
@@ -1250,6 +1253,10 @@ class TasksService:
             assigned_user_id=task.assigned_user_id,
             completion_percentage=task.completion_percentage,
             is_delayed=is_delayed,
+
+            audio_instruction_url=task.audio_instruction_url,
+            instruction_image_url=task.instruction_image_url,
+            task_icon=task.task_icon,
         )
 
     async def create_task(
@@ -1259,6 +1266,11 @@ class TasksService:
         *,
         project_id: int,
         payload: s.TaskCreate,
+
+        audio_instruction_url: Optional[str] = None,
+
+        instruction_image_url: Optional[str] = None,
+
     ) -> s.TaskOut | list[s.TaskOut]:
 
         self._assert_task_mutation_role(current_user)
@@ -1282,6 +1294,18 @@ class TasksService:
                 raise NotFoundError("Invalid activity type")
 
         data = payload.model_dump(exclude_unset=True)
+
+        # =========================
+        # MEDIA FILES
+        # =========================
+
+        data["audio_instruction_url"] = (
+            audio_instruction_url
+        )
+
+        data["instruction_image_url"] = (
+            instruction_image_url
+        )
 
         if "priority" in data:
             if isinstance(data["priority"], TaskPriority):
@@ -1529,6 +1553,15 @@ class TasksService:
         project_id: int,
         task_id: int,
         payload: s.TaskUpdate,
+
+        audio_instruction_url: Optional[str] = None,
+
+        instruction_image_url: Optional[str] = None,
+
+        remove_audio: bool = False,
+
+        remove_image: bool = False,
+
     ) -> s.TaskOut:
         self._assert_task_mutation_role(current_user)
 
@@ -1543,6 +1576,30 @@ class TasksService:
         )
 
         data = payload.model_dump(exclude_unset=True)
+
+        # =====================================
+        # MEDIA FILES
+        # =====================================
+
+        if audio_instruction_url:
+
+            data["audio_instruction_url"] = (
+                audio_instruction_url
+            )
+
+        if instruction_image_url:
+
+            data["instruction_image_url"] = (
+                instruction_image_url
+            )
+
+        if remove_audio:
+
+            data["audio_instruction_url"] = None
+
+        if remove_image:
+
+            data["instruction_image_url"] = None
 
         if "priority" in data:
             if isinstance(data["priority"], TaskPriority):
@@ -3005,27 +3062,160 @@ async def delete_milestone(
     }
 
 
+IMAGE_DIR = "uploads/task_images"
+
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
+AUDIO_DIR = "uploads/task_audio"
+
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
 @tasks_router.post(
-    "/{project_id}/tasks", response_model=Union[s.TaskOut, List[s.TaskOut]]
+    "/{project_id}/tasks",
+    response_model=Union[s.TaskOut, List[s.TaskOut]]
 )
 async def create_task(
+
     project_id: int,
-    payload: s.TaskCreate,
+
+    payload: s.TaskCreateForm = Depends(),
+
+    audio_file: Optional[UploadFile] = File(None),
+
+    instruction_image: Optional[UploadFile] = File(None),
+
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+
     db: AsyncSession = Depends(get_db_session),
+
     redis=Depends(get_request_redis),
+
     service: TasksService = Depends(get_tasks_service),
 ):
+
     logger.info(f"Creating task project_id={project_id}")
 
-    try:
-        out = await service.create_task(
-            db, current_user, project_id=project_id, payload=payload
+    task_payload = payload.to_schema()
+
+    # =========================================
+    # SAVE AUDIO FILE
+    # =========================================
+
+    audio_instruction_url = None
+
+    if audio_file:
+
+        allowed_audio = ["mp3", "wav", "m4a", "webm", "aac", "ogg"]
+
+        if "." not in audio_file.filename:
+
+            raise ValidationError(
+                "Audio file must have extension"
+            )
+
+        ext = audio_file.filename.rsplit(".", 1)[-1].lower()
+
+        if ext not in allowed_audio:
+
+            raise ValidationError(
+                "Invalid audio format"
+            )
+
+        filename = f"{uuid.uuid4().hex}.{ext}"
+
+        filepath = os.path.join(
+            AUDIO_DIR,
+            filename
         )
-        await bump_cache_version(redis, VERSION_KEY)
+
+        with open(filepath, "wb") as buffer:
+
+            shutil.copyfileobj(
+                audio_file.file,
+                buffer
+            )
+
+        audio_instruction_url = (
+            filepath.replace("\\", "/")
+        )
+
+
+    # =========================================
+    # SAVE IMAGE FILE
+    # =========================================
+
+    instruction_image_url = None
+
+    if instruction_image:
+
+        allowed_images = [
+            "jpg",
+            "jpeg",
+            "png",
+            "webp"
+        ]
+
+        if "." not in instruction_image.filename:
+
+            raise ValidationError(
+                "Image file must have extension"
+            )
+
+        ext = instruction_image.filename.rsplit(".", 1)[-1].lower()
+
+        if ext not in allowed_images:
+
+            raise ValidationError(
+                "Invalid image format"
+            )
+
+        filename = f"{uuid.uuid4().hex}.{ext}"
+
+        filepath = os.path.join(
+            IMAGE_DIR,
+            filename
+        )
+
+        with open(filepath, "wb") as buffer:
+
+            shutil.copyfileobj(
+                instruction_image.file,
+                buffer
+            )
+
+        instruction_image_url = (
+            filepath.replace("\\", "/")
+        )
+
+    try:
+
+        out = await service.create_task(
+
+            db,
+
+            current_user,
+
+            project_id=project_id,
+
+            payload=task_payload,
+
+            audio_instruction_url=audio_instruction_url,
+
+            instruction_image_url=instruction_image_url,
+        )
+        await bump_cache_version(
+            redis,
+            VERSION_KEY
+        )
+
     except Exception:
-        logger.exception(f"Task creation failed project_id={project_id}")
+
+        logger.exception(
+            f"Task creation failed project_id={project_id}"
+        )
+
         raise
+
 
     if isinstance(out, list):
         logger.info(f"Tasks created count={len(out)}")
@@ -3078,26 +3268,161 @@ async def get_task(
 
 
 @tasks_router.put(
-    "/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]]
+    "/{project_id}/tasks/{task_id}",
+    response_model=Union[s.TaskOut, List[s.TaskOut]]
 )
 async def update_task(
+
     project_id: int,
+
     task_id: int,
-    payload: s.TaskUpdate,
+
+    payload: s.TaskUpdateForm = Depends(),
+
+    audio_file: Optional[UploadFile] = File(None),
+
+    instruction_image: Optional[UploadFile] = File(None),
+
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+
     db: AsyncSession = Depends(get_db_session),
+
     redis=Depends(get_request_redis),
+
     service: TasksService = Depends(get_tasks_service),
 ):
+
     logger.info(f"Updating task id={task_id}")
 
-    try:
-        out = await service.update_task(
-            db, current_user, project_id=project_id, task_id=task_id, payload=payload
+    task_payload = payload.to_schema()
+
+    # =========================================
+    # SAVE AUDIO FILE
+    # =========================================
+
+    audio_instruction_url = None
+
+    if audio_file:
+
+        allowed_audio = [
+            "mp3",
+            "wav",
+            "m4a",
+            "webm"
+        ]
+
+        if "." not in audio_file.filename:
+
+            raise BadRequestError(
+                "Audio file must have extension"
+            )
+
+        ext = audio_file.filename.rsplit(".", 1)[-1].lower()
+
+        if ext not in allowed_audio:
+
+            raise BadRequestError(
+                "Invalid audio format"
+            )
+
+        filename = f"{uuid.uuid4().hex}.{ext}"
+
+        filepath = os.path.join(
+            AUDIO_DIR,
+            filename
         )
-        await bump_cache_version(redis, VERSION_KEY)
+
+        with open(filepath, "wb") as buffer:
+
+            shutil.copyfileobj(
+                audio_file.file,
+                buffer
+            )
+
+        audio_instruction_url = (
+            filepath.replace("\\", "/")
+        )
+
+    # =========================================
+    # SAVE IMAGE FILE
+    # =========================================
+
+    instruction_image_url = None
+    if instruction_image:
+
+        allowed_images = [
+            "jpg",
+            "jpeg",
+            "png",
+            "webp"
+        ]
+
+        if "." not in instruction_image.filename:
+
+            raise BadRequestError(
+                "Image file must have extension"
+            )
+
+        ext = instruction_image.filename.rsplit(".", 1)[-1].lower()
+
+        if ext not in allowed_images:
+
+            raise BadRequestError(
+                "Invalid image format"
+            )
+
+        filename = f"{uuid.uuid4().hex}.{ext}"
+
+        filepath = os.path.join(
+            IMAGE_DIR,
+            filename
+        )
+
+        with open(filepath, "wb") as buffer:
+
+            shutil.copyfileobj(
+                instruction_image.file,
+                buffer
+            )
+
+        instruction_image_url = (
+            filepath.replace("\\", "/")
+        )
+
+    try:
+
+        out = await service.update_task(
+
+            db,
+
+            current_user,
+
+            project_id=project_id,
+
+            task_id=task_id,
+
+            payload=task_payload,
+
+            audio_instruction_url=audio_instruction_url,
+
+            instruction_image_url=instruction_image_url,
+
+            remove_audio=payload.remove_audio,
+
+            remove_image=payload.remove_image,
+        )
+
+        await bump_cache_version(
+            redis,
+            VERSION_KEY
+        )
+
     except Exception:
-        logger.exception(f"Task update failed id={task_id}")
+
+        logger.exception(
+            f"Task update failed id={task_id}"
+        )
+
         raise
 
     logger.info(f"Task updated id={task_id}")

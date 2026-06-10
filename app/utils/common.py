@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-
+import re
 from app.models import project as m
 from app.models.user import User, UserRole
 from app.utils.helpers import PermissionDeniedError
@@ -155,3 +155,44 @@ async def create_system_alert(
     db.add(alert)
     await db.flush()
     return alert
+
+
+async def generate_readable_master_code(
+    db: AsyncSession,
+    model,
+    prefix: str,
+    name: str,
+    code_column: str = "unique_code",
+    padding: int = 3,
+):
+    """
+    Example:
+    LAB-MASON-001
+    ACT-BRICKWORK-001
+    """
+
+    column = getattr(model, code_column)
+
+    # Clean name
+    cleaned_name = re.sub(r"[^A-Za-z0-9 ]", "", name)
+    cleaned_name = cleaned_name.upper().replace(" ", "-")
+
+    base_prefix = f"{prefix}-{cleaned_name}-"
+
+    result = await db.execute(
+        select(func.max(column)).where(column.like(f"{base_prefix}%"))
+    )
+
+    last_code = result.scalar()
+
+    if last_code:
+        try:
+            last_number = int(last_code.split("-")[-1])
+        except Exception:
+            last_number = 0
+    else:
+        last_number = 0
+
+    next_number = last_number + 1
+
+    return f"{base_prefix}{str(next_number).zfill(padding)}"

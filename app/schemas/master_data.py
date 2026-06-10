@@ -15,7 +15,7 @@ class MasterDataBase(BaseModel):
 
     name: str
 
-    unique_code: Optional[str] = None
+    # unique_code: Optional[str] = None
 
     category: Optional[str] = None
 
@@ -43,16 +43,22 @@ class UnitUpdate(BaseModel):
 
     name: Optional[str] = None
 
-    unique_code: Optional[str] = None
+    # unique_code: Optional[str] = None
 
     category: Optional[str] = None
 
     is_active: Optional[bool] = None
 
 
-class UnitOut(MasterDataBase):
+class UnitOut(BaseModel):
 
     id: int
+
+    name: str
+
+    unique_code: Optional[str]
+
+    category: Optional[str]
 
     is_active: bool
 
@@ -106,7 +112,7 @@ class LabourTypeUpdate(BaseModel):
 
     name: Optional[str] = None
 
-    unique_code: Optional[str] = None
+    # unique_code: Optional[str] = None
 
     category: Optional[str] = None
 
@@ -147,6 +153,8 @@ class LabourTypeOut(MasterDataBase):
 
     id: int
 
+    unique_code: Optional[str]
+
     default_daily_wage: Decimal
 
     default_working_hours: int
@@ -176,7 +184,7 @@ class ActivityTypeUpdate(BaseModel):
 
     name: Optional[str] = None
 
-    unique_code: Optional[str] = None
+    # unique_code: Optional[str] = None
 
     category: Optional[str] = None
 
@@ -186,6 +194,8 @@ class ActivityTypeUpdate(BaseModel):
 class ActivityTypeOut(MasterDataBase):
 
     id: int
+
+    unique_code: Optional[str]
 
     is_active: bool
 
@@ -223,7 +233,7 @@ class MaterialMasterUpdate(BaseModel):
 
     unit: Optional[str] = None
 
-    unique_code: Optional[str] = None
+    # unique_code: Optional[str] = None
 
     category: Optional[str] = None
 
@@ -247,6 +257,8 @@ class MaterialMasterOut(MasterDataBase):
     unit: str
 
     brand: Optional[str]
+
+    unique_code: Optional[str]
 
     specification: Optional[str]
 

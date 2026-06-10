@@ -199,87 +199,324 @@ class MilestoneOut(BaseSchema):
 # ===================== TASK =====================
 
 
+# ===================== TASK =====================
+
+from fastapi import Form
+import json
+
+
 class TaskCreate(BaseSchema):
     title: str
     description: Optional[str] = None
+
     priority: Union[int, TaskPriority]
+
     status: TaskStatus = TaskStatus.PLANNED
+
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+
     assigned_user_ids: Optional[list[int]] = None
+
     activity_type_id: Optional[int] = None
+
     milestone_id: Optional[int] = None
+
     boq_id: Optional[int] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        return validate_start_end_dates(info.data.get("start_date"), v)
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v,
+        )
+
+
+# =========================================================
+# TASK CREATE FORM (multipart/form-data support)
+# =========================================================
+
+class TaskCreateForm:
+
+    def __init__(
+
+        self,
+
+        title: str = Form(...),
+
+        description: Optional[str] = Form(None),
+
+        priority: Optional[Union[int, TaskPriority]] = Form(None),
+
+        status: TaskStatus = Form(TaskStatus.PLANNED),
+
+        start_date: Optional[date] = Form(None),
+
+        end_date: Optional[date] = Form(None),
+
+        assigned_user_ids: Optional[str] = Form(None),
+
+        activity_type_id: Optional[int] = Form(None),
+
+        milestone_id: Optional[int] = Form(None),
+
+        boq_id: Optional[int] = Form(None),
+
+    ):
+
+        self.title = title
+
+        self.description = description
+
+        self.priority = priority
+
+        self.status = status
+
+        self.start_date = start_date
+
+        self.end_date = end_date
+
+        self.assigned_user_ids = (
+            json.loads(assigned_user_ids)
+            if assigned_user_ids
+            else None
+        )
+
+        self.activity_type_id = activity_type_id
+
+        self.milestone_id = milestone_id
+
+        self.boq_id = boq_id
+
+    # =====================================================
+    # CONVERT TO PYDANTIC SCHEMA
+    # =====================================================
+
+    def to_schema(self) -> TaskCreate:
+
+        return TaskCreate(
+
+            title=self.title,
+
+            description=self.description,
+
+            priority=self.priority,
+
+            status=self.status,
+
+            start_date=self.start_date,
+
+            end_date=self.end_date,
+
+            assigned_user_ids=self.assigned_user_ids,
+
+            activity_type_id=self.activity_type_id,
+
+            milestone_id=self.milestone_id,
+
+            boq_id=self.boq_id,
+        )
 
 
 class TaskUpdate(BaseSchema):
+
     title: Optional[str] = None
+
     description: Optional[str] = None
+
     priority: Optional[Union[int, TaskPriority]] = None
+
     start_date: Optional[date] = None
+
     end_date: Optional[date] = None
+
+    status: Optional[TaskStatus] = None
 
     assigned_user_id: Optional[int] = None
 
     activity_type_id: Optional[int] = None
+
     milestone_id: Optional[int] = None
+
     boq_id: Optional[int] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
-        return validate_start_end_dates(info.data.get("start_date"), v)
+        return validate_start_end_dates(
+            info.data.get("start_date"),
+            v,
+        )
+
+
+# =========================================================
+# TASK UPDATE FORM (multipart/form-data support)
+# =========================================================
+
+class TaskUpdateForm:
+
+    def __init__(
+
+        self,
+
+        title: Optional[str] = Form(None),
+
+        description: Optional[str] = Form(None),
+
+        priority: Optional[int] = Form(None),
+
+        start_date: Optional[date] = Form(None),
+
+        end_date: Optional[date] = Form(None),
+
+        status: Optional[TaskStatus] = Form(None),
+
+        assigned_user_id: Optional[int] = Form(None),
+
+        activity_type_id: Optional[int] = Form(None),
+
+        milestone_id: Optional[int] = Form(None),
+
+        boq_id: Optional[int] = Form(None),
+
+        remove_audio: bool = Form(False),
+
+        remove_image: bool = Form(False),
+
+    ):
+
+        self.title = title
+
+        self.description = description
+
+        self.priority = priority
+
+        self.start_date = start_date
+
+        self.end_date = end_date
+        
+        self.status = status
+
+        self.assigned_user_id = assigned_user_id
+
+        self.activity_type_id = activity_type_id
+
+        self.milestone_id = milestone_id
+
+        self.boq_id = boq_id
+
+        self.remove_audio = remove_audio
+
+        self.remove_image = remove_image
+
+    def to_schema(self) -> TaskUpdate:
+
+        return TaskUpdate(
+
+            title=self.title,
+
+            description=self.description,
+
+            priority=self.priority,
+
+            start_date=self.start_date,
+
+            end_date=self.end_date,
+
+            status=self.status,
+
+            assigned_user_id=self.assigned_user_id,
+
+            activity_type_id=self.activity_type_id,
+
+            milestone_id=self.milestone_id,
+
+            boq_id=self.boq_id,
+        )
 
 
 class TaskOut(BaseSchema):
+
     id: int
+
     project_id: int
+
     milestone_id: Optional[int] = None
+
     boq_id: Optional[int] = None
+
     title: str
+
     description: Optional[str] = None
+
     priority: TaskPriority
+
     status: TaskStatus
+
     start_date: Optional[date] = None
+
     end_date: Optional[date] = None
+
     actual_start_date: Optional[date] = None
+
     actual_end_date: Optional[date] = None
+
     created_by_user_id: int
+
     assigned_user_id: Optional[int]
+
     completion_percentage: float
+
     is_delayed: bool
+
     execution_duration: int = 0
+
     delay_days: int = 0
+
     actual_cost: float = 0.0
+
     planned_cost: float = 0.0
+
+    # ================= TASK MEDIA =================
+
+    audio_instruction_url: Optional[str] = None
+
+    instruction_image_url: Optional[str] = None
+
+    task_icon: Optional[str] = None
 
 
 class TaskProgressUpdate(BaseSchema):
+
     percentage: Annotated[int, Field(ge=0, le=100)]
+
     remarks: Optional[str] = None
 
 
 class TaskProgressOut(BaseSchema):
+
     id: int
+
     task_id: int
+
     percentage: int
+
     remarks: Optional[str] = None
+
     created_at: datetime
 
 
 class TaskPass(BaseSchema):
+
     new_user_id: int
+
     remark: Optional[str] = None
 
 
 class TaskStatusUpdate(BaseSchema):
-    status: TaskStatus
 
+    status: TaskStatus
 
 # ===================== COMMENTS =====================
 

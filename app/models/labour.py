@@ -161,6 +161,65 @@ class Labour(Base, TimestampMixin):
 
         return Decimal("0")
 
+
+# ======================
+# ATTENDANCE (NO CHANGE)
+# ======================
+class LabourAttendance(Base, TimestampMixin):
+    __tablename__ = "labour_attendance"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    labour_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("labour.id", ondelete="CASCADE"), index=True
+    )
+
+    project_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+
+    attendance_date: Mapped[date] = mapped_column(index=True)
+
+    status: Mapped[AttendanceStatus] = mapped_column(
+        SAEnum(AttendanceStatus),
+        default=AttendanceStatus.PRESENT
+    )
+
+    in_time: Mapped[Optional[time]] = mapped_column(Time)
+    out_time: Mapped[Optional[time]] = mapped_column(Time)
+
+    check_in_image: Mapped[Optional[str]] = mapped_column(String(500))
+    check_out_image: Mapped[Optional[str]] = mapped_column(String(500))
+
+    working_hours: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), default=0)
+    overtime_hours: Mapped[Decimal] = mapped_column(DECIMAL(5, 2), default=0)
+    overtime_rate: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), default=0)
+
+    check_in_latitude: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(9, 6))
+    check_in_longitude: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(9, 6))
+
+    check_out_latitude: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(9, 6))
+    check_out_longitude: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(9, 6))
+
+    check_in_address: Mapped[Optional[str]] = mapped_column(String(255))
+    check_out_address: Mapped[Optional[str]] = mapped_column(String(255))
+
+    task_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("tasks.id"), nullable=True
+    )
+
+    task = relationship("Task")
+
+    task_description: Mapped[str] = mapped_column(String(255))
+
+
+Index(
+    "idx_labour_attendance_project_date",
+    LabourAttendance.project_id,
+    LabourAttendance.attendance_date,
+)
+
+
 # ======================
 # PAYROLL (NO CHANGE)
 # ======================

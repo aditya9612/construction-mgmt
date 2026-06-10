@@ -59,7 +59,6 @@ from app.api.quotation import router as quotation_router
 from app.api.agreement import router as agreement_router
 from app.api.project_visualization import router as visualization_router
 from app.api.attendance import router as attendance_router
-from app.api.voice_task import router as voice_task_router
 from app.api.notification import router as notification_router
 from app.api.rbac import router as rbac_router
 from app.cache.redis import create_redis_client
@@ -299,7 +298,6 @@ def create_app() -> FastAPI:
     api_router.include_router(agreement_router)
     api_router.include_router(visualization_router)
     api_router.include_router(attendance_router)
-    api_router.include_router(voice_task_router)
     api_router.include_router(notification_router)
 
 
