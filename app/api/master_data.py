@@ -7,6 +7,7 @@ from app.db.session import get_db_session
 from app.models import master_data as m
 from app.schemas import master_data as s
 
+from app.utils.common import generate_readable_master_code
 from app.utils.helpers import NotFoundError, ValidationError
 
 from app.core.dependencies import (
@@ -225,7 +226,17 @@ async def create_unit(
         raise ValidationError("Unit already exists")
 
     # CREATE UNIT
-    obj = m.Unit(**payload.model_dump())
+    unique_code = await generate_readable_master_code(
+        db=db,
+        model=m.Unit,
+        prefix="UOM",
+        name=payload.name
+    )
+
+    obj = m.Unit(
+        **payload.model_dump(),
+        unique_code=unique_code
+    )
 
     db.add(obj)
 
@@ -288,7 +299,17 @@ async def create_labour_type(
         raise ValidationError("Labour type already exists")
 
     # CREATE LABOUR TYPE
-    obj = m.LabourType(**payload.model_dump())
+    unique_code = await generate_readable_master_code(
+        db=db,
+        model=m.LabourType,
+        prefix="LAB",
+        name=payload.name
+    )
+
+    obj = m.LabourType(
+        **payload.model_dump(),
+        unique_code=unique_code
+    )
 
     db.add(obj)
 
@@ -345,7 +366,17 @@ async def create_activity_type(
         raise ValidationError("Activity type already exists")
 
     # CREATE ACTIVITY TYPE
-    obj = m.ActivityType(**payload.model_dump())
+    unique_code = await generate_readable_master_code(
+        db=db,
+        model=m.ActivityType,
+        prefix="ACT",
+        name=payload.name
+    )
+
+    obj = m.ActivityType(
+        **payload.model_dump(),
+        unique_code=unique_code
+    )
 
     db.add(obj)
 
@@ -409,7 +440,17 @@ async def create_material_master(
         raise ValidationError("Material already exists")
 
     # CREATE MATERIAL
-    obj = m.MaterialMaster(**payload.model_dump())
+    unique_code = await generate_readable_master_code(
+        db=db,
+        model=m.MaterialMaster,
+        prefix="MAT",
+        name=payload.name
+    )
+
+    obj = m.MaterialMaster(
+        **payload.model_dump(),
+        unique_code=unique_code
+    )
 
     db.add(obj)
 

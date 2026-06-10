@@ -362,22 +362,22 @@ class Task(Base):
             return (today - self.end_date).days
         return 0
 
-    # --- Voice Task Assignment Fields ---
-    voice_instruction_url: Mapped[Optional[str]] = mapped_column(
-        String(500), nullable=True
+    # ================= TASK INSTRUCTION MEDIA =================
+
+    audio_instruction_url: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
     )
-    generated_audio_url: Mapped[Optional[str]] = mapped_column(
-        String(500), nullable=True
+
+    instruction_image_url: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
     )
-    original_transcription_text: Mapped[Optional[str]] = mapped_column(
-        Text, nullable=True
+
+    task_icon: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
     )
-    translated_english_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    language_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
-    audio_duration: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    task_icon: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    instruction_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    # ------------------------------------
 
     # in Task model
 
