@@ -193,9 +193,7 @@ async def send_message(
 
     # MENTION DETECTION
 
-    mention_ids = list(
-        set(payload.mention_user_ids)
-    )
+    mention_ids = list(set(payload.mention_user_ids))
 
     mentioned_users = []
 
@@ -208,25 +206,14 @@ async def send_message(
             )
         )
 
-        valid_member_ids = set(
-            valid_members.scalars().all()
-        )
+        valid_member_ids = set(valid_members.scalars().all())
 
-        invalid_ids = set(
-            mention_ids
-        ) - valid_member_ids
+        invalid_ids = set(mention_ids) - valid_member_ids
 
         if invalid_ids:
-            raise HTTPException(
-                400,
-                f"Invalid mentioned users: {list(invalid_ids)}"
-            )
+            raise HTTPException(400, f"Invalid mentioned users: {list(invalid_ids)}")
 
-        users = await db.execute(
-            select(User).where(
-                User.id.in_(mention_ids)
-            )
-        )
+        users = await db.execute(select(User).where(User.id.in_(mention_ids)))
 
         mentioned_users = users.scalars().all()
 
@@ -244,7 +231,7 @@ async def send_message(
 
             if count > 10:
                 raise HTTPException(429, "Too many messages")
-            
+
     except HTTPException:
         raise
 
@@ -299,11 +286,7 @@ async def send_message(
     if not chat:
         raise HTTPException(404, "Chat not found")
 
-    chat.last_message = (
-        payload.message
-        if payload.message
-        else "📎 Attachment"
-    )
+    chat.last_message = payload.message if payload.message else "📎 Attachment"
     chat.last_message_at = datetime.utcnow()
 
     #  4. REDIS FAIL SAFETY
@@ -381,9 +364,17 @@ async def upload_chat_file(
     ext = Path(file.filename).suffix.lower()
 
     ALLOWED_EXTENSIONS = {
-        ".jpg", ".jpeg", ".png", ".webp",
-        ".mp4", ".mov",
-        ".pdf", ".doc", ".docx", ".xls", ".xlsx"
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+        ".mp4",
+        ".mov",
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
     }
 
     if ext not in ALLOWED_EXTENSIONS:
@@ -511,11 +502,7 @@ async def mark_delivered(
     if not msg:
         raise HTTPException(404, "Message not found")
 
-    await validate_membership(
-        msg.chat_id,
-        current_user.id,
-        db
-    )
+    await validate_membership(msg.chat_id, current_user.id, db)
 
     if msg.sender_id == current_user.id:
         return {"status": "ignored"}
@@ -577,7 +564,7 @@ async def get_messages(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    
+
     if limit > 100:
         limit = 100
 
@@ -587,10 +574,8 @@ async def get_messages(
 
     query = (
         select(ChatMessage, User, Parent)
-
         # HERE
         .options(selectinload(ChatMessage.attachments))
-
         .join(User, ChatMessage.sender_id == User.id)
         .outerjoin(Parent, ChatMessage.parent_id == Parent.id)
         .where(ChatMessage.chat_id == chat_id)
@@ -629,11 +614,7 @@ async def get_messages(
                         "message": (
                             "[deleted]"
                             if parent.is_deleted
-                            else (
-                                parent.message
-                                if parent.message
-                                else "[attachment]"
-                            )
+                            else (parent.message if parent.message else "[attachment]")
                         ),
                     }
                     if parent
@@ -661,9 +642,7 @@ async def get_messages(
     # AUTO READ WHEN OPENING CHAT
 
     message_ids = [
-        msg.id
-        for msg in message_objects
-        if msg.sender_id != current_user.id
+        msg.id for msg in message_objects if msg.sender_id != current_user.id
     ][:50]
 
     if message_ids:
@@ -675,10 +654,7 @@ async def get_messages(
             )
         )
 
-        delivery_map = {
-            d.message_id: d
-            for d in existing_deliveries.scalars().all()
-        }
+        delivery_map = {d.message_id: d for d in existing_deliveries.scalars().all()}
 
         new_deliveries = []
 
@@ -714,9 +690,7 @@ async def get_messages(
             )
         )
 
-        already_read_ids = set(
-            existing_reads.scalars().all()
-        )
+        already_read_ids = set(existing_reads.scalars().all())
 
         new_reads = [
             MessageRead(
@@ -786,11 +760,7 @@ async def get_messages(
                     )
                 ).label("read_count"),
             )
-            .where(
-                MessageDelivery.message_id.in_(
-                    [m.id for m in message_objects]
-                )
-            )
+            .where(MessageDelivery.message_id.in_([m.id for m in message_objects]))
             .group_by(MessageDelivery.message_id)
         )
 
@@ -866,9 +836,7 @@ async def get_replies(
 
     result = await db.execute(
         select(ChatMessage, User)
-
         .options(selectinload(ChatMessage.attachments))
-
         .join(User, ChatMessage.sender_id == User.id)
         .where(ChatMessage.parent_id == message_id)
         .order_by(ChatMessage.created_at.asc())
@@ -904,6 +872,93 @@ async def get_replies(
     return replies
 
 
+@router.get("/pinned", response_model=list[ChatListEnhancedOut])
+async def get_pinned_chats(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    result = await db.execute(
+        select(
+            ChatSession,
+            ChatMember,
+        )
+        .join(ChatMember, ChatMember.chat_id == ChatSession.id)
+        .where(
+            ChatMember.user_id == current_user.id,
+            ChatMember.is_pinned == True,
+        )
+        .order_by(ChatMember.pinned_at.desc())
+    )
+
+    rows = result.all()
+
+    private_chat_ids = [
+        chat.id for chat, member in rows if chat.type == ChatType.PRIVATE
+    ]
+
+    private_users_map = {}
+
+    if private_chat_ids:
+
+        private_users = await db.execute(
+            select(
+                ChatMember.chat_id,
+                User.id,
+                User.full_name,
+                User.profile_image,
+            )
+            .join(User, ChatMember.user_id == User.id)
+            .where(
+                ChatMember.chat_id.in_(private_chat_ids),
+                User.id != current_user.id,
+            )
+        )
+
+        for chat_id, uid, name, avatar in private_users.all():
+
+            private_users_map[chat_id] = {
+                "id": uid,
+                "name": name,
+                "avatar": avatar,
+            }
+
+    chats = []
+
+    for chat, member in rows:
+
+        other_user_id = None
+        other_user_name = None
+        other_user_avatar = None
+
+        if chat.type == ChatType.PRIVATE:
+
+            other_user = private_users_map.get(chat.id)
+
+            if other_user:
+                other_user_id = other_user["id"]
+                other_user_name = other_user["name"]
+                other_user_avatar = other_user["avatar"]
+
+        chats.append(
+            {
+                "id": chat.id,
+                "type": chat.type.value,
+                "name": chat.name,
+                "avatar_url": chat.avatar_url,
+                "other_user_id": other_user_id,
+                "other_user_name": other_user_name,
+                "other_user_avatar": other_user_avatar,
+                "last_message": chat.last_message,
+                "last_message_at": chat.last_message_at,
+                "unread_count": 0,
+                "is_pinned": member.is_pinned,
+            }
+        )
+
+    return chats
+
+
 @router.get("/{chat_id}/unread")
 async def unread_count(
     chat_id: int,
@@ -931,10 +986,7 @@ async def unread_count(
     return {"unread": count}
 
 
-@router.get(
-    "/messages/{message_id}/reads",
-    response_model=list[MessageReadUserOut]
-)
+@router.get("/messages/{message_id}/reads", response_model=list[MessageReadUserOut])
 async def get_message_reads(
     message_id: int,
     current_user: User = Depends(get_current_user),
@@ -946,30 +998,13 @@ async def get_message_reads(
     if not msg:
         raise HTTPException(404, "Message not found")
 
-    await validate_membership(
-        msg.chat_id,
-        current_user.id,
-        db
-    )
+    await validate_membership(msg.chat_id, current_user.id, db)
 
     result = await db.execute(
-        select(
-            MessageRead,
-            User
-        )
-
-        .join(
-            User,
-            MessageRead.user_id == User.id
-        )
-
-        .where(
-            MessageRead.message_id == message_id
-        )
-
-        .order_by(
-            MessageRead.read_at.asc()
-        )
+        select(MessageRead, User)
+        .join(User, MessageRead.user_id == User.id)
+        .where(MessageRead.message_id == message_id)
+        .order_by(MessageRead.read_at.asc())
     )
 
     rows = result.all()
@@ -1026,6 +1061,7 @@ async def create_group(
     await db.commit()
 
     return {"chat_id": chat.id}
+
 
 @router.get("/users", response_model=list[ChatUserOut])
 async def get_chat_users(
@@ -1114,7 +1150,7 @@ async def search_chat_users(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    
+
     if limit > 100:
         limit = 100
 
@@ -1188,15 +1224,9 @@ async def get_enhanced_chat_list(
             ChatSession.last_message,
             ChatSession.last_message_at,
             ChatMember.is_pinned,
-            func.coalesce(
-                unread_subquery.c.unread_count,
-                0
-            ).label("unread_count"),
+            func.coalesce(unread_subquery.c.unread_count, 0).label("unread_count"),
         )
-        .join(
-            ChatMember,
-            ChatMember.chat_id == ChatSession.id
-        )
+        .join(ChatMember, ChatMember.chat_id == ChatSession.id)
         .outerjoin(
             unread_subquery,
             unread_subquery.c.chat_id == ChatSession.id,
@@ -1214,11 +1244,7 @@ async def get_enhanced_chat_list(
 
     rows = result.all()
 
-    private_chat_ids = [
-        row.id
-        for row in rows
-        if row.type == ChatType.PRIVATE
-    ]
+    private_chat_ids = [row.id for row in rows if row.type == ChatType.PRIVATE]
 
     private_users_map = {}
 
@@ -1367,10 +1393,7 @@ async def add_multiple_members(
     invalid_ids = set(member_ids) - valid_user_ids
 
     if invalid_ids:
-        raise HTTPException(
-            400,
-            f"Invalid users: {list(invalid_ids)}"
-        )
+        raise HTTPException(400, f"Invalid users: {list(invalid_ids)}")
 
     existing = await db.execute(
         select(ChatMember.user_id).where(
@@ -1462,36 +1485,16 @@ async def get_mentions(
 
     result = await db.execute(
         select(ChatMessage, User)
-
-        .options(
-            selectinload(ChatMessage.attachments)
-        )
-
-        .join(
-            MessageMention,
-            MessageMention.message_id == ChatMessage.id
-        )
-
-        .join(
-            User,
-            ChatMessage.sender_id == User.id
-        )
-
-        .join(
-            ChatMember,
-            ChatMember.chat_id == ChatMessage.chat_id
-        )
-
+        .options(selectinload(ChatMessage.attachments))
+        .join(MessageMention, MessageMention.message_id == ChatMessage.id)
+        .join(User, ChatMessage.sender_id == User.id)
+        .join(ChatMember, ChatMember.chat_id == ChatMessage.chat_id)
         .where(
             MessageMention.mentioned_user_id == current_user.id,
             ChatMember.user_id == current_user.id,
             ChatMember.is_deleted == False,
         )
-
-        .order_by(
-            ChatMessage.created_at.desc()
-        )
-
+        .order_by(ChatMessage.created_at.desc())
         .limit(limit)
     )
 
@@ -1508,12 +1511,10 @@ async def get_mentions(
                 "message": msg.message,
                 "sender_id": msg.sender_id,
                 "created_at": msg.created_at,
-
                 "sender": {
                     "id": sender.id,
                     "name": sender.full_name,
                 },
-
                 "attachments": [
                     {
                         "id": a.id,
@@ -1530,6 +1531,7 @@ async def get_mentions(
 
     return output
 
+
 @router.get("/{chat_id}/mention-users")
 async def mention_users(
     chat_id: int,
@@ -1538,7 +1540,7 @@ async def mention_users(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    
+
     if limit > 100:
         limit = 100
 
@@ -1610,7 +1612,6 @@ async def add_member(
     db.add(ChatMember(chat_id=chat_id, user_id=user_id, role=MemberRole.MEMBER))
 
     return {"status": "added"}
-
 
 
 @router.post("/group/{chat_id}/remove")
@@ -1931,15 +1932,9 @@ async def get_chat_list(
             ChatSession.last_message,
             ChatSession.last_message_at,
             ChatMember.is_pinned,
-            func.coalesce(
-                unread_subquery.c.unread_count,
-                0
-            ).label("unread_count"),
+            func.coalesce(unread_subquery.c.unread_count, 0).label("unread_count"),
         )
-        .join(
-            ChatMember,
-            ChatMember.chat_id == ChatSession.id
-        )
+        .join(ChatMember, ChatMember.chat_id == ChatSession.id)
         .outerjoin(
             unread_subquery,
             unread_subquery.c.chat_id == ChatSession.id,
@@ -2239,7 +2234,7 @@ async def delete_message(
 
     if not msg:
         raise HTTPException(404, "ChatMessage not found")
-    
+
     await validate_membership(msg.chat_id, current_user.id, db)
 
     if msg.sender_id != current_user.id:
@@ -2302,36 +2297,22 @@ async def search_messages(
     search_query = f"{clean_query}*"
 
     if len(clean_query) < 3:
-        condition = ChatMessage.message.ilike(
-            f"%{clean_query}%"
-        )
+        condition = ChatMessage.message.ilike(f"%{clean_query}%")
     else:
-        condition = text(
-            "MATCH(message) AGAINST(:q IN BOOLEAN MODE)"
-        )
+        condition = text("MATCH(message) AGAINST(:q IN BOOLEAN MODE)")
 
     query_stmt = (
         select(ChatMessage, User, Parent)
-
         .options(selectinload(ChatMessage.attachments))
-
         .join(User, ChatMessage.sender_id == User.id)
         .outerjoin(Parent, ChatMessage.parent_id == Parent.id)
-
-        .where(
-            ChatMessage.chat_id == chat_id,
-            condition
-        )
-
+        .where(ChatMessage.chat_id == chat_id, condition)
         .order_by(ChatMessage.created_at.desc())
-
         .limit(50)
     )
 
     if len(clean_query) >= 3:
-        query_stmt = query_stmt.params(
-            q=f"{clean_query}*"
-        )
+        query_stmt = query_stmt.params(q=f"{clean_query}*")
 
     result = await db.execute(query_stmt)
 
@@ -2345,51 +2326,31 @@ async def search_messages(
             {
                 "id": msg.id,
                 "chat_id": msg.chat_id,
-
-                "message": (
-                    "[deleted]"
-                    if msg.is_deleted
-                    else msg.message
-                ),
-
+                "message": ("[deleted]" if msg.is_deleted else msg.message),
                 "sender_id": msg.sender_id,
-
                 "created_at": msg.created_at,
-
                 "is_delivered": False,
                 "is_read": False,
-
                 "parent_id": msg.parent_id,
-
                 "sender": {
                     "id": user.id,
                     "name": user.full_name,
                 },
-
                 "parent": (
                     {
                         "id": parent.id,
-
                         "message": (
                             "[deleted]"
                             if parent.is_deleted
-                            else (
-                                parent.message
-                                if parent.message
-                                else "[attachment]"
-                            )
+                            else (parent.message if parent.message else "[attachment]")
                         ),
                     }
                     if parent
                     else None
                 ),
-
                 "is_deleted": msg.is_deleted,
-
                 "is_edited": msg.is_edited,
-
                 "is_pinned": msg.is_pinned,
-
                 "attachments": [
                     {
                         "id": a.id,
@@ -2401,11 +2362,8 @@ async def search_messages(
                     }
                     for a in msg.attachments
                 ],
-
                 "reply_count": 0,
-
                 "read_by": [],
-
                 "reactions": [],
             }
         )
@@ -2450,10 +2408,7 @@ async def pin_message(
     )
 
     if pin_count >= 3:
-        raise HTTPException(
-            status_code=400,
-            detail="Maximum 3 pinned messages allowed"
-        )
+        raise HTTPException(status_code=400, detail="Maximum 3 pinned messages allowed")
 
     msg.is_pinned = True
 
@@ -2472,9 +2427,7 @@ async def pinned_messages(
 
     result = await db.execute(
         select(ChatMessage, User)
-
         .options(selectinload(ChatMessage.attachments))
-
         .join(User, ChatMessage.sender_id == User.id)
         .where(ChatMessage.chat_id == chat_id, ChatMessage.is_pinned == True)
         .order_by(ChatMessage.created_at.desc())
@@ -2607,98 +2560,6 @@ async def unpin_chat(
     return {"status": "unpinned"}
 
 
-@router.get("/pinned", response_model=list[ChatListEnhancedOut])
-async def get_pinned_chats(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-):
-
-    result = await db.execute(
-        select(
-            ChatSession,
-            ChatMember,
-        )
-        .join(
-            ChatMember,
-            ChatMember.chat_id == ChatSession.id
-        )
-        .where(
-            ChatMember.user_id == current_user.id,
-            ChatMember.is_pinned == True,
-        )
-        .order_by(ChatMember.pinned_at.desc())
-    )
-
-    rows = result.all()
-
-    private_chat_ids = [
-        chat.id
-        for chat, member in rows
-        if chat.type == ChatType.PRIVATE
-    ]
-
-    private_users_map = {}
-
-    if private_chat_ids:
-
-        private_users = await db.execute(
-            select(
-                ChatMember.chat_id,
-                User.id,
-                User.full_name,
-                User.profile_image,
-            )
-            .join(User, ChatMember.user_id == User.id)
-            .where(
-                ChatMember.chat_id.in_(private_chat_ids),
-                User.id != current_user.id,
-            )
-        )
-
-        for chat_id, uid, name, avatar in private_users.all():
-
-            private_users_map[chat_id] = {
-                "id": uid,
-                "name": name,
-                "avatar": avatar,
-            }
-
-    chats = []
-
-    for chat, member in rows:
-
-        other_user_id = None
-        other_user_name = None
-        other_user_avatar = None
-
-        if chat.type == ChatType.PRIVATE:
-
-            other_user = private_users_map.get(chat.id)
-
-            if other_user:
-                other_user_id = other_user["id"]
-                other_user_name = other_user["name"]
-                other_user_avatar = other_user["avatar"]
-
-        chats.append(
-            {
-                "id": chat.id,
-                "type": chat.type.value,
-                "name": chat.name,
-                "avatar_url": chat.avatar_url,
-                "other_user_id": other_user_id,
-                "other_user_name": other_user_name,
-                "other_user_avatar": other_user_avatar,
-                "last_message": chat.last_message,
-                "last_message_at": chat.last_message_at,
-                "unread_count": 0,
-                "is_pinned": member.is_pinned,
-            }
-        )
-
-    return chats
-
-
 @router.post("/messages/{message_id}/forward")
 async def forward_message(
     message_id: int,
@@ -2764,9 +2625,7 @@ async def forward_message(
 
     if chat:
         chat.last_message = (
-            original.message
-            if original.message
-            else "📎 Forwarded Attachment"
+            original.message if original.message else "📎 Forwarded Attachment"
         )
         chat.last_message_at = datetime.utcnow()
 
@@ -2819,15 +2678,9 @@ async def active_users(
     if not redis:
         return {"active_users": []}
 
-    users = await redis.smembers(
-        f"chat:{chat_id}:online_users"
-    )
+    users = await redis.smembers(f"chat:{chat_id}:online_users")
 
-    return {
-        "active_users": [
-            int(u.decode()) for u in users
-        ]
-    }
+    return {"active_users": [int(u.decode()) for u in users]}
 
 
 @router.get("/{chat_id}/user-states")
@@ -2838,25 +2691,15 @@ async def get_user_states(
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    await validate_membership(
-        chat_id,
-        current_user.id,
-        db
-    )
+    await validate_membership(chat_id, current_user.id, db)
 
-    redis = getattr(
-        request.app.state,
-        "redis",
-        None
-    )
+    redis = getattr(request.app.state, "redis", None)
 
     if not redis:
         return []
 
     result = await db.execute(
-        select(ChatMember.user_id).where(
-            ChatMember.chat_id == chat_id
-        )
+        select(ChatMember.user_id).where(ChatMember.chat_id == chat_id)
     )
 
     user_ids = result.scalars().all()

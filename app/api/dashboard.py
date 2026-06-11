@@ -1724,7 +1724,7 @@ async def project_engineer_dashboard(
             date=e.expense_date,
             type="Expense",
             category=e.category,
-            note=e.remarks,
+            note=e.description,
             amount=float(e.amount),
         )
         for e in expenses_query.scalars().all()
