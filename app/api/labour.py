@@ -1,8 +1,11 @@
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import io
+from fastapi import Form
+from pydantic import EmailStr
 from app.models.master_data import LabourType
 from sqlalchemy import case
+from sqlalchemy.orm import selectinload
 from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -39,6 +42,7 @@ from zoneinfo import ZoneInfo
 from app.models.invoice import Transaction
 from app.models.accountant import JournalEntry, JournalLine
 from app.models.project import ProjectOTPolicy
+
 
 async def get_user_project_ids(db, user):
     if user.role == UserRole.ADMIN.value:
@@ -116,9 +120,7 @@ async def create_labour(
 
     if profile_image:
         image_path = await validate_and_save_image(
-            file=profile_image,
-            upload_dir="uploads/labour",
-            prefix="labour"
+            file=profile_image, upload_dir="uploads/labour", prefix="labour"
         )
 
     data["profile_image"] = image_path
@@ -132,19 +134,14 @@ async def create_labour(
     # ADD HERE
     # =========================================
 
-    labour_type = await db.get(
-        LabourType,
-        payload.labour_type_id
-    )
+    labour_type = await db.get(LabourType, payload.labour_type_id)
 
     if not labour_type:
         raise ValidationError("Invalid labour_type_id")
 
     for _ in range(3):
         try:
-            worker_code = await generate_business_id(
-                db, Labour, "worker_code", "LAB"
-            )
+            worker_code = await generate_business_id(db, Labour, "worker_code", "LAB")
             data["worker_code"] = worker_code
 
             # Create User for this labour to allow attendance check-in
@@ -152,6 +149,9 @@ async def create_labour(
                 email=payload.email or f"{worker_code.lower()}@labour.local",
                 mobile=payload.mobile_number,
                 full_name=payload.labour_name,
+                aadhaar_number=payload.aadhaar_number,
+                pan_number=payload.pan_number,
+                address=payload.address,
                 profile_image=image_path,
                 role=UserRole.LABOUR.value,
                 is_active=(payload.status == LabourStatus.ACTIVE),
@@ -159,20 +159,30 @@ async def create_labour(
             )
             db.add(user)
             await db.flush()
-            
+
             data["user_id"] = user.id
 
             obj = Labour(**data)
             db.add(obj)
             await db.flush()
-            await db.refresh(obj)
+            await db.refresh(
+                obj,
+                attribute_names=[
+                    "user",
+                    "contractor",
+                    "labour_type",
+                ],
+            )
 
             await r.bump_cache_version(redis, "dashboard_version")
 
             return s.LabourOut.model_validate(obj)
 
-        except IntegrityError:
+        except IntegrityError as e:
             await db.rollback()
+
+            logger.warning(f"Labour creation retry due to integrity error: {e}")
+
             continue
 
     raise Exception("Failed to create labour")
@@ -204,7 +214,14 @@ async def list_labour(
     if cached:
         return PaginatedResponse[s.LabourOut].model_validate(cached)
 
-    query =  ( select(Labour) .options( selectinload(Labour.contractor), selectinload(Labour.labour_type), ) ).distinct()
+    query = (
+        select(Labour).options(
+            selectinload(Labour.user),
+            selectinload(Labour.contractor),
+            selectinload(Labour.labour_type),
+        )
+    ).distinct()
+
     count_query = select(func.count(func.distinct(Labour.id))).select_from(Labour)
 
     #  Subquery instead of JOIN
@@ -218,13 +235,15 @@ async def list_labour(
 
     if search:
         query = query.outerjoin(Contractor, Labour.contractor_id == Contractor.id)
-        count_query = count_query.outerjoin(Contractor, Labour.contractor_id == Contractor.id)
-        
+        count_query = count_query.outerjoin(
+            Contractor, Labour.contractor_id == Contractor.id
+        )
+
         search_filter = or_(
             Labour.labour_name.ilike(f"%{search}%"),
             Labour.worker_code.ilike(f"%{search}%"),
             Labour.aadhaar_number.ilike(f"%{search}%"),
-            Contractor.name.ilike(f"%{search}%")
+            Contractor.name.ilike(f"%{search}%"),
         )
         query = query.where(search_filter)
         count_query = count_query.where(search_filter)
@@ -248,6 +267,7 @@ async def list_labour(
     await r.cache_set_json(redis, cache_key, result)
 
     return PaginatedResponse[s.LabourOut].model_validate(result)
+
 
 @router.get("/payroll", response_model=list[s.PayrollDetailsOut])
 async def get_payroll_list(
@@ -406,11 +426,21 @@ async def get_contractor_liability(
     return output
 
 
-
 @router.put("/{labour_id}", response_model=s.LabourOut)
 async def update_labour(
     labour_id: int,
-    payload: s.LabourUpdate = Depends(),
+    aadhaar_number: Optional[str] = Form(None),
+    pan_number: Optional[str] = Form(None),
+    labour_name: Optional[str] = Form(None),
+    mobile_number: Optional[str] = Form(None),
+    email: Optional[EmailStr] = Form(None),
+    address: Optional[str] = Form(None),
+    labour_type_id: Optional[int] = Form(None),
+    custom_daily_wage_rate: Optional[Decimal] = Form(None),
+    custom_ot_rate_per_hour: Optional[Decimal] = Form(None),
+    contractor_id: Optional[int] = Form(None),
+    status: Optional[LabourStatus] = Form(None),
+    notes: Optional[str] = Form(None),
     profile_image: UploadFile = File(None),
     current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
@@ -428,30 +458,48 @@ async def update_labour(
 
     project_ids = mappings.all()
 
-    if not project_ids:
-        raise ValidationError("Labour not assigned")
+    # CHECK ANY ACCESS ONLY IF ASSIGNED
+    if project_ids:
 
-    #  CHECK ANY ACCESS
-    allowed = False
-    for pid in project_ids:
-        try:
-            await assert_project_access(db, project_id=pid, current_user=current_user)
-            allowed = True
-            break
-        except:
-            continue
+        allowed = False
 
-    if not allowed:
-        raise PermissionDeniedError("No access to this labour")
+        for pid in project_ids:
+            try:
+                await assert_project_access(
+                    db, project_id=pid, current_user=current_user
+                )
 
-    data = payload.model_dump(exclude_unset=True)
+                allowed = True
+                break
 
-    if payload.labour_type_id:
+            except PermissionDeniedError:
+                continue
 
-        labour_type = await db.get(
-            LabourType,
-            payload.labour_type_id
-        )
+        if not allowed:
+            raise PermissionDeniedError("No access to this labour")
+
+    # data = payload.model_dump(exclude_unset=True)
+
+    data = {
+        "aadhaar_number": aadhaar_number,
+        "pan_number": pan_number,
+        "labour_name": labour_name,
+        "mobile_number": mobile_number,
+        "email": email,
+        "address": address,
+        "labour_type_id": labour_type_id,
+        "custom_daily_wage_rate": custom_daily_wage_rate,
+        "custom_ot_rate_per_hour": custom_ot_rate_per_hour,
+        "contractor_id": contractor_id,
+        "status": status,
+        "notes": notes,
+    }
+
+    data = {k: v for k, v in data.items() if v is not None}
+
+    if labour_type_id is not None:
+
+        labour_type = await db.get(LabourType, labour_type_id)
 
         if not labour_type:
             raise ValidationError("Invalid labour_type_id")
@@ -459,9 +507,7 @@ async def update_labour(
     # PROFILE IMAGE UPDATE
     if profile_image:
         image_path = await validate_and_save_image(
-            file=profile_image,
-            upload_dir="uploads/labour",
-            prefix="labour"
+            file=profile_image, upload_dir="uploads/labour", prefix="labour"
         )
 
         data["profile_image"] = image_path
@@ -483,18 +529,31 @@ async def update_labour(
             if "email" in data:
                 user.email = data["email"]
 
+            if "aadhaar_number" in data:
+                user.aadhaar_number = data["aadhaar_number"]
+
             if "profile_image" in data:
                 user.profile_image = data["profile_image"]
 
             if "status" in data:
-                user.is_active = (
-                    data["status"] == LabourStatus.ACTIVE
-                )
+                user.is_active = data["status"] == LabourStatus.ACTIVE
+
+            if "pan_number" in data:
+                user.pan_number = data["pan_number"]
+
+            if "address" in data:
+                user.address = data["address"]
 
     await db.flush()
 
-    await db.refresh(obj)
-    await db.refresh(obj, attribute_names=["contractor"])
+    await db.refresh(
+        obj,
+        attribute_names=[
+            "user",
+            "contractor",
+            "labour_type",
+        ],
+    )
 
     await r.bump_cache_version(redis, VERSION_KEY)
     await r.bump_cache_version(redis, "dashboard_version")
@@ -502,7 +561,7 @@ async def update_labour(
     return s.LabourOut.model_validate(obj, from_attributes=True)
 
 
-@router.delete("/{labour_id}", status_code=204)
+@router.delete("/{labour_id}", status_code=200)
 async def delete_labour(
     labour_id: int,
     current_user: User = Depends(d.require_roles(LABOUR_DELETE_ROLES)),
@@ -521,33 +580,38 @@ async def delete_labour(
 
     project_ids = mappings.all()
 
-    if not project_ids:
-        raise ValidationError("Labour not assigned")
+    # If labour assigned to projects -> validate access
+    if project_ids:
+        allowed = False
 
-    allowed = False
-    for pid in project_ids:
-        try:
-            await assert_project_access(db, project_id=pid, current_user=current_user)
-            allowed = True
-            break
-        except:
-            continue
+        for pid in project_ids:
+            try:
+                await assert_project_access(
+                    db, project_id=pid, current_user=current_user
+                )
+                allowed = True
+                break
 
-    if not allowed:
-        raise PermissionDeniedError("No access to this labour")
+            except PermissionDeniedError:
+                continue
+
+        if not allowed:
+            raise PermissionDeniedError("No access to this labour")
 
     if obj.user_id:
         user = await db.get(User, obj.user_id)
-        if user:
-            await db.delete(user)
 
-    await db.delete(obj)
+        if user:
+            user.is_active = False
+
+    obj.status = LabourStatus.INACTIVE
+
     await db.flush()
 
     await r.bump_cache_version(redis, VERSION_KEY)
     await r.bump_cache_version(redis, "dashboard_version")
 
-    return None
+    return {"message": "Labour deactivated successfully"}
 
 
 @router.post("/assign-project", response_model=s.LabourProjectOut)
@@ -804,20 +868,25 @@ async def weekly_report(
 
     project_ids = mapping.all()
 
-    if not project_ids:
-        raise ValidationError("Labour not assigned")
+    # Validate access only if labour assigned to projects
+    if project_ids:
 
-    allowed = False
-    for pid in project_ids:
-        try:
-            await assert_project_access(db, project_id=pid, current_user=current_user)
-            allowed = True
-            break
-        except:
-            continue
+        allowed = False
 
-    if not allowed:
-        raise PermissionDeniedError("No access to this labour")
+        for pid in project_ids:
+            try:
+                await assert_project_access(
+                    db, project_id=pid, current_user=current_user
+                )
+
+                allowed = True
+                break
+
+            except PermissionDeniedError:
+                continue
+
+        if not allowed:
+            raise PermissionDeniedError("No access to this labour")
 
     result = await db.execute(
         select(
@@ -883,20 +952,25 @@ async def monthly_report(
 
     project_ids = mapping.all()
 
-    if not project_ids:
-        raise ValidationError("Labour not assigned")
+    # Validate access only if labour assigned to projects
+    if project_ids:
 
-    allowed = False
-    for pid in project_ids:
-        try:
-            await assert_project_access(db, project_id=pid, current_user=current_user)
-            allowed = True
-            break
-        except:
-            continue
+        allowed = False
 
-    if not allowed:
-        raise PermissionDeniedError("No access to this labour")
+        for pid in project_ids:
+            try:
+                await assert_project_access(
+                    db, project_id=pid, current_user=current_user
+                )
+
+                allowed = True
+                break
+
+            except PermissionDeniedError:
+                continue
+
+        if not allowed:
+            raise PermissionDeniedError("No access to this labour")
 
     result = await db.execute(
         select(
@@ -1009,10 +1083,7 @@ async def generate_payroll(
                 ot_rate = row.overtime_rate or Decimal("0")
                 ot_hours = row.overtime_hours or Decimal("0")
 
-                wage = (
-                    hourly_rate * working_hours
-                    + ot_rate * ot_hours
-                )
+                wage = hourly_rate * working_hours + ot_rate * ot_hours
 
             else:
 
@@ -1021,10 +1092,7 @@ async def generate_payroll(
                 ot_rate = row.overtime_rate or Decimal("0")
                 ot_hours = row.overtime_hours or Decimal("0")
 
-                wage = (
-                    hourly_rate * working_hours
-                    + ot_rate * ot_hours
-                )
+                wage = hourly_rate * working_hours + ot_rate * ot_hours
 
             key = (labour.id, row.project_id)
 
@@ -1036,7 +1104,7 @@ async def generate_payroll(
                 }
 
             payroll_map[key]["working_hours"] += working_hours
-            payroll_map[key]["overtime_hours"] += row.overtime_hours
+            payroll_map[key]["overtime_hours"] += row.overtime_hours or Decimal("0")
             payroll_map[key]["total_wage"] += wage
 
         output = []
@@ -1386,15 +1454,10 @@ async def labour_skill_summary(
     )
 
     result = await db.execute(
-        select(
-            LabourType.skill_category,
-            func.count(Labour.id)
-        )
+        select(LabourType.skill_category, func.count(Labour.id))
         .join(LabourProject)
         .join(LabourType, Labour.labour_type_id == LabourType.id)
-        .where(
-            LabourProject.project_id == project_id
-        )
+        .where(LabourProject.project_id == project_id)
         .group_by(LabourType.skill_category)
     )
 
@@ -1421,7 +1484,11 @@ async def export_excel(
 
     project_ids = await get_user_project_ids(db, current_user)
     result = await db.execute(
-        select(Labour).join(LabourProject).where(LabourProject.project_id == project_id)
+        select(Labour)
+        .join(LabourProject)
+        .where(
+            LabourProject.project_id == project_id, Labour.status == LabourStatus.ACTIVE
+        )
     )
     rows = result.scalars().all()
 
@@ -1464,6 +1531,7 @@ async def export_attendance_excel(
         .where(
             UserAttendance.project_id == project_id,
             UserAttendance.attendance_date.between(from_date, to_date),
+            Labour.status == LabourStatus.ACTIVE,
         )
     )
 
@@ -1568,7 +1636,15 @@ async def get_labour(
         return s.LabourOut.model_validate(cached)
 
     #  FETCH LABOUR
-    obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
+    obj = await db.scalar(
+        select(Labour)
+        .options(
+            selectinload(Labour.user),
+            selectinload(Labour.contractor),
+            selectinload(Labour.labour_type),
+        )
+        .where(Labour.id == labour_id)
+    )
 
     if not obj:
         raise NotFoundError("Labour record not found")
@@ -1580,28 +1656,33 @@ async def get_labour(
 
     project_ids = result.all()
 
-    if not project_ids:
-        raise ValidationError("Labour not assigned to any project")
+    # If labour is assigned to projects,
+    # validate access against at least one project
 
-    allowed = False
+    if project_ids:
 
-    for pid in project_ids:
-        try:
-            await assert_project_access(db, project_id=pid, current_user=current_user)
-            allowed = True
-            break
-        except Exception:
-            continue
+        allowed = False
 
-    if not allowed:
-        raise PermissionDeniedError("No access to this labour")
+        for pid in project_ids:
+            try:
+                await assert_project_access(
+                    db, project_id=pid, current_user=current_user
+                )
+
+                allowed = True
+                break
+
+            except PermissionDeniedError:
+                continue
+
+        if not allowed:
+            raise PermissionDeniedError("No access to this labour")
 
     out = s.LabourOut.model_validate(obj, from_attributes=True)
 
     await r.cache_set_json(redis, cache_key, out.model_dump())
 
     return out
-
 
 
 @router.get("/payroll/weekly-velocity", response_model=list[s.WeeklyVelocityOut])
@@ -1617,50 +1698,29 @@ async def get_weekly_velocity(
     query = (
         select(
             extract("week", UserAttendance.attendance_date).label("week_number"),
-
             func.count(UserAttendance.id).label("attendance_count"),
-
             func.sum(UserAttendance.working_hours).label("working_hours"),
-
             func.sum(UserAttendance.overtime_hours).label("ot_hours"),
-
             func.sum(
                 (
                     func.coalesce(
-                        Labour.custom_daily_wage_rate,
-                        LabourType.default_daily_wage
-                    ) / Decimal("8")
-                ) * UserAttendance.working_hours
-                +
-                UserAttendance.overtime_rate
-                * UserAttendance.overtime_hours
+                        Labour.custom_daily_wage_rate, LabourType.default_daily_wage
+                    )
+                    / Decimal("8")
+                )
+                * UserAttendance.working_hours
+                + UserAttendance.overtime_rate * UserAttendance.overtime_hours
             ).label("total_wage"),
-
             Labour.id.label("labour_id"),
         )
-
-        .join(
-            Labour,
-            Labour.user_id == UserAttendance.user_id
-        )
-
-        .join(
-            LabourType,
-            Labour.labour_type_id == LabourType.id
-        )
-
+        .join(Labour, Labour.user_id == UserAttendance.user_id)
+        .join(LabourType, Labour.labour_type_id == LabourType.id)
         .where(
             UserAttendance.project_id == project_id,
-
             extract("month", UserAttendance.attendance_date) == month,
-
             extract("year", UserAttendance.attendance_date) == year,
         )
-
-        .group_by(
-            "week_number",
-            Labour.id
-        )
+        .group_by("week_number", Labour.id)
     )
 
     result = await db.execute(query)
@@ -1907,42 +1967,34 @@ async def get_aggregate_report(
     # ------------------------------------------------------
     columns = [
         Labour.id.label("labour_id"),
-
         Labour.labour_name,
-
         LabourType.skill_category.label("skill_category"),
-
         func.coalesce(
-            Labour.custom_daily_wage_rate,
-            LabourType.default_daily_wage
+            Labour.custom_daily_wage_rate, LabourType.default_daily_wage
         ).label("daily_wage"),
-
         func.count(
             case(
                 (UserAttendance.status == AttendanceStatus.PRESENT, 1),
                 else_=None,
             )
         ).label("days_present"),
-
         func.coalesce(
             func.sum(UserAttendance.overtime_hours),
             Decimal("0"),
         ).label("ot_hours"),
-
         func.coalesce(
             func.sum(
                 (
                     func.coalesce(
-                        Labour.custom_daily_wage_rate,
-                        LabourType.default_daily_wage
-                    ) / Decimal("8")
-                ) * UserAttendance.working_hours
-                + UserAttendance.overtime_rate
-                * UserAttendance.overtime_hours
+                        Labour.custom_daily_wage_rate, LabourType.default_daily_wage
+                    )
+                    / Decimal("8")
+                )
+                * UserAttendance.working_hours
+                + UserAttendance.overtime_rate * UserAttendance.overtime_hours
             ),
             Decimal("0"),
         ).label("total_wage_earned"),
-
         Labour.status.label("status"),
     ]
 
@@ -1955,17 +2007,8 @@ async def get_aggregate_report(
     # ------------------------------------------------------
     query = (
         select(*columns)
-
-        .join(
-            LabourProject,
-            LabourProject.labour_id == Labour.id
-        )
-
-        .join(
-            LabourType,
-            Labour.labour_type_id == LabourType.id
-        )
-
+        .join(LabourProject, LabourProject.labour_id == Labour.id)
+        .join(LabourType, Labour.labour_type_id == LabourType.id)
         .outerjoin(
             UserAttendance,
             and_(

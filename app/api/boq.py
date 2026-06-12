@@ -35,7 +35,7 @@ from app.schemas.boq import (
     BOQActualsUpdate,
     BOQBulkCreate,
 )
-from app.utils.helpers import InvalidStateError, NotFoundError
+from app.utils.helpers import InvalidStateError, NotFoundError, ValidationError
 from app.core.logger import logger
 from app.models.boq import BOQAudit
 
@@ -99,12 +99,28 @@ async def create_boq(
     # =========================
     # MASTER DATA VALIDATION (ADD HERE)
     # =========================
-    activity_type_id = getattr(payload, "activity_type_id", None)
+    activity = await db.get(
+        ActivityType,
+        payload.activity_type_id
+    )
 
-    if activity_type_id is not None:
-        activity = await db.get(ActivityType, activity_type_id)
-        if not activity:
-            raise NotFoundError("Invalid activity type")
+    if not activity:
+        raise NotFoundError(
+            "Invalid activity type"
+        )
+
+    unit_name = "unit"
+
+    if activity.default_unit_id:
+        from app.models.master_data import Unit
+
+        unit_obj = await db.get(
+            Unit,
+            activity.default_unit_id
+        )
+
+        if unit_obj:
+            unit_name = unit_obj.name
 
     try:
 
@@ -127,23 +143,18 @@ async def create_boq(
             boq_group_id=group.id,
             version_no=1,
             is_latest=True,
-
             item_name=payload.item_name,
-            category=payload.category,
+            category=activity.category,
             description=payload.description,
-
             quantity=quantity,
-            unit=payload.unit,
+            unit=unit_name,
             unit_cost=unit_cost,
-
             total_cost=total_cost,
             actual_quantity=Decimal(0),
             actual_cost=Decimal(0),
             variance_cost=variance,
-
             status=payload.status,
             approval_status="Draft",
-
             activity_type_id=payload.activity_type_id,
         )
 
@@ -287,7 +298,7 @@ async def update_boq(
         raise InvalidStateError(
             "Cannot modify old BOQ version. Create a new version first."
         )
-    
+
     if obj.approval_status == "Approved":
         raise InvalidStateError(
             "Approved BOQ cannot be modified. Create a new version first."
@@ -297,10 +308,33 @@ async def update_boq(
         data = payload.model_dump(exclude_unset=True)
 
         if payload.activity_type_id is not None:
-            activity = await db.get(ActivityType, payload.activity_type_id)
+
+            activity = await db.get(
+                ActivityType,
+                payload.activity_type_id
+            )
 
             if not activity:
-                raise NotFoundError("Invalid activity type")
+                raise NotFoundError(
+                    "Invalid activity type"
+                )
+
+            obj.category = activity.category
+
+            unit_name = "unit"
+
+            if activity.default_unit_id:
+                from app.models.master_data import Unit
+
+                unit_obj = await db.get(
+                    Unit,
+                    activity.default_unit_id
+                )
+
+                if unit_obj:
+                    unit_name = unit_obj.name
+
+            obj.unit = unit_name
 
         for k, v in data.items():
             setattr(obj, k, v)
@@ -349,11 +383,11 @@ async def delete_boq(
         raise InvalidStateError(
             "Cannot modify old BOQ version. Create a new version first."
         )
-            
+
     if obj.approval_status == "Approved":
-            raise InvalidStateError(
-                "Approved BOQ cannot be modified. Create a new version first."
-            )
+        raise InvalidStateError(
+            "Approved BOQ cannot be modified. Create a new version first."
+        )
 
     obj.status = "Deleted"
 
@@ -378,36 +412,24 @@ async def update_actuals(
 ):
     logger.info(f"Updating BOQ actuals id={boq_id}")
 
-    obj = await db.scalar(
-        select(BOQ).where(
-            BOQ.id == boq_id,
-            BOQ.status != "Deleted"
-        )
-    )
+    obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
 
     if not obj:
         raise NotFoundError("BOQ not found")
 
     # prevent modifying historical versions
     if not obj.is_latest:
-        raise InvalidStateError(
-            "Cannot modify old BOQ version."
-        )
-    
+        raise InvalidStateError("Cannot modify old BOQ version.")
+
     if obj.approval_status == "Approved":
         raise InvalidStateError(
             "Approved BOQ cannot be modified. Create a new version first."
         )
-    
 
     obj.actual_quantity = Decimal(str(payload.actual_quantity))
     obj.actual_cost = Decimal(str(payload.actual_cost))
 
-    _, variance = calculate_cost(
-        obj.quantity,
-        obj.unit_cost,
-        payload.actual_cost
-    )
+    _, variance = calculate_cost(obj.quantity, obj.unit_cost, payload.actual_cost)
 
     obj.variance_cost = variance
 
@@ -494,9 +516,13 @@ async def boq_report(
     rows = (
         (
             await db.execute(
-                select(BOQ).where(
-                    BOQ.boq_group_id == base.boq_group_id, BOQ.version_no == base.version_no , BOQ.status != "Deleted"
-                ).order_by(BOQ.id.asc())
+                select(BOQ)
+                .where(
+                    BOQ.boq_group_id == base.boq_group_id,
+                    BOQ.version_no == base.version_no,
+                    BOQ.status != "Deleted",
+                )
+                .order_by(BOQ.id.asc())
             )
         )
         .scalars()
@@ -536,11 +562,13 @@ async def boq_alerts(
     rows = (
         (
             await db.execute(
-                select(BOQ).where(
+                select(BOQ)
+                .where(
                     BOQ.boq_group_id == base.boq_group_id,
                     BOQ.version_no == base.version_no,
                     BOQ.status != "Deleted",
-                ).order_by(BOQ.id.asc())
+                )
+                .order_by(BOQ.id.asc())
             )
         )
         .scalars()
@@ -595,11 +623,13 @@ async def get_boq_by_project(
     rows = (
         (
             await db.execute(
-                select(BOQ).where(
+                select(BOQ)
+                .where(
                     BOQ.project_id == project_id,
                     BOQ.is_latest == True,
                     BOQ.status != "Deleted",
-                ).order_by(BOQ.id.asc())
+                )
+                .order_by(BOQ.id.asc())
             )
         )
         .scalars()
@@ -644,13 +674,28 @@ async def add_item(
             "Approved BOQ cannot be modified. Create a new version first."
         )
 
-    activity_type_id = getattr(payload, "activity_type_id", None)
+    activity = await db.get(
+        ActivityType,
+        payload.activity_type_id
+    )
 
-    if activity_type_id is not None:
-        activity = await db.get(ActivityType, activity_type_id)
+    if not activity:
+        raise NotFoundError(
+            "Invalid activity type"
+        )
+        
+    unit_name = "unit"
 
-        if not activity:
-            raise NotFoundError("Invalid activity type")
+    if activity.default_unit_id:
+        from app.models.master_data import Unit
+
+        unit_obj = await db.get(
+            Unit,
+            activity.default_unit_id
+        )
+
+        if unit_obj:
+            unit_name = unit_obj.name
 
     quantity = Decimal(str(payload.quantity))
     unit_cost = Decimal(str(payload.unit_cost))
@@ -663,10 +708,10 @@ async def add_item(
         version_no=parent.version_no,
         is_latest=True,
         item_name=payload.item_name,
-        category=payload.category,
+        category=activity.category,
         description=payload.description,
         quantity=quantity,
-        unit=payload.unit,
+        unit=unit_name,
         unit_cost=unit_cost,
         total_cost=total_cost,
         variance_cost=variance,
@@ -690,8 +735,7 @@ async def get_items(
     db: AsyncSession = Depends(get_db_session),
 ):
     base = await db.scalar(
-        select(BOQ)
-        .where(
+        select(BOQ).where(
             BOQ.boq_group_id == group_id,
             BOQ.is_latest == True,
             BOQ.status != "Deleted",
@@ -704,11 +748,13 @@ async def get_items(
     rows = (
         (
             await db.execute(
-                select(BOQ).where(
+                select(BOQ)
+                .where(
                     BOQ.boq_group_id == base.boq_group_id,
                     BOQ.version_no == base.version_no,
                     BOQ.status != "Deleted",
-                ).order_by(BOQ.id.asc())
+                )
+                .order_by(BOQ.id.asc())
             )
         )
         .scalars()
@@ -745,10 +791,33 @@ async def update_item(
     data = payload.model_dump(exclude_unset=True)
 
     if payload.activity_type_id is not None:
-        activity = await db.get(ActivityType, payload.activity_type_id)
+
+        activity = await db.get(
+            ActivityType,
+            payload.activity_type_id
+        )
 
         if not activity:
-            raise NotFoundError("Invalid activity type")
+            raise NotFoundError(
+                "Invalid activity type"
+            )
+
+        obj.category = activity.category
+
+        unit_name = "unit"
+
+        if activity.default_unit_id:
+            from app.models.master_data import Unit
+
+            unit_obj = await db.get(
+                Unit,
+                activity.default_unit_id
+            )
+
+            if unit_obj:
+                unit_name = unit_obj.name
+
+        obj.unit = unit_name
 
     for k, v in data.items():
         setattr(obj, k, v)
@@ -776,7 +845,7 @@ async def bulk_add_items(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    
+
     async with db.begin():
         parent = await db.scalar(
             select(BOQ)
@@ -790,12 +859,12 @@ async def bulk_add_items(
 
         if not parent:
             raise NotFoundError("BOQ not found")
-        
+
         if not parent.is_latest:
             raise InvalidStateError(
                 "Cannot modify old BOQ version. Create a new version first."
             )
-        
+
         if parent.approval_status == "Approved":
             raise InvalidStateError(
                 "Approved BOQ cannot be modified. Create a new version first."
@@ -805,18 +874,36 @@ async def bulk_add_items(
 
         for item in payload.items:
 
-            activity_type_id = getattr(item, "activity_type_id", None)
+            activity = await db.get(
+                ActivityType,
+                item.activity_type_id
+            )
 
-            if activity_type_id is not None:
-                activity = await db.get(ActivityType, activity_type_id)
+            if not activity:
+                raise NotFoundError(
+                    "Invalid activity type"
+                )
 
-                if not activity:
-                    raise NotFoundError("Invalid activity type")
+            unit_name = "unit"
+
+            if activity.default_unit_id:
+                from app.models.master_data import Unit
+
+                unit_obj = await db.get(
+                    Unit,
+                    activity.default_unit_id
+                )
+
+                if unit_obj:
+                    unit_name = unit_obj.name
 
             quantity = Decimal(str(item.quantity))
             unit_cost = Decimal(str(item.unit_cost))
 
-            total_cost, variance = calculate_cost(quantity, unit_cost)
+            total_cost, variance = calculate_cost(
+                quantity,
+                unit_cost
+            )
 
             obj = BOQ(
                 project_id=item.project_id,
@@ -824,10 +911,10 @@ async def bulk_add_items(
                 version_no=parent.version_no,
                 is_latest=True,
                 item_name=item.item_name,
-                category=item.category,
+                category=activity.category,
                 description=item.description,
                 quantity=quantity,
-                unit=item.unit,
+                unit=unit_name,
                 unit_cost=unit_cost,
                 total_cost=total_cost,
                 variance_cost=variance,
@@ -837,7 +924,7 @@ async def bulk_add_items(
             )
 
             db.add(obj)
-            created_items.append(obj) 
+            created_items.append(obj)
 
         await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
@@ -846,6 +933,100 @@ async def bulk_add_items(
         "message": f"{len(created_items)} items created",
         "items": [BOQOut.model_validate(i) for i in created_items],
     }
+
+
+# @router.post("/groups/{group_id}/items/bulk")
+# async def bulk_add_items(
+#     group_id: int,
+#     payload: BOQBulkCreate,
+#     current_user: User = Depends(require_roles(WRITE_ROLES)),
+#     db: AsyncSession = Depends(get_db_session),
+#     redis=Depends(get_request_redis),
+# ):
+
+#     parent = await db.scalar(
+#         select(BOQ)
+#         .where(
+#             BOQ.boq_group_id == group_id,
+#             BOQ.is_latest == True,
+#             BOQ.status != "Deleted",
+#         )
+#         .order_by(BOQ.id.asc())
+#     )
+
+#     if not parent:
+#         raise NotFoundError("BOQ not found")
+
+#     if not parent.is_latest:
+#         raise InvalidStateError(
+#             "Cannot modify old BOQ version. Create a new version first."
+#         )
+
+#     if parent.approval_status == "Approved":
+#         raise InvalidStateError(
+#             "Approved BOQ cannot be modified. Create a new version first."
+#         )
+
+#     created_items = []
+
+#     for item in payload.items:
+
+#         activity_type_id = getattr(item, "activity_type_id", None)
+
+#         if activity_type_id is not None:
+#             activity = await db.get(ActivityType, activity_type_id)
+
+#             if not activity:
+#                 raise NotFoundError("Invalid activity type")
+
+    unit_name = "unit"
+
+    if activity.default_unit_id:
+        from app.models.master_data import Unit
+
+        unit_obj = await db.get(
+            Unit,
+            activity.default_unit_id
+        )
+
+        if unit_obj:
+            unit_name = unit_obj.name
+
+#         quantity = Decimal(str(item.quantity))
+#         unit_cost = Decimal(str(item.unit_cost))
+
+#         total_cost, variance = calculate_cost(quantity, unit_cost)
+
+#         obj = BOQ(
+#             project_id=item.project_id,
+#             boq_group_id=parent.boq_group_id,
+#             version_no=parent.version_no,
+#             is_latest=True,
+#             item_name=item.item_name,
+#             category=activity.category,
+#             description=item.description,
+#             quantity=quantity,
+#             unit=unit_name,
+#             unit_cost=unit_cost,
+#             total_cost=total_cost,
+#             variance_cost=variance,
+#             status=item.status,
+#             approval_status="Draft",
+#             activity_type_id=item.activity_type_id,
+#         )
+
+#         db.add(obj)
+#         created_items.append(obj)
+
+#     await db.flush()
+#     await db.commit()
+
+#     await bump_cache_version(redis, VERSION_KEY)
+
+#     return {
+#         "message": f"{len(created_items)} items created",
+#         "items": [BOQOut.model_validate(i) for i in created_items],
+#     }
 
 
 @router.delete("/items/{item_id}")
@@ -892,8 +1073,7 @@ async def create_version(
     async with db.begin():
 
         base = await db.scalar(
-            select(BOQ)
-            .where(
+            select(BOQ).where(
                 BOQ.boq_group_id == group_id,
                 BOQ.is_latest == True,
                 BOQ.status != "Deleted",
@@ -999,11 +1179,13 @@ async def export_boq_json(
     rows = (
         (
             await db.execute(
-                select(BOQ).where(
+                select(BOQ)
+                .where(
                     BOQ.boq_group_id == base.boq_group_id,
                     BOQ.version_no == base.version_no,
                     BOQ.status != "Deleted",
-                ).order_by(BOQ.id.asc())
+                )
+                .order_by(BOQ.id.asc())
             )
         )
         .scalars()
@@ -1032,11 +1214,13 @@ async def export_boq_excel(
     rows = (
         (
             await db.execute(
-                select(BOQ).where(
+                select(BOQ)
+                .where(
                     BOQ.boq_group_id == base.boq_group_id,
                     BOQ.version_no == base.version_no,
                     BOQ.status != "Deleted",
-                ).order_by(BOQ.id.asc())
+                )
+                .order_by(BOQ.id.asc())
             )
         )
         .scalars()
@@ -1090,11 +1274,13 @@ async def export_boq_pdf(
     rows = (
         (
             await db.execute(
-                select(BOQ).where(
+                select(BOQ)
+                .where(
                     BOQ.boq_group_id == base.boq_group_id,
                     BOQ.version_no == base.version_no,
                     BOQ.status != "Deleted",
-                ).order_by(BOQ.id.asc())
+                )
+                .order_by(BOQ.id.asc())
             )
         )
         .scalars()
@@ -1155,9 +1341,13 @@ async def boq_optimize(
     rows = (
         (
             await db.execute(
-                select(BOQ).where(
-                    BOQ.boq_group_id == base.boq_group_id,BOQ.version_no == base.version_no, BOQ.status != "Deleted"
-                ).order_by(BOQ.id.asc())
+                select(BOQ)
+                .where(
+                    BOQ.boq_group_id == base.boq_group_id,
+                    BOQ.version_no == base.version_no,
+                    BOQ.status != "Deleted",
+                )
+                .order_by(BOQ.id.asc())
             )
         )
         .scalars()
@@ -1258,6 +1448,7 @@ async def export_boq_logs_csv(
         file_path, filename=f"boq_audit_logs_{boq_id}.csv", media_type="text/csv"
     )
 
+
 @router.post("/{boq_id}/generate-tasks")
 async def generate_tasks_from_boq(
     boq_id: int,
@@ -1277,29 +1468,26 @@ async def generate_tasks_from_boq(
 
     # prevent task generation from historical versions
     if not boq.is_latest:
-        raise InvalidStateError(
-            "Cannot generate task from old BOQ version."
-        )
+        raise InvalidStateError("Cannot generate task from old BOQ version.")
 
     if boq.approval_status != "Approved":
-        raise InvalidStateError(
-            "BOQ must be approved before generating tasks."
-        )
+        raise InvalidStateError("BOQ must be approved before generating tasks.")
 
     # prevent duplicate task generation
-    existing_task = await db.scalar(
-        select(Task).where(Task.boq_id == boq.id)
-    )
+    existing_task = await db.scalar(select(Task).where(Task.boq_id == boq.id))
 
     if milestone_id:
         from app.models.project import Milestone
+
         milestone = await db.scalar(
             select(Milestone).where(Milestone.id == milestone_id)
         )
         if not milestone:
             raise NotFoundError("Milestone not found")
         if milestone.project_id != boq.project_id:
-            raise ValidationError("Milestone does not belong to the same project as the BOQ")
+            raise ValidationError(
+                "Milestone does not belong to the same project as the BOQ"
+            )
 
     if existing_task:
         return {

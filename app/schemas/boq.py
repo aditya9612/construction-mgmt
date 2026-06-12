@@ -8,16 +8,26 @@ from app.core.validators import (
     validate_non_empty_string,
 )
 
+# class BOQCreate(BaseSchema):
+#     project_id: int
+#     item_name: str
+#     category: str
+#     description: Optional[str] = None
+#     quantity: Decimal = Decimal("1")
+#     unit: str = "unit"
+#     unit_cost: Decimal = Decimal("1")
+#     status: Optional[str] = "Active"
+#     activity_type_id: Optional[int] = None
+
 class BOQCreate(BaseSchema):
     project_id: int
     item_name: str
-    category: str
     description: Optional[str] = None
     quantity: Decimal = Decimal("1")
-    unit: str = "unit"
     unit_cost: Decimal = Decimal("1")
     status: Optional[str] = "Active"
-    activity_type_id: Optional[int] = None
+
+    activity_type_id: int
 
     @field_validator("quantity", "unit_cost")
     @classmethod
@@ -25,7 +35,12 @@ class BOQCreate(BaseSchema):
         return validate_positive_required(v)
 
 
-    @field_validator("item_name", "category", "unit")
+    # @field_validator("item_name", "category", "unit")
+    # @classmethod
+    # def string_validator(cls, v):
+    #     return validate_non_empty_string(v)
+
+    @field_validator("item_name")
     @classmethod
     def string_validator(cls, v):
         return validate_non_empty_string(v)
@@ -49,7 +64,7 @@ class BOQUpdate(BaseSchema):
             return v
         return validate_positive_required(v)
 
-    @field_validator("item_name", "category", "unit")
+    @field_validator("item_name")
     @classmethod
     def string_validator(cls, v):
         if v is None:

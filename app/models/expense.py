@@ -3,10 +3,20 @@ from typing import Optional
 from sqlalchemy import Column, Integer, String, ForeignKey, Date, DECIMAL
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin
-
+from sqlalchemy import UniqueConstraint
 
 class Expense(Base, TimestampMixin):
     __tablename__ = "expenses"
+
+    # __table_args__ = (
+    #     UniqueConstraint(
+    #         "project_id",
+    #         "labour_id",
+    #         "expense_date",
+    #         "category",
+    #         name="uq_labour_daily_expense"
+    #     ),
+    # ) need t add in future
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
@@ -38,3 +48,9 @@ class Expense(Base, TimestampMixin):
 
     expense_date: Mapped[str] = mapped_column(Date, nullable=False, index=True)
     payment_mode: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    source_type: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+        index=True
+    )

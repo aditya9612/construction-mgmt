@@ -64,10 +64,17 @@ async def get_master_stats(
 
 # ===================== ALL / SEARCH =====================
 
-@router.get("/all", response_model=List[s.MasterDataUnified])
+@router.get(
+    "/all",
+    response_model=List[s.MasterDataUnified],
+    response_model_exclude_none=True
+)
 async def get_all_master_data(
     search: Optional[str] = None,
-    tag: Optional[str] = Query(None, description="MATERIAL, LABOR, ACTIVITY, UNIT"),
+    tag: Optional[str] = Query(
+        None,
+        description="MATERIAL, LABOR, ACTIVITY, UNIT"
+    ),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
@@ -355,6 +362,18 @@ async def create_activity_type(
     current_user: User = Depends(admin_required),
 ):
 
+    if payload.default_unit_id:
+
+        unit = await db.get(
+            m.Unit,
+            payload.default_unit_id
+        )
+
+        if not unit:
+            raise ValidationError(
+                "Invalid unit"
+            )
+
     # CHECK EXISTING ACTIVITY TYPE
     existing = await db.scalar(
         select(m.ActivityType).where(
@@ -516,6 +535,22 @@ async def update_master(
     update_data = validated_payload.model_dump(
         exclude_unset=True
     )
+
+    if (
+        entity == "activity-types"
+        and "default_unit_id" in update_data
+        and update_data["default_unit_id"] is not None
+    ):
+
+        unit = await db.get(
+            m.Unit,
+            update_data["default_unit_id"]
+        )
+
+        if not unit:
+            raise ValidationError(
+                "Invalid unit"
+            )
 
     # DUPLICATE NAME CHECK
     if "name" in update_data:

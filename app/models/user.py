@@ -2,16 +2,26 @@ import enum
 from datetime import date
 from typing import Any, Dict, Optional
 
-from sqlalchemy import JSON, VARCHAR, Boolean, Date, Enum, Float, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    VARCHAR,
+    Boolean,
+    Date,
+    Enum,
+    Float,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 from datetime import datetime
 from typing import Optional
 from app.models.base import Base, TimestampMixin
-from sqlalchemy import ForeignKey , DateTime
+from sqlalchemy import ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from typing import Optional
-
 
 # Exact role values for RBAC
 ROLES = [
@@ -38,9 +48,7 @@ class UserRole(str, enum.Enum):
 class User(Base, TimestampMixin):
     __tablename__ = "users"
 
-    __table_args__ = (
-        Index("idx_users_is_deleted_id", "is_deleted", "id"),
-    )
+    __table_args__ = (Index("idx_users_is_deleted_id", "is_deleted", "id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
@@ -48,11 +56,13 @@ class User(Base, TimestampMixin):
         VARCHAR(255, collation="utf8mb4_0900_ai_ci"),
         unique=True,
         index=True,
-        nullable=False
+        nullable=False,
     )
     hashed_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    mobile: Mapped[Optional[str]] = mapped_column(String(20), unique=True, nullable=True, index=True)
+    mobile: Mapped[Optional[str]] = mapped_column(
+        String(20), unique=True, nullable=True, index=True
+    )
 
     # role: Mapped[UserRole] = mapped_column(
     #     Enum(UserRole, name="user_role", values_callable=lambda x: [e.value for e in x]),
@@ -79,8 +89,12 @@ class User(Base, TimestampMixin):
     # -----------------------
     # AUDIT
     # ------------------------
-    created_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
-    updated_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_by: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    updated_by: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
 
     # ------------------------
     # SOFT DELETE
@@ -109,7 +123,9 @@ class UserAuditLog(Base):
     new_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     changed_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
-    changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow , index=True)
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, index=True
+    )
     change_group_id: Mapped[str] = mapped_column(String(36), index=True)
 
 
@@ -138,15 +154,15 @@ class UserAttendance(Base, TimestampMixin):
     )
 
     project_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("projects.id", ondelete="CASCADE"), index=True, nullable=True
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
     )
 
     attendance_date: Mapped[date] = mapped_column(Date, index=True)
 
-    status: Mapped[str] = mapped_column(
-        String(50),
-        default="present"
-    )
+    status: Mapped[str] = mapped_column(String(50), default="present")
 
     in_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     out_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -167,12 +183,23 @@ class UserAttendance(Base, TimestampMixin):
     check_in_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     check_out_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    task_id: Mapped[Optional[int]] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    task_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("tasks.id"), nullable=True
+    )
     task_description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    remarks: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
+    remarks: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    work_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    task_deadline_reason: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True
+    )
+
+    work_report_pdf: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     is_approved: Mapped[bool] = mapped_column(Boolean, default=False)
-    approved_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    approved_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     is_outside_geofence: Mapped[bool] = mapped_column(Boolean, default=False)
 
     is_late: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -185,6 +212,7 @@ class UserAttendance(Base, TimestampMixin):
     task = relationship("Task")
     user = relationship("User", backref="attendance_records", foreign_keys=[user_id])
     approved_by = relationship("User", foreign_keys=[approved_by_id])
+
 
 Index(
     "idx_user_attendance_project_date",

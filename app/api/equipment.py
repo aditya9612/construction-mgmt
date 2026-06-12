@@ -2055,7 +2055,6 @@ async def get_audit_logs(
 
 # ======================== REPORTS ========================
 
-
 @router.get("/reports/pdf")
 async def equipment_full_pdf_report(
     db: AsyncSession = Depends(get_db_session),
@@ -2063,7 +2062,6 @@ async def equipment_full_pdf_report(
 ):
     try:
         import io
-        import traceback
         from datetime import datetime
 
         from fastapi import HTTPException
@@ -2077,7 +2075,6 @@ async def equipment_full_pdf_report(
             Spacer,
             HRFlowable,
         )
-
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -2110,7 +2107,6 @@ async def equipment_full_pdf_report(
             bottomMargin=40,
         )
 
-        # ================= SAFE FONTS =================
         FONT = "Helvetica"
         FONT_BOLD = "Helvetica-Bold"
 
@@ -2170,36 +2166,30 @@ async def equipment_full_pdf_report(
         now_str = datetime.now().strftime("%d %b %Y")
         now_ts = datetime.now().strftime("%d/%m/%Y %I:%M %p")
 
-        # ================= STORY =================
-        story = []
-
-        story.append(Paragraph("Equipment Management Report", title_style))
-
-        story.append(Spacer(1, 6))
-
-        story.append(
-            Paragraph(
-                f"Pune, Maharashtra | {now_str}",
-                sub_style,
-            )
-        )
-
-        story.append(
-            HRFlowable(
-                width="100%",
-                thickness=2,
-                color=ORANGE,
-                spaceAfter=12,
-            )
-        )
-
-        # ================= SUMMARY =================
+        # ================= HELPERS =================
         def safe_condition(e):
             try:
                 return str(getattr(e.condition, "value", e.condition or "")).upper()
             except Exception:
                 return ""
 
+        def safe_status(e):
+            try:
+                return str(getattr(e.status, "value", e.status or "")).upper()
+            except Exception:
+                return ""
+
+        # ================= STORY =================
+        story = []
+
+        story.append(Paragraph("Equipment Management Report", title_style))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Pune, Maharashtra | {now_str}", sub_style))
+        story.append(
+            HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=12)
+        )
+
+        # ================= SUMMARY =================
         good_count = sum(1 for e in equipments if safe_condition(e) == "GOOD")
 
         summary_data = [
@@ -2219,54 +2209,47 @@ async def equipment_full_pdf_report(
             ],
         ]
 
-        sum_table = Table(
-            summary_data,
-            colWidths=[95, 95, 110, 110, 110],
-        )
-
+        sum_table = Table(summary_data, colWidths=[95, 95, 110, 110, 110])
         sum_table.setStyle(
-            TableStyle(
-                [
-                    ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                    ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("FONTNAME", (0, 0), (-1, -1), FONT_BOLD),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                    ("TOPPADDING", (0, 0), (-1, -1), 6),
-                ]
-            )
+            TableStyle([
+                ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("FONTNAME", (0, 0), (-1, -1), FONT_BOLD),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ])
         )
 
         story.append(sum_table)
         story.append(Spacer(1, 20))
 
         # ================= EQUIPMENT TABLE =================
-        eq_data = [["#", "ID", "Code", "Name", "Condition", "Project"]]
+        eq_data = [["#", "ID", "Code", "Name", "Condition", "Status", "Project"]]
 
         for i, e in enumerate(equipments, 1):
-
             cond = safe_condition(e)
+            status = safe_status(e)
 
-            eq_data.append(
-                [
-                    str(i),
-                    str(e.id or "-"),
-                    str(e.equipment_code or "-"),
-                    str(e.equipment_name or "-"),
-                    cond or "-",
-                    str(e.project_id or "-"),
-                ]
-            )
+            eq_data.append([
+                str(i),
+                str(e.id or "-"),
+                str(e.equipment_code or "-"),
+                str(e.equipment_name or "-"),
+                cond or "-",
+                status or "-",
+                str(e.project_id or "-"),
+            ])
 
         eq_table = Table(
             eq_data,
-            colWidths=[25, 35, 95, 160, 80, 65],
+            colWidths=[25, 35, 90, 150, 75, 80, 65],
             repeatRows=1,
         )
 
-        eq_style = TableStyle(
-            [
+        eq_table.setStyle(
+            TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), TABLE_HDR),
                 ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
                 ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
@@ -2276,10 +2259,8 @@ async def equipment_full_pdf_report(
                 ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
                 ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ]
+            ])
         )
-
-        eq_table.setStyle(eq_style)
 
         story.append(eq_table)
         story.append(Spacer(1, 20))
@@ -2288,14 +2269,12 @@ async def equipment_full_pdf_report(
         m_data = [["Equip ID", "Description", "Date", "Cost"]]
 
         for m in maint:
-            m_data.append(
-                [
-                    str(m.equipment_id or "-"),
-                    str(m.description or "-"),
-                    str(m.maintenance_date or "-"),
-                    f"{float(m.cost or 0):,.2f}",
-                ]
-            )
+            m_data.append([
+                str(m.equipment_id or "-"),
+                str(m.description or "-"),
+                str(m.maintenance_date or "-"),
+                f"{float(m.cost or 0):,.2f}",
+            ])
 
         m_table = Table(
             m_data,
@@ -2304,16 +2283,14 @@ async def equipment_full_pdf_report(
         )
 
         m_table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), GREEN_HDR),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
-                    ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
-                    ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
-                ]
-            )
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), GREEN_HDR),
+                ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
+                ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
+                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
+            ])
         )
 
         story.append(m_table)
@@ -2323,15 +2300,13 @@ async def equipment_full_pdf_report(
         r_data = [["Equip ID", "Client", "Start", "End", "Cost"]]
 
         for r in rentals:
-            r_data.append(
-                [
-                    str(r.equipment_id or "-"),
-                    str(r.client_name or "-"),
-                    str(r.start_date or "-"),
-                    str(r.end_date or "-"),
-                    f"{float(r.rental_cost or 0):,.2f}",
-                ]
-            )
+            r_data.append([
+                str(r.equipment_id or "-"),
+                str(r.client_name or "-"),
+                str(r.start_date or "-"),
+                str(r.end_date or "-"),
+                f"{float(r.rental_cost or 0):,.2f}",
+            ])
 
         r_table = Table(
             r_data,
@@ -2340,16 +2315,14 @@ async def equipment_full_pdf_report(
         )
 
         r_table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), RED_HDR),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
-                    ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
-                    ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
-                ]
-            )
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), RED_HDR),
+                ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
+                ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
+                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
+            ])
         )
 
         story.append(r_table)
@@ -2357,7 +2330,6 @@ async def equipment_full_pdf_report(
         # ================= HEADER FOOTER =================
         def draw_header_footer(canvas, doc):
             canvas.saveState()
-
             w, h = letter
 
             canvas.setFillColor(DARK_NAVY)
@@ -2372,26 +2344,12 @@ async def equipment_full_pdf_report(
 
             canvas.setFont(FONT, 7)
             canvas.setFillColor(colors.HexColor("#CCCCCC"))
-            canvas.drawString(
-                36,
-                h - 44,
-                "Construction Equipment Management",
-            )
+            canvas.drawString(36, h - 44, "Construction Equipment Management")
 
             canvas.setFont(FONT, 8)
             canvas.setFillColor(colors.grey)
-
-            canvas.drawCentredString(
-                w / 2,
-                10,
-                "Generated by Infra Pilot System",
-            )
-
-            canvas.drawRightString(
-                w - 36,
-                10,
-                f"Page {doc.page}",
-            )
+            canvas.drawCentredString(w / 2, 10, "Generated by Infra Pilot System")
+            canvas.drawRightString(w - 36, 10, f"Page {doc.page}")
 
             canvas.restoreState()
 
@@ -2403,7 +2361,6 @@ async def equipment_full_pdf_report(
         )
 
         buffer.seek(0)
-
         filename = f"equipment_report_{datetime.now().strftime('%Y%m%d')}.pdf"
 
         return StreamingResponse(
@@ -2414,17 +2371,11 @@ async def equipment_full_pdf_report(
 
     except Exception as e:
         import traceback
-
-        print("PDF REPORT ERROR:", str(e))
         traceback.print_exc()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"PDF generation failed: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
 
-# ================================excel report==========================
+# ================================ EXCEL REPORT ================================
 
 
 @router.get("/reports/excel")
@@ -2434,20 +2385,13 @@ async def equipment_excel_report(
 ):
     try:
         import io
-        import traceback
         from datetime import datetime
 
         from fastapi import HTTPException
         from fastapi.responses import StreamingResponse
 
         from openpyxl import Workbook
-        from openpyxl.styles import (
-            Font,
-            PatternFill,
-            Alignment,
-            Border,
-            Side,
-        )
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
 
         # ================= FETCH DATA =================
@@ -2468,49 +2412,34 @@ async def equipment_excel_report(
         now_str = datetime.now().strftime("%d %b %Y %I:%M %p")
 
         # ================= COLORS =================
-        C_NAVY = "1A2B4A"
-        C_WHITE = "FFFFFF"
-        C_LIGHT = "F5F5F5"
-        C_ALT = "EFF3FB"
-        C_GREEN_BG = "E8F5E9"
-        C_GREEN_FG = "2E7D32"
+        C_NAVY      = "1A2B4A"
+        C_WHITE     = "FFFFFF"
+        C_ALT       = "EFF3FB"
+        C_GREEN_BG  = "E8F5E9"
+        C_GREEN_FG  = "2E7D32"
         C_GREEN_HDR = "2E7D32"
-        C_RED_BG = "FFEBEE"
-        C_RED_FG = "C62828"
-        C_RED_HDR = "C62828"
-        C_BORDER = "CCCCCC"
-        C_ORANGE = "F5A623"
+        C_RED_BG    = "FFEBEE"
+        C_RED_FG    = "C62828"
+        C_RED_HDR   = "C62828"
+        C_BORDER    = "CCCCCC"
+        C_ORANGE    = "F5A623"
 
         CURRENCY_FMT = '"Rs." #,##0.00'
-        DEC_FMT = "#,##0.00"
+        DEC_FMT      = "#,##0.00"
 
         # ================= STYLE HELPERS =================
         def fill(color):
             return PatternFill("solid", fgColor=color)
 
         def font(bold=False, color="333333", size=10):
-            return Font(
-                name="Arial",
-                bold=bold,
-                color=color,
-                size=size,
-            )
+            return Font(name="Arial", bold=bold, color=color, size=size)
 
         def align(h="center", wrap=False):
-            return Alignment(
-                horizontal=h,
-                vertical="center",
-                wrap_text=wrap,
-            )
+            return Alignment(horizontal=h, vertical="center", wrap_text=wrap)
 
         def border():
             s = Side(style="thin", color=C_BORDER)
-            return Border(
-                left=s,
-                right=s,
-                top=s,
-                bottom=s,
-            )
+            return Border(left=s, right=s, top=s, bottom=s)
 
         def safe_condition(e):
             try:
@@ -2518,331 +2447,219 @@ async def equipment_excel_report(
             except Exception:
                 return ""
 
-        # ================= WORKBOOK =================
+        def safe_status(e):
+            try:
+                return str(getattr(e.status, "value", e.status or "")).upper()
+            except Exception:
+                return ""
+
+        def write_section_title(ws, row, col_span, title, bg_color):
+            """Section heading — merged cell, colored background."""
+            ws.merge_cells(
+                start_row=row, start_column=1,
+                end_row=row, end_column=col_span,
+            )
+            cell = ws.cell(row=row, column=1, value=title)
+            cell.font = font(bold=True, color=C_WHITE, size=11)
+            cell.fill = fill(bg_color)
+            cell.alignment = align(h="left")
+            ws.row_dimensions[row].height = 22
+
+        # ================= WORKBOOK — single sheet =================
         wb = Workbook()
+        ws = wb.active
+        ws.title = "Equipment Report"
+
+        # Fixed column widths (widest table = equipment, 7 cols)
+        col_widths = [5, 10, 18, 26, 16, 20, 14, 20, 16, 18]
+        for i, w in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+        current_row = 1
 
         # =========================================================
-        # SUMMARY SHEET
+        # HEADER — rows 1-2
         # =========================================================
-        ws_sum = wb.active
-        ws_sum.title = "Summary"
+        ws.merge_cells(f"A{current_row}:J{current_row}")
+        c = ws.cell(row=current_row, column=1, value="INFRA PILOT - Equipment Management Report")
+        c.font = font(bold=True, color=C_WHITE, size=14)
+        c.fill = fill(C_NAVY)
+        c.alignment = align()
+        ws.row_dimensions[current_row].height = 28
+        current_row += 1
 
-        ws_sum.merge_cells("A1:F1")
-        ws_sum["A1"] = "INFRA PILOT - Equipment Report"
+        ws.merge_cells(f"A{current_row}:J{current_row}")
+        c = ws.cell(row=current_row, column=1, value=f"Generated: {now_str}")
+        c.font = font(bold=True, color=C_WHITE, size=10)
+        c.fill = fill(C_ORANGE)
+        c.alignment = align()
+        ws.row_dimensions[current_row].height = 18
+        current_row += 2  # blank gap
 
-        ws_sum["A1"].font = font(
-            bold=True,
-            color=C_WHITE,
-            size=14,
-        )
-
-        ws_sum["A1"].fill = fill(C_NAVY)
-        ws_sum["A1"].alignment = align()
-
-        ws_sum.merge_cells("A2:F2")
-        ws_sum["A2"] = f"Generated: {now_str}"
-
-        ws_sum["A2"].font = font(
-            bold=True,
-            color=C_WHITE,
-            size=10,
-        )
-
-        ws_sum["A2"].fill = fill(C_ORANGE)
-        ws_sum["A2"].alignment = align()
-
-        # ================= SUMMARY DATA =================
-        good_count = sum(1 for e in equipments if safe_condition(e) == "GOOD")
-
+        # =========================================================
+        # SUMMARY — row 4-5
+        # =========================================================
+        good_count    = sum(1 for e in equipments if safe_condition(e) == "GOOD")
         damaged_count = sum(1 for e in equipments if safe_condition(e) == "DAMAGED")
 
         summary_headers = [
-            "Total Equipment",
-            "Good",
-            "Damaged",
-            "Maintenance Cost",
-            "Rental Cost",
-            "Grand Total",
+            "Total Equipment", "Good Condition", "Damaged",
+            "Maintenance Cost", "Rental Cost", "Grand Total",
         ]
-
         summary_values = [
-            len(equipments),
-            good_count,
-            damaged_count,
-            total_maint_cost,
-            total_rental_cost,
-            grand_total,
+            len(equipments), good_count, damaged_count,
+            total_maint_cost, total_rental_cost, grand_total,
         ]
 
         for col, header in enumerate(summary_headers, 1):
-            cell = ws_sum.cell(row=4, column=col, value=header)
-
-            cell.font = font(
-                bold=True,
-                color=C_WHITE,
-            )
-
+            cell = ws.cell(row=current_row, column=col, value=header)
+            cell.font = font(bold=True, color=C_WHITE)
             cell.fill = fill(C_NAVY)
             cell.alignment = align()
             cell.border = border()
+        current_row += 1
 
         for col, value in enumerate(summary_values, 1):
-            cell = ws_sum.cell(row=5, column=col, value=value)
-
+            cell = ws.cell(row=current_row, column=col, value=value)
             cell.font = font(bold=True)
             cell.alignment = align()
             cell.border = border()
-
             if col >= 4:
                 cell.number_format = CURRENCY_FMT
-
-        # Column widths
-        widths = [20, 15, 15, 22, 22, 22]
-
-        for i, w in enumerate(widths, 1):
-            ws_sum.column_dimensions[get_column_letter(i)].width = w
+        current_row += 2  # blank gap
 
         # =========================================================
-        # EQUIPMENT SHEET
+        # EQUIPMENT TABLE
         # =========================================================
-        ws_eq = wb.create_sheet("Equipment")
+        write_section_title(ws, current_row, 7, "  Equipment List", C_NAVY)
+        current_row += 1
 
-        headers = [
-            "#",
-            "ID",
-            "Code",
-            "Name",
-            "Condition",
-            "Project",
-            "Working Hours",
-            "Fuel Used",
-            "Rental Cost",
-            "Status",
-        ]
-
-        for col, header in enumerate(headers, 1):
-            cell = ws_eq.cell(row=1, column=col, value=header)
-
-            cell.font = font(
-                bold=True,
-                color=C_WHITE,
-            )
-
+        eq_headers = ["#", "ID", "Code", "Name", "Condition", "Status", "Project"]
+        for col, header in enumerate(eq_headers, 1):
+            cell = ws.cell(row=current_row, column=col, value=header)
+            cell.font = font(bold=True, color=C_WHITE)
             cell.fill = fill(C_NAVY)
-            cell.alignment = align(wrap=True)
+            cell.alignment = align()
             cell.border = border()
+        current_row += 1
 
-        # ================= EQUIPMENT DATA =================
-        for i, e in enumerate(equipments, start=2):
-
-            cond = safe_condition(e)
-
-            status = "Maintenance" if cond == "DAMAGED" else "Active"
+        for i, e in enumerate(equipments, 1):
+            cond   = safe_condition(e)
+            status = safe_status(e)
+            bg     = C_WHITE if i % 2 != 0 else C_ALT
 
             values = [
-                i - 1,
+                i,
                 e.id or "-",
                 e.equipment_code or "-",
                 e.equipment_name or "-",
                 cond or "-",
+                status or "-",
                 e.project_id or "-",
-                float(e.working_hours or 0),
-                float(e.fuel_used or 0),
-                float(e.rental_cost or 0),
-                status,
             ]
 
             for col, val in enumerate(values, 1):
-
-                cell = ws_eq.cell(
-                    row=i,
-                    column=col,
-                    value=val,
-                )
-
+                cell = ws.cell(row=current_row, column=col, value=val)
                 cell.font = font()
                 cell.alignment = align()
                 cell.border = border()
-
-                bg = C_WHITE if i % 2 == 0 else C_ALT
                 cell.fill = fill(bg)
 
-                if col in [7, 8]:
-                    cell.number_format = DEC_FMT
-
-                if col == 9:
-                    cell.number_format = CURRENCY_FMT
-
-                if col == 5:
+                if col == 5:  # Condition
                     if cond == "GOOD":
                         cell.fill = fill(C_GREEN_BG)
-                        cell.font = font(
-                            bold=True,
-                            color=C_GREEN_FG,
-                        )
-
+                        cell.font = font(bold=True, color=C_GREEN_FG)
                     elif cond == "DAMAGED":
                         cell.fill = fill(C_RED_BG)
-                        cell.font = font(
-                            bold=True,
-                            color=C_RED_FG,
-                        )
+                        cell.font = font(bold=True, color=C_RED_FG)
 
-                if col == 10:
-                    if status == "Maintenance":
-                        cell.fill = fill(C_RED_BG)
-                        cell.font = font(
-                            bold=True,
-                            color=C_RED_FG,
-                        )
-
-                    else:
+                if col == 6:  # Status
+                    if status == "AVAILABLE":
                         cell.fill = fill(C_GREEN_BG)
-                        cell.font = font(
-                            bold=True,
-                            color=C_GREEN_FG,
-                        )
+                        cell.font = font(bold=True, color=C_GREEN_FG)
+                    elif status in ("UNDER_MAINTENANCE", "RENTED"):
+                        cell.fill = fill(C_RED_BG)
+                        cell.font = font(bold=True, color=C_RED_FG)
 
-        eq_widths = [5, 8, 16, 24, 16, 12, 16, 16, 18, 16]
+            current_row += 1
 
-        for i, w in enumerate(eq_widths, 1):
-            ws_eq.column_dimensions[get_column_letter(i)].width = w
+        current_row += 1  # blank gap
 
         # =========================================================
-        # MAINTENANCE SHEET
+        # MAINTENANCE TABLE
         # =========================================================
-        ws_m = wb.create_sheet("Maintenance")
+        write_section_title(ws, current_row, 5, "  Maintenance Records", C_GREEN_HDR)
+        current_row += 1
 
-        m_headers = [
-            "#",
-            "Equipment ID",
-            "Description",
-            "Date",
-            "Cost",
-        ]
-
+        m_headers = ["Equip ID", "Description", "Date", "Cost"]
+        m_col_count = len(m_headers)
         for col, header in enumerate(m_headers, 1):
-
-            cell = ws_m.cell(
-                row=1,
-                column=col,
-                value=header,
-            )
-
-            cell.font = font(
-                bold=True,
-                color=C_WHITE,
-            )
-
+            cell = ws.cell(row=current_row, column=col, value=header)
+            cell.font = font(bold=True, color=C_WHITE)
             cell.fill = fill(C_GREEN_HDR)
             cell.alignment = align()
             cell.border = border()
+        current_row += 1
 
-        for i, m in enumerate(maint, start=2):
-
+        for i, m in enumerate(maint, 1):
+            bg = C_WHITE if i % 2 != 0 else C_ALT
             values = [
-                i - 1,
                 m.equipment_id or "-",
                 m.description or "-",
                 str(m.maintenance_date or "-"),
                 float(m.cost or 0),
             ]
-
             for col, val in enumerate(values, 1):
-
-                cell = ws_m.cell(
-                    row=i,
-                    column=col,
-                    value=val,
-                )
-
+                cell = ws.cell(row=current_row, column=col, value=val)
                 cell.font = font()
                 cell.alignment = align()
                 cell.border = border()
-
-                bg = C_WHITE if i % 2 == 0 else C_ALT
                 cell.fill = fill(bg)
-
-                if col == 5:
+                if col == 4:
                     cell.number_format = CURRENCY_FMT
+            current_row += 1
 
-        m_widths = [5, 14, 40, 18, 18]
-
-        for i, w in enumerate(m_widths, 1):
-            ws_m.column_dimensions[get_column_letter(i)].width = w
+        current_row += 1  # blank gap
 
         # =========================================================
-        # RENTAL SHEET
+        # RENTAL TABLE
         # =========================================================
-        ws_r = wb.create_sheet("Rentals")
+        write_section_title(ws, current_row, 6, "  Rental Records", C_RED_HDR)
+        current_row += 1
 
-        r_headers = [
-            "#",
-            "Equipment ID",
-            "Client",
-            "Start Date",
-            "End Date",
-            "Cost",
-        ]
-
+        r_headers = ["Equip ID", "Client", "Start", "End", "Cost"]
         for col, header in enumerate(r_headers, 1):
-
-            cell = ws_r.cell(
-                row=1,
-                column=col,
-                value=header,
-            )
-
-            cell.font = font(
-                bold=True,
-                color=C_WHITE,
-            )
-
+            cell = ws.cell(row=current_row, column=col, value=header)
+            cell.font = font(bold=True, color=C_WHITE)
             cell.fill = fill(C_RED_HDR)
             cell.alignment = align()
             cell.border = border()
+        current_row += 1
 
-        for i, r in enumerate(rentals, start=2):
-
+        for i, r in enumerate(rentals, 1):
+            bg = C_WHITE if i % 2 != 0 else C_ALT
             values = [
-                i - 1,
                 r.equipment_id or "-",
                 r.client_name or "-",
                 str(r.start_date or "-"),
                 str(r.end_date or "-"),
                 float(r.rental_cost or 0),
             ]
-
             for col, val in enumerate(values, 1):
-
-                cell = ws_r.cell(
-                    row=i,
-                    column=col,
-                    value=val,
-                )
-
+                cell = ws.cell(row=current_row, column=col, value=val)
                 cell.font = font()
                 cell.alignment = align()
                 cell.border = border()
-
-                bg = C_WHITE if i % 2 == 0 else C_ALT
                 cell.fill = fill(bg)
-
-                if col == 6:
+                if col == 5:
                     cell.number_format = CURRENCY_FMT
-
-        r_widths = [5, 14, 26, 16, 16, 18]
-
-        for i, w in enumerate(r_widths, 1):
-            ws_r.column_dimensions[get_column_letter(i)].width = w
+            current_row += 1
 
         # =========================================================
         # SAVE FILE
         # =========================================================
         output = io.BytesIO()
-
         wb.save(output)
-
         output.seek(0)
 
         filename = f"equipment_report_{datetime.now().strftime('%Y%m%d')}.xlsx"
@@ -2850,16 +2667,10 @@ async def equipment_excel_report(
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": (f"attachment; filename={filename}")},
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
     except Exception as e:
         import traceback
-
-        print("EXCEL REPORT ERROR:", str(e))
         traceback.print_exc()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Excel generation failed: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Excel generation failed: {str(e)}")

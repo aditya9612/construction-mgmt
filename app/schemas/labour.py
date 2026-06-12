@@ -1,6 +1,7 @@
 from decimal import Decimal
 from typing import Optional
 from datetime import date, time, datetime
+from fastapi import Form
 from pydantic import BaseModel, field_validator
 from app.core import enums as e
 from pydantic import EmailStr
@@ -23,6 +24,9 @@ class LabourCreate(BaseModel):
     mobile_number: str
 
     email: Optional[EmailStr] = None
+
+    pan_number: Optional[str] = None
+    address: Optional[str] = None
 
     # skill_type: e.SkillType
 
@@ -47,11 +51,11 @@ class LabourCreate(BaseModel):
     @field_validator("mobile_number")
     def validate_mobile_field(cls, v):
         return validate_mobile(v)
-    
+
     @field_validator("labour_name")
     def validate_labour_name(cls, v):
         return validate_full_name(v)
-    
+
     # @field_validator("daily_wage_rate")
     # def validate_wage(cls, v):
     #     return validate_positive_decimal(v, "Daily wage")
@@ -62,11 +66,7 @@ class LabourCreate(BaseModel):
         if v is None:
             return v
 
-        return validate_positive_decimal(
-            v,
-            "Custom daily wage"
-        )
-
+        return validate_positive_decimal(v, "Custom daily wage")
 
     @field_validator("custom_ot_rate_per_hour")
     def validate_custom_ot(cls, v):
@@ -74,10 +74,8 @@ class LabourCreate(BaseModel):
         if v is None:
             return v
 
-        return validate_positive_decimal(
-            v,
-            "Custom OT rate"
-        )
+        return validate_positive_decimal(v, "Custom OT rate")
+
 
 class LabourUpdate(BaseModel):
     aadhaar_number: Optional[str] = None
@@ -87,6 +85,10 @@ class LabourUpdate(BaseModel):
     mobile_number: Optional[str] = None
 
     email: Optional[EmailStr] = None
+
+    pan_number: Optional[str] = None
+
+    address: Optional[str] = None
 
     # skill_type: Optional[e.SkillType] = None
 
@@ -104,6 +106,22 @@ class LabourUpdate(BaseModel):
 
     notes: Optional[str] = None
 
+    @field_validator("custom_daily_wage_rate")
+    def validate_custom_wage(cls, v):
+
+        if v is None:
+            return v
+
+        return validate_positive_decimal(v, "Custom daily wage")
+
+    @field_validator("custom_ot_rate_per_hour")
+    def validate_custom_ot(cls, v):
+
+        if v is None:
+            return v
+
+        return validate_positive_decimal(v, "Custom OT rate")
+
     @field_validator("aadhaar_number")
     def validate_aadhaar_field(cls, v):
         return validate_aadhaar(v)
@@ -111,7 +129,7 @@ class LabourUpdate(BaseModel):
     @field_validator("mobile_number")
     def validate_mobile_field(cls, v):
         return validate_mobile(v)
-    
+
     @field_validator("labour_name")
     def validate_labour_name(cls, v):
         return validate_full_name(v)
@@ -120,9 +138,13 @@ class LabourUpdate(BaseModel):
 class LabourOut(BaseModel):
     id: int
     worker_code: str
+    user_id: Optional[int] = None
+    role: Optional[str] = None
     aadhaar_number: Optional[str]
     labour_name: str
     mobile_number: Optional[str]
+    pan_number: Optional[str] = None
+    address: Optional[str] = None
     email: Optional[str]
     profile_image: Optional[str]
     # skill_type: e.SkillType

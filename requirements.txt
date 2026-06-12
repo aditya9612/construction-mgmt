@@ -72,6 +72,6 @@ watchfiles==1.1.1
 websockets==16.0
 num2words==0.5.14
 qrcode==8.2
-faster-whisper
-gTTS==2.5.1
-deep-translator==1.11.4
+# faster-whisper
+# gTTS==2.5.1
+# deep-translator==1.11.4

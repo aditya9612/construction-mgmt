@@ -112,6 +112,9 @@ def upgrade():
     sa.Column('task_id', sa.Integer(), nullable=True),
     sa.Column('task_description', sa.String(length=255), nullable=True),
     sa.Column('remarks', sa.String(length=500), nullable=True),
+    sa.Column('work_summary', sa.Text(), nullable=True),
+    sa.Column('task_deadline_reason', sa.String(length=500), nullable=True),
+    sa.Column('work_report_pdf', sa.String(length=500), nullable=True),
     sa.Column('is_approved', sa.Boolean(), nullable=False),
     sa.Column('approved_by_id', sa.Integer(), nullable=True),
     sa.Column('is_outside_geofence', sa.Boolean(), nullable=False),
@@ -133,6 +136,8 @@ def upgrade():
     op.create_index(op.f('ix_user_attendance_project_id'), 'user_attendance', ['project_id'], unique=False)
     op.create_index(op.f('ix_user_attendance_user_id'), 'user_attendance', ['user_id'], unique=False)
     op.add_column('activity_types', sa.Column('is_active', sa.Boolean(), nullable=True))
+    op.add_column('activity_types',sa.Column('default_unit_id', sa.Integer(), nullable=True))
+    op.create_foreign_key("fk_activity_types_default_unit", "activity_types", "units", ["default_unit_id"], ["id"])
     op.add_column('chat_members', sa.Column('is_pinned', sa.Boolean(), nullable=False))
     op.add_column('chat_members', sa.Column('is_deleted', sa.Boolean(), nullable=False))
     op.add_column('chat_members', sa.Column('pinned_at', sa.DateTime(), nullable=True))
@@ -167,12 +172,27 @@ def upgrade():
     op.add_column('labour', sa.Column('labour_type_id', sa.Integer(), nullable=True))
     op.add_column('labour', sa.Column('custom_daily_wage_rate', sa.DECIMAL(precision=18, scale=2), nullable=True))
     op.add_column('labour', sa.Column('custom_ot_rate_per_hour', sa.DECIMAL(precision=18, scale=2), nullable=True))
+    op.add_column('labour',sa.Column('pan_number', sa.String(length=20), nullable=True))
+    op.add_column('labour',sa.Column('address', sa.String(length=500), nullable=True))
     op.create_index(op.f('ix_labour_labour_type_id'), 'labour', ['labour_type_id'], unique=False)
     op.create_index(op.f('ix_labour_mobile_number'), 'labour', ['mobile_number'], unique=True)
     op.create_index(op.f('ix_labour_user_id'), 'labour', ['user_id'], unique=False)
     op.create_unique_constraint(None, 'labour', ['email'])
     op.create_foreign_key(None, 'labour', 'users', ['user_id'], ['id'], ondelete='SET NULL')
     op.create_foreign_key(None, 'labour', 'labour_types', ['labour_type_id'], ['id'])
+    op.alter_column(
+        'labour',
+        'daily_wage_rate',
+        existing_type=sa.DECIMAL(precision=18, scale=2),
+        nullable=True
+    )
+
+    op.alter_column(
+        'labour',
+        'skill_type',
+        existing_type=mysql.ENUM('SKILLED', 'UNSKILLED'),
+        nullable=True
+    )
     # op.drop_column('labour', 'skill_type')
     # op.drop_column('labour', 'daily_wage_rate')
     op.add_column('labour_types', sa.Column('skill_category', sa.Enum('SKILLED', 'SEMI_SKILLED', 'UNSKILLED', name='skilltype'), nullable=False))
@@ -211,6 +231,8 @@ def upgrade():
     op.add_column('projects', sa.Column('shift_start_time', sa.Time(), nullable=True))
     op.add_column('projects', sa.Column('shift_end_time', sa.Time(), nullable=True))
     op.add_column('projects', sa.Column('grace_period_minutes', sa.Integer(), nullable=False))
+    op.add_column('expenses', sa.Column('source_type', sa.String(length=50), nullable=True))
+    op.create_index(op.f('ix_expenses_source_type'), 'expenses', ['source_type'], unique=False)
     op.add_column('ra_bills', sa.Column('measurement_id', sa.Integer(), nullable=True))
     op.create_index(op.f('ix_ra_bills_measurement_id'), 'ra_bills', ['measurement_id'], unique=False)
     op.create_foreign_key(None, 'ra_bills', 'final_measurements', ['measurement_id'], ['id'], ondelete='SET NULL')
@@ -298,6 +320,8 @@ def downgrade():
     op.drop_index(op.f('ix_labour_user_id'), table_name='labour')
     op.drop_index(op.f('ix_labour_mobile_number'), table_name='labour')
     op.drop_index(op.f('ix_labour_labour_type_id'), table_name='labour')
+    op.drop_column('labour', 'address')
+    op.drop_column('labour', 'pan_number')
     op.drop_column('labour', 'custom_ot_rate_per_hour')
     op.drop_column('labour', 'custom_daily_wage_rate')
     op.drop_column('labour', 'labour_type_id')
@@ -332,6 +356,8 @@ def downgrade():
     op.drop_column('chat_members', 'pinned_at')
     op.drop_column('chat_members', 'is_deleted')
     op.drop_column('chat_members', 'is_pinned')
+    op.drop_constraint("fk_activity_types_default_unit", "activity_types", type_="foreignkey")
+    op.drop_column("activity_types", "default_unit_id")
     op.drop_column('activity_types', 'is_active')
     op.drop_index(op.f('ix_user_attendance_user_id'), table_name='user_attendance')
     op.drop_index(op.f('ix_user_attendance_project_id'), table_name='user_attendance')
@@ -351,6 +377,8 @@ def downgrade():
     op.drop_table('notifications')
     op.drop_index(op.f('ix_permissions_module'), table_name='permissions')
     op.drop_index(op.f('ix_permissions_code'), table_name='permissions')
+    op.drop_index(op.f('ix_expenses_source_type'), table_name='expenses')
+    op.drop_column('expenses', 'source_type')
     op.drop_table('permissions')
     # ### end Alembic commands ###
 

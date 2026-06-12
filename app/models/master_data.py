@@ -2,9 +2,11 @@ from sqlalchemy import (
     Boolean,
     Column,
     DECIMAL,
+    ForeignKey,
     Integer,
     String,
 )
+from sqlalchemy.orm import relationship
 
 from app.core.enums import SkillType
 from app.models.base import Base
@@ -76,7 +78,15 @@ class ActivityType(Base):
 
     category = Column(String(100), nullable=True)
 
+    default_unit_id = Column(
+        Integer,
+        ForeignKey("units.id"),
+        nullable=True
+    )
+
     is_active = Column(Boolean, default=True)
+
+    default_unit = relationship("Unit")
 
 
 # =====================================================

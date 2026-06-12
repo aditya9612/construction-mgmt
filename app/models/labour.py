@@ -13,6 +13,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Date,
 )
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.enums import AttendanceStatus, LabourStatus, OTPolicyType, PayrollStatus, SkillType
 from app.models.base import Base, TimestampMixin
@@ -71,6 +72,16 @@ class Labour(Base, TimestampMixin):
 
     aadhaar_number: Mapped[Optional[str]] = mapped_column(String(20), index=True)
 
+    pan_number: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True
+    )
+
+    address: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True
+    )
+
     labour_name: Mapped[str] = mapped_column(String(255), index=True)
 
     # skill_type: Mapped[SkillType] = mapped_column(SAEnum(SkillType), nullable=False)
@@ -103,6 +114,7 @@ class Labour(Base, TimestampMixin):
     projects = relationship("LabourProject", backref="labour", cascade="all, delete")
     contractor = relationship("Contractor")
     labour_type = relationship("LabourType")
+    user = relationship("User")
 
     @property
     def contractor_name(self) -> Optional[str]:
@@ -160,6 +172,11 @@ class Labour(Base, TimestampMixin):
             return self.labour_type.default_daily_wage
 
         return Decimal("0")
+    
+
+    @property
+    def role(self):
+        return self.user.role if self.user else None
 
 
 # ======================

@@ -52,7 +52,7 @@ from app.models.user import User, UserRole
 from app.models.owner import Owner
 from app.models.expense import Expense
 from app.models.invoice import Invoice
-from app.models.master_data import ActivityType
+from app.models.master_data import ActivityType, LabourType
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import project as s
 from app.core.logger import logger
@@ -1253,7 +1253,6 @@ class TasksService:
             assigned_user_id=task.assigned_user_id,
             completion_percentage=task.completion_percentage,
             is_delayed=is_delayed,
-
             audio_instruction_url=task.audio_instruction_url,
             instruction_image_url=task.instruction_image_url,
             task_icon=task.task_icon,
@@ -1266,11 +1265,8 @@ class TasksService:
         *,
         project_id: int,
         payload: s.TaskCreate,
-
         audio_instruction_url: Optional[str] = None,
-
         instruction_image_url: Optional[str] = None,
-
     ) -> s.TaskOut | list[s.TaskOut]:
 
         self._assert_task_mutation_role(current_user)
@@ -1299,13 +1295,9 @@ class TasksService:
         # MEDIA FILES
         # =========================
 
-        data["audio_instruction_url"] = (
-            audio_instruction_url
-        )
+        data["audio_instruction_url"] = audio_instruction_url
 
-        data["instruction_image_url"] = (
-            instruction_image_url
-        )
+        data["instruction_image_url"] = instruction_image_url
 
         if "priority" in data:
             if isinstance(data["priority"], TaskPriority):
@@ -1553,15 +1545,10 @@ class TasksService:
         project_id: int,
         task_id: int,
         payload: s.TaskUpdate,
-
         audio_instruction_url: Optional[str] = None,
-
         instruction_image_url: Optional[str] = None,
-
         remove_audio: bool = False,
-
         remove_image: bool = False,
-
     ) -> s.TaskOut:
         self._assert_task_mutation_role(current_user)
 
@@ -1583,15 +1570,11 @@ class TasksService:
 
         if audio_instruction_url:
 
-            data["audio_instruction_url"] = (
-                audio_instruction_url
-            )
+            data["audio_instruction_url"] = audio_instruction_url
 
         if instruction_image_url:
 
-            data["instruction_image_url"] = (
-                instruction_image_url
-            )
+            data["instruction_image_url"] = instruction_image_url
 
         if remove_audio:
 
@@ -3070,26 +3053,18 @@ AUDIO_DIR = "uploads/task_audio"
 
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
+
 @tasks_router.post(
-    "/{project_id}/tasks",
-    response_model=Union[s.TaskOut, List[s.TaskOut]]
+    "/{project_id}/tasks", response_model=Union[s.TaskOut, List[s.TaskOut]]
 )
 async def create_task(
-
     project_id: int,
-
     payload: s.TaskCreateForm = Depends(),
-
     audio_file: Optional[UploadFile] = File(None),
-
     instruction_image: Optional[UploadFile] = File(None),
-
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-
     db: AsyncSession = Depends(get_db_session),
-
     redis=Depends(get_request_redis),
-
     service: TasksService = Depends(get_tasks_service),
 ):
 
@@ -3109,36 +3084,23 @@ async def create_task(
 
         if "." not in audio_file.filename:
 
-            raise ValidationError(
-                "Audio file must have extension"
-            )
+            raise ValidationError("Audio file must have extension")
 
         ext = audio_file.filename.rsplit(".", 1)[-1].lower()
 
         if ext not in allowed_audio:
 
-            raise ValidationError(
-                "Invalid audio format"
-            )
+            raise ValidationError("Invalid audio format")
 
         filename = f"{uuid.uuid4().hex}.{ext}"
 
-        filepath = os.path.join(
-            AUDIO_DIR,
-            filename
-        )
+        filepath = os.path.join(AUDIO_DIR, filename)
 
         with open(filepath, "wb") as buffer:
 
-            shutil.copyfileobj(
-                audio_file.file,
-                buffer
-            )
+            shutil.copyfileobj(audio_file.file, buffer)
 
-        audio_instruction_url = (
-            filepath.replace("\\", "/")
-        )
-
+        audio_instruction_url = filepath.replace("\\", "/")
 
     # =========================================
     # SAVE IMAGE FILE
@@ -3148,74 +3110,45 @@ async def create_task(
 
     if instruction_image:
 
-        allowed_images = [
-            "jpg",
-            "jpeg",
-            "png",
-            "webp"
-        ]
+        allowed_images = ["jpg", "jpeg", "png", "webp"]
 
         if "." not in instruction_image.filename:
 
-            raise ValidationError(
-                "Image file must have extension"
-            )
+            raise ValidationError("Image file must have extension")
 
         ext = instruction_image.filename.rsplit(".", 1)[-1].lower()
 
         if ext not in allowed_images:
 
-            raise ValidationError(
-                "Invalid image format"
-            )
+            raise ValidationError("Invalid image format")
 
         filename = f"{uuid.uuid4().hex}.{ext}"
 
-        filepath = os.path.join(
-            IMAGE_DIR,
-            filename
-        )
+        filepath = os.path.join(IMAGE_DIR, filename)
 
         with open(filepath, "wb") as buffer:
 
-            shutil.copyfileobj(
-                instruction_image.file,
-                buffer
-            )
+            shutil.copyfileobj(instruction_image.file, buffer)
 
-        instruction_image_url = (
-            filepath.replace("\\", "/")
-        )
+        instruction_image_url = filepath.replace("\\", "/")
 
     try:
 
         out = await service.create_task(
-
             db,
-
             current_user,
-
             project_id=project_id,
-
             payload=task_payload,
-
             audio_instruction_url=audio_instruction_url,
-
             instruction_image_url=instruction_image_url,
         )
-        await bump_cache_version(
-            redis,
-            VERSION_KEY
-        )
+        await bump_cache_version(redis, VERSION_KEY)
 
     except Exception:
 
-        logger.exception(
-            f"Task creation failed project_id={project_id}"
-        )
+        logger.exception(f"Task creation failed project_id={project_id}")
 
         raise
-
 
     if isinstance(out, list):
         logger.info(f"Tasks created count={len(out)}")
@@ -3268,27 +3201,17 @@ async def get_task(
 
 
 @tasks_router.put(
-    "/{project_id}/tasks/{task_id}",
-    response_model=Union[s.TaskOut, List[s.TaskOut]]
+    "/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]]
 )
 async def update_task(
-
     project_id: int,
-
     task_id: int,
-
     payload: s.TaskUpdateForm = Depends(),
-
     audio_file: Optional[UploadFile] = File(None),
-
     instruction_image: Optional[UploadFile] = File(None),
-
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-
     db: AsyncSession = Depends(get_db_session),
-
     redis=Depends(get_request_redis),
-
     service: TasksService = Depends(get_tasks_service),
 ):
 
@@ -3304,44 +3227,27 @@ async def update_task(
 
     if audio_file:
 
-        allowed_audio = [
-            "mp3",
-            "wav",
-            "m4a",
-            "webm"
-        ]
+        allowed_audio = ["mp3", "wav", "m4a", "webm"]
 
         if "." not in audio_file.filename:
 
-            raise BadRequestError(
-                "Audio file must have extension"
-            )
+            raise BadRequestError("Audio file must have extension")
 
         ext = audio_file.filename.rsplit(".", 1)[-1].lower()
 
         if ext not in allowed_audio:
 
-            raise BadRequestError(
-                "Invalid audio format"
-            )
+            raise BadRequestError("Invalid audio format")
 
         filename = f"{uuid.uuid4().hex}.{ext}"
 
-        filepath = os.path.join(
-            AUDIO_DIR,
-            filename
-        )
+        filepath = os.path.join(AUDIO_DIR, filename)
 
         with open(filepath, "wb") as buffer:
 
-            shutil.copyfileobj(
-                audio_file.file,
-                buffer
-            )
+            shutil.copyfileobj(audio_file.file, buffer)
 
-        audio_instruction_url = (
-            filepath.replace("\\", "/")
-        )
+        audio_instruction_url = filepath.replace("\\", "/")
 
     # =========================================
     # SAVE IMAGE FILE
@@ -3350,78 +3256,47 @@ async def update_task(
     instruction_image_url = None
     if instruction_image:
 
-        allowed_images = [
-            "jpg",
-            "jpeg",
-            "png",
-            "webp"
-        ]
+        allowed_images = ["jpg", "jpeg", "png", "webp"]
 
         if "." not in instruction_image.filename:
 
-            raise BadRequestError(
-                "Image file must have extension"
-            )
+            raise BadRequestError("Image file must have extension")
 
         ext = instruction_image.filename.rsplit(".", 1)[-1].lower()
 
         if ext not in allowed_images:
 
-            raise BadRequestError(
-                "Invalid image format"
-            )
+            raise BadRequestError("Invalid image format")
 
         filename = f"{uuid.uuid4().hex}.{ext}"
 
-        filepath = os.path.join(
-            IMAGE_DIR,
-            filename
-        )
+        filepath = os.path.join(IMAGE_DIR, filename)
 
         with open(filepath, "wb") as buffer:
 
-            shutil.copyfileobj(
-                instruction_image.file,
-                buffer
-            )
+            shutil.copyfileobj(instruction_image.file, buffer)
 
-        instruction_image_url = (
-            filepath.replace("\\", "/")
-        )
+        instruction_image_url = filepath.replace("\\", "/")
 
     try:
 
         out = await service.update_task(
-
             db,
-
             current_user,
-
             project_id=project_id,
-
             task_id=task_id,
-
             payload=task_payload,
-
             audio_instruction_url=audio_instruction_url,
-
             instruction_image_url=instruction_image_url,
-
             remove_audio=payload.remove_audio,
-
             remove_image=payload.remove_image,
         )
 
-        await bump_cache_version(
-            redis,
-            VERSION_KEY
-        )
+        await bump_cache_version(redis, VERSION_KEY)
 
     except Exception:
 
-        logger.exception(
-            f"Task update failed id={task_id}"
-        )
+        logger.exception(f"Task update failed id={task_id}")
 
         raise
 
@@ -3686,30 +3561,36 @@ async def create_dsr(
         if not contractor:
             raise ValidationError("Invalid contractor_id")
 
-    # Labour summary
     labour_result = await db.execute(
         select(
-            m.Labour.skill_type,
-            func.count(func.distinct(m.Labour.id)),
+            LabourType.skill_category,
+            func.count(func.distinct(Labour.id)),
         )
-        .join(UserAttendance, m.Labour.user_id == UserAttendance.user_id)
+        .join(
+            LabourType,
+            Labour.labour_type_id == LabourType.id,
+        )
+        .join(
+            UserAttendance,
+            Labour.user_id == UserAttendance.user_id,
+        )
         .where(
             UserAttendance.project_id == payload.project_id,
-            m.Labour.status == LabourStatus.ACTIVE,
+            Labour.status == LabourStatus.ACTIVE,
         )
-        .group_by(m.Labour.skill_type)
+        .group_by(LabourType.skill_category)
     )
 
     skilled = 0
     unskilled = 0
 
-    for row in labour_result:
-        if row.skill_type == SkillType.SKILLED:
-            skilled = row[1]
+    for skill_category, count in labour_result.all():
+        if skill_category == SkillType.SKILLED:
+            skilled += count
         else:
-            unskilled += row[1]
+            unskilled += count
 
-    total_labour = skilled + unskilled
+        total_labour = skilled + unskilled
 
     data = payload.model_dump()
 
