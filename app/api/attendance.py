@@ -75,10 +75,10 @@ async def check_in(
             # Geofencing Check - bypass if WFH
             if (
                 work_location_type != "WFH"
-                and project.latitude
-                and project.longitude
-                and check_in_latitude
-                and check_in_longitude
+                and project.latitude is not None
+                and project.longitude is not None
+                and check_in_latitude is not None
+                and check_in_longitude is not None
             ):
                 dist = calculate_distance(
                     lat1=check_in_latitude,
@@ -90,15 +90,25 @@ async def check_in(
                     is_outside_geofence = True
 
             # Late Detection Logic
+            # Normalize timezone-aware datetime
+            if actual_in_time.tzinfo is not None:
+                actual_in_time = actual_in_time.astimezone().replace(tzinfo=None)
+
+            # Late Detection Logic
             if project.shift_start_time:
+
                 shift_start_dt = datetime.combine(
                     attendance_date, project.shift_start_time
                 )
+
                 grace_mins = project.grace_period_minutes or 15
+
                 shift_start_with_grace = shift_start_dt + timedelta(minutes=grace_mins)
 
                 if actual_in_time > shift_start_with_grace:
+
                     is_late = True
+
                     late_minutes = int(
                         (actual_in_time - shift_start_dt).total_seconds() / 60
                     )
@@ -168,6 +178,9 @@ async def check_out(
         raise HTTPException(status_code=400, detail="Already checked out")
 
     actual_out_time = out_time or datetime.now()
+
+    if actual_out_time.tzinfo is not None:
+        actual_out_time = actual_out_time.replace(tzinfo=None)
 
     # Early Departure Detection
     is_early_departure = False
@@ -271,32 +284,21 @@ async def check_out(
                     # FIXED RATE POLICY
                     if policy.policy_type == OTPolicyType.FIXED_RATE:
 
-                        overtime_rate = (
-                            policy.fixed_ot_rate
-                            or Decimal("0")
-                        )
+                        overtime_rate = policy.fixed_ot_rate or Decimal("0")
 
                     # MULTIPLIER POLICY
                     else:
 
-                        multiplier = (
-                            policy.normal_day_multiplier
-                            or Decimal("1")
-                        )
+                        multiplier = policy.normal_day_multiplier or Decimal("1")
 
                         today = attendance.attendance_date.weekday()
 
                         # Sunday
                         if today == 6:
 
-                            multiplier = (
-                                policy.sunday_multiplier
-                                or multiplier
-                            )
+                            multiplier = policy.sunday_multiplier or multiplier
 
-                        overtime_rate = (
-                            hourly_rate * multiplier
-                        )
+                        overtime_rate = hourly_rate * multiplier
 
             attendance.overtime_rate = overtime_rate
 
@@ -308,8 +310,8 @@ async def check_out(
                 select(Expense).where(
                     Expense.project_id == attendance.project_id,
                     Expense.labour_id == labour.id,
-                    Expense.category == "Labour",
                     Expense.expense_date == attendance.attendance_date,
+                    Expense.source_type == "attendance_auto",
                 )
             )
 
@@ -323,6 +325,7 @@ async def check_out(
                     project_id=attendance.project_id,
                     labour_id=labour.id,
                     category="Labour",
+                    source_type="attendance_auto",
                     description=f"Labour expense - {attendance.attendance_date}",
                     amount=total_wage,
                     expense_date=attendance.attendance_date,
@@ -353,8 +356,15 @@ async def check_out(
     attendance.is_approved = True
     attendance.approved_by_id = current_user.id
 
-    await db.commit()
+    try:
+        await db.commit()
+
+    except Exception:
+        await db.rollback()
+        raise
+
     await db.refresh(attendance)
+
     return attendance
 
 
@@ -388,9 +398,20 @@ async def today_status(
 
     # Calculate running hours if still checked in
     running_hours = 0
+
     if attendance.in_time and not attendance.out_time:
-        delta = datetime.now() - attendance.in_time
+
+        now = datetime.now()
+
+        in_time = attendance.in_time
+
+        if in_time and in_time.tzinfo is not None:
+            in_time = in_time.replace(tzinfo=None)
+
+        delta = now - in_time
+
         running_hours = round(delta.total_seconds() / 3600.0, 2)
+
     elif attendance.working_hours:
         running_hours = attendance.working_hours
 
@@ -414,10 +435,9 @@ async def today_status(
             "check_in_address": attendance.check_in_address,
             "check_out_address": attendance.check_out_address,
             "task_description": attendance.task_description,
-            "work_summary": attendance.work_summary,
+            "remarks": attendance.remarks,
             "task_deadline_reason": attendance.task_deadline_reason,
             "work_report_pdf": attendance.work_report_pdf,
-            "remarks": attendance.remarks,
             "work_location_type": attendance.work_location_type,
             "is_approved": attendance.is_approved,
             "is_outside_geofence": attendance.is_outside_geofence,

@@ -5821,6 +5821,30 @@ async def add_daily_progress(
 
         update_activity_status(activity)
 
+        # ================= UPDATE WORK ORDER COMPLETED QUANTITY =================
+
+        if activity.work_order_id:
+
+            from app.models.work_order import WorkOrder
+            from sqlalchemy import func
+
+            work_order = await db.get(
+                WorkOrder,
+                activity.work_order_id,
+            )
+
+            if work_order:
+
+                result = await db.execute(
+                    select(func.sum(WorkActivity.total_completed)).where(
+                        WorkActivity.work_order_id == activity.work_order_id
+                    )
+                )
+
+                total_completed = result.scalar() or Decimal("0")
+
+                work_order.completed_quantity = Decimal(str(total_completed))
+
         # ================= STORE NEW DATA =================
 
         new_data = {

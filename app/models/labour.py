@@ -13,8 +13,15 @@ from sqlalchemy import (
     UniqueConstraint,
     Date,
 )
+from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from app.core.enums import AttendanceStatus, LabourStatus, OTPolicyType, PayrollStatus, SkillType
+from app.core.enums import (
+    AttendanceStatus,
+    LabourStatus,
+    OTPolicyType,
+    PayrollStatus,
+    SkillType,
+)
 from app.models.base import Base, TimestampMixin
 
 
@@ -58,18 +65,20 @@ class Labour(Base, TimestampMixin):
     )
 
     mobile_number: Mapped[Optional[str]] = mapped_column(
-        String(15),unique=True,index=True,nullable=True
+        String(15), unique=True, index=True, nullable=True
     )
 
     email: Mapped[Optional[str]] = mapped_column(
-        String(255),nullable=True,unique=True
+        String(255), nullable=True, unique=True
     )
 
-    profile_image: Mapped[Optional[str]] = mapped_column(
-        String(500),nullable=True
-    )
+    profile_image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     aadhaar_number: Mapped[Optional[str]] = mapped_column(String(20), index=True)
+
+    pan_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
+    address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     labour_name: Mapped[str] = mapped_column(String(255), index=True)
 
@@ -78,15 +87,15 @@ class Labour(Base, TimestampMixin):
     # daily_wage_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
 
     labour_type_id: Mapped[int] = mapped_column(
-        Integer,ForeignKey("labour_types.id"),nullable=True,index=True
-    ) #we need to make it false later
+        Integer, ForeignKey("labour_types.id"), nullable=True, index=True
+    )  # we need to make it false later
 
     custom_daily_wage_rate: Mapped[Optional[Decimal]] = mapped_column(
-        DECIMAL(18, 2),nullable=True
+        DECIMAL(18, 2), nullable=True
     )
 
     custom_ot_rate_per_hour: Mapped[Optional[Decimal]] = mapped_column(
-        DECIMAL(18, 2),nullable=True
+        DECIMAL(18, 2), nullable=True
     )
 
     contractor_id: Mapped[Optional[int]] = mapped_column(
@@ -103,29 +112,21 @@ class Labour(Base, TimestampMixin):
     projects = relationship("LabourProject", backref="labour", cascade="all, delete")
     contractor = relationship("Contractor")
     labour_type = relationship("LabourType")
+    user = relationship("User")
 
     @property
     def contractor_name(self) -> Optional[str]:
         return self.contractor.name if self.contractor else None
 
-
     @property
     def labour_type_name(self):
 
-        return (
-            self.labour_type.name
-            if self.labour_type else None
-        )
-
+        return self.labour_type.name if self.labour_type else None
 
     @property
     def skill_category(self):
 
-        return (
-            self.labour_type.skill_category
-            if self.labour_type else None
-        )
-
+        return self.labour_type.skill_category if self.labour_type else None
 
     @property
     def effective_daily_wage(self):
@@ -138,7 +139,6 @@ class Labour(Base, TimestampMixin):
 
         return Decimal("0")
 
-
     @property
     def effective_ot_rate(self):
 
@@ -146,10 +146,7 @@ class Labour(Base, TimestampMixin):
             return self.custom_ot_rate_per_hour
 
         if self.labour_type:
-            return (
-                self.labour_type.default_ot_rate_per_hour
-                or Decimal("0")
-            )
+            return self.labour_type.default_ot_rate_per_hour or Decimal("0")
 
         return Decimal("0")
 
@@ -160,6 +157,10 @@ class Labour(Base, TimestampMixin):
             return self.labour_type.default_daily_wage
 
         return Decimal("0")
+
+    @property
+    def role(self):
+        return self.user.role if self.user else None
 
 
 # ======================
@@ -181,8 +182,7 @@ class LabourAttendance(Base, TimestampMixin):
     attendance_date: Mapped[date] = mapped_column(index=True)
 
     status: Mapped[AttendanceStatus] = mapped_column(
-        SAEnum(AttendanceStatus),
-        default=AttendanceStatus.PRESENT
+        SAEnum(AttendanceStatus), default=AttendanceStatus.PRESENT
     )
 
     in_time: Mapped[Optional[time]] = mapped_column(Time)
@@ -242,9 +242,6 @@ class LabourPayroll(Base, TimestampMixin):
     paid_amount = Column(DECIMAL(18, 2), default=0)
     remaining_amount = Column(DECIMAL(18, 2), default=0)
 
-    status = Column(
-        SAEnum(PayrollStatus),
-        default=PayrollStatus.PENDING
-    )
+    status = Column(SAEnum(PayrollStatus), default=PayrollStatus.PENDING)
 
     labour = relationship("Labour")

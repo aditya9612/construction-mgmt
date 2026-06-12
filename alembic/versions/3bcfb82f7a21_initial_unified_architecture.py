@@ -165,6 +165,9 @@ def upgrade():
         sa.Column("task_id", sa.Integer(), nullable=True),
         sa.Column("task_description", sa.String(length=255), nullable=True),
         sa.Column("remarks", sa.String(length=500), nullable=True),
+        sa.Column("work_summary", sa.Text(), nullable=True),
+        sa.Column("task_deadline_reason", sa.String(length=500), nullable=True),
+        sa.Column("work_report_pdf", sa.String(length=500), nullable=True),
         sa.Column("is_approved", sa.Boolean(), nullable=False),
         sa.Column("approved_by_id", sa.Integer(), nullable=True),
         sa.Column("is_outside_geofence", sa.Boolean(), nullable=False),
@@ -340,6 +343,10 @@ def upgrade():
             "custom_ot_rate_per_hour", sa.DECIMAL(precision=18, scale=2), nullable=True
         ),
     )
+    op.add_column(
+        "labour", sa.Column("pan_number", sa.String(length=20), nullable=True)
+    )
+    op.add_column("labour", sa.Column("address", sa.String(length=500), nullable=True))
     op.create_index(
         op.f("ix_labour_labour_type_id"), "labour", ["labour_type_id"], unique=False
     )
@@ -358,6 +365,7 @@ def upgrade():
         existing_type=sa.DECIMAL(precision=18, scale=2),
         nullable=True,
     )
+
     op.alter_column(
         "labour",
         "skill_type",
@@ -477,6 +485,12 @@ def upgrade():
     op.add_column("projects", sa.Column("shift_end_time", sa.Time(), nullable=True))
     op.add_column(
         "projects", sa.Column("grace_period_minutes", sa.Integer(), nullable=False)
+    )
+    op.add_column(
+        "expenses", sa.Column("source_type", sa.String(length=50), nullable=True)
+    )
+    op.create_index(
+        op.f("ix_expenses_source_type"), "expenses", ["source_type"], unique=False
     )
     op.add_column("ra_bills", sa.Column("measurement_id", sa.Integer(), nullable=True))
     op.create_index(
@@ -622,6 +636,8 @@ def downgrade():
     op.drop_index(op.f("ix_labour_user_id"), table_name="labour")
     op.drop_index(op.f("ix_labour_mobile_number"), table_name="labour")
     op.drop_index(op.f("ix_labour_labour_type_id"), table_name="labour")
+    op.drop_column("labour", "address")
+    op.drop_column("labour", "pan_number")
     op.drop_column("labour", "custom_ot_rate_per_hour")
     op.drop_column("labour", "custom_daily_wage_rate")
     op.drop_column("labour", "labour_type_id")
@@ -687,5 +703,7 @@ def downgrade():
     op.drop_table("notifications")
     op.drop_index(op.f("ix_permissions_module"), table_name="permissions")
     op.drop_index(op.f("ix_permissions_code"), table_name="permissions")
+    op.drop_index(op.f("ix_expenses_source_type"), table_name="expenses")
+    op.drop_column("expenses", "source_type")
     op.drop_table("permissions")
     # ### end Alembic commands ###

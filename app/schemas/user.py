@@ -197,6 +197,9 @@ class UserAttendanceOut(BaseSchema):
     task_id: Optional[int]
     task_description: Optional[str]
     remarks: Optional[str] = None
+    work_summary: Optional[str] = None
+    task_deadline_reason: Optional[str] = None
+    work_report_pdf: Optional[str] = None
     is_approved: bool = False
     approved_by_id: Optional[int] = None
     is_outside_geofence: bool = False
