@@ -265,6 +265,7 @@ class MessageMention(Base):
     message = relationship(
         "ChatMessage",
         foreign_keys=[message_id],
+        overlaps="mentions",
     )
 
     user = relationship(
