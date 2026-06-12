@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
@@ -22,6 +23,7 @@ from app.models.owner import OwnerTransaction
 from app.core.enums import OTPolicyType
 
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
+logger = logging.getLogger(__name__)
 
 # Roles allowed to approve attendance
 APPROVE_ROLES = ["Admin", "ProjectManager", "SiteEngineer"]
@@ -261,44 +263,29 @@ async def check_out(
             )
 
             if overtime_hours > 0:
+                base_ot_rate = labour.effective_ot_rate or Decimal("0")
 
-                # =========================================
-                # PRIORITY 1 + 2
-                # LABOUR / LABOUR TYPE OT RATE
-                # =========================================
-
-                base_ot_rate = labour.effective_ot_rate
-
-                # Labour custom OT
-                # OR LabourType default OT
-                if base_ot_rate and base_ot_rate > 0:
-
-                    overtime_rate = base_ot_rate
-
-                # =========================================
-                # PRIORITY 3
-                # PROJECT POLICY
-                # =========================================
-                elif policy:
-
-                    # FIXED RATE POLICY
-                    if policy.policy_type == OTPolicyType.FIXED_RATE:
-
-                        overtime_rate = policy.fixed_ot_rate or Decimal("0")
-
-                    # MULTIPLIER POLICY
-                    else:
-
+                if policy and policy.policy_type == OTPolicyType.FIXED_RATE:
+                    overtime_rate = policy.fixed_ot_rate or Decimal("0")
+                else:
+                    if base_ot_rate <= 0:
+                        logger.warning(f"Labour {labour.id} has missing or zero base OT rate. OT calculated as 0.")
+                        overtime_rate = Decimal("0")
+                    elif policy:
                         multiplier = policy.normal_day_multiplier or Decimal("1")
-
                         today = attendance.attendance_date.weekday()
 
-                        # Sunday
+                        # TODO: Holiday Calendar integration
+                        # is_holiday = False  # Implementation needed
+                        # if is_holiday:
+                        #     multiplier = policy.holiday_multiplier or multiplier
+                        # elif today == 6:
                         if today == 6:
-
                             multiplier = policy.sunday_multiplier or multiplier
 
-                        overtime_rate = hourly_rate * multiplier
+                        overtime_rate = base_ot_rate * multiplier
+                    else:
+                        overtime_rate = base_ot_rate
 
             attendance.overtime_rate = overtime_rate
 
@@ -318,6 +305,16 @@ async def check_out(
             if existing_expense:
 
                 existing_expense.amount = total_wage
+                
+                existing_transaction = await db.scalar(
+                    select(OwnerTransaction).where(
+                        OwnerTransaction.reference_id == existing_expense.id,
+                        OwnerTransaction.reference_type == "labour",
+                        OwnerTransaction.project_id == attendance.project_id
+                    )
+                )
+                if existing_transaction:
+                    existing_transaction.amount = total_wage
 
             else:
 

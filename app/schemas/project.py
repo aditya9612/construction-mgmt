@@ -1314,8 +1314,16 @@ class ProjectOTPolicyCreate(BaseModel):
     @model_validator(mode="after")
     def validate_policy(self):
 
-        if self.policy_type == OTPolicyType.FIXED_RATE and self.fixed_ot_rate is None:
-            raise ValueError("fixed_ot_rate required for FixedRate policy")
+        if self.policy_type == OTPolicyType.FIXED_RATE:
+            if self.fixed_ot_rate is None or self.fixed_ot_rate <= 0:
+                raise ValueError("fixed_ot_rate must be > 0 for FixedRate policy")
+        else:
+            if self.normal_day_multiplier is not None and self.normal_day_multiplier <= 0:
+                raise ValueError("normal_day_multiplier must be > 0")
+            if self.sunday_multiplier is not None and self.sunday_multiplier <= 0:
+                raise ValueError("sunday_multiplier must be > 0")
+            if self.holiday_multiplier is not None and self.holiday_multiplier <= 0:
+                raise ValueError("holiday_multiplier must be > 0")
 
         return self
 
