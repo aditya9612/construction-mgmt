@@ -9,7 +9,9 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from openpyxl import Workbook
 from app.models.contractor import Contractor
+from app.models.final_measurement import FinalMeasurement
 from app.models.invoice import Invoice, Transaction
+from app.models.master_data import LabourType
 from app.models.user import UserAttendance
 from app.models.material import Material
 from app.utils.common import assert_project_access
@@ -132,19 +134,22 @@ async def labour_report(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    from app.models.labour import Labour
+
     result = await db.execute(
-        select(m.Labour.skill_type, func.count(func.distinct(m.Labour.id)))
-        .join(UserAttendance, m.Labour.user_id == UserAttendance.user_id)
+        select(LabourType.skill_category, func.count(func.distinct(Labour.id)))
+        .join(Labour, Labour.labour_type_id == LabourType.id)
+        .join(UserAttendance, Labour.user_id == UserAttendance.user_id)
         .where(
             UserAttendance.project_id == project_id,
-            m.Labour.status == LabourStatus.ACTIVE,
+            Labour.status == LabourStatus.ACTIVE,
         )
-        .group_by(m.Labour.skill_type)
+        .group_by(LabourType.skill_category)
     )
 
     rows = result.all()
 
-    return {"labour_summary": [{"skill_type": r[0], "count": r[1]} for r in rows]}
+    return {"labour_summary": [{"skill_type": row[0], "count": row[1]} for row in rows]}
 
 
 # ===================== LABOUR EXCEL =====================
@@ -156,32 +161,35 @@ async def export_labour_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    #  Correct query (JOIN + GROUP BY)
+    from app.models.labour import Labour
+
     result = await db.execute(
-        select(m.Labour.skill_type, func.count(func.distinct(m.Labour.id)))
-        .join(UserAttendance, m.Labour.user_id == UserAttendance.user_id)
+        select(LabourType.skill_category, func.count(func.distinct(Labour.id)))
+        .join(Labour, Labour.labour_type_id == LabourType.id)
+        .join(UserAttendance, Labour.user_id == UserAttendance.user_id)
         .where(
             UserAttendance.project_id == project_id,
-            m.Labour.status == LabourStatus.ACTIVE,
+            Labour.status == LabourStatus.ACTIVE,
         )
-        .group_by(m.Labour.skill_type)
+        .group_by(LabourType.skill_category)
     )
 
     rows = result.all()
 
-    #  Create Excel
     wb = Workbook()
     ws = wb.active
     ws.title = "Labour Report"
 
-    # Headers
     ws.append(["Skill Type", "Count"])
 
-    # Data
-    for r in rows:
-        ws.append([str(r[0]), int(r[1])])
+    for skill_type, count in rows:
+        ws.append(
+            [
+                str(skill_type) if skill_type else "Unknown",
+                int(count),
+            ]
+        )
 
-    # Save to buffer
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -1563,7 +1571,10 @@ async def quarterly_audit_summary(
         ),
     }
 
+
 # ===================== COMMERCIAL & BOQ EXECUTION ======================
+
+
 @router.get("/commercial-execution")
 async def commercial_execution_analytics(
     project_id: int,
@@ -1573,26 +1584,56 @@ async def commercial_execution_analytics(
     from app.models.boq import BOQ
     from app.models.final_measurement import FinalMeasurement
 
-    boq_items = (await db.execute(select(BOQ).where(BOQ.project_id == project_id))).scalars().all()
-    
-    # BOQ vs Actual Analysis
-    boq_total_planned_cost = sum([float(b.total_amount) for b in boq_items])
-    
-    measurements = (await db.execute(
-        select(FinalMeasurement)
-        .where(FinalMeasurement.project_id == project_id, FinalMeasurement.status.in_(["VERIFIEE", "APPROVED", "BILLED"]))
-    )).scalars().all()
-    
-    # Assuming actual_cost can be derived roughly from certified_qty * boq.rate or from FinalMeasurement total_amount
-    actual_certified_amount = sum([float(m.total_amount) for m in measurements])
-    
+    # BOQ Items
+    boq_items = (
+        (await db.execute(select(BOQ).where(BOQ.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+
+    # Planned Cost from BOQ
+    boq_total_planned_cost = sum(float(item.total_cost or 0) for item in boq_items)
+
+    # Final Measurements
+    measurements = (
+        (
+            await db.execute(
+                select(FinalMeasurement).where(
+                    FinalMeasurement.project_id == project_id,
+                    FinalMeasurement.status.in_(["VERIFIED", "APPROVED", "BILLED"]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Actual Certified Amount
+    actual_certified_amount = sum(
+        float(getattr(m, "total_amount", 0) or 0) for m in measurements
+    )
+
+    variance = boq_total_planned_cost - actual_certified_amount
+
+    billing_efficiency = round(
+        (
+            (actual_certified_amount / boq_total_planned_cost * 100)
+            if boq_total_planned_cost > 0
+            else 0
+        ),
+        2,
+    )
+
     return {
         "project_id": project_id,
+        "boq_items_count": len(boq_items),
+        "measurements_count": len(measurements),
         "boq_total_planned_cost": boq_total_planned_cost,
         "actual_certified_amount": actual_certified_amount,
-        "variance": boq_total_planned_cost - actual_certified_amount,
-        "billing_efficiency": round((actual_certified_amount / boq_total_planned_cost * 100) if boq_total_planned_cost else 0, 2)
+        "variance": variance,
+        "billing_efficiency": billing_efficiency,
     }
+
 
 # ===================== CONTRACTOR EXECUTION =====================
 @router.get("/contractor-execution")
@@ -1602,11 +1643,13 @@ async def contractor_execution_analytics(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
 ):
     from app.models.billing import RABill
-    
-    bills = (await db.execute(
-        select(RABill).where(RABill.project_id == project_id)
-    )).scalars().all()
-    
+
+    bills = (
+        (await db.execute(select(RABill).where(RABill.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+
     contractor_stats = {}
     for bill in bills:
         cid = bill.contractor_id
@@ -1614,15 +1657,12 @@ async def contractor_execution_analytics(
             contractor_stats[cid] = {
                 "total_billed": 0,
                 "paid_amount": 0,
-                "bill_count": 0
+                "bill_count": 0,
             }
-            
+
         contractor_stats[cid]["total_billed"] += float(bill.gross_amount)
         contractor_stats[cid]["bill_count"] += 1
         if bill.status == "Paid":
             contractor_stats[cid]["paid_amount"] += float(bill.net_amount)
-            
-    return {
-        "project_id": project_id,
-        "contractor_stats": contractor_stats
-    }
+
+    return {"project_id": project_id, "contractor_stats": contractor_stats}
