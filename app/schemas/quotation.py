@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from typing import Optional, Literal
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 # =========================================================
 # MATERIAL
@@ -537,3 +537,28 @@ class QuotationOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# =========================================================
+# QUOTATION CONVERT TO PROJECT
+# =========================================================
+
+class QuotationToProjectConvertRequest(BaseModel):
+    owner_id: int
+    location_type: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
+    pincode: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    shift_start_time: Optional[time] = None
+    shift_end_time: Optional[time] = None
+    grace_period_minutes: int = 15
+
+class QuotationToProjectConvertResponse(BaseModel):
+    message: str
+    project_id: int
+    project_business_id: str
+    quotation_id: int
+    budget_amount: float

@@ -91,6 +91,17 @@ class Project(Base, TimestampMixin):
     shift_end_time = mapped_column(Time, nullable=True)
     grace_period_minutes: Mapped[int] = mapped_column(Integer, default=15)
 
+    quotation_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("quotation_master.id", ondelete="SET NULL"),
+        unique=True,
+        nullable=True,
+        index=True,
+    )
+    budget_amount: Mapped[Decimal] = mapped_column(
+        DECIMAL(15, 2), default=Decimal("0.00"), nullable=False
+    )
+
     owner_id: Mapped[int] = mapped_column(
         ForeignKey("owners.id"), nullable=False, index=True
     )
