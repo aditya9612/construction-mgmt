@@ -396,8 +396,11 @@ class TasksRepository:
     async def get_task(
         self, db: AsyncSession, *, project_id: int, task_id: int
     ) -> Optional[m.Task]:
+        from sqlalchemy.orm import selectinload, joinedload
         return await db.scalar(
-            select(m.Task).where(m.Task.project_id == project_id, m.Task.id == task_id)
+            select(m.Task)
+            .options(selectinload(m.Task.assignments).joinedload(m.TaskAssignment.user))
+            .where(m.Task.project_id == project_id, m.Task.id == task_id)
         )
 
     async def list_tasks(
@@ -410,9 +413,10 @@ class TasksRepository:
         limit: int,
         offset: int,
     ) -> tuple[list[m.Task], int]:
-        query = select(m.Task).where(m.Task.project_id == project_id)
+        from sqlalchemy.orm import selectinload, joinedload
+        query = select(m.Task).options(selectinload(m.Task.assignments).joinedload(m.TaskAssignment.user)).where(m.Task.project_id == project_id)
         count_query = (
-            select(func.count())
+            select(func.count(m.Task.id.distinct()))
             .select_from(m.Task)
             .where(m.Task.project_id == project_id)
         )
@@ -422,8 +426,8 @@ class TasksRepository:
             count_query = count_query.where(m.Task.status == status)
 
         if assigned_user_id is not None:
-            query = query.where(m.Task.assigned_user_id == assigned_user_id)
-            count_query = count_query.where(m.Task.assigned_user_id == assigned_user_id)
+            query = query.where(m.Task.assignments.any(m.TaskAssignment.user_id == assigned_user_id))
+            count_query = count_query.where(m.Task.assignments.any(m.TaskAssignment.user_id == assigned_user_id))
 
         query = query.order_by(m.Task.id.desc()).limit(limit).offset(offset)
 
@@ -1225,7 +1229,7 @@ class TasksService:
         ):
             return
 
-        if current_user.id == task.assigned_user_id:
+        if any(a.user_id == current_user.id for a in task.assignments):
             return
 
         allowed = await self.members_repo.is_member(
@@ -1238,6 +1242,15 @@ class TasksService:
             raise PermissionDeniedError("Insufficient permissions")
 
     def _task_to_out(self, *, task: m.Task, is_delayed: bool) -> s.TaskOut:
+        assigned_users_list = [
+            s.AssignedUserOut(
+                id=a.user.id, 
+                name=a.user.full_name or str(a.user.id),
+                role=a.user.role.value if hasattr(a.user.role, 'value') else str(a.user.role)
+            )
+            for a in task.assignments
+        ] if hasattr(task, 'assignments') else []
+
         return s.TaskOut(
             id=task.id,
             project_id=task.project_id,
@@ -1250,7 +1263,7 @@ class TasksService:
             start_date=task.start_date,
             end_date=task.end_date,
             created_by_user_id=task.created_by_user_id,
-            assigned_user_id=task.assigned_user_id,
+            assigned_users=assigned_users_list,
             completion_percentage=task.completion_percentage,
             is_delayed=is_delayed,
             audio_instruction_url=task.audio_instruction_url,
@@ -1267,7 +1280,7 @@ class TasksService:
         payload: s.TaskCreate,
         audio_instruction_url: Optional[str] = None,
         instruction_image_url: Optional[str] = None,
-    ) -> s.TaskOut | list[s.TaskOut]:
+    ) -> s.TaskOut:
 
         self._assert_task_mutation_role(current_user)
 
@@ -1319,111 +1332,79 @@ class TasksService:
         if assigned_ids == []:
             raise ValidationError("assigned_user_ids cannot be empty")
 
-        #  CASE 1: SINGLE / OLD FLOW
-        if assigned_ids is None:
+        # Resolve all unique user IDs from either input method
+        final_user_ids = set()
+        
+        if assigned_ids is not None:
+            for uid in assigned_ids:
+                if uid is not None:
+                    final_user_ids.add(uid)
+                    
+        final_user_ids_list = list(final_user_ids)
 
-            user_id = data.get("assigned_user_id")
+        # Validate all users
+        for uid in final_user_ids_list:
+            assigned_user = await db.scalar(select(User).where(User.id == uid))
+            if assigned_user is None:
+                raise NotFoundError(f"User {uid} not found")
 
-            if user_id is not None:
-                assigned_user = await db.scalar(select(User).where(User.id == user_id))
-                if assigned_user is None:
-                    raise NotFoundError("User not found")
-
-                is_member = await db.scalar(
-                    select(m.ProjectMember).where(
-                        m.ProjectMember.project_id == project_id,
-                        m.ProjectMember.user_id == user_id,
-                    )
-                )
-                if not is_member:
-                    raise ValidationError("User not part of project")
-
-            data["created_by_user_id"] = current_user.id
-
-            try:
-                obj = await self.tasks_repo.create_task(
-                    db,
-                    project_id=project_id,
-                    data=data,
-                )
-            except IntegrityError:
-                await db.rollback()
-                raise ConflictError(
-                    "Task with this title already exists in this project"
-                )
-
-            if user_id:
-                await create_notification(
-                    db,
-                    user_id=user_id,
-                    title="New Task Assigned",
-                    message=f"You have been assigned a new task: {obj.title}",
-                    type="info",
-                )
-
-            return self._task_to_out(
-                task=obj,
-                is_delayed=self._is_delayed(task=obj, current_date=date.today()),
-            )
-
-        # =========================
-        # CASE 2: MULTI-ASSIGN
-        # =========================
-        tasks = []
-
-        for user_id in assigned_ids:
-
-            if user_id is not None:
-                assigned_user = await db.scalar(select(User).where(User.id == user_id))
-                if assigned_user is None:
-                    raise NotFoundError("User not found")
-
-                is_member = await db.scalar(
-                    select(m.ProjectMember).where(
-                        m.ProjectMember.project_id == project_id,
-                        m.ProjectMember.user_id == user_id,
-                    )
-                )
-                if not is_member:
-                    raise ValidationError("User not part of project")
-
-            new_data = data.copy()
-            new_data["assigned_user_id"] = user_id
-            new_data["created_by_user_id"] = current_user.id
-
-            try:
-                obj = await self.tasks_repo.create_task(
-                    db,
-                    project_id=project_id,
-                    data=new_data,
-                )
-            except IntegrityError:
-                await db.rollback()
-                raise ConflictError(
-                    "Task with this title already exists in this project"
-                )
-
-            if user_id:
-                await create_notification(
-                    db,
-                    user_id=user_id,
-                    title="New Task Assigned",
-                    message=f"You have been assigned a new task: {obj.title}",
-                    type="info",
-                )
-
-            tasks.append(
-                self._task_to_out(
-                    task=obj,
-                    is_delayed=self._is_delayed(task=obj, current_date=date.today()),
+            is_member = await db.scalar(
+                select(m.ProjectMember).where(
+                    m.ProjectMember.project_id == project_id,
+                    m.ProjectMember.user_id == uid,
                 )
             )
+            if not is_member:
+                raise ValidationError(f"User {uid} not part of project")
 
-        #  AFTER LOOP (correct place)
-        if len(tasks) == 1:
-            return tasks[0]
+        data["created_by_user_id"] = current_user.id
+        
+        # We no longer populate assigned_user_id
 
-        return tasks
+        # 1. Create ONE Task
+        try:
+            obj = await self.tasks_repo.create_task(
+                db,
+                project_id=project_id,
+                data=data,
+            )
+        except IntegrityError:
+            await db.rollback()
+            raise ConflictError(
+                "Task with this title already exists in this project"
+            )
+
+        # 2. Create TaskAssignments
+        for uid in final_user_ids_list:
+            assignment = m.TaskAssignment(
+                task_id=obj.id,
+                user_id=uid,
+                assigned_by_user_id=current_user.id
+            )
+            db.add(assignment)
+            
+            await create_notification(
+                db,
+                user_id=uid,
+                title="New Task Assigned",
+                message=f"You have been assigned a new task: {obj.title}",
+                type="info",
+            )
+            
+        await db.flush()
+
+        from sqlalchemy.orm import selectinload, joinedload
+        # Refetch with relations
+        obj = await db.scalar(
+            select(m.Task)
+            .options(selectinload(m.Task.assignments).joinedload(m.TaskAssignment.user))
+            .where(m.Task.id == obj.id)
+        )
+
+        return self._task_to_out(
+            task=obj,
+            is_delayed=self._is_delayed(task=obj, current_date=date.today()),
+        )
 
     async def list_tasks(
         self,
@@ -1449,9 +1430,10 @@ class TasksService:
             current_user=current_user,
         )
 
+        from sqlalchemy.orm import selectinload, joinedload
         #  base query
-        query = select(m.Task)
-        count_query = select(func.count()).select_from(m.Task)
+        query = select(m.Task).options(selectinload(m.Task.assignments).joinedload(m.TaskAssignment.user))
+        count_query = select(func.count(m.Task.id.distinct())).select_from(m.Task)
 
         #  mandatory filter
         query = query.where(m.Task.project_id == project_id)
@@ -1464,8 +1446,8 @@ class TasksService:
             count_query = count_query.where(m.Task.status == status)
 
         if assigned_user_id is not None:
-            query = query.where(m.Task.assigned_user_id == assigned_user_id)
-            count_query = count_query.where(m.Task.assigned_user_id == assigned_user_id)
+            query = query.where(m.Task.assignments.any(m.TaskAssignment.user_id == assigned_user_id))
+            count_query = count_query.where(m.Task.assignments.any(m.TaskAssignment.user_id == assigned_user_id))
 
         if search:
             query = query.where(m.Task.title.ilike(f"%{search}%"))
@@ -1478,14 +1460,14 @@ class TasksService:
             )
 
         elif view == "received":
-            query = query.where(m.Task.assigned_user_id == current_user.id)
-            count_query = count_query.where(m.Task.assigned_user_id == current_user.id)
+            query = query.where(m.Task.assignments.any(m.TaskAssignment.user_id == current_user.id))
+            count_query = count_query.where(m.Task.assignments.any(m.TaskAssignment.user_id == current_user.id))
 
         #  ordering + pagination
         query = query.order_by(m.Task.id.desc()).limit(limit).offset(offset)
 
         #  execute
-        rows = (await db.execute(query)).scalars().all()
+        rows = (await db.execute(query)).scalars().unique().all()
         total = await db.scalar(count_query)
 
         current_date = date.today()
@@ -1603,30 +1585,81 @@ class TasksService:
         if "status" in data and data["status"] is None:
             raise ValidationError("status cannot be null")
 
-        if "assigned_user_id" in data:
-            assigned_user_id = data["assigned_user_id"]
+        # Resolve user IDs
+        assigned_ids = data.pop("assigned_user_ids", None)
+        
+        has_assignment_update = assigned_ids is not None
+        
+        if has_assignment_update:
+            final_user_ids = set()
+            if assigned_ids is not None:
+                for uid in assigned_ids:
+                    if uid is not None:
+                        final_user_ids.add(uid)
+            
+            final_user_ids_list = list(final_user_ids)
+            
+            if not final_user_ids_list:
+                raise ValidationError("assigned_user_ids cannot be empty")
+            
+            for uid in final_user_ids_list:
+                assigned_user = await db.scalar(select(User).where(User.id == uid))
+                if assigned_user is None:
+                    raise NotFoundError(f"User {uid} not found")
 
-            if assigned_user_id is None:
-                raise ValidationError("assigned_user_id cannot be null")
-
-            assigned_user = await db.scalar(
-                select(User).where(User.id == assigned_user_id)
-            )
-            if assigned_user is None:
-                raise NotFoundError("User not found")
-
-            is_member = await db.scalar(
-                select(m.ProjectMember).where(
-                    m.ProjectMember.project_id == project_id,
-                    m.ProjectMember.user_id == assigned_user_id,
+                is_member = await db.scalar(
+                    select(m.ProjectMember).where(
+                        m.ProjectMember.project_id == project_id,
+                        m.ProjectMember.user_id == uid,
+                    )
                 )
-            )
-            if not is_member:
-                raise ValidationError("User not part of project")
+                if not is_member:
+                    raise ValidationError(f"User {uid} not part of project")
 
         try:
             await self.tasks_repo.update_task(db, obj=obj, data=data)
             await db.refresh(obj)
+            
+            # Sync Assignments
+            if has_assignment_update:
+                from sqlalchemy.orm import selectinload
+                # Load current assignments
+                obj_with_assignments = await db.scalar(
+                    select(m.Task).options(selectinload(m.Task.assignments)).where(m.Task.id == obj.id)
+                )
+                
+                current_uids = {a.user_id for a in obj_with_assignments.assignments}
+                target_uids = set(final_user_ids_list)
+                
+                to_remove = current_uids - target_uids
+                to_add = target_uids - current_uids
+                
+                if to_remove:
+                    await db.execute(
+                        m.TaskAssignment.__table__.delete().where(
+                            m.TaskAssignment.task_id == obj.id,
+                            m.TaskAssignment.user_id.in_(to_remove)
+                        )
+                    )
+                
+                if to_add:
+                    for uid in to_add:
+                        assignment = m.TaskAssignment(
+                            task_id=obj.id,
+                            user_id=uid,
+                            assigned_by_user_id=current_user.id
+                        )
+                        db.add(assignment)
+                        
+                        await create_notification(
+                            db,
+                            user_id=uid,
+                            title="New Task Assigned",
+                            message=f"You have been assigned a new task: {obj.title}",
+                            type="info",
+                        )
+                await db.flush()
+
         except IntegrityError:
             await db.rollback()
             raise ConflictError("Task with this title already exists in this project")
@@ -1634,6 +1667,13 @@ class TasksService:
             await db.rollback()
             logger.exception(f"Task update failed id={task_id}")
             raise
+
+        from sqlalchemy.orm import selectinload, joinedload
+        obj = await db.scalar(
+            select(m.Task)
+            .options(selectinload(m.Task.assignments).joinedload(m.TaskAssignment.user))
+            .where(m.Task.id == obj.id)
+        )
 
         is_delayed = self._is_delayed(task=obj, current_date=date.today())
 
@@ -1672,13 +1712,26 @@ class TasksService:
         if not is_member:
             raise ValidationError("User not part of project")
 
-        await self.tasks_repo.update_task(
-            db,
-            obj=obj,
-            data={"assigned_user_id": new_user_id},
+        # Overwrite assignments with this single new user
+        await db.execute(
+            m.TaskAssignment.__table__.delete().where(
+                m.TaskAssignment.task_id == obj.id,
+            )
         )
+        assignment = m.TaskAssignment(
+            task_id=obj.id,
+            user_id=new_user_id,
+            assigned_by_user_id=current_user.id
+        )
+        db.add(assignment)
+        await db.flush()
 
-        await db.refresh(obj)
+        from sqlalchemy.orm import selectinload, joinedload
+        obj = await db.scalar(
+            select(m.Task)
+            .options(selectinload(m.Task.assignments).joinedload(m.TaskAssignment.user))
+            .where(m.Task.id == obj.id)
+        )
 
         return self._task_to_out(
             task=obj,
@@ -2212,9 +2265,17 @@ class ReportsService:
         outstanding = boq_val - invoiced_val
 
         # Tasks
+        from sqlalchemy.orm import selectinload
         tasks = (
-            (await db.execute(select(m.Task).where(m.Task.project_id == project_id)))
+            (
+                await db.execute(
+                    select(m.Task)
+                    .options(selectinload(m.Task.assignments).joinedload(m.TaskAssignment.user))
+                    .where(m.Task.project_id == project_id)
+                )
+            )
             .scalars()
+            .unique()
             .all()
         )
         total_tasks = len(tasks)
@@ -2326,7 +2387,7 @@ class ReportsService:
                 {
                     "name": t.title,
                     "assignee": (
-                        str(t.assigned_user_id) if t.assigned_user_id else "Unassigned"
+                        ", ".join([a.user.full_name for a in t.assignments if a.user and a.user.full_name]) if t.assignments else "Unassigned"
                     ),
                     "start_date": t.start_date,
                     "end_date": t.end_date,
@@ -3055,7 +3116,7 @@ os.makedirs(AUDIO_DIR, exist_ok=True)
 
 
 @tasks_router.post(
-    "/{project_id}/tasks", response_model=Union[s.TaskOut, List[s.TaskOut]]
+    "/{project_id}/tasks", response_model=s.TaskOut
 )
 async def create_task(
     project_id: int,
@@ -3185,7 +3246,7 @@ async def list_tasks(
 
 
 @tasks_router.get(
-    "/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]]
+    "/{project_id}/tasks/{task_id}", response_model=s.TaskOut
 )
 async def get_task(
     project_id: int,
@@ -3201,7 +3262,7 @@ async def get_task(
 
 
 @tasks_router.put(
-    "/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]]
+    "/{project_id}/tasks/{task_id}", response_model=s.TaskOut
 )
 async def update_task(
     project_id: int,

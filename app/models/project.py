@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from typing import Optional, TYPE_CHECKING
 from sqlalchemy import (
     DECIMAL,
@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     Column,
     Date,
+    DateTime,
     Float,
     ForeignKey,
     Integer,
@@ -394,6 +395,10 @@ class Task(Base):
 
     qc_records = relationship("QCRecord", back_populates="task")
 
+    assignments = relationship(
+        "TaskAssignment", back_populates="task", cascade="all, delete-orphan"
+    )
+
     __table_args__ = (
         UniqueConstraint("project_id", "title", name="uq_task_project_title"),
         #  ONLY KEEP THIS (high value composite index)
@@ -404,6 +409,30 @@ class Task(Base):
             "assigned_user_id",
         ),
     )
+
+
+class TaskAssignment(Base):
+    __tablename__ = "task_assignments"
+    
+    __table_args__ = (
+        UniqueConstraint("task_id", "user_id", name="uq_task_assignment"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tasks.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    assigned_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    assigned_by_user_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    task = relationship("Task", back_populates="assignments")
+    user = relationship("User", foreign_keys=[user_id])
+    assigned_by = relationship("User", foreign_keys=[assigned_by_user_id])
 
 
 class TaskProgress(Base, TimestampMixin):

@@ -277,11 +277,15 @@ class TaskCreateForm:
 
         self.end_date = end_date
 
-        self.assigned_user_ids = (
-            json.loads(assigned_user_ids)
-            if assigned_user_ids
-            else None
-        )
+        parsed_ids = None
+        if assigned_user_ids:
+            try:
+                parsed = json.loads(assigned_user_ids)
+                parsed_ids = parsed if isinstance(parsed, list) else [parsed]
+            except json.JSONDecodeError:
+                parsed_ids = [int(x.strip()) for x in assigned_user_ids.split(",") if x.strip().isdigit()]
+        
+        self.assigned_user_ids = parsed_ids
 
         self.activity_type_id = activity_type_id
 
@@ -333,7 +337,7 @@ class TaskUpdate(BaseSchema):
 
     status: Optional[TaskStatus] = None
 
-    assigned_user_id: Optional[int] = None
+    assigned_user_ids: Optional[list[int]] = None
 
     activity_type_id: Optional[int] = None
 
@@ -372,7 +376,7 @@ class TaskUpdateForm:
 
         status: Optional[TaskStatus] = Form(None),
 
-        assigned_user_id: Optional[int] = Form(None),
+        assigned_user_ids: Optional[str] = Form(None),
 
         activity_type_id: Optional[int] = Form(None),
 
@@ -398,7 +402,15 @@ class TaskUpdateForm:
         
         self.status = status
 
-        self.assigned_user_id = assigned_user_id
+        parsed_ids = None
+        if assigned_user_ids:
+            try:
+                parsed = json.loads(assigned_user_ids)
+                parsed_ids = parsed if isinstance(parsed, list) else [parsed]
+            except json.JSONDecodeError:
+                parsed_ids = [int(x.strip()) for x in assigned_user_ids.split(",") if x.strip().isdigit()]
+        
+        self.assigned_user_ids = parsed_ids
 
         self.activity_type_id = activity_type_id
 
@@ -426,7 +438,7 @@ class TaskUpdateForm:
 
             status=self.status,
 
-            assigned_user_id=self.assigned_user_id,
+            assigned_user_ids=self.assigned_user_ids,
 
             activity_type_id=self.activity_type_id,
 
@@ -435,6 +447,11 @@ class TaskUpdateForm:
             boq_id=self.boq_id,
         )
 
+
+class AssignedUserOut(BaseSchema):
+    id: int
+    name: str
+    role: Optional[str] = None
 
 class TaskOut(BaseSchema):
 
@@ -464,7 +481,7 @@ class TaskOut(BaseSchema):
 
     created_by_user_id: int
 
-    assigned_user_id: Optional[int]
+    assigned_users: list[AssignedUserOut] = []
 
     completion_percentage: float
 
