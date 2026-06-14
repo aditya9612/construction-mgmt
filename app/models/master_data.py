@@ -1,12 +1,4 @@
-from sqlalchemy import (
-    Boolean,
-    Column,
-    DECIMAL,
-    Integer,
-    String,
-)
-
-from app.core.enums import SkillType
+from sqlalchemy import Column, Integer, String, Text
 from app.models.base import Base
 from sqlalchemy import Enum as SAEnum
 
@@ -75,13 +67,6 @@ class ActivityType(Base):
     unique_code = Column(String(50), unique=True, nullable=True)
 
     category = Column(String(100), nullable=True)
-
-    is_active = Column(Boolean, default=True)
-
-
-# =====================================================
-# MATERIAL MASTER
-# =====================================================
 
 
 class MaterialMaster(Base):

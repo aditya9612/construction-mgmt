@@ -229,93 +229,7 @@ class TaskCreate(BaseSchema):
 
         return validate_start_end_dates(
             info.data.get("start_date"),
-            v,
-        )
-
-
-# =========================================================
-# TASK CREATE FORM (multipart/form-data support)
-# =========================================================
-
-class TaskCreateForm:
-
-    def __init__(
-
-        self,
-
-        title: str = Form(...),
-
-        description: Optional[str] = Form(None),
-
-        priority: Optional[Union[int, TaskPriority]] = Form(None),
-
-        status: TaskStatus = Form(TaskStatus.PLANNED),
-
-        start_date: Optional[date] = Form(None),
-
-        end_date: Optional[date] = Form(None),
-
-        assigned_user_ids: Optional[str] = Form(None),
-
-        activity_type_id: Optional[int] = Form(None),
-
-        milestone_id: Optional[int] = Form(None),
-
-        boq_id: Optional[int] = Form(None),
-
-    ):
-
-        self.title = title
-
-        self.description = description
-
-        self.priority = priority
-
-        self.status = status
-
-        self.start_date = start_date
-
-        self.end_date = end_date
-
-        self.assigned_user_ids = (
-            json.loads(assigned_user_ids)
-            if assigned_user_ids
-            else None
-        )
-
-        self.activity_type_id = activity_type_id
-
-        self.milestone_id = milestone_id
-
-        self.boq_id = boq_id
-
-    # =====================================================
-    # CONVERT TO PYDANTIC SCHEMA
-    # =====================================================
-
-    def to_schema(self) -> TaskCreate:
-
-        return TaskCreate(
-
-            title=self.title,
-
-            description=self.description,
-
-            priority=self.priority,
-
-            status=self.status,
-
-            start_date=self.start_date,
-
-            end_date=self.end_date,
-
-            assigned_user_ids=self.assigned_user_ids,
-
-            activity_type_id=self.activity_type_id,
-
-            milestone_id=self.milestone_id,
-
-            boq_id=self.boq_id,
+            v
         )
 
 
@@ -330,16 +244,7 @@ class TaskUpdate(BaseSchema):
     start_date: Optional[date] = None
 
     end_date: Optional[date] = None
-
-    status: Optional[TaskStatus] = None
-
     assigned_user_id: Optional[int] = None
-
-    activity_type_id: Optional[int] = None
-
-    milestone_id: Optional[int] = None
-
-    boq_id: Optional[int] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
@@ -348,93 +253,6 @@ class TaskUpdate(BaseSchema):
             info.data.get("start_date"),
             v,
         )
-
-
-# =========================================================
-# TASK UPDATE FORM (multipart/form-data support)
-# =========================================================
-
-class TaskUpdateForm:
-
-    def __init__(
-
-        self,
-
-        title: Optional[str] = Form(None),
-
-        description: Optional[str] = Form(None),
-
-        priority: Optional[int] = Form(None),
-
-        start_date: Optional[date] = Form(None),
-
-        end_date: Optional[date] = Form(None),
-
-        status: Optional[TaskStatus] = Form(None),
-
-        assigned_user_id: Optional[int] = Form(None),
-
-        activity_type_id: Optional[int] = Form(None),
-
-        milestone_id: Optional[int] = Form(None),
-
-        boq_id: Optional[int] = Form(None),
-
-        remove_audio: bool = Form(False),
-
-        remove_image: bool = Form(False),
-
-    ):
-
-        self.title = title
-
-        self.description = description
-
-        self.priority = priority
-
-        self.start_date = start_date
-
-        self.end_date = end_date
-        
-        self.status = status
-
-        self.assigned_user_id = assigned_user_id
-
-        self.activity_type_id = activity_type_id
-
-        self.milestone_id = milestone_id
-
-        self.boq_id = boq_id
-
-        self.remove_audio = remove_audio
-
-        self.remove_image = remove_image
-
-    def to_schema(self) -> TaskUpdate:
-
-        return TaskUpdate(
-
-            title=self.title,
-
-            description=self.description,
-
-            priority=self.priority,
-
-            start_date=self.start_date,
-
-            end_date=self.end_date,
-
-            status=self.status,
-
-            assigned_user_id=self.assigned_user_id,
-
-            activity_type_id=self.activity_type_id,
-
-            milestone_id=self.milestone_id,
-
-            boq_id=self.boq_id,
-        )
-
 
 class TaskOut(BaseSchema):
 
@@ -463,9 +281,7 @@ class TaskOut(BaseSchema):
     actual_end_date: Optional[date] = None
 
     created_by_user_id: int
-
     assigned_user_id: Optional[int]
-
     completion_percentage: float
 
     is_delayed: bool
@@ -1294,39 +1110,3 @@ class ProjectsModuleResponse(BaseSchema):
     summary: ProjectsModuleSummary
 
     activities: List[ProjectActivityItem]
-
-
-# =======================PROJECTS ot-policy==================================
-
-
-class ProjectOTPolicyCreate(BaseModel):
-
-    policy_type: OTPolicyType
-
-    normal_day_multiplier: Optional[Decimal] = Decimal("1.5")
-
-    sunday_multiplier: Optional[Decimal] = Decimal("2.0")
-
-    holiday_multiplier: Optional[Decimal] = Decimal("3.0")
-
-    fixed_ot_rate: Optional[Decimal] = None
-
-    @model_validator(mode="after")
-    def validate_policy(self):
-
-        if self.policy_type == OTPolicyType.FIXED_RATE and self.fixed_ot_rate is None:
-            raise ValueError("fixed_ot_rate required for FixedRate policy")
-
-        return self
-
-
-class ProjectOTPolicyOut(ProjectOTPolicyCreate):
-
-    id: int
-
-    project_id: int
-
-    class Config:
-        from_attributes = True
-
-        json_encoders = {Decimal: float}

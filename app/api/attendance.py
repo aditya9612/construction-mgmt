@@ -1,4 +1,3 @@
-from decimal import Decimal
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +21,7 @@ from app.models.owner import OwnerTransaction
 from app.core.enums import OTPolicyType
 
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
+logger = logging.getLogger(__name__)
 
 # Roles allowed to approve attendance
 APPROVE_ROLES = ["Admin", "ProjectManager", "SiteEngineer"]
@@ -233,124 +233,7 @@ async def check_out(
     # Calculate working hours
     if attendance.in_time and attendance.out_time:
         delta = attendance.out_time - attendance.in_time
-        attendance.working_hours = Decimal(
-            str(round(delta.total_seconds() / 3600.0, 2))
-        )
-        # ==================================================
-        # LABOUR OT + WAGE LOGIC
-        # ==================================================
-
-        if labour:
-
-            total_hours = Decimal(str(attendance.working_hours or 0))
-
-            working_hours = min(total_hours, Decimal("8"))
-
-            overtime_hours = max(Decimal("0"), total_hours - working_hours)
-
-            attendance.overtime_hours = overtime_hours
-
-            hourly_rate = labour.effective_daily_wage / Decimal("8")
-
-            overtime_rate = Decimal("0")
-
-            policy = await db.scalar(
-                select(ProjectOTPolicy).where(
-                    ProjectOTPolicy.project_id == attendance.project_id
-                )
-            )
-
-            if overtime_hours > 0:
-
-                # =========================================
-                # PRIORITY 1 + 2
-                # LABOUR / LABOUR TYPE OT RATE
-                # =========================================
-
-                base_ot_rate = labour.effective_ot_rate
-
-                # Labour custom OT
-                # OR LabourType default OT
-                if base_ot_rate and base_ot_rate > 0:
-
-                    overtime_rate = base_ot_rate
-
-                # =========================================
-                # PRIORITY 3
-                # PROJECT POLICY
-                # =========================================
-                elif policy:
-
-                    # FIXED RATE POLICY
-                    if policy.policy_type == OTPolicyType.FIXED_RATE:
-
-                        overtime_rate = policy.fixed_ot_rate or Decimal("0")
-
-                    # MULTIPLIER POLICY
-                    else:
-
-                        multiplier = policy.normal_day_multiplier or Decimal("1")
-
-                        today = attendance.attendance_date.weekday()
-
-                        # Sunday
-                        if today == 6:
-
-                            multiplier = policy.sunday_multiplier or multiplier
-
-                        overtime_rate = hourly_rate * multiplier
-
-            attendance.overtime_rate = overtime_rate
-
-            total_wage = hourly_rate * working_hours + overtime_rate * overtime_hours
-
-            total_wage = total_wage.quantize(Decimal("0.01"))
-
-            existing_expense = await db.scalar(
-                select(Expense).where(
-                    Expense.project_id == attendance.project_id,
-                    Expense.labour_id == labour.id,
-                    Expense.expense_date == attendance.attendance_date,
-                    Expense.source_type == "attendance_auto",
-                )
-            )
-
-            if existing_expense:
-
-                existing_expense.amount = total_wage
-
-            else:
-
-                expense = Expense(
-                    project_id=attendance.project_id,
-                    labour_id=labour.id,
-                    category="Labour",
-                    source_type="attendance_auto",
-                    description=f"Labour expense - {attendance.attendance_date}",
-                    amount=total_wage,
-                    expense_date=attendance.attendance_date,
-                    payment_mode="auto",
-                )
-
-                db.add(expense)
-
-                await db.flush()
-
-                project = await db.get(Project, attendance.project_id)
-
-                if project:
-
-                    db.add(
-                        OwnerTransaction(
-                            owner_id=project.owner_id,
-                            project_id=attendance.project_id,
-                            type="debit",
-                            amount=total_wage,
-                            reference_type="labour",
-                            reference_id=expense.id,
-                            description=f"Labour expense ({attendance.attendance_date})",
-                        )
-                    )
+        attendance.working_hours = round(delta.total_seconds() / 3600.0, 2)
 
     # Auto-approve attendance upon checkout
     attendance.is_approved = True

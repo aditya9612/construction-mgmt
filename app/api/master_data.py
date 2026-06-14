@@ -63,11 +63,13 @@ async def get_master_stats(
     )
 
 # ===================== ALL / SEARCH =====================
-
 @router.get("/all", response_model=List[s.MasterDataUnified])
 async def get_all_master_data(
     search: Optional[str] = None,
-    tag: Optional[str] = Query(None, description="MATERIAL, LABOR, ACTIVITY, UNIT"),
+    tag: Optional[str] = Query(
+        None,
+        description="MATERIAL, LABOR, ACTIVITY, UNIT"
+    ),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
@@ -354,29 +356,7 @@ async def create_activity_type(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
-
-    # CHECK EXISTING ACTIVITY TYPE
-    existing = await db.scalar(
-        select(m.ActivityType).where(
-            m.ActivityType.name == payload.name
-        )
-    )
-
-    if existing:
-        raise ValidationError("Activity type already exists")
-
-    # CREATE ACTIVITY TYPE
-    unique_code = await generate_readable_master_code(
-        db=db,
-        model=m.ActivityType,
-        prefix="ACT",
-        name=payload.name
-    )
-
-    obj = m.ActivityType(
-        **payload.model_dump(),
-        unique_code=unique_code
-    )
+    obj = m.ActivityType(**payload.model_dump())
 
     db.add(obj)
 
@@ -510,31 +490,7 @@ async def update_master(
     if not obj:
         raise NotFoundError("Item not found")
 
-    # VALIDATE PAYLOAD
-    validated_payload = schema(**payload)
-
-    update_data = validated_payload.model_dump(
-        exclude_unset=True
-    )
-
-    # DUPLICATE NAME CHECK
-    if "name" in update_data:
-
-        existing = await db.scalar(
-            select(model).where(
-                model.name == update_data["name"],
-                model.id != id
-            )
-        )
-
-        if existing:
-            raise ValidationError(
-                f"{entity} with this name already exists"
-            )
-
-    # UPDATE FIELDS
-    for k, v in update_data.items():
-
+    for k, v in payload.items():
         if hasattr(obj, k):
             setattr(obj, k, v)
 

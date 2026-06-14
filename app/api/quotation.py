@@ -1737,7 +1737,7 @@ async def convert_to_bill(
 # So create the invoice exactly like /api/v1/invoices/from-quotation does.
 
 from app.models.invoice import Invoice
-from app.models.owner import OwnerTransaction
+from app.models.owner import Owner, OwnerTransaction
 from app.models.project import Project
 from decimal import Decimal
 
@@ -2433,4 +2433,82 @@ async def generate_pdf(quotation_id: int, db: AsyncSession = Depends(get_db_sess
         pdf_buffer,
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{safe_filename}.pdf"'},
+    )
+
+
+# =========================================================
+# CONVERT QUOTATION TO PROJECT
+# =========================================================
+
+from app.core.enums import ProjectStatus
+
+@router.post("/{quotation_id}/convert-to-project", response_model=s.QuotationToProjectConvertResponse)
+async def convert_quotation_to_project(
+    quotation_id: int,
+    payload: s.QuotationToProjectConvertRequest,
+    db: AsyncSession = Depends(get_db_session)
+):
+    quotation = await get_quotation_or_404(quotation_id, db)
+
+    if not quotation.is_approved:
+        raise HTTPException(status_code=400, detail="Quotation must be approved before converting to a project")
+
+    # Check if a project already exists for this quotation
+    result = await db.execute(select(Project).where(Project.quotation_id == quotation_id))
+    existing_project = result.scalars().first()
+
+    if existing_project:
+        raise HTTPException(status_code=400, detail="A project has already been created for this quotation")
+
+    owner = await db.get(Owner, payload.owner_id)
+
+    if not owner:
+        raise HTTPException(
+            status_code=404,
+            detail="Owner not found"
+        )
+
+    business_id = await generate_business_id(db, Project, "business_id", "PRJ")
+
+    project = Project(
+        business_id=business_id,
+        project_name=quotation.project_name,
+        type=quotation.project_type,
+        site_address=quotation.site_address,
+        start_date=quotation.project_start_date,
+        end_date=quotation.project_end_date,
+        budget_amount=quotation.grand_total,
+        quotation_id=quotation.id,
+        description=f"Created from quotation {quotation.quotation_no}",
+        status=ProjectStatus.PLANNED,
+        owner_id=payload.owner_id,
+        location_type=payload.location_type,
+        city=payload.city,
+        state=payload.state,
+        country=payload.country,
+        pincode=payload.pincode,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        shift_start_time=payload.shift_start_time,
+        shift_end_time=payload.shift_end_time,
+        grace_period_minutes=payload.grace_period_minutes,
+    )
+
+    db.add(project)
+    await db.flush()
+    
+    # TODO: Future BOQ Integration
+    # Quotation -> Project -> BOQ -> Tasks
+    quotation.project_id = project.id
+    quotation.status = QuotationStatus.CONVERTED
+    
+    await db.commit()
+    await db.refresh(project)
+
+    return s.QuotationToProjectConvertResponse(
+        message="Project created successfully from quotation",
+        project_id=project.id,
+        project_business_id=project.business_id,
+        quotation_id=quotation.id,
+        budget_amount=float(project.budget_amount)
     )

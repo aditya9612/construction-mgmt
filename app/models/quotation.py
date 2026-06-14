@@ -65,7 +65,7 @@ class QuotationMaster(Base):
         ForeignKey("projects.id"), nullable=True, index=True
     )
 
-    project = relationship("Project", lazy="selectin")
+    project = relationship("Project", foreign_keys=[project_id], lazy="selectin")
 
     project_name: Mapped[str] = mapped_column(String(150))
 

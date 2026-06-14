@@ -426,25 +426,11 @@ async def get_contractor_liability(
     return output
 
 
-from sqlalchemy.orm import selectinload
-
 
 @router.put("/{labour_id}", response_model=s.LabourOut)
 async def update_labour(
     labour_id: int,
-    aadhaar_number: Optional[str] = Form(None),
-    pan_number: Optional[str] = Form(None),
-    labour_name: Optional[str] = Form(None),
-    mobile_number: Optional[str] = Form(None),
-    email: Optional[EmailStr] = Form(None),
-    address: Optional[str] = Form(None),
-    labour_type_id: Optional[int] = Form(None),
-    contractor_id: Optional[int] = Form(None),
-    status: Optional[LabourStatus] = Form(None),
-    notes: Optional[str] = Form(None),
-    custom_daily_wage_rate: Optional[Decimal] = Query(None),
-    custom_ot_rate_per_hour: Optional[Decimal] = Query(None),
-    profile_image: UploadFile = File(None),
+    payload: s.LabourUpdate,
     current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
@@ -456,46 +442,36 @@ async def update_labour(
     if not obj:
         raise NotFoundError("Labour record not found")
 
-    data = {
-        "aadhaar_number": aadhaar_number,
-        "pan_number": pan_number,
-        "labour_name": labour_name,
-        "mobile_number": mobile_number,
-        "email": email,
-        "address": address,
-        "labour_type_id": labour_type_id,
-        "custom_daily_wage_rate": custom_daily_wage_rate,
-        "custom_ot_rate_per_hour": custom_ot_rate_per_hour,
-        "contractor_id": contractor_id,
-        "status": status,
-        "notes": notes,
-    }
+    #  FIX: get ALL mappings
+    mappings = await db.scalars(
+        select(LabourProject.project_id).where(LabourProject.labour_id == labour_id)
+    )
 
-    data = {k: v for k, v in data.items() if v is not None}
+    project_ids = mappings.all()
 
-    if profile_image:
-        image_path = await validate_and_save_image(
-            file=profile_image,
-            upload_dir="uploads/labour",
-            prefix="labour",
-        )
-        data["profile_image"] = image_path
+    if not project_ids:
+        raise ValidationError("Labour not assigned")
+
+    #  CHECK ANY ACCESS
+    allowed = False
+    for pid in project_ids:
+        try:
+            await assert_project_access(db, project_id=pid, current_user=current_user)
+            allowed = True
+            break
+        except:
+            continue
+
+    if not allowed:
+        raise PermissionDeniedError("No access to this labour")
+
+    data = payload.model_dump(exclude_unset=True)
 
     for k, v in data.items():
         setattr(obj, k, v)
 
-    await db.commit()
-
-    # FIX FOR MissingGreenlet ERROR
-    obj = await db.scalar(
-        select(Labour)
-        .options(
-            selectinload(Labour.user),
-            selectinload(Labour.contractor),
-            selectinload(Labour.labour_type),
-        )
-        .where(Labour.id == labour_id)
-    )
+    await db.flush()
+    await db.refresh(obj)
 
     await r.bump_cache_version(redis, VERSION_KEY)
     await r.bump_cache_version(redis, "dashboard_version")

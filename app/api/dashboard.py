@@ -816,21 +816,25 @@ async def pm_command_center(
                     )
                 )
 
+        from sqlalchemy.orm import selectinload, joinedload
+        from app.models.project import TaskAssignment
         # 8. Task Management Overview
         tasks_query = await db.execute(
-            select(Task, User.full_name)
-            .outerjoin(User, Task.assigned_user_id == User.id)
+            select(Task)
+            .options(selectinload(Task.assignments).joinedload(TaskAssignment.user))
             .where(Task.project_id.in_(project_ids))
             .order_by(Task.end_date.asc())
             .limit(4)
         )
         task_mgmt = []
-        for t, eng_name in tasks_query.all():
+        for t in tasks_query.scalars().unique().all():
+            engineers = [a.user.full_name for a in t.assignments if a.user]
+            eng_name = ", ".join(engineers) if engineers else "Unassigned"
             task_mgmt.append(
                 PMTaskOverview(
                     id=t.id,
                     task_name=t.title,
-                    engineer_name=eng_name or "Unassigned",
+                    engineer_name=eng_name,
                     status=(
                         t.status.value if hasattr(t.status, "value") else str(t.status)
                     ),

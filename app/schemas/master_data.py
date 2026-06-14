@@ -65,88 +65,10 @@ class UnitOut(BaseModel):
     class Config:
         from_attributes = True
 
-# =====================================================
 
-# LABOUR TYPE MASTER
-
-# =====================================================
-
-
-# =====================================================
-# LABOUR TYPE MASTER
-# =====================================================
-
+# ---------- LABOUR ----------
 class LabourTypeCreate(MasterDataBase):
-
-    skill_category: e.SkillType
-
-    default_daily_wage: Decimal
-
-    default_working_hours: int = 8
-
-    default_ot_rate_per_hour: Optional[Decimal] = None
-
-    is_active: bool = True
-
-    @field_validator("default_daily_wage")
-    def validate_daily_wage(cls, v):
-
-        return validate_positive_decimal(
-            v,
-            "Default daily wage"
-        )
-
-    @field_validator("default_ot_rate_per_hour")
-    def validate_ot_rate(cls, v):
-
-        if v is None:
-            return v
-
-        return validate_positive_decimal(
-            v,
-            "Default OT rate"
-        )
-
-
-class LabourTypeUpdate(BaseModel):
-
-    name: Optional[str] = None
-
-    # unique_code: Optional[str] = None
-
-    category: Optional[str] = None
-
-    skill_category: Optional[e.SkillType] = None
-
-    default_daily_wage: Optional[Decimal] = None
-
-    default_working_hours: Optional[int] = None
-
-    default_ot_rate_per_hour: Optional[Decimal] = None
-
-    is_active: Optional[bool] = None
-
-    @field_validator("default_daily_wage")
-    def validate_daily_wage(cls, v):
-
-        if v is None:
-            return v
-
-        return validate_positive_decimal(
-            v,
-            "Default daily wage"
-        )
-
-    @field_validator("default_ot_rate_per_hour")
-    def validate_ot_rate(cls, v):
-
-        if v is None:
-            return v
-
-        return validate_positive_decimal(
-            v,
-            "Default OT rate"
-        )
+    pass
 
 
 class LabourTypeOut(MasterDataBase):
@@ -177,7 +99,19 @@ class LabourTypeOut(MasterDataBase):
 
 
 class ActivityTypeCreate(MasterDataBase):
-    pass
+
+    default_unit_id: Optional[int] = None
+
+
+class ActivityTypeUpdate(BaseModel):
+
+    name: Optional[str] = None
+
+    category: Optional[str] = None
+
+    default_unit_id: Optional[int] = None
+
+    is_active: Optional[bool] = None
 
 
 class ActivityTypeUpdate(BaseModel):
@@ -194,10 +128,6 @@ class ActivityTypeUpdate(BaseModel):
 class ActivityTypeOut(MasterDataBase):
 
     id: int
-
-    unique_code: Optional[str]
-
-    is_active: bool
 
     class Config:
         from_attributes = True
