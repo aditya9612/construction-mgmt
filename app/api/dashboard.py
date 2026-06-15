@@ -2171,7 +2171,13 @@ async def get_labour_dashboard(
     # 1. Fetch Labour Profile
     from sqlalchemy.orm import selectinload
     result = await db.execute(
-        select(Labour).where(Labour.user_id == current_user.id).options(selectinload(Labour.contractor))
+        select(Labour)
+        .where(Labour.user_id == current_user.id)
+        .options(
+            selectinload(Labour.contractor),
+            selectinload(Labour.labour_type),
+            selectinload(Labour.user),
+        )
     )
     labour = result.scalar_one_or_none()
     

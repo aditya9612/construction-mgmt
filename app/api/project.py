@@ -3693,7 +3693,7 @@ async def create_dsr(
         else:
             unskilled += count
 
-        total_labour = skilled + unskilled
+    total_labour = skilled + unskilled
 
     data = payload.model_dump()
 
