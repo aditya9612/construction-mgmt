@@ -63,9 +63,11 @@ from app.schemas.dashboard import (
 )
 
 # PDF + Excel
-from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 import pandas as pd
+import csv
 
 from app.utils.common import assert_project_access
 from app.utils.helpers import NotFoundError
@@ -930,8 +932,99 @@ async def export_dashboard(
         media_type="application/pdf",
         headers={"Content-Disposition": "attachment; filename=dashboard.pdf"},
     )
+@router.get("/admin/projects/export/csv")
+async def export_master_projects_csv(
+    current_user: User = Depends(d.require_roles([UserRole.ADMIN.value])),
+    db: AsyncSession = Depends(get_db_session),
+):
+    projects_query = await db.execute(select(m.Project))
+    projects = projects_query.scalars().all()
+    
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["Site/Project", "Dates", "Total Progress", "Health"])
+    
+    for p in projects:
+        avg_progress = (
+            await db.scalar(
+                select(func.avg(m.Task.completion_percentage)).where(
+                    m.Task.project_id == p.id
+                )
+            )
+            or 0
+        )
+        dates_str = f"{p.start_date or 'N/A'} - {p.end_date or 'N/A'}"
+        health = str(p.status.value) if hasattr(p.status, "value") else str(p.status)
+        writer.writerow([
+            p.project_name,
+            dates_str,
+            f"{round(float(avg_progress), 2)}%",
+            health
+        ])
+    
+    buffer.seek(0)
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=master_projects.csv"}
+    )
 
 
+@router.get("/admin/projects/export/pdf")
+async def export_master_projects_pdf(
+    current_user: User = Depends(d.require_roles([UserRole.ADMIN.value])),
+    db: AsyncSession = Depends(get_db_session),
+):
+    projects_query = await db.execute(select(m.Project))
+    projects = projects_query.scalars().all()
+    
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer)
+    styles = getSampleStyleSheet()
+    
+    elements = []
+    elements.append(Paragraph("Master Projects Overview", styles["Title"]))
+    
+    data = [["Site/Project", "Dates", "Total Progress", "Health"]]
+    
+    for p in projects:
+        avg_progress = (
+            await db.scalar(
+                select(func.avg(m.Task.completion_percentage)).where(
+                    m.Task.project_id == p.id
+                )
+            )
+            or 0
+        )
+        dates_str = f"{p.start_date or 'N/A'} - {p.end_date or 'N/A'}"
+        health = str(p.status.value) if hasattr(p.status, "value") else str(p.status)
+        data.append([
+            p.project_name,
+            dates_str,
+            f"{round(float(avg_progress), 2)}%",
+            health
+        ])
+    
+    table = Table(data)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    
+    elements.append(table)
+    doc.build(elements)
+    
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=master_projects.pdf"}
+    )
 @router.get("/client")
 async def client_dashboard(
     project_id: int,

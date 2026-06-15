@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, UploadFile, File, Form, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 import os
@@ -102,7 +103,17 @@ async def upload_agreement(
     await db.commit()
     await db.refresh(agreement)
 
-    return agreement
+    out = AgreementOut.from_orm(agreement)
+    
+    if owner_id:
+        owner_name = await db.scalar(select(Owner.owner_name).where(Owner.id == owner_id))
+        out.owner_name = owner_name
+
+    if project_id:
+        project_name = await db.scalar(select(Project.project_name).where(Project.id == project_id))
+        out.project_name = project_name
+
+    return out
 
 
 @router.get("/stats", response_model=AgreementStats)
@@ -148,3 +159,26 @@ async def get_agreement_stats(
         "missing_docs": missing,
         "recent_uploads": recent or 0,
     }
+
+
+@router.get("/{agreement_id}/download")
+async def download_agreement(
+    agreement_id: int,
+    current_user: User = Depends(d.require_permissions(["agreements.view"])),
+    db: AsyncSession = Depends(get_db_session)
+):
+    agreement = await db.scalar(select(Agreement).where(Agreement.id == agreement_id))
+    if not agreement:
+        raise NotFoundError("Agreement not found")
+        
+    file_name = os.path.basename(agreement.file_url)
+    actual_path = os.path.join(UPLOAD_DIR, file_name)
+    
+    if not os.path.exists(actual_path):
+        raise NotFoundError("Agreement file not found on disk")
+        
+    return FileResponse(
+        path=actual_path,
+        filename=file_name,
+        media_type="application/octet-stream"
+    )
