@@ -192,3 +192,34 @@ class PMCommandCenterOut(BaseModel):
     task_management: List[PMTaskOverview]
     recent_activities: List[ProjectActivity]
 
+# =========================================
+# LABOUR DASHBOARD (NEW)
+# =========================================
+
+class LabourTaskItem(BaseModel):
+    task_id: str
+    title: str
+    status: str
+    priority: str
+    start_date: Optional[date]
+    progress: float
+
+class LabourActivityItem(BaseModel):
+    title: str
+    description: str
+    time: str
+
+class LabourDashboardOut(BaseModel):
+    user_name: str
+    project_name: Optional[str]
+    contractor_name: Optional[str]
+    
+    check_in_status: str
+    
+    total_tasks: int
+    completed_tasks: int
+    pending_tasks: int
+    this_month_earnings: float
+    
+    recent_tasks: List[LabourTaskItem]
+    recent_activity: List[LabourActivityItem]

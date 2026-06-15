@@ -57,6 +57,9 @@ from app.schemas.dashboard import (
     PMDelayRiskAnalysis,
     PMCriticalAlert,
     PMTaskOverview,
+    LabourDashboardOut,
+    LabourTaskItem,
+    LabourActivityItem,
 )
 
 # PDF + Excel
@@ -66,6 +69,8 @@ import pandas as pd
 
 from app.utils.common import assert_project_access
 from app.utils.helpers import NotFoundError
+from app.models.labour import Labour, LabourProject, LabourAttendance, LabourPayroll
+from app.core.enums import TaskStatus
 
 DASHBOARD_READ_ROLES = [
     r.value
@@ -2150,3 +2155,143 @@ async def client_command_center(
         logger.warning(f"Cache save failed: " f"{str(cache_error)}")
 
     return response
+
+# =========================================
+# LABOUR DASHBOARD
+# =========================================
+
+@router.get("/labour", response_model=dict)
+async def get_labour_dashboard(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(d.get_current_active_user),
+):
+    if current_user.role != UserRole.LABOUR.value:
+        raise HTTPException(status_code=403, detail="Not authorized for Labour Dashboard")
+
+    # 1. Fetch Labour Profile
+    from sqlalchemy.orm import selectinload
+    result = await db.execute(
+        select(Labour).where(Labour.user_id == current_user.id).options(selectinload(Labour.contractor))
+    )
+    labour = result.scalar_one_or_none()
+    
+    if not labour:
+        raise HTTPException(status_code=404, detail="Labour profile not found")
+
+    # 2. Get active project from LabourProject
+    lp_result = await db.execute(
+        select(LabourProject).where(LabourProject.labour_id == labour.id).order_by(desc(LabourProject.assigned_date))
+    )
+    labour_project = lp_result.scalars().first()
+    
+    project_name = None
+    if labour_project:
+        project_id = labour_project.project_id
+        # get project name
+        proj_res = await db.execute(select(m.Project.project_name).where(m.Project.id == project_id))
+        project_name = proj_res.scalar_one_or_none()
+
+    # 3. Get Attendance Status for today
+    today = date.today()
+    att_res = await db.execute(
+        select(LabourAttendance).where(
+            LabourAttendance.labour_id == labour.id,
+            LabourAttendance.attendance_date == today
+        )
+    )
+    today_attendance = att_res.scalar_one_or_none()
+    
+    check_in_status = "NOT CHECKED IN"
+    if today_attendance:
+        if today_attendance.out_time:
+            check_in_status = "CHECKED OUT"
+        elif today_attendance.in_time:
+            check_in_status = "CHECKED IN"
+
+    # 4. Get Tasks (Assigned to this user)
+    tasks_res = await db.execute(
+        select(Task).where(Task.assigned_user_id == current_user.id).order_by(desc(Task.start_date))
+    )
+    all_tasks = tasks_res.scalars().all()
+    
+    total_tasks = len(all_tasks)
+    completed_tasks = sum(1 for t in all_tasks if t.status == TaskStatus.COMPLETED)
+    pending_tasks = total_tasks - completed_tasks
+    
+    # Recent Tasks
+    recent_tasks_models = all_tasks[:5]
+    recent_tasks = [
+        LabourTaskItem(
+            task_id=f"T-{t.id:03d}",
+            title=t.title,
+            status=t.status.value,
+            priority=str(t.priority),
+            start_date=t.start_date,
+            progress=t.completion_percentage
+        )
+        for t in recent_tasks_models
+    ]
+
+    # 5. This Month Earnings
+    current_month = today.month
+    current_year = today.year
+    payroll_res = await db.execute(
+        select(LabourPayroll).where(
+            LabourPayroll.labour_id == labour.id,
+            LabourPayroll.month == current_month,
+            LabourPayroll.year == current_year
+        )
+    )
+    payrolls = payroll_res.scalars().all()
+    this_month_earnings = sum(float(p.total_wage or 0) for p in payrolls)
+
+    # If no payroll generated, fallback to attendance
+    if this_month_earnings == 0:
+        att_month_res = await db.execute(
+            select(LabourAttendance).where(
+                LabourAttendance.labour_id == labour.id,
+                func.extract('month', LabourAttendance.attendance_date) == current_month,
+                func.extract('year', LabourAttendance.attendance_date) == current_year
+            )
+        )
+        month_attendances = att_month_res.scalars().all()
+        wage = labour.effective_daily_wage
+        ot_rate = labour.effective_ot_rate
+        for a in month_attendances:
+            this_month_earnings += float(wage) * (float(a.working_hours) / 8.0)
+            this_month_earnings += float(ot_rate) * float(a.overtime_hours)
+    
+    # 6. Recent Activity
+    activity_res = await db.execute(
+        select(ActivityLog).where(
+            ActivityLog.performed_by == current_user.id
+        ).order_by(desc(ActivityLog.created_at)).limit(5)
+    )
+    activities = activity_res.scalars().all()
+    
+    recent_activity = [
+        LabourActivityItem(
+            title=a.action,
+            description=a.entity,
+            time=a.created_at.strftime("%I:%M %p")
+        )
+        for a in activities
+    ]
+    
+    data = LabourDashboardOut(
+        user_name=current_user.full_name or "Labour User",
+        project_name=project_name,
+        contractor_name=labour.contractor.name if labour.contractor else None,
+        check_in_status=check_in_status,
+        total_tasks=total_tasks,
+        completed_tasks=completed_tasks,
+        pending_tasks=pending_tasks,
+        this_month_earnings=float(this_month_earnings),
+        recent_tasks=recent_tasks,
+        recent_activity=recent_activity
+    )
+    
+    return success_response(
+        message="Labour dashboard fetched successfully",
+        data=data.model_dump()
+    )

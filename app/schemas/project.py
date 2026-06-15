@@ -127,6 +127,9 @@ class ProjectOut(BaseSchema):
     shift_end_time: Optional[time] = None
     grace_period_minutes: int = 15
 
+    quotation_id: Optional[int] = None
+    budget_amount: Decimal = Decimal("0.00")
+
     @field_validator("business_id")
     def validate_business_id(cls, v):
         if not v.startswith("PRJ"):
