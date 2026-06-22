@@ -136,7 +136,7 @@ async def list_expenses(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
 ):
-    result = await db.execute(select(Expense))
+    result = await db.execute(select(Expense).order_by(Expense.created_at.desc()))
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 
@@ -266,7 +266,7 @@ async def get_by_project(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
 ):
-    result = await db.execute(select(Expense).where(Expense.project_id == project_id))
+    result = await db.execute(select(Expense).where(Expense.project_id == project_id).order_by(Expense.created_at.desc()))
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 

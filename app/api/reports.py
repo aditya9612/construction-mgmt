@@ -1,10 +1,13 @@
+from collections import defaultdict
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date, datetime, timedelta
 import io
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from typing import Optional
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from openpyxl import Workbook
@@ -17,7 +20,7 @@ from app.models.material import Material
 from app.utils.common import assert_project_access
 from app.utils.email import send_email
 from app.core.dependencies import get_current_active_user, require_roles
-from app.core.enums import InvoiceStatus, IssueStatus, LabourStatus, TaskStatus
+from app.core.enums import InvoiceStatus, IssueStatus, IssuePriority, LabourStatus, ProjectStatus, TaskStatus
 from app.db.session import get_db_session
 from app.models import project as m
 from app.models.accountant import FixedAsset
@@ -31,6 +34,1102 @@ REPORT_READ_ROLES = [role.value for role in UserRole]
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
 
+
+# ===================== PROJECT REPORTS =====================
+
+@router.get("/projects/excel")
+async def export_projects_excel(
+    project_id: Optional[int] = Query(None, description="Project ID to filter. If none, exports all projects."),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from app.api.project import get_reports_service
+    service = get_reports_service()
+    
+    if project_id:
+        return await service.export_excel(db, project_id, current_user)
+        
+    # Export ALL projects
+    projects_query = select(m.Project)
+    projects = (await db.execute(projects_query)).scalars().all()
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "All Projects Portfolio"
+    
+    headers = [
+        "ID", "Business ID", "Project Name", "Status", "Type", 
+        "Location", "Start Date", "End Date"
+    ]
+    ws.append(headers)
+    
+    for p in projects:
+        ws.append([
+            p.id,
+            p.business_id,
+            p.project_name,
+            str(p.status.value if hasattr(p.status, "value") else p.status),
+            str(p.type.value if hasattr(p.type, "value") else p.type) if p.type else "N/A",
+            f"{p.city or ''}, {p.state or ''}".strip(", "),
+            str(p.start_date) if p.start_date else "N/A",
+            str(p.end_date) if p.end_date else "N/A",
+        ])
+        
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=all_projects_report.xlsx"},
+    )
+
+@router.get("/projects/pdf")
+async def export_projects_pdf(
+    project_id: Optional[int] = Query(None, description="Project ID to filter. If none, exports all projects."),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from app.api.project import get_reports_service
+    service = get_reports_service()
+    
+    if project_id:
+        return await service.export_pdf(db, project_id, current_user)
+        
+    # Export ALL projects
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+    
+    projects_query = select(m.Project)
+    projects = (await db.execute(projects_query)).scalars().all()
+    
+    stream = io.BytesIO()
+    doc = SimpleDocTemplate(stream, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    elements.append(Paragraph("Company Portfolio Overview", styles['Title']))
+    elements.append(Spacer(1, 12))
+    
+    elements.append(Paragraph(f"Generated on: {date.today()}", styles['Normal']))
+    elements.append(Spacer(1, 12))
+    
+    total_projects = len(projects)
+    ongoing = sum(1 for p in projects if str(getattr(p.status, "value", p.status)) == "Ongoing")
+    completed = sum(1 for p in projects if str(getattr(p.status, "value", p.status)) == "Completed")
+    
+    elements.append(Paragraph(f"Total Projects: {total_projects}", styles['Normal']))
+    elements.append(Paragraph(f"Ongoing: {ongoing}", styles['Normal']))
+    elements.append(Paragraph(f"Completed: {completed}", styles['Normal']))
+    elements.append(Spacer(1, 24))
+    
+    table_data = [["ID", "Name", "Status", "Start Date", "End Date"]]
+    for p in projects:
+        table_data.append([
+            p.business_id,
+            p.project_name[:30] + "..." if len(p.project_name) > 30 else p.project_name,
+            str(getattr(p.status, "value", p.status)),
+            str(p.start_date) if p.start_date else "N/A",
+            str(p.end_date) if p.end_date else "N/A"
+        ])
+        
+    t = Table(table_data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+        ('GRID', (0,0), (-1,-1), 1, colors.black)
+    ]))
+    
+    elements.append(t)
+    doc.build(elements)
+
+    stream.seek(0)
+
+    return StreamingResponse(
+        stream,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": "attachment; filename=all_projects_portfolio.pdf"
+        }
+    )
+
+# ===================== AUDIT REPORTS =====================
+
+@router.get("/audit/excel")
+async def export_audit_excel(
+    start_date: Optional[date] = Query(None, description="Start date"),
+    end_date: Optional[date] = Query(None, description="End date"),
+    user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    module: Optional[str] = Query(None, description="Filter by entity/module"),
+    action: Optional[str] = Query(None, description="Filter by action (CREATE, UPDATE, DELETE)"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(ActivityLog, User).outerjoin(User, ActivityLog.performed_by == User.id)
+    
+    if start_date:
+        query = query.where(ActivityLog.created_at >= start_date)
+    if end_date:
+        query = query.where(ActivityLog.created_at <= end_date + timedelta(days=1))
+    if user_id:
+        query = query.where(ActivityLog.performed_by == user_id)
+    if module:
+        query = query.where(ActivityLog.entity == module)
+    if action:
+        query = query.where(ActivityLog.action == action)
+        
+    query = query.order_by(ActivityLog.created_at.desc())
+    result = await db.execute(query)
+    logs = result.all()
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Audit Summary"
+    
+    headers = ["Timestamp", "User Name", "Module", "Action", "Entity ID", "Details"]
+    ws.append(headers)
+    
+    for log, user in logs:
+        details_str = str(log.details) if log.details else ""
+        user_name = user.full_name if user else "System/Unknown"
+        ws.append([
+            str(log.created_at),
+            user_name,
+            log.entity,
+            log.action,
+            log.entity_id or "",
+            details_str
+        ])
+        
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=audit_summary_report.xlsx"},
+    )
+
+@router.get("/audit/pdf")
+async def export_audit_pdf(
+    start_date: Optional[date] = Query(None, description="Start date"),
+    end_date: Optional[date] = Query(None, description="End date"),
+    user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    module: Optional[str] = Query(None, description="Filter by entity/module"),
+    action: Optional[str] = Query(None, description="Filter by action (CREATE, UPDATE, DELETE)"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from reportlab.lib.pagesizes import landscape, letter
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+    
+    query = select(ActivityLog, User).outerjoin(User, ActivityLog.performed_by == User.id)
+    
+    if start_date:
+        query = query.where(ActivityLog.created_at >= start_date)
+    if end_date:
+        query = query.where(ActivityLog.created_at <= end_date + timedelta(days=1))
+    if user_id:
+        query = query.where(ActivityLog.performed_by == user_id)
+    if module:
+        query = query.where(ActivityLog.entity == module)
+    if action:
+        query = query.where(ActivityLog.action == action)
+        
+    query = query.order_by(ActivityLog.created_at.desc()).limit(1000) # Limit PDF to 1000 rows for performance
+    result = await db.execute(query)
+    logs = result.all()
+    
+    stream = io.BytesIO()
+    doc = SimpleDocTemplate(stream, pagesize=landscape(letter))
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    elements.append(Paragraph("System Audit Summary", styles['Title']))
+    elements.append(Spacer(1, 12))
+    
+    filter_text = f"Generated: {date.today()}"
+    if start_date or end_date:
+        filter_text += f" | Period: {start_date or 'Start'} to {end_date or 'End'}"
+    if module:
+        filter_text += f" | Module: {module}"
+    if action:
+        filter_text += f" | Action: {action}"
+        
+    elements.append(Paragraph(filter_text, styles['Normal']))
+    elements.append(Spacer(1, 12))
+    
+    total_logs = len(logs)
+    elements.append(Paragraph(f"Total Logs Included: {total_logs} (Max 1000)", styles['Normal']))
+    elements.append(Spacer(1, 24))
+    
+    table_data = [["Date/Time", "User", "Module", "Action", "Details"]]
+    for log, user in logs:
+        details_str = str(log.details)[:50] + "..." if log.details and len(str(log.details)) > 50 else (str(log.details) if log.details else "N/A")
+        user_name = user.full_name if user else "System"
+        table_data.append([
+            log.created_at.strftime("%Y-%m-%d %H:%M"),
+            user_name,
+            log.entity or "N/A",
+            log.action or "N/A",
+            details_str
+        ])
+        
+    t = Table(table_data, colWidths=[100, 100, 100, 100, 300])
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.darkblue),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('BACKGROUND', (0,1), (-1,-1), colors.aliceblue),
+        ('GRID', (0,0), (-1,-1), 1, colors.black)
+    ]))
+    
+    elements.append(t)
+    doc.build(elements)
+    
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=audit_summary_report.pdf"}
+    )
+
+# ===================== ASSET REPORTS =====================
+
+@router.get("/assets/excel")
+async def export_assets_excel(
+    project_id: Optional[int] = Query(None, description="Filter by allocated project ID"),
+    start_date: Optional[date] = Query(None, description="Purchase start date"),
+    end_date: Optional[date] = Query(None, description="Purchase end date"),
+    min_value: Optional[float] = Query(None, description="Minimum current value"),
+    max_value: Optional[float] = Query(None, description="Maximum current value"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(FixedAsset, m.Project).outerjoin(m.Project, FixedAsset.project_id == m.Project.id)
+    
+    if project_id:
+        query = query.where(FixedAsset.project_id == project_id)
+    if start_date:
+        query = query.where(FixedAsset.purchase_date >= start_date)
+    if end_date:
+        query = query.where(FixedAsset.purchase_date <= end_date)
+    if min_value is not None:
+        query = query.where(FixedAsset.current_value >= min_value)
+    if max_value is not None:
+        query = query.where(FixedAsset.current_value <= max_value)
+        
+    result = await db.execute(query)
+    assets = result.all()
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Fixed Asset Register"
+    
+    headers = [
+        "Asset ID", "Asset Name", "Allocated Project", "Purchase Date",
+        "Purchase Value", "Depreciation Rate (%)", "Accumulated Depreciation", "Current Net Book Value"
+    ]
+    ws.append(headers)
+    
+    for asset, project in assets:
+        proj_name = project.project_name if project else "Unallocated"
+        purch_val = float(asset.purchase_value or 0)
+        curr_val = float(asset.current_value or 0)
+        depr_acc = purch_val - curr_val
+        
+        ws.append([
+            asset.id,
+            asset.name,
+            proj_name,
+            str(asset.purchase_date) if asset.purchase_date else "N/A",
+            purch_val,
+            float(asset.depreciation_rate or 0),
+            depr_acc,
+            curr_val
+        ])
+        
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=fixed_asset_register.xlsx"},
+    )
+
+@router.get("/assets/pdf")
+async def export_assets_pdf(
+    project_id: Optional[int] = Query(None, description="Filter by allocated project ID"),
+    start_date: Optional[date] = Query(None, description="Purchase start date"),
+    end_date: Optional[date] = Query(None, description="Purchase end date"),
+    min_value: Optional[float] = Query(None, description="Minimum current value"),
+    max_value: Optional[float] = Query(None, description="Maximum current value"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from reportlab.lib.pagesizes import landscape, letter
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+    
+    query = select(FixedAsset, m.Project).outerjoin(m.Project, FixedAsset.project_id == m.Project.id)
+    
+    if project_id:
+        query = query.where(FixedAsset.project_id == project_id)
+    if start_date:
+        query = query.where(FixedAsset.purchase_date >= start_date)
+    if end_date:
+        query = query.where(FixedAsset.purchase_date <= end_date)
+    if min_value is not None:
+        query = query.where(FixedAsset.current_value >= min_value)
+    if max_value is not None:
+        query = query.where(FixedAsset.current_value <= max_value)
+        
+    result = await db.execute(query)
+    assets = result.all()
+    
+    stream = io.BytesIO()
+    doc = SimpleDocTemplate(stream, pagesize=landscape(letter))
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    elements.append(Paragraph("Fixed Asset & Depreciation Report", styles['Title']))
+    elements.append(Spacer(1, 12))
+    
+    filter_text = f"Generated: {date.today()}"
+    if project_id or start_date or end_date or min_value or max_value:
+        filter_text += " | Filters Applied"
+        
+    elements.append(Paragraph(filter_text, styles['Normal']))
+    elements.append(Spacer(1, 12))
+    
+    total_assets = len(assets)
+    total_purchase = sum(float(a.FixedAsset.purchase_value or 0) for a in assets)
+    total_current = sum(float(a.FixedAsset.current_value or 0) for a in assets)
+    total_depr = total_purchase - total_current
+    
+    elements.append(Paragraph(f"<b>Total Assets:</b> {total_assets}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Total Original Value:</b> ${total_purchase:,.2f}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Total Accumulated Depreciation:</b> ${total_depr:,.2f}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Total Current Net Book Value:</b> ${total_current:,.2f}", styles['Normal']))
+    elements.append(Spacer(1, 24))
+    
+    table_data = [["ID", "Name", "Project", "Purchase Date", "Orig Value", "Depr", "Net Book Value"]]
+    for asset, project in assets:
+        proj_name = project.project_name[:20] + "..." if project and len(project.project_name) > 20 else (project.project_name if project else "Unallocated")
+        purch_val = float(asset.purchase_value or 0)
+        curr_val = float(asset.current_value or 0)
+        depr_acc = purch_val - curr_val
+        
+        table_data.append([
+            str(asset.id),
+            asset.name[:25] + "..." if len(asset.name) > 25 else asset.name,
+            proj_name,
+            str(asset.purchase_date) if asset.purchase_date else "N/A",
+            f"${purch_val:,.2f}",
+            f"${depr_acc:,.2f}",
+            f"${curr_val:,.2f}"
+        ])
+        
+    t = Table(table_data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.darkgreen),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('BACKGROUND', (0,1), (-1,-1), colors.honeydew),
+        ('GRID', (0,0), (-1,-1), 1, colors.black)
+    ]))
+    
+    elements.append(t)
+    doc.build(elements)
+    
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=fixed_asset_depreciation_report.pdf"}
+    )
+
+# ===================== ISSUE REPORTS =====================
+
+@router.get("/issues/excel")
+async def export_issues_excel(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    status: Optional[str] = Query(None, description="Filter by status (e.g., OPEN, RESOLVED)"),
+    priority: Optional[str] = Query(None, description="Filter by priority (e.g., HIGH, LOW)"),
+    start_date: Optional[date] = Query(None, description="Reported start date"),
+    end_date: Optional[date] = Query(None, description="Reported end date"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(m.Issue, m.Project, User).join(m.Project, m.Issue.project_id == m.Project.id).outerjoin(User, m.Issue.assigned_to == User.id)
+    
+    if project_id:
+        query = query.where(m.Issue.project_id == project_id)
+    if status:
+        query = query.where(m.Issue.status == status)
+    if priority:
+        query = query.where(m.Issue.priority == priority)
+    if start_date:
+        query = query.where(m.Issue.reported_date >= start_date)
+    if end_date:
+        query = query.where(m.Issue.reported_date <= end_date)
+        
+    query = query.order_by(m.Issue.reported_date.desc())
+    result = await db.execute(query)
+    issues = result.all()
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Site Issue Log"
+    
+    headers = [
+        "Issue ID", "Project Name", "Title", "Category", 
+        "Reported Date", "Priority", "Status", "Assigned To", 
+        "Description", "Resolution Notes"
+    ]
+    ws.append(headers)
+    
+    for issue, project, user in issues:
+        assigned_name = user.full_name if user else "Unassigned"
+        ws.append([
+            issue.business_id or str(issue.id),
+            project.project_name,
+            issue.title,
+            str(issue.category.value if hasattr(issue.category, "value") else issue.category),
+            str(issue.reported_date) if issue.reported_date else "N/A",
+            str(issue.priority.value if hasattr(issue.priority, "value") else issue.priority),
+            str(issue.status.value if hasattr(issue.status, "value") else issue.status),
+            assigned_name,
+            issue.description or "",
+            issue.resolution or ""
+        ])
+        
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=site_issue_log.xlsx"},
+    )
+
+@router.get("/issues/pdf")
+async def export_issues_pdf(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    status: Optional[str] = Query(None, description="Filter by status (e.g., OPEN, RESOLVED)"),
+    priority: Optional[str] = Query(None, description="Filter by priority (e.g., HIGH, LOW)"),
+    start_date: Optional[date] = Query(None, description="Reported start date"),
+    end_date: Optional[date] = Query(None, description="Reported end date"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from reportlab.lib.pagesizes import landscape, letter
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+    
+    query = select(m.Issue, m.Project, User).join(m.Project, m.Issue.project_id == m.Project.id).outerjoin(User, m.Issue.assigned_to == User.id)
+    
+    if project_id:
+        query = query.where(m.Issue.project_id == project_id)
+    if status:
+        query = query.where(m.Issue.status == status)
+    if priority:
+        query = query.where(m.Issue.priority == priority)
+    if start_date:
+        query = query.where(m.Issue.reported_date >= start_date)
+    if end_date:
+        query = query.where(m.Issue.reported_date <= end_date)
+        
+    query = query.order_by(m.Issue.reported_date.desc()).limit(1000)
+    result = await db.execute(query)
+    issues = result.all()
+    
+    stream = io.BytesIO()
+    doc = SimpleDocTemplate(stream, pagesize=landscape(letter))
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    elements.append(Paragraph("Executive Site Issue Report", styles['Title']))
+    elements.append(Spacer(1, 12))
+    
+    filter_text = f"Generated: {date.today()}"
+    if project_id or status or priority or start_date or end_date:
+        filter_text += " | Filters Applied"
+        
+    elements.append(Paragraph(filter_text, styles['Normal']))
+    elements.append(Spacer(1, 12))
+    
+    total_issues = len(issues)
+    open_count = sum(1 for i in issues if str(getattr(i.Issue.status, "value", i.Issue.status)) in ["OPEN", "IN_PROGRESS"])
+    resolved_count = sum(1 for i in issues if str(getattr(i.Issue.status, "value", i.Issue.status)) in ["RESOLVED", "CLOSED"])
+    critical_count = sum(1 for i in issues if str(getattr(i.Issue.priority, "value", i.Issue.priority)) in ["HIGH", "CRITICAL"])
+    
+    elements.append(Paragraph(f"<b>Total Issues:</b> {total_issues}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Open/In-Progress:</b> {open_count}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Resolved/Closed:</b> {resolved_count}", styles['Normal']))
+    elements.append(Paragraph(f"<b>High Priority:</b> {critical_count}", styles['Normal']))
+    elements.append(Spacer(1, 24))
+    
+    table_data = [["ID", "Date", "Project", "Title", "Priority", "Status", "Assigned To"]]
+    for issue, project, user in issues:
+        proj_name = project.project_name[:15] + "..." if len(project.project_name) > 15 else project.project_name
+        title = issue.title[:25] + "..." if len(issue.title) > 25 else issue.title
+        assigned_name = user.full_name[:15] + "..." if user and len(user.full_name) > 15 else (user.full_name if user else "Unassigned")
+        
+        table_data.append([
+            issue.business_id or str(issue.id),
+            str(issue.reported_date) if issue.reported_date else "N/A",
+            proj_name,
+            title,
+            str(getattr(issue.priority, "value", issue.priority)),
+            str(getattr(issue.status, "value", issue.status)),
+            assigned_name
+        ])
+        
+    t = Table(table_data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.darkred),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('BACKGROUND', (0,1), (-1,-1), colors.mistyrose),
+        ('GRID', (0,0), (-1,-1), 1, colors.black)
+    ]))
+    
+    elements.append(t)
+    doc.build(elements)
+    
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=executive_issue_report.pdf"}
+    )
+
+# ===================== FINANCIAL REPORTS =====================
+
+@router.get("/finance/excel")
+async def export_finance_excel(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    start_date: Optional[date] = Query(None, description="Start date for financial period"),
+    end_date: Optional[date] = Query(None, description="End date for financial period"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from sqlalchemy.future import select
+    from collections import defaultdict
+    
+    # 1. Fetch Projects
+    proj_query = select(m.Project)
+    if project_id:
+        proj_query = proj_query.where(m.Project.id == project_id)
+    projects = (await db.execute(proj_query)).scalars().all()
+    project_map = {p.id: p.project_name for p in projects}
+    
+    # 2. Fetch Expenses (grouped by project and category)
+    exp_query = select(Expense.project_id, Expense.category, func.sum(Expense.amount)).group_by(Expense.project_id, Expense.category)
+    if project_id:
+        exp_query = exp_query.where(Expense.project_id == project_id)
+    if start_date:
+        exp_query = exp_query.where(Expense.expense_date >= start_date)
+    if end_date:
+        exp_query = exp_query.where(Expense.expense_date <= end_date)
+        
+    exp_result = await db.execute(exp_query)
+    
+    project_expenses = defaultdict(lambda: defaultdict(float))
+    all_categories = set()
+    for pid, cat, amount in exp_result.all():
+        if pid in project_map:
+            project_expenses[pid][cat] += float(amount or 0)
+            all_categories.add(cat)
+            
+    # 3. Fetch Invoices (grouped by project and status)
+    inv_query = select(Invoice.project_id, Invoice.status, func.sum(Invoice.total_amount)).group_by(Invoice.project_id, Invoice.status)
+    if project_id:
+        inv_query = inv_query.where(Invoice.project_id == project_id)
+    if start_date:
+        inv_query = inv_query.where(Invoice.created_at >= start_date)
+    if end_date:
+        # Cast created_at to Date for accurate comparison, or just add days
+        inv_query = inv_query.where(Invoice.created_at <= end_date + timedelta(days=1))
+        
+    inv_result = await db.execute(inv_query)
+    
+    project_invoices = defaultdict(lambda: defaultdict(float))
+    for pid, status, amount in inv_result.all():
+        if pid in project_map:
+            status_str = status.value if hasattr(status, "value") else str(status)
+            project_invoices[pid][status_str] += float(amount or 0)
+            
+    # 4. Generate Excel
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Financial Ledger"
+    
+    sorted_categories = sorted(list(all_categories))
+    
+    headers = [
+        "Project ID", "Project Name", 
+        "Total Invoiced", "Amount Paid", "Amount Pending",
+        "Total Expenses"
+    ]
+    # Add dynamic category headers for expenses
+    for cat in sorted_categories:
+        headers.append(f"Exp: {cat}")
+        
+    headers.append("Net Profit / Loss")
+    headers.append("Profit Margin (%)")
+    ws.append(headers)
+    
+    for pid, p_name in project_map.items():
+        inv_totals = project_invoices[pid]
+        total_inv = sum(inv_totals.values())
+        paid_inv = inv_totals.get("PAID", 0.0) + inv_totals.get("PARTIAL", 0.0) # simplify
+        pending_inv = inv_totals.get("PENDING", 0.0)
+        
+        exp_totals = project_expenses[pid]
+        total_exp = sum(exp_totals.values())
+        
+        net_profit = total_inv - total_exp
+        margin = (net_profit / total_inv * 100) if total_inv > 0 else 0.0
+        
+        row = [
+            pid,
+            p_name,
+            total_inv,
+            paid_inv,
+            pending_inv,
+            total_exp
+        ]
+        
+        for cat in sorted_categories:
+            row.append(exp_totals.get(cat, 0.0))
+            
+        row.append(net_profit)
+        row.append(round(margin, 2))
+        
+        ws.append(row)
+        
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=financial_ledger_report.xlsx"},
+    )
+
+@router.get("/finance/pdf")
+async def export_finance_pdf(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    start_date: Optional[date] = Query(None, description="Start date for financial period"),
+    end_date: Optional[date] = Query(None, description="End date for financial period"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from sqlalchemy.future import select
+    from collections import defaultdict
+    from reportlab.lib.pagesizes import landscape, letter
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+    
+    proj_query = select(m.Project)
+    if project_id:
+        proj_query = proj_query.where(m.Project.id == project_id)
+    projects = (await db.execute(proj_query)).scalars().all()
+    project_map = {p.id: p.project_name for p in projects}
+    
+    exp_query = select(Expense.project_id, func.sum(Expense.amount)).group_by(Expense.project_id)
+    if project_id:
+        exp_query = exp_query.where(Expense.project_id == project_id)
+    if start_date:
+        exp_query = exp_query.where(Expense.expense_date >= start_date)
+    if end_date:
+        exp_query = exp_query.where(Expense.expense_date <= end_date)
+        
+    exp_result = await db.execute(exp_query)
+    project_expenses = {pid: float(amt or 0) for pid, amt in exp_result.all()}
+    
+    inv_query = select(Invoice.project_id, Invoice.status, func.sum(Invoice.total_amount)).group_by(Invoice.project_id, Invoice.status)
+    if project_id:
+        inv_query = inv_query.where(Invoice.project_id == project_id)
+    if start_date:
+        inv_query = inv_query.where(Invoice.created_at >= start_date)
+    if end_date:
+        inv_query = inv_query.where(Invoice.created_at <= end_date + timedelta(days=1))
+        
+    inv_result = await db.execute(inv_query)
+    project_invoices = defaultdict(lambda: defaultdict(float))
+    for pid, status, amount in inv_result.all():
+        status_str = status.value if hasattr(status, "value") else str(status)
+        project_invoices[pid][status_str] += float(amount or 0)
+        
+    stream = io.BytesIO()
+    doc = SimpleDocTemplate(stream, pagesize=landscape(letter))
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    elements.append(Paragraph("Executive Financial Summary", styles['Title']))
+    elements.append(Spacer(1, 12))
+    
+    filter_text = f"Generated: {date.today()}"
+    if project_id or start_date or end_date:
+        filter_text += " | Filters Applied"
+        
+    elements.append(Paragraph(filter_text, styles['Normal']))
+    elements.append(Spacer(1, 12))
+    
+    global_exp = sum(project_expenses.values())
+    global_inv = sum(sum(inv.values()) for inv in project_invoices.values())
+    global_profit = global_inv - global_exp
+    global_margin = (global_profit / global_inv * 100) if global_inv > 0 else 0.0
+    
+    elements.append(Paragraph(f"<b>Total Company Expenses:</b> ${global_exp:,.2f}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Total Company Invoiced:</b> ${global_inv:,.2f}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Total Net Profit:</b> ${global_profit:,.2f}", styles['Normal']))
+    elements.append(Paragraph(f"<b>Overall Profit Margin:</b> {global_margin:,.2f}%", styles['Normal']))
+    elements.append(Spacer(1, 24))
+    
+    table_data = [["Project", "Total Expenses", "Total Invoiced", "Pending", "Net Profit", "Margin"]]
+    for pid, p_name in project_map.items():
+        total_exp = project_expenses.get(pid, 0.0)
+        inv_totals = project_invoices[pid]
+        total_inv = sum(inv_totals.values())
+        pending_inv = inv_totals.get("PENDING", 0.0)
+        
+        net_profit = total_inv - total_exp
+        margin = (net_profit / total_inv * 100) if total_inv > 0 else 0.0
+        
+        p_name_short = p_name[:25] + "..." if len(p_name) > 25 else p_name
+        
+        table_data.append([
+            p_name_short,
+            f"${total_exp:,.2f}",
+            f"${total_inv:,.2f}",
+            f"${pending_inv:,.2f}",
+            f"${net_profit:,.2f}",
+            f"{margin:,.2f}%"
+        ])
+        
+    t = Table(table_data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.darkcyan),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'RIGHT'),
+        ('ALIGN', (0,0), (0,-1), 'LEFT'), # Left align project name
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('BACKGROUND', (0,1), (-1,-1), colors.lightcyan),
+        ('GRID', (0,0), (-1,-1), 1, colors.black)
+    ]))
+    
+    elements.append(t)
+    doc.build(elements)
+    
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=executive_financial_summary.pdf"}
+    )
+
+# ===================== PROFIT & LOSS REPORTS =====================
+
+@router.get("/profit-loss/excel")
+async def export_profit_loss_excel(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    year: Optional[int] = Query(None, description="Financial Year"),
+    quarter: Optional[int] = Query(None, description="Quarter (1-4)"),
+    start_date: Optional[date] = Query(None, description="Start date"),
+    end_date: Optional[date] = Query(None, description="End date"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from sqlalchemy.future import select
+    from sqlalchemy import extract
+    from collections import defaultdict
+    import calendar
+    
+    # Base queries
+    inv_query = select(Invoice)
+    exp_query = select(Expense)
+    
+    if project_id:
+        inv_query = inv_query.where(Invoice.project_id == project_id)
+        exp_query = exp_query.where(Expense.project_id == project_id)
+        
+    if year:
+        inv_query = inv_query.where(extract('year', Invoice.created_at) == year)
+        exp_query = exp_query.where(extract('year', Expense.expense_date) == year)
+        if quarter:
+            q_months = {1: (1,3), 2: (4,6), 3: (7,9), 4: (10,12)}
+            sm, em = q_months[quarter]
+            inv_query = inv_query.where(extract('month', Invoice.created_at).between(sm, em))
+            exp_query = exp_query.where(extract('month', Expense.expense_date).between(sm, em))
+            
+    if start_date:
+        inv_query = inv_query.where(Invoice.created_at >= start_date)
+        exp_query = exp_query.where(Expense.expense_date >= start_date)
+    if end_date:
+        inv_query = inv_query.where(Invoice.created_at <= end_date + timedelta(days=1))
+        exp_query = exp_query.where(Expense.expense_date <= end_date)
+        
+    invoices = (await db.execute(inv_query)).scalars().all()
+    expenses = (await db.execute(exp_query)).scalars().all()
+    
+    # Group by YYYY-MM
+    monthly_data = defaultdict(lambda: {"revenue": 0.0, "cogs_labour": 0.0, "cogs_material": 0.0, "overhead": defaultdict(float)})
+    all_months = set()
+    
+    for inv in invoices:
+        month_key = inv.created_at.strftime("%Y-%m")
+        all_months.add(month_key)
+        amt = float(inv.total_amount or 0)
+        
+        # 'owner' invoices are revenue. others are COGS
+        if inv.type == "owner":
+            monthly_data[month_key]["revenue"] += amt
+        elif inv.type == "labour":
+            monthly_data[month_key]["cogs_labour"] += amt
+        elif inv.type == "material":
+            monthly_data[month_key]["cogs_material"] += amt
+            
+    for exp in expenses:
+        month_key = exp.expense_date.strftime("%Y-%m")
+        all_months.add(month_key)
+        amt = float(exp.amount or 0)
+        monthly_data[month_key]["overhead"][exp.category] += amt
+        
+    sorted_months = sorted(list(all_months))
+    all_overhead_cats = set()
+    for data in monthly_data.values():
+        all_overhead_cats.update(data["overhead"].keys())
+    sorted_overhead_cats = sorted(list(all_overhead_cats))
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Profit and Loss"
+    
+    headers = ["Category", "Total"] + sorted_months
+    ws.append(headers)
+    
+    def append_row(name, data_dict, overhead_cat=None):
+        row = [name]
+        total = 0.0
+        month_vals = []
+        for m in sorted_months:
+            if overhead_cat:
+                val = data_dict[m]["overhead"].get(overhead_cat, 0.0)
+            else:
+                val = data_dict[m].get(name.lower().replace(" ", "_"), 0.0)
+                # handle specific mappings
+                if name == "Revenue": val = data_dict[m]["revenue"]
+                elif name == "Labour Costs": val = data_dict[m]["cogs_labour"]
+                elif name == "Material Costs": val = data_dict[m]["cogs_material"]
+            total += val
+            month_vals.append(val)
+        row.append(total)
+        row.extend(month_vals)
+        ws.append(row)
+        return total, month_vals
+        
+    ws.append(["--- REVENUE ---"])
+    total_rev, rev_months = append_row("Revenue", monthly_data)
+    
+    ws.append([])
+    ws.append(["--- COST OF GOODS SOLD (COGS) ---"])
+    t_labour, m_labour = append_row("Labour Costs", monthly_data)
+    t_material, m_material = append_row("Material Costs", monthly_data)
+    
+    total_cogs = t_labour + t_material
+    cogs_months = [l + m for l, m in zip(m_labour, m_material)]
+    
+    gross_profit = total_rev - total_cogs
+    gp_months = [r - c for r, c in zip(rev_months, cogs_months)]
+    
+    ws.append(["Gross Profit", gross_profit] + gp_months)
+    
+    ws.append([])
+    ws.append(["--- OPERATING EXPENSES (OVERHEAD) ---"])
+    total_op_ex = 0.0
+    op_ex_months = [0.0] * len(sorted_months)
+    for cat in sorted_overhead_cats:
+        t_cat, m_cat = append_row(cat, monthly_data, overhead_cat=cat)
+        total_op_ex += t_cat
+        op_ex_months = [o + c for o, c in zip(op_ex_months, m_cat)]
+        
+    ws.append(["Total Operating Expenses", total_op_ex] + op_ex_months)
+    
+    ws.append([])
+    ws.append(["--- NET INCOME ---"])
+    net_income = gross_profit - total_op_ex
+    ni_months = [g - o for g, o in zip(gp_months, op_ex_months)]
+    ws.append(["Net Income", net_income] + ni_months)
+    
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=profit_and_loss.xlsx"},
+    )
+
+@router.get("/profit-loss/pdf")
+async def export_profit_loss_pdf(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    year: Optional[int] = Query(None, description="Financial Year"),
+    quarter: Optional[int] = Query(None, description="Quarter (1-4)"),
+    start_date: Optional[date] = Query(None, description="Start date"),
+    end_date: Optional[date] = Query(None, description="End date"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from sqlalchemy.future import select
+    from sqlalchemy import extract
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+    
+    inv_query = select(Invoice)
+    exp_query = select(Expense)
+    
+    if project_id:
+        inv_query = inv_query.where(Invoice.project_id == project_id)
+        exp_query = exp_query.where(Expense.project_id == project_id)
+        
+    if year:
+        inv_query = inv_query.where(extract('year', Invoice.created_at) == year)
+        exp_query = exp_query.where(extract('year', Expense.expense_date) == year)
+        if quarter:
+            q_months = {1: (1,3), 2: (4,6), 3: (7,9), 4: (10,12)}
+            sm, em = q_months[quarter]
+            inv_query = inv_query.where(extract('month', Invoice.created_at).between(sm, em))
+            exp_query = exp_query.where(extract('month', Expense.expense_date).between(sm, em))
+            
+    if start_date:
+        inv_query = inv_query.where(Invoice.created_at >= start_date)
+        exp_query = exp_query.where(Expense.expense_date >= start_date)
+    if end_date:
+        inv_query = inv_query.where(Invoice.created_at <= end_date + timedelta(days=1))
+        exp_query = exp_query.where(Expense.expense_date <= end_date)
+        
+    invoices = (await db.execute(inv_query)).scalars().all()
+    expenses = (await db.execute(exp_query)).scalars().all()
+    
+    revenue = 0.0
+    cogs_labour = 0.0
+    cogs_material = 0.0
+    overhead = defaultdict(float)
+    
+    for inv in invoices:
+        amt = float(inv.total_amount or 0)
+        if inv.type == "owner": revenue += amt
+        elif inv.type == "labour": cogs_labour += amt
+        elif inv.type == "material": cogs_material += amt
+            
+    total_overhead = 0.0
+    for exp in expenses:
+        amt = float(exp.amount or 0)
+        overhead[exp.category] += amt
+        total_overhead += amt
+        
+    cogs = cogs_labour + cogs_material
+    gross_profit = revenue - cogs
+    net_income = gross_profit - total_overhead
+    margin = (net_income / revenue * 100) if revenue > 0 else 0.0
+    
+    stream = io.BytesIO()
+    doc = SimpleDocTemplate(stream, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    elements.append(Paragraph("Profit & Loss Statement", styles['Title']))
+    elements.append(Spacer(1, 12))
+    
+    filter_text = f"Generated: {date.today()}"
+    if project_id: filter_text += f" | Project ID: {project_id}"
+    if year: filter_text += f" | Year: {year}"
+    if quarter: filter_text += f" | Quarter: {quarter}"
+    
+    elements.append(Paragraph(filter_text, styles['Normal']))
+    elements.append(Spacer(1, 20))
+    
+    # Statement Table
+    table_data = [
+        ["Revenue", f"${revenue:,.2f}"],
+        ["", ""],
+        ["Cost of Goods Sold (COGS)", ""],
+        ["  Labour Costs", f"${cogs_labour:,.2f}"],
+        ["  Material Costs", f"${cogs_material:,.2f}"],
+        ["Total COGS", f"${cogs:,.2f}"],
+        ["", ""],
+        ["Gross Profit", f"${gross_profit:,.2f}"],
+        ["", ""],
+        ["Operating Expenses (Overhead)", ""]
+    ]
+    
+    for cat, amt in overhead.items():
+        table_data.append([f"  {cat}", f"${amt:,.2f}"])
+        
+    table_data.extend([
+        ["Total Operating Expenses", f"${total_overhead:,.2f}"],
+        ["", ""],
+        ["Net Income", f"${net_income:,.2f}"],
+        ["Net Profit Margin", f"{margin:,.2f}%"]
+    ])
+    
+    t = Table(table_data, colWidths=[300, 150])
+    t.setStyle(TableStyle([
+        ('FONTNAME', (0,0), (-1,-1), 'Helvetica'),
+        ('FONTNAME', (0,0), (0,0), 'Helvetica-Bold'), # Revenue
+        ('FONTNAME', (0,2), (0,2), 'Helvetica-Bold'), # COGS title
+        ('FONTNAME', (0,5), (-1,5), 'Helvetica-Bold'), # Total COGS
+        ('FONTNAME', (0,7), (-1,7), 'Helvetica-Bold'), # Gross Profit
+        ('FONTNAME', (0,9), (0,9), 'Helvetica-Bold'), # OpEx Title
+        ('FONTNAME', (0,-4), (-1,-4), 'Helvetica-Bold'), # Total OpEx
+        ('FONTNAME', (0,-2), (-1,-1), 'Helvetica-Bold'), # Net Income / Margin
+        ('LINEABOVE', (1,5), (1,5), 1, colors.black), # Line above Total COGS
+        ('LINEABOVE', (1,7), (1,7), 1, colors.black), # Line above Gross Profit
+        ('LINEABOVE', (1,-4), (1,-4), 1, colors.black), # Line above Total OpEx
+        ('LINEABOVE', (1,-2), (1,-2), 2, colors.black), # Double line above Net Income
+        ('LINEBELOW', (1,-2), (1,-2), 2, colors.black), # Double line below Net Income
+        ('ALIGN', (1,0), (1,-1), 'RIGHT'),
+    ]))
+    
+    elements.append(t)
+    doc.build(elements)
+    
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=profit_and_loss_statement.pdf"}
+    )
 
 # ===================== DAILY REPORT =====================
 
@@ -152,54 +1251,175 @@ async def labour_report(
     return {"labour_summary": [{"skill_type": row[0], "count": row[1]} for row in rows]}
 
 
-# ===================== LABOUR EXCEL =====================
+# ===================== LABOUR DISTRIBUTION REPORTS =====================
 
-
-@router.get("/labour/export/excel")
-async def export_labour_excel(
-    project_id: int,
+@router.get("/labour-distribution/excel")
+async def export_labour_distribution_excel(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    date: Optional[date] = Query(None, description="Specific date for attendance filter"),
+    skill_category: Optional[str] = Query(None, description="Filter by SKILLED, UNSKILLED, etc"),
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from app.models.labour import Labour
-
-    result = await db.execute(
-        select(LabourType.skill_category, func.count(func.distinct(Labour.id)))
-        .join(Labour, Labour.labour_type_id == LabourType.id)
-        .join(UserAttendance, Labour.user_id == UserAttendance.user_id)
-        .where(
-            UserAttendance.project_id == project_id,
-            Labour.status == LabourStatus.ACTIVE,
-        )
-        .group_by(LabourType.skill_category)
+    from sqlalchemy.future import select
+    from app.models.labour import Labour, LabourProject
+    from app.models.user import UserAttendance
+    from collections import defaultdict
+    
+    query = select(Labour, m.Project, LabourType).join(LabourProject, Labour.id == LabourProject.labour_id).join(m.Project, LabourProject.project_id == m.Project.id).outerjoin(LabourType, Labour.labour_type_id == LabourType.id)
+    
+    if project_id:
+        query = query.where(m.Project.id == project_id)
+    if skill_category:
+        query = query.where(LabourType.skill_category == skill_category)
+        
+    query = query.where(Labour.status == LabourStatus.ACTIVE)
+    results = (await db.execute(query)).all()
+    
+    attendance_map = {}
+    if date:
+        att_query = select(UserAttendance.user_id, UserAttendance.status).where(UserAttendance.date == date)
+        if project_id:
+            att_query = att_query.where(UserAttendance.project_id == project_id)
+        att_results = (await db.execute(att_query)).all()
+        attendance_map = {user_id: status for user_id, status in att_results}
+        
+    wb = Workbook()
+    ws_agg = wb.active
+    ws_agg.title = "Distribution Summary"
+    ws_agg.append(["Project Name", "Skill Category", "Trade", "Total Count"])
+    
+    agg_data = defaultdict(int)
+    
+    ws_det = wb.create_sheet(title="Detailed Roster")
+    det_headers = ["Project Name", "Worker Code", "Worker Name", "Skill Category", "Trade", "Status"]
+    if date: det_headers.append(f"Attendance ({date})")
+    ws_det.append(det_headers)
+    
+    for labour, project, ltype in results:
+        skill = str(getattr(ltype.skill_category, "value", ltype.skill_category)) if ltype and getattr(ltype, "skill_category", None) else "Unclassified"
+        trade = ltype.name if ltype else "N/A"
+        
+        att_status = "Not Logged"
+        if date and labour.user_id:
+            att_status_raw = attendance_map.get(labour.user_id)
+            att_status = str(getattr(att_status_raw, "value", att_status_raw)) if att_status_raw else "Absent"
+            
+        row = [
+            project.project_name,
+            labour.worker_code,
+            labour.labour_name,
+            skill,
+            trade,
+            str(getattr(labour.status, "value", labour.status))
+        ]
+        if date: row.append(att_status)
+        ws_det.append(row)
+        
+        agg_key = (project.project_name, skill, trade)
+        agg_data[agg_key] += 1
+        
+    for (proj, skill, trade), count in sorted(agg_data.items()):
+        ws_agg.append([proj, skill, trade, count])
+        
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=labour_distribution_report.xlsx"},
     )
 
-    rows = result.all()
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Labour Report"
-
-    ws.append(["Skill Type", "Count"])
-
-    for skill_type, count in rows:
-        ws.append(
-            [
-                str(skill_type) if skill_type else "Unknown",
-                int(count),
-            ]
-        )
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-
+@router.get("/labour-distribution/pdf")
+async def export_labour_distribution_pdf(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    skill_category: Optional[str] = Query(None, description="Filter by SKILLED, UNSKILLED, etc"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from sqlalchemy.future import select
+    from app.models.labour import Labour, LabourProject
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import Table, TableStyle
+    from reportlab.lib import colors
+    from collections import defaultdict
+    
+    query = select(Labour, m.Project, LabourType).join(LabourProject, Labour.id == LabourProject.labour_id).join(m.Project, LabourProject.project_id == m.Project.id).outerjoin(LabourType, Labour.labour_type_id == LabourType.id).where(Labour.status == LabourStatus.ACTIVE)
+    
+    if project_id: query = query.where(m.Project.id == project_id)
+    if skill_category: query = query.where(LabourType.skill_category == skill_category)
+        
+    results = (await db.execute(query)).all()
+    
+    project_stats = defaultdict(lambda: {"SKILLED": 0, "UNSKILLED": 0, "SEMI_SKILLED": 0, "OTHER": 0})
+    total_workers = 0
+    total_skilled = 0
+    total_unskilled = 0
+    
+    for labour, project, ltype in results:
+        skill = str(getattr(ltype.skill_category, "value", ltype.skill_category)).upper() if ltype and getattr(ltype, "skill_category", None) else "OTHER"
+        if skill not in project_stats[project.project_name]: skill = "OTHER"
+        
+        project_stats[project.project_name][skill] += 1
+        total_workers += 1
+        if skill == "SKILLED": total_skilled += 1
+        elif skill == "UNSKILLED": total_unskilled += 1
+        
+    stream = io.BytesIO()
+    doc = SimpleDocTemplate(stream, pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    elements.append(Paragraph("Executive Labour Distribution Summary", styles['Title']))
+    elements.append(Spacer(1, 12))
+    
+    filter_text = f"Generated: {datetime.now().strftime('%Y-%m-%d')}"
+    if project_id: filter_text += f" | Project ID: {project_id}"
+    elements.append(Paragraph(filter_text, styles['Normal']))
+    elements.append(Spacer(1, 20))
+    
+    elements.append(Paragraph(f"<b>Total Active Workforce:</b> {total_workers}", styles['Normal']))
+    if total_workers > 0:
+        elements.append(Paragraph(f"<b>Skilled:</b> {total_skilled} ({total_skilled/total_workers*100:.1f}%) | <b>Unskilled:</b> {total_unskilled} ({total_unskilled/total_workers*100:.1f}%)", styles['Normal']))
+    elements.append(Paragraph(f"<b>Total Active Projects:</b> {len(project_stats)}", styles['Normal']))
+    elements.append(Spacer(1, 24))
+    
+    table_data = [["Project Name", "Skilled", "Semi", "Unskilled", "Other", "Total", "% of Company"]]
+    for proj, stats in sorted(project_stats.items()):
+        p_total = sum(stats.values())
+        pct = (p_total / total_workers * 100) if total_workers > 0 else 0
+        table_data.append([
+            proj[:25] + "..." if len(proj) > 25 else proj,
+            stats["SKILLED"],
+            stats["SEMI_SKILLED"],
+            stats["UNSKILLED"],
+            stats["OTHER"],
+            p_total,
+            f"{pct:.1f}%"
+        ])
+        
+    t = Table(table_data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.darkblue),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('ALIGN', (0,0), (0,-1), 'LEFT'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('BACKGROUND', (0,1), (-1,-1), colors.aliceblue),
+        ('GRID', (0,0), (-1,-1), 1, colors.black)
+    ]))
+    
+    elements.append(t)
+    doc.build(elements)
+    stream.seek(0)
+    
     return StreamingResponse(
-        buffer,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f"attachment; filename=labour_report_project_{project_id}.xlsx"
-        },
+        stream,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=labour_distribution_summary.pdf"}
     )
 
 
@@ -212,7 +1432,7 @@ async def material_report(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(select(Material).where(Material.project_id == project_id))
+    result = await db.execute(select(Material).where(Material.project_id == project_id).order_by(Material.created_at.desc()))
 
     materials = result.scalars().all()
 
@@ -228,7 +1448,7 @@ async def export_material_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(select(Material).where(Material.project_id == project_id))
+    result = await db.execute(select(Material).where(Material.project_id == project_id).order_by(Material.created_at.desc()))
     materials = result.scalars().all()
 
     wb = Workbook()
@@ -291,7 +1511,7 @@ async def issue_report(
         .select_from(m.Issue)
         .where(
             m.Issue.project_id == project_id,
-            m.Issue.status == "Open",
+            m.Issue.status == IssueStatus.OPEN.value,
         )
     )
 
@@ -300,7 +1520,7 @@ async def issue_report(
         .select_from(m.Issue)
         .where(
             m.Issue.project_id == project_id,
-            m.Issue.status == "Closed",
+            m.Issue.status == IssueStatus.CLOSED.value,
         )
     )
 
@@ -316,7 +1536,7 @@ async def export_issue_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(select(m.Issue).where(m.Issue.project_id == project_id))
+    result = await db.execute(select(m.Issue).where(m.Issue.project_id == project_id).order_by(m.Issue.created_at.desc()))
     issues = result.scalars().all()
 
     wb = Workbook()
@@ -427,6 +1647,7 @@ async def client_report_download(
             m.DailySiteReport.report_date >= start_date,
             m.DailySiteReport.report_date <= end_date,
         )
+        .order_by(m.DailySiteReport.report_date.desc())
     )
     reports = result.scalars().all()
 
@@ -628,7 +1849,7 @@ async def profit_loss(
 
 
 @router.get("/project/{project_id}")
-async def project_report(
+async def project_financial_summary_by_id(
     project_id: int,
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
@@ -838,7 +2059,7 @@ async def financial_summary(
 # QUARTERLY AUDIT SUMMARY
 # =========================================================
 @router.get("/quarterly-audit-summary")
-async def quarterly_audit_summary(
+async def quarterly_financial_audit(
     project_id: int,
     year: int,
     quarter: int,
@@ -1090,10 +2311,11 @@ from calendar import monthrange
 from calendar import monthrange
 
 
+from typing import Optional
 @router.get("/project")
 async def project_report(
-    project_id: int,
     type: str,
+    project_id: Optional[int] = None,
     report_date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -1103,7 +2325,21 @@ async def project_report(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    project_ids = []
+    if project_id is not None:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        project_ids = [project_id]
+    else:
+        # Get all accessible projects
+        if current_user.role in [UserRole.ADMIN.value, UserRole.OWNER.value, UserRole.ACCOUNTANT.value]:
+            res = await db.execute(select(m.Project.id))
+        else:
+            res = await db.execute(select(m.Project.id).where(m.Project.id.in_(
+                select(m.ProjectAssignment.project_id).where(m.ProjectAssignment.user_id == current_user.id)
+            )))
+        project_ids = res.scalars().all()
+        if not project_ids:
+            raise HTTPException(status_code=403, detail="No accessible projects found")
 
     # =====================================================
     # VALIDATION
@@ -1168,25 +2404,29 @@ async def project_report(
     # PROJECT
     # =====================================================
 
-    project = await db.scalar(select(m.Project).where(m.Project.id == project_id))
+    if project_id is not None:
+        project = await db.scalar(select(m.Project).where(m.Project.id == project_id))
+        project_data = {"id": project.id, "project_name": project.project_name}
+    else:
+        project_data = {"id": None, "project_name": "All Authorized Projects"}
 
     # =====================================================
     # TASK SUMMARY
     # =====================================================
 
     total_tasks = await db.scalar(
-        select(func.count()).select_from(m.Task).where(m.Task.project_id == project_id)
+        select(func.count()).select_from(m.Task).where(m.Task.project_id.in_(project_ids))
     )
 
     completed_tasks = await db.scalar(
         select(func.count())
         .select_from(m.Task)
-        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.COMPLETED)
+        .where(m.Task.project_id.in_(project_ids), m.Task.status == TaskStatus.COMPLETED.value if hasattr(TaskStatus.COMPLETED, 'value') else TaskStatus.COMPLETED)
     )
 
     progress = await db.scalar(
         select(func.avg(m.Task.completion_percentage)).where(
-            m.Task.project_id == project_id
+            m.Task.project_id.in_(project_ids)
         )
     )
 
@@ -1195,11 +2435,11 @@ async def project_report(
     # =====================================================
 
     total_invoice = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(Invoice.project_id == project_id)
+        select(func.sum(Invoice.total_amount)).where(Invoice.project_id.in_(project_ids))
     )
 
     total_expense = await db.scalar(
-        select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
+        select(func.sum(Expense.amount)).where(Expense.project_id.in_(project_ids))
     )
 
     # =====================================================
@@ -1209,34 +2449,32 @@ async def project_report(
     open_issues = await db.scalar(
         select(func.count())
         .select_from(m.Issue)
-        .where(m.Issue.project_id == project_id, m.Issue.status == IssueStatus.OPEN)
+        .where(m.Issue.project_id.in_(project_ids), m.Issue.status == IssueStatus.OPEN.value if hasattr(IssueStatus.OPEN, 'value') else IssueStatus.OPEN)
     )
 
     # =====================================================
     # DSR
     # =====================================================
 
-    dsr_result = await db.execute(
-        select(m.DailySiteReport)
-        .where(
-            m.DailySiteReport.project_id == project_id,
-            m.DailySiteReport.report_date >= start_date,
-            m.DailySiteReport.report_date <= end_date,
+    dsr_list = []
+    if project_id is not None:
+        dsr_result = await db.execute(
+            select(m.DailySiteReport)
+            .where(
+                m.DailySiteReport.project_id == project_id,
+                m.DailySiteReport.report_date >= start_date,
+                m.DailySiteReport.report_date <= end_date,
+            )
+            .order_by(m.DailySiteReport.report_date.desc())
         )
-        .order_by(m.DailySiteReport.report_date.desc())
-    )
-
-    dsr_list = dsr_result.scalars().all()
+        dsr_list = dsr_result.scalars().all()
 
     # =====================================================
     # RESPONSE
     # =====================================================
 
     return {
-        "project": {
-            "id": project.id,
-            "project_name": project.project_name,
-        },
+        "project": project_data,
         "report_type": type,
         "quarter": f"Q{quarter}" if type == "quarterly" else None,
         "date_range": {
@@ -1275,8 +2513,8 @@ async def project_report(
 @router.get("/project/export/pdf")
 @router.get("/project/export/pdf")
 async def export_project_report_pdf(
-    project_id: int,
     type: str,
+    project_id: Optional[int] = None,
     report_date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -1359,8 +2597,8 @@ async def export_project_report_pdf(
 
 @router.get("/project/export/excel")
 async def export_project_report_excel(
-    project_id: int,
     type: str,
+    project_id: Optional[int] = None,
     report_date: date | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -1473,7 +2711,7 @@ async def business_intelligence_kpis(
 
     # Efficiency (Active Sites)
     active_sites = await db.scalar(
-        select(func.count(m.Project.id)).where(m.Project.status == "Active")
+        select(func.count(m.Project.id)).where(m.Project.status == ProjectStatus.ONGOING.value)
     )
 
     return {
@@ -1540,7 +2778,7 @@ async def quarterly_audit_summary(
     critical_issues = await db.scalar(
         select(func.count(m.Issue.id)).where(
             m.Issue.project_id == project_id,
-            m.Issue.priority == "HIGH",
+            m.Issue.priority == IssuePriority.HIGH.value,
             m.Issue.created_at >= start_date,
         )
     )

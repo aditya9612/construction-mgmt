@@ -1489,6 +1489,7 @@ async def export_excel(
         .where(
             LabourProject.project_id == project_id, Labour.status == LabourStatus.ACTIVE
         )
+        .order_by(Labour.created_at.desc())
     )
     rows = result.scalars().all()
 
@@ -1570,24 +1571,41 @@ async def export_attendance_excel(
     )
 
 
+from typing import Optional, Literal
+from datetime import date
+from fastapi import Query
+
 @router.get("/payroll/export")
 async def export_payroll_excel(
-    month: int,
-    year: int,
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    labour_id: Optional[int] = None,
+    format: Literal["excel", "pdf"] = Query("excel", description="Export format"),
     current_user: User = Depends(d.require_roles(PAYROLL_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     project_ids = await get_user_project_ids(db, current_user)
 
-    result = await db.execute(
-        select(LabourPayroll, Labour)
-        .join(Labour, Labour.id == LabourPayroll.labour_id)
-        .where(
-            LabourPayroll.month == month,
-            LabourPayroll.year == year,
-            LabourPayroll.project_id.in_(project_ids),
-        )
-    )
+    query = select(LabourPayroll, Labour).join(Labour, Labour.id == LabourPayroll.labour_id)
+    query = query.where(LabourPayroll.project_id.in_(project_ids))
+
+    if month is not None:
+        query = query.where(LabourPayroll.month == month)
+    if year is not None:
+        query = query.where(LabourPayroll.year == year)
+    if labour_id is not None:
+        query = query.where(LabourPayroll.labour_id == labour_id)
+
+    if start_date:
+        start_idx = start_date.year * 12 + start_date.month
+        query = query.where((LabourPayroll.year * 12 + LabourPayroll.month) >= start_idx)
+    if end_date:
+        end_idx = end_date.year * 12 + end_date.month
+        query = query.where((LabourPayroll.year * 12 + LabourPayroll.month) <= end_idx)
+
+    result = await db.execute(query.order_by(LabourPayroll.year.desc(), LabourPayroll.month.desc()))
 
     rows = result.all()
 
@@ -1603,6 +1621,46 @@ async def export_payroll_excel(
                 "Remaining": float(payroll.remaining_amount),
                 "Status": payroll.status.value,
             }
+        )
+
+    if format == "pdf":
+        import io
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.pagesizes import landscape, letter
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
+        
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=landscape(letter))
+        
+        table_data = [["Labour Name", "Working Hours", "OT Hours", "Total Wage", "Paid Amount", "Remaining Amount", "Status"]]
+        for d in data:
+            table_data.append([d["Labour"], d["Working Hours"], d["OT Hours"], d["Total Wage"], d["Paid"], d["Remaining"], d["Status"]])
+            
+        t = Table(table_data)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0,0), (-1,0), 12),
+            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+            ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ]))
+        
+        elements = []
+        styles = getSampleStyleSheet()
+        elements.append(Paragraph("Payroll Export", styles['Title']))
+        elements.append(Spacer(1, 12))
+        elements.append(t)
+        
+        doc.build(elements)
+        buffer.seek(0)
+        
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=payroll.pdf"},
         )
 
     df = pd.DataFrame(data)

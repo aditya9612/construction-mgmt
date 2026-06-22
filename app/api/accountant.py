@@ -7,8 +7,8 @@ from app.schemas.accountant import OfferCreate, OfferOut
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from app.core.enums import PaymentMode
-from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine
+from app.core.enums import AccountType, PaymentMode
+from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine, BankTransaction, FundTransfer, GSTReturn
 from app.schemas.accountant import (
     AccountCreate,
     AccountOut,
@@ -16,6 +16,9 @@ from app.schemas.accountant import (
     JournalEntryCreate,
     PayablePaymentRequest,
     ReceiptCreate,
+    BankTransactionCreate, BankTransactionOut,
+    FundTransferCreate, FundTransferOut,
+    GSTReturnCreate, GSTReturnOut
 )
 from app.db.session import get_db_session
 from app.models.billing import RABill
@@ -329,7 +332,7 @@ async def list_payables(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    rows = (await db.execute(select(RABill))).scalars().all()
+    rows = (await db.execute(select(RABill).order_by(RABill.created_at.desc()))).scalars().all()
 
     #  fetch all payments in one go
     paid_map = dict(
@@ -461,7 +464,7 @@ async def list_transactions(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    rows = (await db.execute(select(Transaction))).scalars().all()
+    rows = (await db.execute(select(Transaction).order_by(Transaction.created_at.desc()))).scalars().all()
     return rows
 
 
@@ -470,7 +473,7 @@ async def payable_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    rows = (await db.execute(select(RABill))).scalars().all()
+    rows = (await db.execute(select(RABill).order_by(RABill.created_at.desc()))).scalars().all()
 
     #  single query for all payments
     paid_map = dict(
@@ -559,7 +562,7 @@ async def list_accounts(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    return (await db.execute(select(Account))).scalars().all()
+    return (await db.execute(select(Account).order_by(Account.id))).scalars().all()
 
 
 @router.post("/journal")
@@ -600,7 +603,7 @@ async def list_journal(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    return (await db.execute(select(JournalEntry))).scalars().all()
+    return (await db.execute(select(JournalEntry).order_by(JournalEntry.created_at.desc()))).scalars().all()
 
 
 @router.get("/gst/summary")
@@ -772,15 +775,15 @@ async def balance_sheet(
 
         item = {"account_id": r.id, "account_name": r.name, "balance": balance}
 
-        if r.type == "asset":
+        if r.type == AccountType.ASSET.value:
             assets.append(item)
             total_assets += balance
 
-        elif r.type == "liability":
+        elif r.type == AccountType.LIABILITY.value:
             liabilities.append(item)
             total_liabilities += balance
 
-        elif r.type == "equity":
+        elif r.type == AccountType.EQUITY.value:
             equity.append(item)
             total_equity += balance
 
@@ -788,13 +791,13 @@ async def balance_sheet(
     income = await db.scalar(
         select(func.sum(JournalLine.credit - JournalLine.debit))
         .join(Account, Account.id == JournalLine.account_id)
-        .where(Account.type == "income")
+        .where(Account.type == AccountType.INCOME.value)
     )
 
     expense = await db.scalar(
         select(func.sum(JournalLine.debit - JournalLine.credit))
         .join(Account, Account.id == JournalLine.account_id)
-        .where(Account.type == "expense")
+        .where(Account.type == AccountType.EXPENSE.value)
     )
 
     income = float(income or 0)
@@ -906,3 +909,110 @@ async def download_offer_pdf(
         filename=os.path.basename(file_path),
         media_type="application/pdf"
     )
+
+
+# ===================== BANK RECONCILIATION =====================
+
+@router.post("/bank/transactions", response_model=BankTransactionOut)
+async def create_bank_transaction(
+    payload: BankTransactionCreate,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    bt = BankTransaction(**payload.model_dump())
+    db.add(bt)
+    await db.commit()
+    await db.refresh(bt)
+    return bt
+
+@router.get("/bank/reconciliation/pending", response_model=list[BankTransactionOut])
+async def get_pending_reconciliations(
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    result = await db.scalars(
+        select(BankTransaction).where(BankTransaction.is_reconciled == 0)
+    )
+    return result.all()
+
+@router.post("/bank/reconciliation/{transaction_id}/match/{journal_id}")
+async def match_bank_transaction(
+    transaction_id: int,
+    journal_id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    bt = await db.get(BankTransaction, transaction_id)
+    je = await db.get(JournalEntry, journal_id)
+    if not bt or not je:
+        raise NotFoundError("Transaction or Journal Entry not found")
+        
+    bt.is_reconciled = 1
+    bt.matched_journal_id = je.id
+    await db.commit()
+    return {"message": "Matched successfully"}
+
+# ===================== FUND TRANSFERS =====================
+
+@router.post("/transfers", response_model=FundTransferOut)
+async def create_fund_transfer(
+    payload: FundTransferCreate,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from app.utils.accounting import auto_post_journal
+    
+    # Validation logic to ensure accounts exist
+    from_acc = await db.get(Account, payload.from_account_id)
+    to_acc = await db.get(Account, payload.to_account_id)
+    
+    if not from_acc or not to_acc:
+        raise NotFoundError("Accounts not found")
+
+    # Post auto journal
+    je = await auto_post_journal(
+        db, 
+        amount=payload.amount, 
+        debit_code=to_acc.code, 
+        credit_code=from_acc.code, 
+        description=f"Fund transfer: {payload.remarks}"
+    )
+
+    ft = FundTransfer(**payload.model_dump())
+    if je:
+        ft.journal_entry_id = je.id
+        
+    db.add(ft)
+    await db.commit()
+    await db.refresh(ft)
+    return ft
+
+@router.get("/transfers", response_model=list[FundTransferOut])
+async def list_fund_transfers(
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    result = await db.scalars(select(FundTransfer))
+    return result.all()
+
+# ===================== GST & TAXATION =====================
+
+@router.post("/gst/returns", response_model=GSTReturnOut)
+async def create_gst_return(
+    payload: GSTReturnCreate,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    gstr = GSTReturn(**payload.model_dump())
+    db.add(gstr)
+    await db.commit()
+    await db.refresh(gstr)
+    return gstr
+
+@router.get("/gst/returns", response_model=list[GSTReturnOut])
+async def list_gst_returns(
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
+    return result.all()

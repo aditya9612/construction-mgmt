@@ -96,3 +96,82 @@ class RedevelopmentOffer(Base):
     note = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
+# ===================== BANK RECONCILIATION =====================
+class BankTransaction(Base):
+    __tablename__ = "bank_transactions"
+
+    id = Column(Integer, primary_key=True)
+    
+    bank_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False, index=True)
+    transaction_date = Column(Date, nullable=False, index=True)
+    
+    amount = Column(DECIMAL(18, 2), nullable=False)
+    type = Column(String(10), nullable=False) # Credit, Debit
+    
+    description = Column(String(255), nullable=True)
+    reference_number = Column(String(100), nullable=True, index=True)
+    
+    is_reconciled = Column(Integer, default=0) # 0 = False, 1 = True (SQLite boolean compat)
+    matched_journal_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# ===================== FUND TRANSFERS =====================
+class FundTransfer(Base):
+    __tablename__ = "fund_transfers"
+
+    id = Column(Integer, primary_key=True)
+    
+    from_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    to_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    
+    amount = Column(DECIMAL(18, 2), nullable=False)
+    transfer_date = Column(Date, nullable=False, index=True)
+    
+    reference_number = Column(String(100), nullable=True)
+    remarks = Column(String(255), nullable=True)
+    
+    journal_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# ===================== GST RETURNS =====================
+class GSTReturn(Base):
+    __tablename__ = "gst_returns"
+    
+    id = Column(Integer, primary_key=True)
+    
+    filing_period = Column(String(20), nullable=False, index=True) # e.g. "2026-06"
+    return_type = Column(String(50), nullable=False) # e.g. "GSTR-1", "GSTR-3B"
+    
+    taxable_value = Column(DECIMAL(18, 2), default=0)
+    gst_liability = Column(DECIMAL(18, 2), default=0)
+    itc_available = Column(DECIMAL(18, 2), default=0)
+    net_gst_payable = Column(DECIMAL(18, 2), default=0)
+    
+    status = Column(String(50), default="Draft") # Draft, Filed
+    filing_date = Column(Date, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# ===================== VENDOR BILLS =====================
+class VendorBill(Base):
+    __tablename__ = "vendor_bills"
+    
+    id = Column(Integer, primary_key=True)
+    
+    supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True, index=True)
+    purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=True, index=True)
+    
+    bill_number = Column(String(50), unique=True, nullable=False, index=True)
+    bill_date = Column(Date, nullable=False)
+    due_date = Column(Date, nullable=False)
+    
+    total_amount = Column(DECIMAL(18, 2), nullable=False)
+    amount_paid = Column(DECIMAL(18, 2), default=0)
+    
+    status = Column(String(50), default="PENDING") # PENDING, PARTIAL, PAID
+    
+    created_at = Column(DateTime, default=datetime.utcnow)

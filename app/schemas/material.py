@@ -37,19 +37,9 @@ class MaterialCreate(BaseSchema):
 
     project_id: int = Field(..., gt=0)
 
-    material_name: str = Field(
+    material_master_id: int = Field(
         ...,
-        max_length=255,
-    )
-
-    category: str = Field(
-        ...,
-        max_length=100,
-    )
-
-    unit: str = Field(
-        ...,
-        max_length=50,
+        gt=0,
     )
 
     supplier_id: int = Field(
@@ -87,14 +77,6 @@ class MaterialCreate(BaseSchema):
         decimal_places=3,
     )
 
-    @field_validator("material_name")
-    def validate_name(cls, v):
-        return validate_material_name(v)
-
-    @field_validator("category", "unit")
-    def validate_strings(cls, v):
-        return validate_material_string(v)
-
     @field_validator(
         "quantity_purchased",
         "payment_given",
@@ -110,19 +92,9 @@ class MaterialCreate(BaseSchema):
 
 class MaterialUpdate(BaseSchema):
 
-    material_name: Optional[str] = Field(
+    material_master_id: Optional[int] = Field(
         None,
-        max_length=255,
-    )
-
-    category: Optional[str] = Field(
-        None,
-        max_length=100,
-    )
-
-    unit: Optional[str] = Field(
-        None,
-        max_length=50,
+        gt=0,
     )
 
     supplier_id: Optional[int] = Field(
@@ -146,14 +118,6 @@ class MaterialUpdate(BaseSchema):
 
     rate_type: Optional[RateType] = None
 
-    @field_validator("material_name")
-    def validate_name(cls, v):
-        return validate_material_name(v)
-
-    @field_validator("category", "unit")
-    def validate_strings(cls, v):
-        return validate_material_string(v)
-
     @field_validator(
         "purchase_rate",
         "minimum_stock_level",
@@ -172,9 +136,19 @@ class MaterialOut(BaseSchema):
 
     project_id: int
 
+    material_master_id: int
+    material_master_name: Optional[str] = None
+
+    # Add these
+    material_master_brand: Optional[str] = None
+    material_master_specification: Optional[str] = None
+    material_master_hsn_code: Optional[str] = None
+
     material_name: str
     category: str
-    unit: str
+
+    unit_id: int
+    unit_name: str
 
     supplier_id: int
     supplier_name: Optional[str] = None
@@ -191,12 +165,9 @@ class MaterialOut(BaseSchema):
     payment_given: float
     payment_pending: float
 
-    extra_paid: float = Field(
-        default=0.0,
-        validation_alias="advance_amount",
-    )
+    extra_paid: float = 0.0
 
-    minimum_stock_level: float = 0.0
+    minimum_stock_level: float
 
     alert_type: str
 
@@ -605,10 +576,16 @@ class SummaryOut(BaseSchema):
 
 # ================= REPORT =================
 class MaterialReport(BaseSchema):
-
     material_id: int
-    material_code: Optional[str] = None
 
+    material_master_id: Optional[int] = None
+    material_master_name: Optional[str] = None
+
+    material_master_brand: Optional[str] = None
+    material_master_specification: Optional[str] = None
+    material_master_hsn_code: Optional[str] = None
+    unit_id: Optional[int] = None
+    unit_name: Optional[str] = None
     material_name: str
     category: str
 

@@ -1442,28 +1442,20 @@ async def remove_multiple_members(
 
     await validate_admin(chat_id, current_user.id, db)
 
-    removed = []
-
-    for uid in payload.member_ids:
-
-        member_result = await db.execute(
-            select(ChatMember).where(
-                ChatMember.chat_id == chat_id,
-                ChatMember.user_id == uid,
-            )
+    members_result = await db.execute(
+        select(ChatMember).where(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id.in_(payload.member_ids),
         )
+    )
+    members = members_result.scalars().all()
 
-        member = member_result.scalar()
-
-        if not member:
-            continue
-
+    removed = []
+    for member in members:
         if member.role == MemberRole.ADMIN:
             continue
-
         await db.delete(member)
-
-        removed.append(uid)
+        removed.append(member.user_id)
 
     await db.commit()
 

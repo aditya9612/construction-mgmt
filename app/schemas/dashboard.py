@@ -96,32 +96,60 @@ class ProjectsManagementDashboardOut(BaseModel):
     master_projects: List[AdminProjectOverview]
 
 
-class AccountantVitals(BaseModel):
-    total_revenue: float
-    total_expense: float
-    pending_payments_count: int
-    total_invoices_count: int
+class AccountantKpiCards(BaseModel):
+    cash_balance: float
+    bank_balance: float
+    receivables: float
+    payables: float
+    total_budget: float
+    total_spent: float
+    net_profit: float
+    gst_due: float
 
+class RevenueExpenseTrend(BaseModel):
+    month: str
+    revenue: float
+    expense: float
 
-class ProjectBudgetSummary(BaseModel):
+class CashFlow(BaseModel):
+    cash_inflow: float
+    cash_outflow: float
+    closing_balance: float
+
+class ProjectCostSummaryItem(BaseModel):
     project_name: str
     budgeted: float
-    actual: float
-    variance_percent: float
+    spent: float
+    remaining: float
 
+class OutstandingReceivable(BaseModel):
+    client_invoice: str
+    amount_due: float
+    due_date: Optional[date]
 
-class MonthlyTrend(BaseModel):
-    month: str
+class PendingPayable(BaseModel):
+    vendor_bill_no: str
+    amount: float
+    due_date: Optional[date]
+
+class UpcomingPayment(BaseModel):
+    category: str # Today, Tomorrow, 5 Days Later
+    description: str
     amount: float
 
+class RecentActivityItem(BaseModel):
+    time: str
+    activity: str
 
 class AccountantDashboardOut(BaseModel):
-    vitals: AccountantVitals
-    consumption_status: dict  # {total_budget, total_spent, percentage}
-    monthly_expense_analysis: List[MonthlyTrend]
-    project_cost_summary: List[ProjectBudgetSummary]
-    recent_invoices: List[dict]
-    recent_transactions: List[dict]
+    kpi_cards: AccountantKpiCards
+    revenue_vs_expense: List[RevenueExpenseTrend]
+    cash_flow: CashFlow
+    project_cost_summary: List[ProjectCostSummaryItem]
+    outstanding_receivables: List[OutstandingReceivable]
+    pending_payables: List[PendingPayable]
+    upcoming_payments: List[UpcomingPayment]
+    recent_activities: List[RecentActivityItem]
 
 
 # =========================================
@@ -223,3 +251,17 @@ class LabourDashboardOut(BaseModel):
     
     recent_tasks: List[LabourTaskItem]
     recent_activity: List[LabourActivityItem]
+
+# =========================================
+# PROJECT MANAGER DASHBOARD
+# =========================================
+
+class PMSummaryOut(BaseModel):
+    total_projects: int
+    active_projects: int
+    completed_projects: int
+    delayed_projects: int
+    pending_approvals: int
+    open_issues: int
+    budget_utilized_percent: float
+    todays_activities: int

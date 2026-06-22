@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.reports import REPORT_READ_ROLES
 from app.core.dependencies import require_roles
 from app.core.enums import (
+    AttendanceStatus,
     InvoiceStatus,
     PaymentMode,
     InvoiceType,
@@ -1025,7 +1026,7 @@ async def list_invoices(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
-    rows = (await db.execute(select(Invoice))).scalars().all()
+    rows = (await db.execute(select(Invoice).where(Invoice.pending_amount > 0))).scalars().all()
     return [InvoiceOut.model_validate(r) for r in rows]
 
 
@@ -1045,7 +1046,7 @@ async def get_by_date_range(
     rows = (
         (
             await db.execute(
-                select(Invoice).where(Invoice.created_at.between(start_dt, end_dt))
+                select(Invoice).where(Invoice.created_at.between(start_dt, end_dt)).order_by(Invoice.created_at.desc())
             )
         )
         .scalars()
@@ -1145,7 +1146,7 @@ async def get_by_project(
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
     rows = (
-        (await db.execute(select(Invoice).where(Invoice.project_id == project_id)))
+        (await db.execute(select(Invoice).where(Invoice.project_id == project_id).order_by(Invoice.created_at.desc())))
         .scalars()
         .all()
     )
@@ -1160,7 +1161,7 @@ async def get_by_type(
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
     rows = (
-        (await db.execute(select(Invoice).where(Invoice.type == type))).scalars().all()
+        (await db.execute(select(Invoice).where(Invoice.type == type).order_by(Invoice.created_at.desc()))).scalars().all()
     )
 
     return [InvoiceOut.model_validate(r) for r in rows]
@@ -1238,67 +1239,66 @@ async def generate_invoice_pdf(
     if not obj:
         raise NotFoundError("Invoice not found")
 
-    #  Register Unicode font (₹ support)
-    pdfmetrics.registerFont(TTFont("DejaVu", "app/fonts/DejaVuSans.ttf"))
-
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer)
-
-    styles = getSampleStyleSheet()
-
-    #  Apply font to ALL styles
-    for style in styles.byName.values():
-        style.fontName = "DejaVu"
-
-    elements = []
-
-    # Title
-    elements.append(
-        Paragraph(f"Invoice #{obj.id}", styles["Title"])
-    )
-
-    elements.append(Spacer(1, 12))
-
-    # Details
-    elements.append(
-        Paragraph(f"Type: {obj.type.value}", styles["Normal"])
-    )
-
-    if obj.source_type:
-        elements.append(
-            Paragraph(
-                f"Source: {obj.source_type.value}",
-                styles["Normal"]
-            )
-        )
-
-    elements.append(
-        Paragraph(f"Amount: ₹{float(obj.amount):,.2f}", styles["Normal"])
-    )
-    elements.append(Spacer(1, 4))
-    elements.append(
-        Paragraph(f"GST: ₹{float(obj.gst_amount):,.2f}", styles["Normal"])
-    )
-    elements.append(Spacer(1, 4))
-
-    elements.append(
-        Paragraph(f"Tax: ₹{float(obj.tax_amount):,.2f}", styles["Normal"])
-    )
-    elements.append(Spacer(1, 4))
-    elements.append(
-        Paragraph(f"Total: ₹{float(obj.total_amount):,.2f}", styles["Normal"])
-    )
-    elements.append(Spacer(1, 4))
-    # Status
-    elements.append(
-        Paragraph(
-            f"Status: {obj.status.value.capitalize()}",
-            styles["Normal"]
-        )
-    )
-
-    doc.build(elements)
-    buffer.seek(0)
+    from app.models.owner import Owner
+    from app.models.project import Project
+    from app.models.settings import CompanySettings, UserSettings
+    from app.utils.invoice_pdf import build_infapilot_invoice
+    
+    owner = await db.get(Owner, obj.owner_id)
+    project = await db.get(Project, obj.project_id)
+    settings = await db.scalar(select(CompanySettings))
+    user_settings = await db.scalar(select(UserSettings))
+    
+    balance_due = float(obj.total_amount) - float(obj.paid_amount)
+    
+    import datetime
+    from dateutil.relativedelta import relativedelta
+    due_date_dt = obj.created_at + relativedelta(days=30) if obj.created_at else datetime.date.today()
+    
+    invoice_data = {
+        "invoice_no": f"INV/{datetime.date.today().year}-{datetime.date.today().year+1}/{obj.id:04d}",
+        "date": obj.created_at.strftime("%d/%m/%Y") if obj.created_at else datetime.date.today().strftime("%d/%m/%Y"),
+        "due_date": due_date_dt.strftime("%d/%m/%Y"),
+        "payment_terms": user_settings.payment_terms if user_settings and user_settings.payment_terms else "30 Days",
+        "work_order_no": f"PRJ-{project.id}" if project else "N/A",
+        "client_name": owner.owner_name if owner else "Unknown Client",
+        "client_address": owner.address if owner else "Address Not Provided",
+        "client_mobile": owner.mobile if owner else "N/A",
+        "client_gst": owner.pan if owner else "N/A",
+        "items": [
+            {
+                "desc_title": f"{obj.type.value.capitalize()} Billing", 
+                "desc_subtitle": obj.description or "General Construction Work",
+                "unit": "LS",
+                "qty": 1.0,
+                "rate": float(obj.amount),
+                "amount": float(obj.amount)
+            }
+        ],
+        "subtotal": float(obj.amount),
+        "cgst": float(obj.gst_amount) / 2 if obj.gst_amount else 0.0,
+        "sgst": float(obj.gst_amount) / 2 if obj.gst_amount else 0.0,
+        "discount": 0.00,
+        "grand_total": float(obj.total_amount),
+        "advance_paid": float(obj.paid_amount),
+        "balance_due": balance_due,
+        "company": {
+            "name": settings.company_name if settings else "INFAPILOT",
+            "logo": settings.company_logo if settings else None,
+            "address": settings.address if settings else "Indore, Madhya Pradesh",
+            "mobile": settings.mobile_number if settings else "+91 98765 43210",
+            "email": settings.email if settings else "info@infapilot.com",
+            "website": settings.website if settings else "www.infapilot.com",
+            "bank_name": settings.bank_name if settings else "HDFC Bank",
+            "account_number": settings.account_number if settings else "50200012345678",
+            "ifsc": settings.ifsc_code if settings else "HDFC0001234",
+            "branch": "Head Office", # Branch missing in model, default it
+            "terms": settings.terms_conditions if settings else "Payment to be made within the due date.",
+            "signature": settings.signature_image if settings else None
+        }
+    }
+    
+    buffer = build_infapilot_invoice(invoice_data)
 
     return StreamingResponse(
         buffer,
@@ -1339,42 +1339,22 @@ async def create_labour_invoice(
     if existing_invoice:
         raise ValidationError("Labour invoice already exists for this date range")
 
-    # 3. Fetch attendances
+    # 3. Fetch locked historical wages from Auto-Generated Expenses
     result = await db.execute(
-        select(UserAttendance).where(
-            UserAttendance.project_id == project_id,
-            UserAttendance.attendance_date.between(start_date, end_date),
-            UserAttendance.status != "ABSENT"
+        select(Expense).where(
+            Expense.project_id == project_id,
+            Expense.source_type == "attendance_auto",
+            Expense.expense_date.between(start_date, end_date)
         )
     )
-    attendances = result.scalars().all()
+    expenses = result.scalars().all()
 
-    if not attendances:
-        raise NotFoundError("No labour attendance found")
+    if not expenses:
+        raise NotFoundError("No locked labour attendance expenses found for this date range")
 
-    # 4. FIX: Load all labours in ONE query (avoid N+1)
-    user_ids = list({att.user_id for att in attendances if att.user_id})
-    labours_result = await db.execute(select(Labour).where(Labour.user_id.in_(user_ids)))
-    labour_map = {l.user_id: l for l in labours_result.scalars().all()}
-
-    total_amount = Decimal(0)
-    attendance_ids: list[int] = []
-
-    # 5. Calculate wages
-    for att in attendances:
-        labour = labour_map.get(att.user_id)
-        if not labour:
-            continue
-
-        attendance_ids.append(att.id)
-
-        daily_rate = Decimal(labour.daily_wage_rate or 0)
-        working_hours = Decimal(att.working_hours or 0)
-        overtime_rate = Decimal(att.overtime_rate or 0)
-        overtime_hours = Decimal(att.overtime_hours or 0)
-
-        wage = daily_rate * working_hours + overtime_rate * overtime_hours
-        total_amount += wage
+    # 4. Calculate total securely
+    total_amount = sum(Decimal(e.amount or 0) for e in expenses)
+    expense_ids = [e.id for e in expenses]
 
     try:
         # 6. Create invoice
@@ -1383,7 +1363,7 @@ async def create_labour_invoice(
             owner_id=project.owner_id,
             type=InvoiceType.LABOUR,
             reference_id=None,
-            linked_expense_ids=attendance_ids,
+            linked_expense_ids=expense_ids,
             amount=total_amount,
             gst_percent=Decimal(0),
             gst_amount=Decimal(0),
@@ -1735,7 +1715,7 @@ async def receivable_aging(
 ):
     today = date.today()
 
-    rows = (await db.execute(select(Invoice))).scalars().all()
+    rows = (await db.execute(select(Invoice).where(Invoice.pending_amount > 0))).scalars().all()
 
     result = {"0-30": 0, "30-60": 0, "60+": 0}
 

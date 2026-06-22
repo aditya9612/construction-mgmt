@@ -49,8 +49,7 @@ class LabourType(Base):
 
     category = Column(String(100), nullable=True)
 
-    skill_category = Column(SAEnum(SkillType),nullable=False
-)
+    skill_category = Column(SAEnum(SkillType), nullable=False)
 
     default_daily_wage = Column(DECIMAL(18, 2), nullable=False)
 
@@ -78,11 +77,7 @@ class ActivityType(Base):
 
     category = Column(String(100), nullable=True)
 
-    default_unit_id = Column(
-        Integer,
-        ForeignKey("units.id"),
-        nullable=True
-    )
+    default_unit_id = Column(Integer, ForeignKey("units.id"), nullable=True)
 
     is_active = Column(Boolean, default=True)
 
@@ -95,14 +90,19 @@ class ActivityType(Base):
 
 
 class MaterialMaster(Base):
-
     __tablename__ = "material_master"
 
     id = Column(Integer, primary_key=True)
 
     name = Column(String(150), nullable=False)
 
-    unit = Column(String(50), nullable=False)
+    unit_id = Column(
+        Integer,
+        ForeignKey("units.id"),
+        nullable=False,
+    )
+
+    unit = relationship("Unit")
 
     unique_code = Column(String(50), unique=True, nullable=True)
 
@@ -119,3 +119,9 @@ class MaterialMaster(Base):
     minimum_stock_level = Column(Integer, default=0)
 
     is_active = Column(Boolean, default=True)
+
+    # Relationship with Material
+    materials = relationship(
+        "Material",
+        back_populates="material_master",
+    )

@@ -473,6 +473,26 @@ class TaskProgress(Base, TimestampMixin):
     __table_args__ = (CheckConstraint("percentage >= 0 AND percentage <= 100"),)
 
 
+class TaskRequest(Base, TimestampMixin):
+    __tablename__ = "task_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    category: Mapped[str] = mapped_column(String(100), nullable=False)
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    priority: Mapped[str] = mapped_column(String(50), nullable=False, default="LOW")
+    description: Mapped[str] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="PENDING")
+    
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    assigned_to: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    attachment_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    
+    # Relationships
+    project = relationship("Project")
+    assignee = relationship("User")
+
+
 class Comment(Base, TimestampMixin):
     __tablename__ = "comments"
 

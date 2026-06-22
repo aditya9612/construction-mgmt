@@ -15,6 +15,7 @@ from app.core.enums import (
     DocumentStatus,
     LabourStatus,
     MilestoneStatus,
+    ProjectStatus,
     SkillType,
     TaskPriority,
     WorkActivityStatus,
@@ -47,7 +48,6 @@ from app.services.notification_service import create_notification
 from app.models.contractor import Contractor
 from sqlalchemy import delete, select, func, or_, update
 from app.models import project as m
-from app.models.messages import MessageStatus
 from app.models.user import User, UserRole
 from app.models.owner import Owner
 from app.models.expense import Expense
@@ -145,6 +145,10 @@ TASK_WRITE_ROLES = [
     r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
 ]
 TASK_DELETE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
+
+TASK_REQUEST_ROLES = [
+    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER, UserRole.PROJECT_MANAGER , UserRole.LABOUR ]
+]
 
 DSR_WRITE_ROLES = [
     r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
@@ -1086,6 +1090,8 @@ class MilestonesService:
                 description=m.description,
                 start_date=m.start_date,
                 end_date=m.end_date,
+                actual_start_date=m.actual_start_date,
+                actual_end_date=m.actual_end_date,
                 status=compute_milestone_status(m),
             )
             for m in rows
@@ -1146,6 +1152,13 @@ class MilestonesService:
         data = payload.model_dump(exclude_unset=True)
         if "title" in data and data["title"] is None:
             raise ValidationError("title cannot be null")
+
+        from datetime import date
+        if "status" in data:
+            if data["status"] == MilestoneStatus.IN_PROGRESS and data.get("actual_start_date") is None and obj.actual_start_date is None:
+                data["actual_start_date"] = date.today()
+            if data["status"] == MilestoneStatus.COMPLETED and data.get("actual_end_date") is None and obj.actual_end_date is None:
+                data["actual_end_date"] = date.today()
 
         try:
             await self.milestones_repo.update_milestone(db, obj=obj, data=data)
@@ -2529,14 +2542,14 @@ async def projects_module_summary(
     # 1. Summary
     total = await db.scalar(select(func.count(m.Project.id)))
     ongoing = await db.scalar(
-        select(func.count(m.Project.id)).where(m.Project.status == "ONGOING")
+        select(func.count(m.Project.id)).where(m.Project.status == ProjectStatus.ONGOING.value)
     )
     completed = await db.scalar(
-        select(func.count(m.Project.id)).where(m.Project.status == "COMPLETED")
+        select(func.count(m.Project.id)).where(m.Project.status == ProjectStatus.COMPLETED.value)
     )
     delayed = await db.scalar(
         select(func.count(m.Project.id)).where(
-            m.Project.status == "ONGOING", m.Project.end_date < today
+            m.Project.status == ProjectStatus.ONGOING.value, m.Project.end_date < today
         )
     )
 
@@ -2650,6 +2663,129 @@ async def create_project(
     logger.info(f"Project created id={out.id}")
 
     return out
+
+# =========================================
+# PM DASHBOARD ENDPOINTS
+# =========================================
+
+@router.get("/calendar", response_model=s.PMCalendarOut)
+async def get_pm_calendar(
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    # Get all project IDs this user has access to
+    from app.models.project import ProjectMember, Task, Milestone
+    from app.models.approval import Approval
+    
+    project_ids = []
+    if current_user.role != UserRole.ADMIN:
+        memberships = await db.scalars(
+            select(ProjectMember.project_id).where(ProjectMember.user_id == current_user.id)
+        )
+        project_ids = list(memberships.all())
+    else:
+        projs = await db.scalars(select(m.Project.id))
+        project_ids = list(projs.all())
+
+    events = []
+    
+    if project_ids:
+        # Tasks (Due Dates)
+        tasks = await db.scalars(
+            select(Task).where(Task.project_id.in_(project_ids), Task.due_date.isnot(None))
+        )
+        for t in tasks:
+            events.append(s.CalendarEvent(
+                title=t.task_name,
+                date=t.due_date,
+                type="Task"
+            ))
+            
+        # Milestones (Due Dates)
+        milestones = await db.scalars(
+            select(Milestone).where(Milestone.project_id.in_(project_ids), Milestone.planned_end_date.isnot(None))
+        )
+        for ml in milestones:
+            events.append(s.CalendarEvent(
+                title=ml.milestone_name,
+                date=ml.planned_end_date,
+                type="Milestone"
+            ))
+
+    return s.PMCalendarOut(events=events)
+
+
+@router.get("/{project_id}/resource-summary", response_model=s.ProjectResourceSummaryOut)
+async def get_project_resource_summary(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id, current_user)
+    
+    from app.models.labour import LabourProject
+    from app.models.equipment import Equipment
+    from app.models.expense import Expense
+
+    labour_count = await db.scalar(
+        select(func.count(LabourProject.labour_id)).where(LabourProject.project_id == project_id)
+    )
+    
+    equipment_count = await db.scalar(
+        select(func.count(Equipment.id)).where(Equipment.project_id == project_id)
+    )
+    
+    material_expense = await db.scalar(
+        select(func.sum(Expense.amount)).where(Expense.project_id == project_id, Expense.category == "Material")
+    )
+
+    return s.ProjectResourceSummaryOut(
+        labour=labour_count or 0,
+        equipment=equipment_count or 0,
+        materials_cost=float(material_expense or 0.0)
+    )
+
+
+@router.get("/{project_id}/health-score", response_model=s.ProjectHealthScoreOut)
+async def get_project_health_score(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id, current_user)
+    
+    from app.models.project import Issue
+    
+    project = await db.get(m.Project, project_id)
+    if not project:
+        raise NotFoundError("Project not found")
+
+    score = 100
+    if project.status == ProjectStatus.ONGOING.value and project.end_date and project.end_date < date.today():
+        score -= 20
+    elif project.status == ProjectStatus.ON_HOLD.value:
+        score -= 15
+        
+    open_critical_issues = await db.scalar(
+        select(func.count(Issue.id)).where(
+            Issue.project_id == project_id,
+            Issue.status == "Open",
+            Issue.priority == "High"
+        )
+    )
+    if open_critical_issues:
+        score -= (open_critical_issues * 5)
+        
+    score = max(0, min(100, score))
+    
+    status_str = "Good"
+    if score < 50:
+        status_str = "Poor"
+    elif score < 80:
+        status_str = "At Risk"
+
+    return s.ProjectHealthScoreOut(health=score, status=status_str)
+
 
 
 @router.get("", response_model=PaginatedResponse[s.ProjectOut])
@@ -2899,26 +3035,6 @@ async def remove_project_member(
     logger.info(f"Member removed user_id={user_id} project_id={project_id}")
 
     return {"success": True, "message": "Member Remove successfully"}
-
-
-@router.get("/{project_id}/report/excel")
-async def export_project_excel(
-    project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    service: ReportsService = Depends(get_reports_service),
-):
-    return await service.export_excel(db, project_id, current_user)
-
-
-@router.get("/{project_id}/report/pdf")
-async def export_project_pdf(
-    project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    service: ReportsService = Depends(get_reports_service),
-):
-    return await service.export_pdf(db, project_id, current_user)
 
 
 @router.get("/{project_id}/logs")
@@ -3520,6 +3636,81 @@ async def list_task_progress_history(
         offset=offset,
     )
 
+
+@tasks_router.post("/", response_model=s.TaskRequestResponse)
+async def create_task_request(
+    request: s.TaskRequestCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+):
+    db_obj = m.TaskRequest(**request.model_dump())
+    db.add(db_obj)
+    await db.commit()
+    await db.refresh(db_obj)
+    return db_obj
+
+@tasks_router.get("/", response_model=List[s.TaskRequestResponse])
+async def get_task_requests(
+    project_id: int = Query(None, description="Filter by project ID"),
+    status: str = Query(None, description="Filter by status"),
+    priority: str = Query(None, description="Filter by priority"),
+    skip: int = Query(0, ge=0, description="Pagination skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Pagination limit"),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+):
+    query = select(m.TaskRequest).where(m.TaskRequest.is_deleted == False)
+    if project_id:
+        query = query.where(m.TaskRequest.project_id == project_id)
+    if status:
+        query = query.where(m.TaskRequest.status == status)
+    if priority:
+        query = query.where(m.TaskRequest.priority == priority)
+        
+    query = query.offset(skip).limit(limit)
+        
+    result = await db.execute(query)
+    task_requests = result.scalars().all()
+    return list(task_requests)
+
+@tasks_router.put("/{request_id}", response_model=s.TaskRequestResponse)
+async def update_task_request(
+    request_id: int,
+    request: s.TaskRequestUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+):
+    result = await db.execute(select(m.TaskRequest).where(m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False))
+    db_obj = result.scalar_one_or_none()
+    
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Task request not found")
+    
+    update_data = request.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_obj, key, value)
+        
+    await db.commit()
+    await db.refresh(db_obj)
+    return db_obj
+
+@tasks_router.delete("/{request_id}", status_code=204)
+async def delete_task_request(
+    request_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+):
+    result = await db.execute(select(m.TaskRequest).where(m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False))
+    db_obj = result.scalar_one_or_none()
+    
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Task request not found")
+        
+    # Soft delete
+    db_obj.is_deleted = True
+    await db.commit()
+    
+    return None
 
 @tasks_router.post(
     "/{project_id}/tasks/{task_id}/comments", response_model=s.CommentOut
@@ -8034,51 +8225,6 @@ async def delete_incident(
 checklist_router = APIRouter(prefix="/checklists", tags=["Checklist"])
 
 
-@checklist_router.post("")
-async def create_checklist(
-    data: s.ChecklistCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-):
-    obj = m.Checklist(**data.dict())
-    db.add(obj)
-    await db.commit()
-    await db.refresh(obj)
-    return obj
-
-
-@checklist_router.post("/items")
-async def add_item(
-    data: s.ChecklistItemCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-):
-    obj = m.ChecklistItem(**data.dict())
-    db.add(obj)
-    await db.commit()
-    return obj
-
-
-@checklist_router.get("")
-async def list_checklists(
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
-):
-    return (await db.execute(select(m.Checklist))).scalars().all()
-
-
-@checklist_router.post("/execute")
-async def execute_checklist(
-    data: s.ChecklistLogCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-):
-    obj = m.ChecklistLog(**data.dict())
-    db.add(obj)
-    await db.commit()
-    return obj
-
-
 @checklist_router.get("/logs", response_model=PaginatedResponse[s.ChecklistLogOut])
 async def list_logs(
     project_id: Optional[int] = None,
@@ -8101,6 +8247,60 @@ async def list_logs(
         items=items, meta=PaginationMeta(total=count, limit=limit, offset=offset)
     )
 
+#=====================================================
+
+
+@checklist_router.post("")
+async def create_checklist(
+    data: s.ChecklistCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    obj = m.Checklist(**data.dict())
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+#=============================================
+
+@checklist_router.get("/{id}")
+async def get_checklist(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    return checklist
+
+#=============================================
+
+@checklist_router.put("/{id}")
+async def update_checklist(
+    id: int,
+    data: s.ChecklistUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    for key, value in data.dict(exclude_unset=True).items():
+        setattr(checklist, key, value)
+
+    await db.commit()
+    await db.refresh(checklist)
+
+    return checklist
+
+#=============================================
 
 @checklist_router.delete("/{id}")
 async def delete_checklist(
@@ -8108,10 +8308,180 @@ async def delete_checklist(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
-    obj = await db.get(m.Checklist, id)
-    await db.delete(obj)
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    await db.delete(checklist)
+
     await db.commit()
-    return {"message": "Checklist deleted"}
+
+    return {"message": "Checklist deleted successfully"}
+
+#=============================================
+
+@checklist_router.post("/items")
+async def add_item(
+    data: s.ChecklistItemCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    checklist = await db.get(m.Checklist, data.checklist_id)
+
+    if not checklist:
+        raise HTTPException(
+            status_code=404,
+            detail="Checklist not found"
+        )
+
+    existing = await db.scalar(
+        select(m.ChecklistItem).where(
+            m.ChecklistItem.checklist_id == data.checklist_id,
+            m.ChecklistItem.item == data.item
+        )
+    )
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Checklist item already exists"
+        )
+
+    obj = m.ChecklistItem(
+        checklist_id=data.checklist_id,
+        item=data.item
+    )
+
+    db.add(obj)
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return obj
+
+#=============================================
+
+
+@checklist_router.get("/{id}/items")
+async def get_items(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    result = await db.execute(
+        select(m.ChecklistItem)
+        .where(m.ChecklistItem.checklist_id == id)
+        .order_by(m.ChecklistItem.id)
+    )
+
+    return result.scalars().all()
+
+#=============================================
+
+
+@checklist_router.put("/items/{item_id}")
+async def update_item(
+    item_id: int,
+    data: s.ChecklistItemUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    item = await db.get(m.ChecklistItem, item_id)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+
+    for key, value in data.dict(exclude_unset=True).items():
+        setattr(item, key, value)
+
+    await db.commit()
+    await db.refresh(item)
+
+    return item
+
+#=============================================
+
+@checklist_router.get("/items/{checklist_id}")
+async def list_items(
+    checklist_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    checklist = await db.get(m.Checklist, checklist_id)
+
+    if not checklist:
+        raise HTTPException(404, "Checklist not found")
+
+    result = await db.execute(
+        select(m.ChecklistItem)
+        .where(m.ChecklistItem.checklist_id == checklist_id)
+        .order_by(m.ChecklistItem.id)
+    )
+
+    return result.scalars().all()
+
+#==========================================
+
+@checklist_router.delete("/items/{item_id}")
+async def delete_item(
+    item_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    item = await db.get(m.ChecklistItem, item_id)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+
+    await db.delete(item)
+
+    await db.commit()
+
+    return {"message": "Checklist item deleted"}
+
+#=============================================
+
+
+@checklist_router.get("")
+async def list_checklists(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    return (await db.execute(select(m.Checklist))).scalars().all()
+
+#=============================================
+
+@checklist_router.post("/{id}/execute")
+async def execute_checklist(
+    id: int,
+    data: s.ChecklistLogCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    log = m.ChecklistLog(
+        checklist_id=id,
+        project_id=data.project_id,
+        remarks=data.remarks,
+        executed_by=current_user.id,
+    )
+
+    db.add(log)
+
+    await db.commit()
+    await db.refresh(log)
+
+    return log
 
 
 # ===================== Site Photos =====================
@@ -8207,6 +8577,7 @@ async def list_photos(
     if end_date:
         query = query.where(m.SitePhoto.date <= end_date)
 
+    query = query.order_by(m.SitePhoto.created_at.desc())
     result = (await db.execute(query)).scalars().all()
     return result
 
@@ -8598,7 +8969,7 @@ async def list_requests(
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
-        select(m.SiteRequest).where(m.SiteRequest.project_id == project_id)
+        select(m.SiteRequest).where(m.SiteRequest.project_id == project_id).order_by(m.SiteRequest.created_at.desc())
     )
     return result.scalars().all()
 
@@ -8630,278 +9001,6 @@ async def reject_request(
     await db.commit()
     return {"message": "Rejected"}
 
-
-# ===================== COMMUNICATION =====================
-from app.models.messages import Message
-
-communication_router = APIRouter(prefix="/communication", tags=["Communication"])
-
-# ===================== 1. SEND MESSAGE =====================
-
-
-@communication_router.post("/{project_id}/messages")
-async def send_message(
-    request: Request,
-    project_id: int,
-    payload: s.MessageCreate,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    #  FIX: validate parent_id
-    parent = None
-    if payload.parent_id:
-        parent = await db.get(Message, payload.parent_id)
-        if not parent:
-            raise HTTPException(status_code=400, detail="Parent message not found")
-
-    obj = Message(
-        project_id=project_id,
-        message=payload.message,
-        parent_id=parent.id if parent else None,  #  FIXED
-        attachment_url=payload.attachment_url,
-        created_by=current_user.id,
-        status=MessageStatus.SENT,
-    )
-
-    db.add(obj)
-    await db.flush()
-    await db.refresh(obj)
-
-    redis = request.app.state.redis
-
-    if redis:
-        await redis.publish(
-            f"project:{project_id}",
-            json.dumps(
-                {
-                    "id": obj.id,
-                    "message": obj.message,
-                    "parent_id": obj.parent_id,  # added (helpful)
-                    "user": current_user.id,
-                    "created_at": obj.created_at.isoformat(),
-                    "status": obj.status.value,
-                    "timestamp": obj.created_at.isoformat(),
-                }
-            ),
-        )
-
-    return obj
-
-
-# ===================== 2. GET MESSAGES =====================
-
-
-@communication_router.get("/{project_id}/messages")
-async def get_messages(
-    project_id: int,
-    limit: int = 20,
-    offset: int = 0,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    result = await db.execute(
-        select(Message)
-        .where(Message.project_id == project_id)
-        .order_by(Message.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-
-    return result.scalars().all()
-
-
-# ===================== 3. GET REPLIES =====================
-
-
-@communication_router.get("/messages/{message_id}/replies")
-async def get_replies(
-    message_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    obj = await db.get(Message, message_id)
-
-    if not obj:
-        raise NotFoundError("Message not found")
-
-    await assert_project_access(
-        db, project_id=obj.project_id, current_user=current_user
-    )
-
-    result = await db.execute(
-        select(Message)
-        .where(Message.parent_id == message_id)
-        .order_by(Message.created_at.asc())
-    )
-
-    return result.scalars().all()
-
-
-# ===================== 4. MARK AS READ =====================
-
-
-@communication_router.put("/messages/{id}/read")
-async def mark_read(
-    request: Request,
-    id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    obj = await db.get(Message, id)
-
-    if not obj:
-        raise NotFoundError("Message not found")
-
-    await assert_project_access(
-        db, project_id=obj.project_id, current_user=current_user
-    )
-
-    obj.status = MessageStatus.READ
-    await db.flush()
-
-    redis = request.app.state.redis
-
-    if redis:
-        await redis.publish(
-            f"project:{obj.project_id}",
-            json.dumps(
-                {
-                    "type": "read",
-                    "message_id": obj.id,
-                    "user": current_user.id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            ),
-        )
-
-    return {"message": "read"}
-
-
-# ===================== 5. MARK AS DELIVERED =====================
-
-
-@communication_router.put("/messages/{id}/delivered")
-async def mark_delivered(
-    request: Request,
-    id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    obj = await db.get(Message, id)
-
-    if not obj:
-        raise NotFoundError("Message not found")
-
-    await assert_project_access(
-        db, project_id=obj.project_id, current_user=current_user
-    )
-
-    obj.status = MessageStatus.DELIVERED
-    await db.flush()
-
-    redis = request.app.state.redis
-
-    if redis:
-        await redis.publish(
-            f"project:{obj.project_id}",
-            json.dumps(
-                {
-                    "type": "delivered",
-                    "message_id": obj.id,
-                    "user": current_user.id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-            ),
-        )
-
-    return {"message": "delivered"}
-
-
-# ===================== 6. UNREAD COUNT =====================
-
-
-@communication_router.get("/{project_id}/messages/unread-count")
-async def unread_count(
-    project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    count = await db.scalar(
-        select(func.count()).where(
-            Message.project_id == project_id, Message.status != "read"
-        )
-    )
-
-    return {"unread": count}
-
-
-# ===================== 7. DELETE MESSAGE =====================
-
-
-@communication_router.delete("/messages/{id}")
-async def delete_message(
-    id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    obj = await db.get(Message, id)
-
-    if not obj:
-        raise NotFoundError("Message not found")
-
-    await assert_project_access(
-        db, project_id=obj.project_id, current_user=current_user
-    )
-
-    if obj.created_by != current_user.id:
-        raise ValidationError("Not allowed")
-
-    result = await db.execute(select(Message).where(Message.parent_id == id))
-    child = result.scalars().first()
-
-    if child:
-        raise ValidationError("Cannot delete message with replies")
-
-    await db.delete(obj)
-    await db.flush()
-
-    return {"message": "deleted"}
-
-
-# ===================== 8. UPDATE MESSAGE =====================
-
-
-@communication_router.put("/messages/{id}")
-async def update_message(
-    id: int,
-    payload: s.MessageCreate,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    obj = await db.get(Message, id)
-
-    if not obj:
-        raise NotFoundError("Message not found")
-
-    await assert_project_access(
-        db, project_id=obj.project_id, current_user=current_user
-    )
-
-    if obj.created_by != current_user.id:
-        raise ValidationError("Not allowed")
-
-    obj.message = payload.message
-    obj.attachment_url = payload.attachment_url
-
-    await db.flush()
-
-    return obj
 
 
 router.include_router(milestones_router)

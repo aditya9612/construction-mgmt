@@ -35,7 +35,6 @@ from app.api.project import (
     site_photo_router,
     drawing_router,
     site_request_router,
-    communication_router,
 )
 from app.api.boq import router as boq_router
 from app.api.user import router as user_router
@@ -274,7 +273,6 @@ def create_app() -> FastAPI:
     api_router.include_router(equipment_router)
     api_router.include_router(document_router)
     api_router.include_router(site_request_router)
-    api_router.include_router(communication_router)
     api_router.include_router(chats_router)
     api_router.include_router(ai_router)
     api_router.include_router(owner_router)

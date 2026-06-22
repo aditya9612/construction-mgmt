@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
@@ -1248,18 +1249,24 @@ async def create_quotation(
 
 
 @router.get("/", response_model=list[s.QuotationOut])
-async def list_quotations(db: AsyncSession = Depends(get_db_session)):
+async def list_quotations(
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    db: AsyncSession = Depends(get_db_session)
+):
 
-    result = await db.execute(
-        select(QuotationMaster).options(
-            selectinload(QuotationMaster.items).selectinload(
-                QuotationItem.measurements
-            ),
-            selectinload(QuotationMaster.labour_items),
-            selectinload(QuotationMaster.material_items),
-            selectinload(QuotationMaster.extra_charge_items),
-        )
+    query = select(QuotationMaster).options(
+        selectinload(QuotationMaster.items).selectinload(
+            QuotationItem.measurements
+        ),
+        selectinload(QuotationMaster.labour_items),
+        selectinload(QuotationMaster.material_items),
+        selectinload(QuotationMaster.extra_charge_items),
     )
+    
+    if project_id:
+        query = query.where(QuotationMaster.project_id == project_id)
+
+    result = await db.execute(query)
 
     return result.scalars().unique().all()
 

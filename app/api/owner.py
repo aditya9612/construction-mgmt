@@ -109,73 +109,62 @@ async def get_client_portfolio(
     portfolio_items = []
     total_outstanding = Decimal("0")
 
+    owner_ids = [o.id for o in owners]
+    if not owner_ids:
+        return {"portfolio": [], "total_outstanding": 0}
+
+    # Batched Project Stats
+    proj_stats_res = await db.execute(
+        select(
+            Project.owner_id, 
+            func.count(Project.id), 
+            func.max(Project.project_name),
+            func.sum(case((and_(Project.status == ProjectStatus.ONGOING.value, Project.end_date < date.today()), 1), else_=0)),
+            func.sum(case((Project.status == "Completed", 1), else_=0))
+        ).where(Project.owner_id.in_(owner_ids)).group_by(Project.owner_id)
+    )
+    proj_stats = {row[0]: (row[1], row[2], int(row[3] or 0), int(row[4] or 0)) for row in proj_stats_res.all()}
+
+    # Batched Financial Stats
+    fin_stats_res = await db.execute(
+        select(
+            Invoice.owner_id,
+            func.sum(Invoice.pending_amount),
+            func.sum(Invoice.paid_amount)
+        ).where(Invoice.owner_id.in_(owner_ids)).group_by(Invoice.owner_id)
+    )
+    fin_stats = {row[0]: (Decimal(row[1] or 0), Decimal(row[2] or 0)) for row in fin_stats_res.all()}
+
+    # Batched Overdue Payments
+    overdue_res = await db.execute(
+        select(
+            OwnerPaymentSchedule.owner_id,
+            func.count(OwnerPaymentSchedule.id)
+        ).where(
+            OwnerPaymentSchedule.owner_id.in_(owner_ids),
+            OwnerPaymentSchedule.status != "Paid",
+            OwnerPaymentSchedule.due_date < date.today()
+        ).group_by(OwnerPaymentSchedule.owner_id)
+    )
+    overdue_stats = {row[0]: int(row[1] or 0) for row in overdue_res.all()}
+
     for owner in owners:
-
-        # 2. Get project stats for this owner
-        project_stats = await db.execute(
-            select(func.count(Project.id), func.max(Project.project_name)).where(
-                Project.owner_id == owner.id
-            )
-        )
-
-        total_projects, latest_project = project_stats.one()
-
-        # 3. Get financial stats for this owner
-        financial_stats = await db.execute(
-            select(
-                func.sum(Invoice.pending_amount), func.sum(Invoice.paid_amount)
-            ).where(Invoice.owner_id == owner.id)
-        )
-
-        pending_billing, total_received = financial_stats.one()
-
-        pending_val = Decimal(pending_billing or 0)
-        received_val = Decimal(total_received or 0)
-
+        total_projects, latest_project, delayed_count, completed_count = proj_stats.get(owner.id, (0, None, 0, 0))
+        pending_val, received_val = fin_stats.get(owner.id, (Decimal(0), Decimal(0)))
+        overdue_count = overdue_stats.get(owner.id, 0)
+        
         total_outstanding += pending_val
 
-        # --- AUTO SATISFACTION CALCULATION ---
-
         score = 100
+        score -= delayed_count * 10
+        score -= overdue_count * 5
+        score += completed_count * 2
 
-        # delayed projects penalty
-        delayed_projects = await db.scalar(
-            select(func.count(Project.id)).where(
-                Project.owner_id == owner.id, Project.status == "Delayed"
-            )
-        )
-
-        score -= int(delayed_projects or 0) * 10
-
-        # overdue payment milestones penalty
-        overdue_payments = await db.scalar(
-            select(func.count(OwnerPaymentSchedule.id)).where(
-                OwnerPaymentSchedule.owner_id == owner.id,
-                OwnerPaymentSchedule.status != "Paid",
-                OwnerPaymentSchedule.due_date < date.today(),
-            )
-        )
-
-        score -= int(overdue_payments or 0) * 5
-
-        # completed projects bonus
-        completed_projects = await db.scalar(
-            select(func.count(Project.id)).where(
-                Project.owner_id == owner.id, Project.status == "Completed"
-            )
-        )
-
-        score += int(completed_projects or 0) * 2
-
-        # high pending billing penalty
         if pending_val > 500000:
             score -= 10
-
-        # no projects = no score
         if not total_projects:
             score = 0
-
-        # clamp final value
+            
         score = max(0, min(score, 100))
 
         portfolio_items.append(
@@ -352,7 +341,7 @@ async def get_owner_payments(
         raise NotFoundError("Owner not found")
 
     result = await db.execute(
-        select(OwnerTransaction).where(OwnerTransaction.owner_id == owner_id)
+        select(OwnerTransaction).where(OwnerTransaction.owner_id == owner_id).order_by(OwnerTransaction.created_at.desc())
     )
     rows = result.scalars().all()
 
@@ -369,7 +358,7 @@ async def get_owner_ledger(
         raise NotFoundError("Owner not found")
 
     result = await db.execute(
-        select(OwnerTransaction).where(OwnerTransaction.owner_id == owner_id)
+        select(OwnerTransaction).where(OwnerTransaction.owner_id == owner_id).order_by(OwnerTransaction.created_at.desc())
     )
     transactions = result.scalars().all()
 

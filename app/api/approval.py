@@ -54,6 +54,32 @@ async def create_approval(
         if boq:
             boq.approval_status = "Pending"
 
+    elif payload.entity_type == "measurement":
+        from app.models.final_measurement import FinalMeasurement
+        measurement = await db.get(FinalMeasurement, payload.entity_id)
+        if measurement:
+            measurement.status = "SUBMITTED"
+
+    elif payload.entity_type == "purchase_order":
+        from app.models.material import PurchaseOrder
+        po = await db.get(PurchaseOrder, payload.entity_id)
+        if not po:
+            raise ValidationError("Purchase Order not found")
+        if po.status not in ["CREATED", "REJECTED"]:
+            raise ValidationError(f"Cannot submit PO for approval. Current status is {po.status}")
+        po.status = "PENDING"
+
+    elif payload.entity_type == "document":
+        from app.models.document import Document
+        from app.core.enums import DocumentStatus
+        
+        doc = await db.get(Document, payload.entity_id)
+        if not doc:
+            raise ValidationError("Document not found")
+        if doc.status not in [DocumentStatus.PENDING, DocumentStatus.REJECTED]:
+            raise ValidationError(f"Cannot submit document for approval. Current status is {doc.status}")
+        doc.status = DocumentStatus.UNDER_REVIEW
+
     elif obj.entity_type == "drawing":
         from app.models.project import DrawingDocument
         from app.core.enums import DocumentStatus
@@ -116,6 +142,28 @@ async def approve(
 
         if boq:
             boq.approval_status = "Approved"
+
+    elif obj.entity_type == "measurement":
+        from app.models.final_measurement import FinalMeasurement
+        measurement = await db.get(FinalMeasurement, obj.entity_id)
+        if measurement:
+            measurement.status = "APPROVED"
+
+    elif obj.entity_type == "purchase_order":
+        from app.models.material import PurchaseOrder
+        po = await db.get(PurchaseOrder, obj.entity_id)
+        if po:
+            if po.status != "PENDING":
+                raise ValidationError(f"Cannot approve PO. Current status is {po.status}")
+            po.status = "APPROVED"
+
+    elif obj.entity_type == "document":
+        from app.models.document import Document
+        from app.core.enums import DocumentStatus
+        
+        doc = await db.get(Document, obj.entity_id)
+        if doc:
+            doc.status = DocumentStatus.APPROVED
 
     elif obj.entity_type == "drawing":
         from app.models.project import DrawingDocument
@@ -183,6 +231,28 @@ async def reject(
 
         if boq:
             boq.approval_status = "Rejected"
+
+    elif obj.entity_type == "measurement":
+        from app.models.final_measurement import FinalMeasurement
+        measurement = await db.get(FinalMeasurement, obj.entity_id)
+        if measurement:
+            measurement.status = "REJECTED"
+
+    elif obj.entity_type == "purchase_order":
+        from app.models.material import PurchaseOrder
+        po = await db.get(PurchaseOrder, obj.entity_id)
+        if po:
+            if po.status != "PENDING":
+                raise ValidationError(f"Cannot reject PO. Current status is {po.status}")
+            po.status = "REJECTED"
+
+    elif obj.entity_type == "document":
+        from app.models.document import Document
+        from app.core.enums import DocumentStatus
+        
+        doc = await db.get(Document, obj.entity_id)
+        if doc:
+            doc.status = DocumentStatus.REJECTED
 
     elif obj.entity_type == "drawing":
         from app.models.project import DrawingDocument

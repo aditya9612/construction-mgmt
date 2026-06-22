@@ -147,6 +147,9 @@ async def update_measurement(
         logger.warning(f"Measurement not found id={id}")
         raise NotFoundError("Measurement not found")
 
+    if obj.status not in ["DRAFT", "REJECTED"]:
+        raise ValidationError("Cannot modify a measurement once it has been submitted for approval.")
+
     invoice_exists = await db.scalar(
         select(Invoice).where(
             Invoice.project_id == obj.project_id, Invoice.type == "owner"
@@ -208,6 +211,9 @@ async def delete_measurement(
         logger.warning(f"Measurement not found id={id}")
         raise NotFoundError("Measurement not found")
 
+    if obj.status not in ["DRAFT", "REJECTED"]:
+        raise ValidationError("Cannot modify a measurement once it has been submitted for approval.")
+
     invoice_exists = await db.scalar(
         select(Invoice).where(
             Invoice.project_id == obj.project_id, Invoice.type == "owner"
@@ -263,6 +269,9 @@ async def update_measurement_status(
     valid_statuses = ["DRAFT", "SUBMITTED", "VERIFIED", "APPROVED", "REJECTED", "BILLED"]
     if payload.status not in valid_statuses:
         raise ValidationError(f"Invalid status. Must be one of: {valid_statuses}")
+
+    if payload.status in ["APPROVED", "REJECTED"]:
+        raise ValidationError("Cannot manually set status to APPROVED or REJECTED. Must use the central Approvals API.")
 
     obj.status = payload.status
 

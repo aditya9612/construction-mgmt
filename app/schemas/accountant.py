@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -63,8 +63,6 @@ class TransactionOut(BaseModel):
     mode: str
     reference: Optional[str]
 
-    class Config:
-        from_attributes = True
 
 
 # ============================
@@ -139,6 +137,59 @@ class OfferOut(BaseModel):
     society_name: str
     address: str
     extra_carpet_percent: int
+
+    class Config:
+        from_attributes = True
+
+
+# ===================== NEW ACCOUNTING SCHEMAS =====================
+
+class BankTransactionCreate(BaseModel):
+    bank_account_id: int
+    transaction_date: date
+    amount: float
+    type: str
+    description: Optional[str] = None
+    reference_number: Optional[str] = None
+
+class BankTransactionOut(BankTransactionCreate):
+    id: int
+    is_reconciled: int
+    matched_journal_id: Optional[int]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class FundTransferCreate(BaseModel):
+    from_account_id: int
+    to_account_id: int
+    amount: float
+    transfer_date: date
+    reference_number: Optional[str] = None
+    remarks: Optional[str] = None
+
+class FundTransferOut(FundTransferCreate):
+    id: int
+    journal_entry_id: Optional[int]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class GSTReturnCreate(BaseModel):
+    filing_period: str
+    return_type: str
+    taxable_value: float = 0
+    gst_liability: float = 0
+    itc_available: float = 0
+    net_gst_payable: float = 0
+    status: str = "Draft"
+    filing_date: Optional[date] = None
+
+class GSTReturnOut(GSTReturnCreate):
+    id: int
+    created_at: datetime
 
     class Config:
         from_attributes = True

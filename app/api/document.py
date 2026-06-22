@@ -58,7 +58,7 @@ async def get_document_stats(
     """
     total_size = await db.scalar(select(func.sum(Document.file_size))) or 0
     pending_count = await db.scalar(
-        select(func.count(Document.id)).where(Document.status == DocumentStatus.PENDING)
+        select(func.count(Document.id)).where(Document.status == DocumentStatus.UNDER_REVIEW)
     )
     total_docs = await db.scalar(
         select(func.count(Document.id)).where(Document.is_folder == False)
@@ -273,6 +273,9 @@ async def update_document(
     if not obj:
         raise NotFoundError("Document not found")
 
+    if obj.status in [DocumentStatus.UNDER_REVIEW, DocumentStatus.APPROVED]:
+        raise ValidationError(f"Cannot edit document. Current status is {obj.status}")
+
     if is_real_value(title):
         obj.title = title
 
@@ -281,9 +284,6 @@ async def update_document(
 
     if is_real_value(remarks):
         obj.remarks = remarks
-
-    if status is not None:
-        obj.status = status
 
     if is_real_value(version):
         obj.version = version
@@ -335,6 +335,9 @@ async def delete_document(
     obj = await db.scalar(select(Document).where(Document.id == document_id))
     if obj is None:
         raise NotFoundError("Document not found")
+
+    if obj.status in [DocumentStatus.UNDER_REVIEW, DocumentStatus.APPROVED]:
+        raise ValidationError(f"Cannot delete document. Current status is {obj.status}")
 
     # Delete physical file
     if obj.file_url and os.path.exists(obj.file_url):

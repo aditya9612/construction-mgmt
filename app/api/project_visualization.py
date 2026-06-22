@@ -20,7 +20,7 @@ async def list_visualizations(
     id: int,
     db: AsyncSession = Depends(get_db_session)
 ):
-    query = select(ProjectVisualization).where(ProjectVisualization.project_id == id)
+    query = select(ProjectVisualization).where(ProjectVisualization.project_id == id).order_by(ProjectVisualization.created_at.desc())
     result = await db.execute(query)
     return result.scalars().all()
 

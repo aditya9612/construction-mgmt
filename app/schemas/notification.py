@@ -23,3 +23,12 @@ class NotificationOut(NotificationBase):
 
     class Config:
         from_attributes = True
+
+class PMNotificationOut(BaseModel):
+    id: int
+    title: str
+    message: str
+    type: str # Delay, Budget, Material, Safety, QC
+    project_name: Optional[str] = None
+    created_at: datetime
+    is_read: bool

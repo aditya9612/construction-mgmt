@@ -117,3 +117,15 @@ class BOQOut(BaseSchema):
 
 class BOQBulkCreate(BaseSchema):
     items: list[BOQCreate]
+
+class BOQImportError(BaseSchema):
+    row: int
+    message: str
+
+class BOQImportResponse(BaseSchema):
+    total_rows: int
+    valid_rows: int
+    invalid_rows: int
+    errors: list[BOQImportError]
+    valid_activity_types: list[str]
+    items: list[BOQCreate]
