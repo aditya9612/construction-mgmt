@@ -5,6 +5,7 @@ import io
 import json
 
 # FastAPI
+from dateutil.utils import today
 from fastapi import (
     APIRouter,
     Depends,
@@ -39,6 +40,7 @@ from app.cache.redis import (
 )
 
 # Internal - Dependencies
+from app.core import db
 from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
@@ -49,6 +51,7 @@ from app.core.dependencies import (
 from app.db.session import get_db_session
 from app.models.equipment import (
     Equipment,
+    EquipmentPurchase,
     EquipmentUsage,
     EquipmentMaintenance,
     EquipmentRental,
@@ -64,11 +67,21 @@ from openpyxl.cell.cell import MergedCell
 # Internal - Schemas
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.equipment import (
+    DeleteRentalResponse,
+    DeleteUsageResponse,
     EquipmentAllocateRequest,
     EquipmentAllocateResponse,
     EquipmentCreate,
     EquipmentDeallocateRequest,
     EquipmentDeallocateResponse,
+    EquipmentKPIOut,
+    EquipmentMaintenanceUpdate,
+    EquipmentPurchaseCreate,
+    EquipmentPurchaseOut,
+    EquipmentPurchaseUpdate,
+    EquipmentPurchaseReportItem,
+    EquipmentRentalUpdate,
+    EquipmentTransferRequest,
     EquipmentUpdate,
     EquipmentOut,
     EquipmentUsageCreate,
@@ -79,6 +92,7 @@ from app.schemas.equipment import (
     EquipmentRentalOut,
     EquipmentAuditLogOut,
     AllocationOut,
+    EquipmentUsageUpdate,
     UsageReportItem,
     CostReportItem,
     AvailabilityReportItem,
@@ -184,6 +198,23 @@ def safe_parse(value):
     return {"raw": str(value)}
 
 
+def status_from_row(row):
+
+    if row.is_completed:
+        return "COMPLETED"
+
+    if row.next_maintenance_date is None:
+        return "NO_SCHEDULE"
+
+    if row.next_maintenance_date < today:
+        return "OVERDUE"
+
+    if row.next_maintenance_date == today:
+        return "TODAY"
+
+    return "UPCOMING"
+
+
 def convert_decimal(obj):
     if isinstance(obj, Decimal):
         return float(obj)
@@ -192,6 +223,345 @@ def convert_decimal(obj):
     if isinstance(obj, list):
         return [convert_decimal(i) for i in obj]
     return obj
+
+
+async def recalculate_equipment_status(
+    db: AsyncSession,
+    equipment: Equipment,
+):
+    today = date.today()
+
+    # 1. Damaged check
+    if equipment.condition == EquipmentCondition.DAMAGED:
+        equipment.status = EquipmentStatus.DAMAGED
+        return
+
+    # 2. Pending maintenance check
+    pending_maintenance = await db.scalar(
+        select(
+            exists().where(
+                EquipmentMaintenance.equipment_id == equipment.id,
+                EquipmentMaintenance.is_completed == False,
+                EquipmentMaintenance.maintenance_date <= today,
+            )
+        )
+    )
+
+    if pending_maintenance:
+        equipment.status = EquipmentStatus.MAINTENANCE
+        return
+
+    # 3. Project allocation check
+    if equipment.project_id:
+        equipment.status = EquipmentStatus.IN_PROJECT
+        return
+
+    active_rental = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.start_date <= today,
+                or_(
+                    EquipmentRental.end_date.is_(None),
+                    EquipmentRental.end_date >= today,
+                ),
+            )
+        )
+    )
+
+    if active_rental:
+        equipment.status = EquipmentStatus.RENTED
+        return
+
+    future_rental = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.start_date > today,
+            )
+        )
+    )
+
+    if future_rental:
+        equipment.status = EquipmentStatus.IDLE
+        return
+
+    equipment.status = EquipmentStatus.AVAILABLE
+
+
+# ============================== EQUIPMENT KPI ========================
+
+MAX_MONTHLY_HOURS = 240
+
+
+@router.get("/kpi", response_model=EquipmentKPIOut)
+async def equipment_kpi(
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    total_equipment = await db.scalar(
+        select(func.count()).select_from(Equipment).where(Equipment.is_deleted == False)
+    )
+
+    available = await db.scalar(
+        select(func.count())
+        .select_from(Equipment)
+        .where(
+            Equipment.status == EquipmentStatus.AVAILABLE,
+            Equipment.is_deleted == False,
+        )
+    )
+
+    allocated = await db.scalar(
+        select(func.count())
+        .select_from(Equipment)
+        .where(
+            Equipment.status == EquipmentStatus.IN_PROJECT,
+            Equipment.is_deleted == False,
+        )
+    )
+
+    rented = await db.scalar(
+        select(func.count())
+        .select_from(Equipment)
+        .where(
+            Equipment.status == EquipmentStatus.RENTED,
+            Equipment.is_deleted == False,
+        )
+    )
+
+    maintenance = await db.scalar(
+        select(func.count())
+        .select_from(Equipment)
+        .where(
+            Equipment.status == EquipmentStatus.MAINTENANCE,
+            Equipment.is_deleted == False,
+        )
+    )
+
+    damaged = await db.scalar(
+        select(func.count())
+        .select_from(Equipment)
+        .where(
+            Equipment.condition == EquipmentCondition.DAMAGED,
+            Equipment.is_deleted == False,
+        )
+    )
+
+    total_hours = (
+        await db.scalar(
+            select(func.sum(EquipmentUsage.working_hours))
+            .join(
+                Equipment,
+                Equipment.id == EquipmentUsage.equipment_id,
+            )
+            .where(
+                Equipment.is_deleted == False,
+            )
+        )
+        or 0
+    )
+
+    max_possible_hours = (total_equipment or 0) * MAX_MONTHLY_HOURS
+
+    utilization_rate = (
+        (float(total_hours) / max_possible_hours) * 100 if max_possible_hours else 0
+    )
+
+    rental_revenue = (
+        await db.scalar(
+            select(func.sum(EquipmentRental.rental_cost))
+            .join(
+                Equipment,
+                Equipment.id == EquipmentRental.equipment_id,
+            )
+            .where(
+                Equipment.is_deleted == False,
+            )
+        )
+        or 0
+    )
+
+    maintenance_cost = (
+        await db.scalar(
+            select(func.sum(EquipmentMaintenance.cost))
+            .join(
+                Equipment,
+                Equipment.id == EquipmentMaintenance.equipment_id,
+            )
+            .where(
+                Equipment.is_deleted == False,
+            )
+        )
+        or 0
+    )
+
+    return EquipmentKPIOut(
+        total_equipment=total_equipment or 0,
+        available=available or 0,
+        allocated=allocated or 0,
+        rented=rented or 0,
+        maintenance=maintenance or 0,
+        damaged=damaged or 0,
+        utilization_rate=round(utilization_rate, 2),
+        total_rental_revenue=float(rental_revenue),
+        total_maintenance_cost=float(maintenance_cost),
+    )
+
+
+# ====================USAGE REPORT====================
+
+
+@router.get("/usage/report", response_model=List[UsageReportItem])
+async def usage_report(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+):
+    stmt = (
+        select(
+            EquipmentUsage.equipment_id,
+            Equipment.equipment_code,
+            func.sum(EquipmentUsage.working_hours).label("total_hours"),
+            func.sum(EquipmentUsage.fuel_used).label("total_fuel"),
+            func.avg(EquipmentUsage.working_hours).label("avg_hours"),
+            func.count().label("usage_count"),
+        )
+        .join(Equipment)
+        .where(Equipment.is_deleted == False)
+        .group_by(EquipmentUsage.equipment_id, Equipment.equipment_code)
+    )
+
+    result = await db.execute(stmt)
+
+    return [
+        UsageReportItem(
+            equipment_id=row.equipment_id,
+            equipment_code=row.equipment_code,
+            total_hours=float(row.total_hours or 0),
+            total_fuel=float(row.total_fuel or 0),
+            avg_hours=float(row.avg_hours or 0),
+            usage_count=int(row.usage_count or 0),
+        )
+        for row in result.all()
+    ]
+
+
+# ========================== COST REPORT ===========================
+
+
+@router.get("/cost/report", response_model=List[CostReportItem])
+async def cost_report(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+):
+    stmt = (
+        select(
+            EquipmentRental.equipment_id,
+            Equipment.equipment_code,
+            func.sum(EquipmentRental.rental_cost).label("total_cost"),
+            func.count(EquipmentRental.id).label("rental_count"),
+            func.sum(
+                (
+                    func.coalesce(
+                        EquipmentRental.end_date,
+                        EquipmentRental.start_date,
+                    )
+                    - EquipmentRental.start_date
+                    + 1
+                )
+            ).label("total_days"),
+        )
+        .join(
+            Equipment,
+            Equipment.id == EquipmentRental.equipment_id,
+        )
+        .where(
+            Equipment.is_deleted == False,
+        )
+        .group_by(
+            EquipmentRental.equipment_id,
+            Equipment.equipment_code,
+        )
+        .order_by(
+            func.sum(EquipmentRental.rental_cost).desc(),
+        )
+    )
+
+    result = await db.execute(stmt)
+
+    response = []
+
+    for row in result.all():
+
+        total_cost = float(row.total_cost or 0)
+        rental_count = int(row.rental_count or 0)
+        total_days = int(row.total_days or 0)
+
+        avg_cost = total_cost / rental_count if rental_count else 0
+
+        revenue_per_day = total_cost / total_days if total_days else 0
+
+        response.append(
+            CostReportItem(
+                equipment_id=row.equipment_id,
+                equipment_code=row.equipment_code,
+                total_cost=round(total_cost, 2),
+                rental_count=rental_count,
+                avg_cost=round(avg_cost, 2),
+                total_days=total_days,
+                revenue_per_day=round(revenue_per_day, 2),
+            )
+        )
+
+    return response
+
+
+# ============================== PURCHASE REPORT ========================
+
+
+@router.get(
+    "/purchase/report",
+    response_model=List[EquipmentPurchaseReportItem],
+)
+async def purchase_report(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+):
+    stmt = (
+        select(
+            EquipmentPurchase.purchase_type,
+            EquipmentPurchase.asset_id,
+            Equipment.equipment_name.label("asset_name"),
+            func.count(EquipmentPurchase.id).label("purchase_count"),
+            func.sum(EquipmentPurchase.quantity).label("total_quantity"),
+            func.sum(EquipmentPurchase.total_amount).label("total_purchase_amount"),
+        )
+        .join(
+            Equipment,
+            Equipment.id == EquipmentPurchase.asset_id,
+        )
+        .group_by(
+            EquipmentPurchase.purchase_type,
+            EquipmentPurchase.asset_id,
+            Equipment.equipment_name,
+        )
+        .order_by(func.sum(EquipmentPurchase.total_amount).desc())
+    )
+
+    result = await db.execute(stmt)
+
+    return [
+        EquipmentPurchaseReportItem(
+            purchase_type=row.purchase_type,
+            asset_id=row.asset_id,
+            asset_name=row.asset_name,
+            purchase_count=row.purchase_count,
+            total_quantity=row.total_quantity,
+            total_purchase_amount=float(row.total_purchase_amount or 0),
+        )
+        for row in result.all()
+    ]
 
 
 # ===================maintenance_alert=======================
@@ -206,18 +576,20 @@ async def maintenance_alerts(
     today = date.today()
     upcoming_date = today + timedelta(days=30)
 
-    #  Subquery → nearest upcoming maintenance per equipment
+    # Nearest pending maintenance per equipment
     subq = (
         select(
             EquipmentMaintenance.equipment_id,
             func.min(EquipmentMaintenance.next_maintenance_date).label("next_date"),
         )
-        .where(EquipmentMaintenance.next_maintenance_date.isnot(None))  # 🔥 IMPORTANT
+        .where(
+            EquipmentMaintenance.next_maintenance_date.isnot(None),
+            EquipmentMaintenance.is_completed == False,
+        )
         .group_by(EquipmentMaintenance.equipment_id)
         .subquery()
     )
 
-    #  Main query
     stmt = (
         select(EquipmentMaintenance, Equipment)
         .join(
@@ -227,19 +599,23 @@ async def maintenance_alerts(
                 EquipmentMaintenance.next_maintenance_date == subq.c.next_date,
             ),
         )
-        .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
+        .join(
+            Equipment,
+            Equipment.id == EquipmentMaintenance.equipment_id,
+        )
         .where(
             and_(
                 EquipmentMaintenance.next_maintenance_date.isnot(None),
+                EquipmentMaintenance.is_completed == False,
                 Equipment.is_deleted == False,
-                Equipment.status == EquipmentStatus.MAINTENANCE,
-                or_(
-                    EquipmentMaintenance.next_maintenance_date < today,
-                    EquipmentMaintenance.next_maintenance_date <= upcoming_date,
-                ),
+
+                # Show all overdue and upcoming maintenance within next 30 days
+                EquipmentMaintenance.next_maintenance_date <= upcoming_date,
             )
         )
-        .order_by(EquipmentMaintenance.next_maintenance_date.asc())
+        .order_by(
+            EquipmentMaintenance.next_maintenance_date.asc()
+        )
     )
 
     result = await db.execute(stmt)
@@ -248,9 +624,9 @@ async def maintenance_alerts(
     alerts = []
 
     for maintenance, equipment in rows:
+
         days_until = (maintenance.next_maintenance_date - today).days
 
-        #  status logic
         if days_until < 0:
             status = "OVERDUE"
         elif days_until == 0:
@@ -274,6 +650,8 @@ async def maintenance_alerts(
 
 
 # ================== "Availability" =======================
+
+
 @router.get("/eq/availability", response_model=List[AvailabilityReportItem])
 async def availability_report(
     db: AsyncSession = Depends(get_db_session),
@@ -281,14 +659,14 @@ async def availability_report(
 ):
     today = date.today()
 
-    # 🔹 get equipments
+    # Get all active equipments
     equipments = (
         (await db.execute(select(Equipment).where(Equipment.is_deleted == False)))
         .scalars()
         .all()
     )
 
-    #  rental ids (bulk)
+    # Active rentals
     rented_ids = set(
         (
             await db.execute(
@@ -305,43 +683,31 @@ async def availability_report(
         .all()
     )
 
-    #  maintenance ids (ONLY TODAY)
-    maintenance_ids = set(
-        (
-            await db.execute(
-                select(EquipmentMaintenance.equipment_id).where(
-                    EquipmentMaintenance.maintenance_date == today
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
     response = []
 
     for eq in equipments:
 
-        # 🔹 determine status
         if eq.condition == EquipmentCondition.DAMAGED:
             status = "DAMAGED"
-        elif eq.id in maintenance_ids:
+
+        elif eq.status == EquipmentStatus.MAINTENANCE:
             status = "MAINTENANCE"
+
         elif eq.id in rented_ids:
             status = "RENTED"
+
         elif eq.project_id is not None:
             status = "ALLOCATED"
+
         else:
             status = "AVAILABLE"
-
-        is_available = status == "AVAILABLE"
 
         response.append(
             AvailabilityReportItem(
                 equipment_id=eq.id,
                 equipment_code=eq.equipment_code,
                 equipment_name=eq.equipment_name,
-                is_available=is_available,
+                is_available=(status == "AVAILABLE"),
                 project_id=eq.project_id,
             )
         )
@@ -605,6 +971,16 @@ async def deallocate_equipment(
             )
             continue
 
+        # NEW VALIDATION
+        if obj.project_id != payload.project_id:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Equipment not allocated to given project",
+                }
+            )
+            continue
+
         old_values = {
             "project_id": obj.project_id,
             "status": obj.status.value,
@@ -649,6 +1025,7 @@ async def deallocate_equipment(
     )
 
     return EquipmentDeallocateResponse(
+        project_id=payload.project_id,
         success_count=len(deallocated_ids),
         failed_count=len(failed),
         deallocated_ids=deallocated_ids,
@@ -676,7 +1053,11 @@ async def get_allocation(
 # =========== EQUIPMENT CRUD ====================
 
 
-@router.post("", response_model=EquipmentOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=EquipmentOut,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_equipment(
     payload: EquipmentCreate,
     current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
@@ -692,28 +1073,59 @@ async def create_equipment(
             )
         )
     )
-    if existing:
-        raise HTTPException(status_code=400, detail="Equipment code already exists")
 
-    # Create project if provided
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment code already exists",
+        )
+
+    # Validate project if provided
     if payload.project_id:
-        project = await db.get(Project, payload.project_id)
+        project = await db.get(
+            Project,
+            payload.project_id,
+        )
+
         if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found",
+            )
 
     obj = Equipment(**payload.model_dump())
+
     db.add(obj)
+
     await db.flush()
 
-    # FIXED HERE
+    # Auto set status based on project/rental/condition
+    await recalculate_equipment_status(
+        db,
+        obj,
+    )
+
     await create_audit_log(
-        db, obj.id, "CREATE", new_values=jsonable_encoder(payload.model_dump())
+        db=db,
+        equipment_id=obj.id,
+        action="CREATE",
+        new_values=jsonable_encoder(payload.model_dump()),
+        user_id=current_user.id,
     )
 
     await db.commit()
-    await bump_cache_version(redis, VERSION_KEY)
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
     await db.refresh(obj)
+
     return EquipmentOut.model_validate(obj)
+
+
+# ================== LIST EQUIPMENT ==================
 
 
 @router.get("", response_model=PaginatedResponse[EquipmentOut])
@@ -764,98 +1176,6 @@ async def list_equipment(
 
     await cache_set_json(redis, cache_key, response)
     return PaginatedResponse[EquipmentOut].model_validate(response)
-
-
-# =====================get_equipment==============================
-
-
-@router.get("/{equipment_id}", response_model=EquipmentOut)
-async def get_equipment(
-    equipment_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    obj = await get_active_equipment_or_404(db, equipment_id)
-    return EquipmentOut.model_validate(obj)
-
-
-@router.put("/{equipment_id}", response_model=EquipmentOut)
-async def update_equipment(
-    equipment_id: int,
-    payload: EquipmentUpdate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(get_request_redis),
-    request: Request = None,
-):
-    # Get existing equipment
-    obj = await get_active_equipment_or_404(db, equipment_id)
-
-    # Duplicate equipment_code check
-    if payload.equipment_code and payload.equipment_code != obj.equipment_code:
-        existing = await db.scalar(
-            select(Equipment).where(
-                and_(
-                    Equipment.equipment_code == payload.equipment_code,
-                    Equipment.is_deleted == False,
-                    Equipment.id != equipment_id,
-                )
-            )
-        )
-        if existing:
-            raise HTTPException(status_code=400, detail="Equipment code already exists")
-
-    # Extract update data
-    update_data = payload.model_dump(exclude_unset=True)
-
-    # Capture old values
-    old_data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
-
-    # Apply updates
-    for field, value in update_data.items():
-        setattr(obj, field, value)
-
-    # Update timestamp
-    if hasattr(obj, "updated_at"):
-        obj.updated_at = datetime.utcnow()
-
-    # Flush changes
-    await db.flush()
-
-    # ONLY changed fields
-    changed_fields = {
-        k: {"old": old_data.get(k), "new": getattr(obj, k)}
-        for k in update_data
-        if old_data.get(k) != getattr(obj, k)
-    }
-
-    # If nothing changed → skip audit
-    if not changed_fields:
-        return EquipmentOut.model_validate(obj)
-
-    # Split old & new properly
-    old_values = {k: v["old"] for k, v in changed_fields.items()}
-    new_values = {k: v["new"] for k, v in changed_fields.items()}
-
-    # 🔹 Audit log (FIXED CORRECTLY)
-    await create_audit_log(
-        db,
-        obj.id,
-        "UPDATE",
-        old_values=jsonable_encoder(old_values),
-        new_values=jsonable_encoder(new_values),
-        user_id=current_user.id,
-        request=request,
-    )
-
-    # 🔹 Cache bump
-    await bump_cache_version(redis, VERSION_KEY)
-
-    # 🔹 Commit + refresh
-    await db.commit()
-    await db.refresh(obj)
-
-    return EquipmentOut.model_validate(obj)
 
 
 # ================== SOFT DELETE ==================
@@ -1048,6 +1368,7 @@ async def create_usage(
             exists().where(
                 EquipmentMaintenance.equipment_id == equipment_id,
                 EquipmentMaintenance.maintenance_date == payload.usage_date,
+                EquipmentMaintenance.is_completed.is_(False),
             )
         )
     )
@@ -1148,44 +1469,163 @@ async def list_usage(
     ]
 
 
-# ====================USAGE REPORT====================
-
-
-@router.get("/usage/report", response_model=List[UsageReportItem])
-async def usage_report(
+# ======================== UPDATE USAGE===========================
+@router.put(
+    "/usage/{usage_id}",
+    response_model=EquipmentUsageOut,
+)
+async def update_usage(
+    usage_id: int,
+    payload: EquipmentUsageUpdate,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    redis=Depends(get_request_redis),
+    request: Request = None,
 ):
-    stmt = (
-        select(
-            EquipmentUsage.equipment_id,
-            Equipment.equipment_code,
-            func.sum(EquipmentUsage.working_hours).label("total_hours"),
-            func.sum(EquipmentUsage.fuel_used).label("total_fuel"),
-            func.avg(EquipmentUsage.working_hours).label("avg_hours"),
-            func.count().label("usage_count"),
-        )
-        .join(Equipment)
-        .where(Equipment.is_deleted == False)
-        .group_by(EquipmentUsage.equipment_id, Equipment.equipment_code)
+
+    usage = await db.get(
+        EquipmentUsage,
+        usage_id,
     )
 
-    result = await db.execute(stmt)
-
-    return [
-        UsageReportItem(
-            equipment_id=row.equipment_id,
-            equipment_code=row.equipment_code,
-            total_hours=float(row.total_hours or 0),
-            total_fuel=float(row.total_fuel or 0),
-            avg_hours=float(row.avg_hours or 0),
-            usage_count=int(row.usage_count or 0),
+    if not usage:
+        raise HTTPException(
+            status_code=404,
+            detail="Usage record not found",
         )
-        for row in result.all()
-    ]
+
+    equipment = await get_active_equipment_or_404(
+        db,
+        usage.equipment_id,
+    )
+
+    old_usage_hours = usage.working_hours
+    old_usage_fuel = usage.fuel_used
+
+    old_total_hours = equipment.working_hours or Decimal("0")
+    old_total_fuel = equipment.fuel_used or Decimal("0")
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    if "usage_date" in update_data and update_data["usage_date"] != usage.usage_date:
+        duplicate = await db.scalar(
+            select(
+                exists().where(
+                    EquipmentUsage.equipment_id == usage.equipment_id,
+                    EquipmentUsage.usage_date == update_data["usage_date"],
+                    EquipmentUsage.id != usage_id,
+                )
+            )
+        )
+
+        if duplicate:
+            raise HTTPException(
+                status_code=400,
+                detail="Usage already exists for this date",
+            )
+
+    for field, value in update_data.items():
+        setattr(usage, field, value)
+
+    equipment.working_hours = old_total_hours - old_usage_hours + usage.working_hours
+
+    equipment.fuel_used = old_total_fuel - old_usage_fuel + usage.fuel_used
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="USAGE_UPDATE",
+        old_values={
+            "working_hours": float(old_usage_hours),
+            "fuel_used": float(old_usage_fuel),
+        },
+        new_values={
+            "working_hours": float(usage.working_hours),
+            "fuel_used": float(usage.fuel_used),
+            "usage_date": str(usage.usage_date),
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+
+    await db.refresh(usage)
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return EquipmentUsageOut.model_validate(usage)
 
 
-# ============== MAINTENANCE =============
+# ========================= DELETE USAGE===========================
+
+
+@router.delete(
+    "/usage/{usage_id}",
+    response_model=DeleteUsageResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def delete_usage(
+    usage_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+
+    usage = await db.get(
+        EquipmentUsage,
+        usage_id,
+    )
+
+    if not usage:
+        raise HTTPException(
+            status_code=404,
+            detail="Usage record not found",
+        )
+
+    equipment = await get_active_equipment_or_404(
+        db,
+        usage.equipment_id,
+    )
+
+    equipment.working_hours -= usage.working_hours
+    equipment.fuel_used -= usage.fuel_used
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="USAGE_DELETE",
+        old_values={
+            "usage_id": usage.id,
+            "working_hours": float(usage.working_hours),
+            "fuel_used": float(usage.fuel_used),
+            "usage_date": str(usage.usage_date),
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.delete(usage)
+
+    await db.commit()
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return DeleteUsageResponse(
+        message="Usage deleted successfully",
+        usage_id=usage_id,
+        equipment_id=equipment.id,
+    )
+
+
+# ==============CREATE MAINTENANCE =============
 
 
 @router.post(
@@ -1353,6 +1793,93 @@ async def create_maintenance(
     )
 
 
+# ======================== UPDATE MAINTENANCE =========================
+@router.put(
+    "/maintenance/{maintenance_id}",
+    response_model=EquipmentMaintenanceOut,
+)
+async def update_maintenance(
+    maintenance_id: int,
+    payload: EquipmentMaintenanceUpdate,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    maintenance = await db.get(
+        EquipmentMaintenance,
+        maintenance_id,
+    )
+
+    if not maintenance:
+        raise HTTPException(
+            status_code=404,
+            detail="Maintenance record not found",
+        )
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    old_values = {}
+
+    for field, value in update_data.items():
+        old_values[field] = getattr(maintenance, field)
+        setattr(maintenance, field, value)
+
+    if (
+        maintenance.next_maintenance_date
+        and maintenance.next_maintenance_date <= maintenance.maintenance_date
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Next maintenance date must be after maintenance date",
+        )
+
+    await create_audit_log(
+        db=db,
+        equipment_id=maintenance.equipment_id,
+        action="MAINTENANCE_UPDATE",
+        old_values=jsonable_encoder(old_values),
+        new_values=jsonable_encoder(update_data),
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+    await db.refresh(maintenance)
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    today = date.today()
+
+    if maintenance.next_maintenance_date:
+
+        if maintenance.next_maintenance_date < today:
+            status = "OVERDUE"
+
+        elif maintenance.next_maintenance_date == today:
+            status = "TODAY"
+
+        else:
+            status = "UPCOMING"
+
+    else:
+        status = "NO_SCHEDULE"
+
+    return EquipmentMaintenanceOut(
+        id=maintenance.id,
+        equipment_id=maintenance.equipment_id,
+        description=maintenance.description,
+        maintenance_date=maintenance.maintenance_date,
+        cost=float(maintenance.cost or 0),
+        next_maintenance_date=maintenance.next_maintenance_date,
+        created_at=maintenance.created_at,
+        status=status,
+    )
+
+
 # ===================== COMPLETE MAINTENANCE =====================
 from datetime import date
 
@@ -1377,6 +1904,13 @@ async def complete_maintenance(
         raise HTTPException(
             status_code=404,
             detail="Maintenance record not found",
+        )
+
+    # Prevent double completion
+    if maintenance.is_completed:
+        raise HTTPException(
+            status_code=400,
+            detail="Maintenance already completed",
         )
 
     equipment = await get_active_equipment_or_404(
@@ -1405,6 +1939,10 @@ async def complete_maintenance(
 
     old_status = equipment.status
 
+    # Mark maintenance completed
+    maintenance.is_completed = True
+    maintenance.completed_at = datetime.utcnow()
+
     # Restore proper equipment status
     if equipment.project_id:
         restored_status = EquipmentStatus.IN_PROJECT
@@ -1423,9 +1961,12 @@ async def complete_maintenance(
         action="MAINTENANCE_COMPLETE",
         old_values={
             "status": old_status.value,
+            "is_completed": False,
         },
         new_values={
             "status": restored_status.value,
+            "is_completed": True,
+            "completed_at": str(maintenance.completed_at),
         },
         user_id=current_user.id,
         request=request,
@@ -1441,7 +1982,6 @@ async def complete_maintenance(
         VERSION_KEY,
     )
 
-    # Return completed status explicitly
     return EquipmentMaintenanceOut(
         id=maintenance.id,
         equipment_id=maintenance.equipment_id,
@@ -1449,9 +1989,74 @@ async def complete_maintenance(
         maintenance_date=maintenance.maintenance_date,
         cost=float(maintenance.cost or 0),
         next_maintenance_date=maintenance.next_maintenance_date,
+        is_completed=maintenance.is_completed,
+        completed_at=maintenance.completed_at,
         created_at=maintenance.created_at,
         status="COMPLETED",
     )
+
+
+# ======================== DELETE MAINTENANCE =====================
+@router.delete(
+    "/maintenance/{maintenance_id}",
+    status_code=status.HTTP_200_OK,
+)
+async def delete_maintenance(
+    maintenance_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    maintenance = await db.get(
+        EquipmentMaintenance,
+        maintenance_id,
+    )
+
+    if not maintenance:
+        raise HTTPException(
+            status_code=404,
+            detail="Maintenance record not found",
+        )
+
+    equipment = await get_active_equipment_or_404(
+        db,
+        maintenance.equipment_id,
+    )
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="MAINTENANCE_DELETE",
+        old_values={
+            "maintenance_id": maintenance.id,
+            "description": maintenance.description,
+            "maintenance_date": str(maintenance.maintenance_date),
+            "cost": float(maintenance.cost or 0),
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.delete(maintenance)
+
+    await recalculate_equipment_status(
+        db,
+        equipment,
+    )
+
+    await db.commit()
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return {
+        "message": "Maintenance deleted successfully",
+        "maintenance_id": maintenance_id,
+        "equipment_id": equipment.id,
+    }
 
 
 # ===================== LIST MAINTENANCE HISTORY =====================
@@ -1493,8 +2098,10 @@ async def list_maintenance(
             maintenance_date=row.maintenance_date,
             cost=float(row.cost or 0),
             next_maintenance_date=row.next_maintenance_date,
+            is_completed=row.is_completed,
+            completed_at=row.completed_at,
             created_at=row.created_at,
-            status=status_from_next(row.next_maintenance_date),
+            status=status_from_row(row),
         )
         for row in rows
     ]
@@ -1566,6 +2173,7 @@ async def create_rental(
                 EquipmentMaintenance.equipment_id == equipment_id,
                 EquipmentMaintenance.maintenance_date >= start_date,
                 EquipmentMaintenance.maintenance_date <= end_date,
+                EquipmentMaintenance.is_completed == False,
             )
         )
     )
@@ -1809,74 +2417,289 @@ async def list_rental(
     return response
 
 
-# ========================== COST REPORT ===========================
+# =============================== RENTAL GET ========================
 
 
-@router.get("/cost/report", response_model=List[CostReportItem])
-async def cost_report(
-    db: AsyncSession = Depends(get_db_session),
+@router.get(
+    "/rental/{rental_id}",
+    response_model=EquipmentRentalOut,
+)
+async def get_rental(
+    rental_id: int,
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
 ):
-    stmt = (
+    rental = await db.get(
+        EquipmentRental,
+        rental_id,
+    )
+
+    if not rental:
+        raise HTTPException(
+            status_code=404,
+            detail="Rental not found",
+        )
+
+    end_date = rental.end_date or rental.start_date
+
+    duration = (end_date - rental.start_date).days + 1
+
+    return EquipmentRentalOut(
+        id=rental.id,
+        equipment_id=rental.equipment_id,
+        start_date=rental.start_date,
+        end_date=rental.end_date,
+        rental_cost=float(rental.rental_cost),
+        client_name=rental.client_name,
+        notes=rental.notes,
+        created_at=rental.created_at,
+        duration=duration,
+        per_day_cost=float(rental.rental_cost) / duration,
+    )
+
+
+# ============================== RENTAL UPDATE ========================
+
+
+@router.put(
+    "/rental/{rental_id}",
+    response_model=EquipmentRentalOut,
+)
+async def update_rental(
+    rental_id: int,
+    payload: EquipmentRentalUpdate,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    rental = await db.get(
+        EquipmentRental,
+        rental_id,
+    )
+
+    if not rental:
+        raise HTTPException(
+            status_code=404,
+            detail="Rental not found",
+        )
+
+    equipment = await get_active_equipment_or_404(
+        db,
+        rental.equipment_id,
+    )
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    old_values = {}
+
+    for field, value in update_data.items():
+        old_values[field] = getattr(
+            rental,
+            field,
+        )
+        setattr(
+            rental,
+            field,
+            value,
+        )
+
+    start_date = rental.start_date
+    end_date = rental.end_date or rental.start_date
+
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=400,
+            detail="End date cannot be before start date",
+        )
+
+    overlap_exists = await db.scalar(
         select(
-            EquipmentRental.equipment_id,
-            Equipment.equipment_code,
-            func.sum(EquipmentRental.rental_cost).label("total_cost"),
-            func.count(EquipmentRental.id).label("rental_count"),
-            func.sum(
-                (
-                    func.coalesce(
-                        EquipmentRental.end_date,
-                        EquipmentRental.start_date,
-                    )
-                    - EquipmentRental.start_date
-                    + 1
-                )
-            ).label("total_days"),
-        )
-        .join(
-            Equipment,
-            Equipment.id == EquipmentRental.equipment_id,
-        )
-        .where(
-            Equipment.is_deleted == False,
-        )
-        .group_by(
-            EquipmentRental.equipment_id,
-            Equipment.equipment_code,
-        )
-        .order_by(
-            func.sum(EquipmentRental.rental_cost).desc(),
+            exists().where(
+                EquipmentRental.equipment_id == rental.equipment_id,
+                EquipmentRental.id != rental.id,
+                EquipmentRental.start_date <= end_date,
+                or_(
+                    EquipmentRental.end_date.is_(None),
+                    EquipmentRental.end_date >= start_date,
+                ),
+            )
         )
     )
 
-    result = await db.execute(stmt)
-
-    response = []
-
-    for row in result.all():
-
-        total_cost = float(row.total_cost or 0)
-        rental_count = int(row.rental_count or 0)
-        total_days = int(row.total_days or 0)
-
-        avg_cost = total_cost / rental_count if rental_count else 0
-
-        revenue_per_day = total_cost / total_days if total_days else 0
-
-        response.append(
-            CostReportItem(
-                equipment_id=row.equipment_id,
-                equipment_code=row.equipment_code,
-                total_cost=round(total_cost, 2),
-                rental_count=rental_count,
-                avg_cost=round(avg_cost, 2),
-                total_days=total_days,
-                revenue_per_day=round(revenue_per_day, 2),
-            )
+    if overlap_exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Rental overlap found",
         )
 
-    return response
+    today = date.today()
+
+    await recalculate_equipment_status(
+        db,
+        equipment,
+    )
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="RENTAL_UPDATE",
+        old_values=jsonable_encoder(old_values),
+        new_values=jsonable_encoder(update_data),
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+
+    await db.refresh(rental)
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    if rental.start_date > today:
+        rental_status = "UPCOMING"
+
+    elif rental.end_date and rental.end_date < today:
+        rental_status = "COMPLETED"
+
+    else:
+        rental_status = "ACTIVE"
+
+    duration = ((rental.end_date or rental.start_date) - rental.start_date).days + 1
+
+    return EquipmentRentalOut(
+        id=rental.id,
+        equipment_id=rental.equipment_id,
+        start_date=rental.start_date,
+        end_date=rental.end_date,
+        rental_cost=float(rental.rental_cost),
+        client_name=rental.client_name,
+        notes=rental.notes,
+        created_at=rental.created_at,
+        status=rental_status,
+        duration=duration,
+        per_day_cost=round(
+            float(rental.rental_cost) / duration,
+            2,
+        ),
+    )
+
+
+# =============================== RENTAL DELETE ========================
+
+
+from pydantic import BaseModel
+
+
+@router.delete(
+    "/rental/{rental_id}",
+    response_model=DeleteRentalResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def delete_rental(
+    rental_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    rental = await db.get(
+        EquipmentRental,
+        rental_id,
+    )
+
+    if not rental:
+        raise HTTPException(
+            status_code=404,
+            detail="Rental not found",
+        )
+
+    equipment = await get_active_equipment_or_404(
+        db,
+        rental.equipment_id,
+    )
+
+    today = date.today()
+
+    old_status = equipment.status
+
+    # Audit before delete
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="RENTAL_DELETE",
+        old_values={
+            "rental_id": rental.id,
+            "start_date": str(rental.start_date),
+            "end_date": str(rental.end_date) if rental.end_date else None,
+            "rental_cost": float(rental.rental_cost),
+            "client_name": rental.client_name,
+            "status": old_status.value if old_status else None,
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.delete(rental)
+
+    # Check if any ACTIVE rental still exists
+    active_rental_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.id != rental_id,
+                EquipmentRental.start_date <= today,
+                or_(
+                    EquipmentRental.end_date.is_(None),
+                    EquipmentRental.end_date >= today,
+                ),
+            )
+        )
+    )
+
+    # Check if any FUTURE rental exists
+    future_rental_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.id != rental_id,
+                EquipmentRental.start_date > today,
+            )
+        )
+    )
+
+    # Restore proper status
+    if equipment.status == EquipmentStatus.MAINTENANCE:
+        pass
+
+    elif equipment.project_id is not None:
+        equipment.status = EquipmentStatus.IN_PROJECT
+
+    elif active_rental_exists:
+        equipment.status = EquipmentStatus.RENTED
+
+    elif future_rental_exists:
+        equipment.status = EquipmentStatus.IDLE
+
+    else:
+        equipment.status = EquipmentStatus.AVAILABLE
+
+    await db.commit()
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return DeleteRentalResponse(
+        message="Rental deleted successfully",
+        rental_id=rental_id,
+        equipment_id=equipment.id,
+        equipment_status=equipment.status.value,
+    )
 
 
 # =================== ADVANCED APIs ============
@@ -2053,13 +2876,706 @@ async def get_audit_logs(
     }
 
 
-# ======================== REPORTS ========================
+# ========================CREATE PURCHASE APIs ========================
+
+
+@router.post(
+    "/purchase",
+    response_model=EquipmentPurchaseOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_purchase(
+    payload: EquipmentPurchaseCreate,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    if payload.purchase_date > date.today():
+        raise HTTPException(
+            status_code=400,
+            detail="Purchase date cannot be future",
+        )
+
+    if payload.warranty_end_date and payload.warranty_end_date <= payload.purchase_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Warranty end date must be after purchase date",
+        )
+
+    equipment = await db.get(
+        Equipment,
+        payload.asset_id,
+    )
+
+    if not equipment:
+        raise HTTPException(
+            status_code=404,
+            detail="Equipment not found",
+        )
+
+    duplicate_invoice = await db.scalar(
+        select(EquipmentPurchase).where(
+            EquipmentPurchase.invoice_number == payload.invoice_number
+        )
+    )
+
+    if duplicate_invoice:
+        raise HTTPException(
+            status_code=400,
+            detail="Invoice number already exists",
+        )
+
+    total_amount = payload.quantity * payload.unit_price
+
+    purchase = EquipmentPurchase(
+        purchase_type=payload.purchase_type,
+        asset_id=payload.asset_id,
+        purchase_date=payload.purchase_date,
+        vendor_name=payload.vendor_name,
+        invoice_number=payload.invoice_number,
+        quantity=payload.quantity,
+        unit_price=payload.unit_price,
+        total_amount=total_amount,
+        warranty_end_date=payload.warranty_end_date,
+        notes=payload.notes,
+    )
+
+    db.add(purchase)
+
+    await db.flush()
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="PURCHASE_CREATE",
+        new_values={
+            "purchase_type": str(payload.purchase_type),
+            "asset_id": payload.asset_id,
+            "invoice_number": payload.invoice_number,
+            "quantity": payload.quantity,
+            "unit_price": float(payload.unit_price),
+            "total_amount": float(total_amount),
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+    await db.refresh(purchase)
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return EquipmentPurchaseOut(
+        id=purchase.id,
+        purchase_type=str(purchase.purchase_type),
+        asset_id=purchase.asset_id,
+        asset_name=equipment.equipment_name,
+        purchase_date=purchase.purchase_date,
+        vendor_name=purchase.vendor_name,
+        invoice_number=purchase.invoice_number,
+        quantity=purchase.quantity,
+        unit_price=float(purchase.unit_price),
+        total_amount=float(purchase.total_amount),
+        warranty_end_date=purchase.warranty_end_date,
+        notes=purchase.notes,
+        created_at=purchase.created_at,
+    )
+
+
+# =============================== PURCHASE LIST ========================
+
+
+@router.get(
+    "/purchase",
+    response_model=List[EquipmentPurchaseOut],
+)
+async def list_purchase(
+    purchase_type: Optional[str] = None,
+    asset_id: Optional[int] = None,
+    vendor_name: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    stmt = select(
+        EquipmentPurchase,
+        Equipment.equipment_name,
+    ).join(
+        Equipment,
+        Equipment.id == EquipmentPurchase.asset_id,
+    )
+
+    if purchase_type:
+        stmt = stmt.where(EquipmentPurchase.purchase_type == purchase_type)
+
+    if asset_id:
+
+        equipment = await get_active_equipment_or_404(
+            db,
+            asset_id,
+        )
+
+        stmt = stmt.where(EquipmentPurchase.asset_id == equipment.id)
+
+    if vendor_name:
+        stmt = stmt.where(EquipmentPurchase.vendor_name.ilike(f"%{vendor_name}%"))
+
+    stmt = (
+        stmt.order_by(
+            EquipmentPurchase.purchase_date.desc(),
+            EquipmentPurchase.created_at.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+
+    result = await db.execute(stmt)
+
+    rows = result.all()
+
+    return [
+        EquipmentPurchaseOut(
+            id=purchase.id,
+            purchase_type=str(purchase.purchase_type),
+            asset_id=purchase.asset_id,
+            asset_name=equipment_name,
+            purchase_date=purchase.purchase_date,
+            vendor_name=purchase.vendor_name,
+            invoice_number=purchase.invoice_number,
+            quantity=purchase.quantity,
+            unit_price=float(purchase.unit_price),
+            total_amount=float(purchase.total_amount),
+            warranty_end_date=purchase.warranty_end_date,
+            notes=purchase.notes,
+            created_at=purchase.created_at,
+        )
+        for purchase, equipment_name in rows
+    ]
+
+
+# =============================== PURCHASE GET ========================
+
+
+@router.get(
+    "/purchase/{purchase_id}",
+    response_model=EquipmentPurchaseOut,
+)
+async def get_purchase(
+    purchase_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    result = await db.execute(
+        select(
+            EquipmentPurchase,
+            Equipment.equipment_name,
+        )
+        .join(
+            Equipment,
+            Equipment.id == EquipmentPurchase.asset_id,
+        )
+        .where(
+            EquipmentPurchase.id == purchase_id,
+        )
+    )
+
+    row = result.first()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Purchase not found",
+        )
+
+    purchase, equipment_name = row
+
+    return EquipmentPurchaseOut(
+        id=purchase.id,
+        purchase_type=str(purchase.purchase_type),
+        asset_id=purchase.asset_id,
+        asset_name=equipment_name,
+        purchase_date=purchase.purchase_date,
+        vendor_name=purchase.vendor_name,
+        invoice_number=purchase.invoice_number,
+        quantity=purchase.quantity,
+        unit_price=float(purchase.unit_price),
+        total_amount=float(purchase.total_amount),
+        warranty_end_date=purchase.warranty_end_date,
+        notes=purchase.notes,
+        created_at=purchase.created_at,
+    )
+
+
+# =============================== PURCHASE UPDATE ========================
+
+
+@router.put(
+    "/purchase/{purchase_id}",
+    response_model=EquipmentPurchaseOut,
+)
+async def update_purchase(
+    purchase_id: int,
+    payload: EquipmentPurchaseUpdate,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    purchase = await db.get(
+        EquipmentPurchase,
+        purchase_id,
+    )
+
+    if not purchase:
+        raise HTTPException(
+            status_code=404,
+            detail="Purchase not found",
+        )
+
+    if payload.invoice_number and payload.invoice_number != purchase.invoice_number:
+        duplicate = await db.scalar(
+            select(EquipmentPurchase).where(
+                EquipmentPurchase.invoice_number == payload.invoice_number,
+                EquipmentPurchase.id != purchase_id,
+            )
+        )
+
+        if duplicate:
+            raise HTTPException(
+                status_code=400,
+                detail="Invoice number already exists",
+            )
+
+    if (
+        payload.warranty_end_date
+        and payload.warranty_end_date <= purchase.purchase_date
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Warranty end date must be after purchase date",
+        )
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    old_values = {}
+
+    for field, value in update_data.items():
+        old_values[field] = getattr(purchase, field)
+        setattr(purchase, field, value)
+
+    if purchase.quantity is not None and purchase.unit_price is not None:
+        purchase.total_amount = purchase.quantity * purchase.unit_price
+
+    equipment = await db.get(
+        Equipment,
+        purchase.asset_id,
+    )
+
+    # FIX: Convert Decimal/date values before saving audit log
+    audit_old_values = jsonable_encoder(convert_decimal(old_values))
+
+    audit_new_values = jsonable_encoder(convert_decimal(update_data))
+
+    await create_audit_log(
+        db=db,
+        equipment_id=purchase.asset_id,
+        action="PURCHASE_UPDATE",
+        old_values=audit_old_values,
+        new_values=audit_new_values,
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+    await db.refresh(purchase)
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return EquipmentPurchaseOut(
+        id=purchase.id,
+        purchase_type=str(purchase.purchase_type),
+        asset_id=purchase.asset_id,
+        asset_name=equipment.equipment_name if equipment else None,
+        purchase_date=purchase.purchase_date,
+        vendor_name=purchase.vendor_name,
+        invoice_number=purchase.invoice_number,
+        quantity=purchase.quantity,
+        unit_price=float(purchase.unit_price),
+        total_amount=float(purchase.total_amount),
+        warranty_end_date=purchase.warranty_end_date,
+        notes=purchase.notes,
+        created_at=purchase.created_at,
+    )
+
+
+# =============================== PURCHASE DELETE ========================
+
+
+@router.delete(
+    "/purchase/{purchase_id}",
+    status_code=status.HTTP_200_OK,
+)
+async def delete_purchase(
+    purchase_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    purchase = await db.get(
+        EquipmentPurchase,
+        purchase_id,
+    )
+
+    if not purchase:
+        raise HTTPException(
+            status_code=404,
+            detail="Purchase not found",
+        )
+
+    await create_audit_log(
+        db=db,
+        equipment_id=purchase.asset_id,
+        action="PURCHASE_DELETE",
+        old_values={
+            "purchase_id": purchase.id,
+            "asset_id": purchase.asset_id,
+            "invoice_number": purchase.invoice_number,
+            "vendor_name": purchase.vendor_name,
+            "quantity": purchase.quantity,
+            "unit_price": float(purchase.unit_price),
+            "total_amount": float(purchase.total_amount),
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    asset_id = purchase.asset_id
+    invoice_number = purchase.invoice_number
+
+    await db.delete(purchase)
+
+    await db.commit()
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return {
+        "message": "Purchase deleted successfully",
+        "purchase_id": purchase_id,
+        "asset_id": asset_id,
+        "invoice_number": invoice_number,
+    }
+
+
+# ============================== EQUIPMENT TRANSFER ========================
+
+
+@router.post("/transfer")
+async def transfer_equipment(
+    payload: EquipmentTransferRequest,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    equipment = await get_active_equipment_or_404(
+        db,
+        payload.equipment_id,
+    )
+
+    if equipment.condition == EquipmentCondition.DAMAGED:
+        raise HTTPException(
+            status_code=400,
+            detail="Damaged equipment cannot be transferred",
+        )
+
+    if equipment.status == EquipmentStatus.MAINTENANCE:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment under maintenance",
+        )
+
+    if equipment.project_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment not allocated",
+        )
+
+    if equipment.project_id == payload.to_project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Already allocated to same project",
+        )
+
+    project = await db.get(
+        Project,
+        payload.to_project_id,
+    )
+
+    if not project:
+        raise HTTPException(
+            status_code=404,
+            detail="Target project not found",
+        )
+
+    today = date.today()
+
+    if project.end_date and project.end_date < today:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot transfer to completed project",
+        )
+
+    rental_exists = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.start_date <= today,
+                or_(
+                    EquipmentRental.end_date.is_(None),
+                    EquipmentRental.end_date >= today,
+                ),
+            )
+        )
+    )
+
+    if rental_exists:
+        raise HTTPException(
+            status_code=400,
+            detail="Equipment currently rented",
+        )
+
+    old_project = equipment.project_id
+
+    equipment.project_id = payload.to_project_id
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="TRANSFER",
+        old_values={
+            "project_id": old_project,
+        },
+        new_values={
+            "project_id": payload.to_project_id,
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    return {
+        "message": "Equipment transferred successfully",
+        "equipment_id": equipment.id,
+        "from_project": old_project,
+        "to_project": payload.to_project_id,
+    }
+
+
+# =====================get_equipment==============================
+
+
+@router.get("/{equipment_id}", response_model=EquipmentOut)
+async def get_equipment(
+    equipment_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    obj = await get_active_equipment_or_404(
+        db,
+        equipment_id,
+    )
+
+    # Recalculate latest status
+    await recalculate_equipment_status(
+        db,
+        obj,
+    )
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return EquipmentOut.model_validate(obj)
+
+
+#=============================update_equipment=======================
+
+@router.put("/{equipment_id}", response_model=EquipmentOut)
+async def update_equipment(
+    equipment_id: int,
+    payload: EquipmentUpdate,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    obj = await get_active_equipment_or_404(db, equipment_id)
+
+    if payload.equipment_code and payload.equipment_code != obj.equipment_code:
+        existing = await db.scalar(
+            select(Equipment).where(
+                and_(
+                    Equipment.equipment_code == payload.equipment_code,
+                    Equipment.is_deleted == False,
+                    Equipment.id != equipment_id,
+                )
+            )
+        )
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Equipment code already exists",
+            )
+
+    update_data = payload.model_dump(exclude_unset=True)
+
+    old_data = {
+        c.name: getattr(obj, c.name)
+        for c in obj.__table__.columns
+    }
+
+    # Apply updates
+    for field, value in update_data.items():
+        setattr(obj, field, value)
+
+    # 🔥 FIX
+    await recalculate_equipment_status(
+        db,
+        obj,
+    )
+
+    if hasattr(obj, "updated_at"):
+        obj.updated_at = datetime.utcnow()
+
+    await db.flush()
+
+    changed_fields = {
+        k: {"old": old_data.get(k), "new": getattr(obj, k)}
+        for k in update_data
+        if old_data.get(k) != getattr(obj, k)
+    }
+
+    if not changed_fields:
+        return EquipmentOut.model_validate(obj)
+
+    old_values = {
+        k: v["old"]
+        for k, v in changed_fields.items()
+    }
+
+    new_values = {
+        k: v["new"]
+        for k, v in changed_fields.items()
+    }
+
+    await create_audit_log(
+        db,
+        obj.id,
+        "UPDATE",
+        old_values=jsonable_encoder(old_values),
+        new_values=jsonable_encoder(new_values),
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return EquipmentOut.model_validate(obj)
+
+
+# ============================== EQUIPMENT PURCHASE HISTORY ========================
+
+
+@router.get(
+    "/purchase/equipment/{equipment_id}",
+    response_model=List[EquipmentPurchaseOut],
+)
+async def get_equipment_purchase_history(
+    equipment_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    equipment = await get_active_equipment_or_404(
+        db,
+        equipment_id,
+    )
+
+    if not equipment:
+        raise HTTPException(
+            status_code=404,
+            detail="Equipment not found",
+        )
+
+    result = await db.execute(
+        select(EquipmentPurchase)
+        .where(
+            EquipmentPurchase.asset_id == equipment_id,
+        )
+        .order_by(
+            EquipmentPurchase.purchase_date.desc(),
+            EquipmentPurchase.created_at.desc(),
+        )
+    )
+
+    purchases = result.scalars().all()
+
+    return [
+        EquipmentPurchaseOut(
+            id=purchase.id,
+            purchase_type=str(purchase.purchase_type),
+            asset_id=purchase.asset_id,
+            asset_name=equipment.equipment_name,
+            purchase_date=purchase.purchase_date,
+            vendor_name=purchase.vendor_name,
+            invoice_number=purchase.invoice_number,
+            quantity=purchase.quantity,
+            unit_price=float(purchase.unit_price),
+            total_amount=float(purchase.total_amount),
+            warranty_end_date=purchase.warranty_end_date,
+            notes=purchase.notes,
+            created_at=purchase.created_at,
+        )
+        for purchase in purchases
+    ]
+
+
+# ======================== REPORTS PDF========================
+
 
 @router.get("/reports/pdf")
 async def equipment_full_pdf_report(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
+    """
+    NOTE: Make sure these are imported at the top of this router file
+    (alongside Equipment, EquipmentMaintenance, EquipmentRental):
+        from app.models.equipment import EquipmentUsage, EquipmentPurchase
+    """
     try:
         import io
         from datetime import datetime
@@ -2078,287 +3594,312 @@ async def equipment_full_pdf_report(
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
-        # ================= COLORS =================
-        DARK_NAVY = colors.HexColor("#1A2B4A")
-        ORANGE = colors.HexColor("#F5A623")
-        TABLE_HDR = colors.HexColor("#1A2B4A")
+        # ================= SIMPLE, CONSISTENT COLORS =================
+        TABLE_HDR = colors.HexColor("#305496")  # one header color for every table
         ROW_ALT = colors.HexColor("#F5F5F5")
         ROW_WHITE = colors.white
         BORDER_CLR = colors.HexColor("#DDDDDD")
         TEXT_DARK = colors.HexColor("#222222")
         TEXT_LIGHT = colors.white
-        LABEL_GREY = colors.HexColor("#555555")
-        GREEN_HDR = colors.HexColor("#2E7D32")
-        RED_HDR = colors.HexColor("#C62828")
-        ORANGE_LIGHT = colors.HexColor("#FFF3E0")
-        RED_LIGHT = colors.HexColor("#FFEBEE")
+        LABEL_GREY = colors.HexColor("#666666")
+
+        FONT = "Helvetica"
+        FONT_BOLD = "Helvetica-Bold"
 
         # ================= PDF SETUP =================
         buffer = io.BytesIO()
-
         doc = SimpleDocTemplate(
             buffer,
             pagesize=letter,
             leftMargin=36,
             rightMargin=36,
-            topMargin=90,
-            bottomMargin=40,
+            topMargin=40,
+            bottomMargin=36,
         )
-
-        FONT = "Helvetica"
-        FONT_BOLD = "Helvetica-Bold"
 
         # ================= STYLES =================
-        styles = getSampleStyleSheet()
-
-        def S(name, **kw):
-            return ParagraphStyle(name, **kw)
-
-        title_style = S(
+        title_style = ParagraphStyle(
             "Title",
             fontSize=16,
+            leading=20,
             textColor=TEXT_DARK,
             alignment=TA_CENTER,
             fontName=FONT_BOLD,
-            spaceAfter=2,
+            spaceAfter=6,
         )
-
-        sub_style = S(
+        sub_style = ParagraphStyle(
             "Sub",
             fontSize=9,
+            leading=12,
             textColor=LABEL_GREY,
             alignment=TA_CENTER,
+            spaceBefore=2,
             spaceAfter=4,
         )
-
-        info_label = S(
-            "InfoLabel",
-            fontSize=8,
-            textColor=LABEL_GREY,
-        )
-
-        bold_style = S(
-            "BoldStyle",
+        empty_style = ParagraphStyle(
+            "Empty",
             fontSize=9,
+            textColor=LABEL_GREY,
+            fontName="Helvetica-Oblique",
+            spaceAfter=10,
+        )
+        section_style = ParagraphStyle(
+            "Section",
+            fontSize=11,
             textColor=TEXT_DARK,
             fontName=FONT_BOLD,
+            alignment=TA_LEFT,
+            spaceBefore=14,
+            spaceAfter=6,
+        )
+        info_label = ParagraphStyle("InfoLabel", fontSize=8, textColor=LABEL_GREY)
+        bold_style = ParagraphStyle(
+            "BoldStyle", fontSize=9, textColor=TEXT_DARK, fontName=FONT_BOLD
         )
 
         # ================= FETCH DATA =================
-        eq_stmt = select(Equipment).where(Equipment.is_deleted == False)
-        eq_result = await db.execute(eq_stmt)
+        eq_result = await db.execute(
+            select(Equipment).where(Equipment.is_deleted == False)
+        )
         equipments = eq_result.scalars().all() or []
 
-        m_result = await db.execute(select(EquipmentMaintenance))
-        maint = m_result.scalars().all() or []
-
-        r_result = await db.execute(select(EquipmentRental))
-        rentals = r_result.scalars().all() or []
+        usages = (await db.execute(select(EquipmentUsage))).scalars().all() or []
+        maint = (await db.execute(select(EquipmentMaintenance))).scalars().all() or []
+        rentals = (await db.execute(select(EquipmentRental))).scalars().all() or []
+        purchases = (await db.execute(select(EquipmentPurchase))).scalars().all() or []
 
         # ================= SAFE TOTALS =================
         total_maint_cost = sum(float(m.cost or 0) for m in maint)
         total_rental_cost = sum(float(r.rental_cost or 0) for r in rentals)
-        grand_total = total_maint_cost + total_rental_cost
+        total_purchase_cost = sum(float(p.total_amount or 0) for p in purchases)
+        grand_total = total_maint_cost + total_rental_cost + total_purchase_cost
 
-        # ================= DATES =================
         now_str = datetime.now().strftime("%d %b %Y")
-        now_ts = datetime.now().strftime("%d/%m/%Y %I:%M %p")
 
         # ================= HELPERS =================
-        def safe_condition(e):
-            try:
-                return str(getattr(e.condition, "value", e.condition or "")).upper()
-            except Exception:
-                return ""
+        def safe_val(obj, attr):
+            v = getattr(obj, attr, None)
+            if v is None:
+                return "-"
+            return str(getattr(v, "value", v)).upper()
 
-        def safe_status(e):
-            try:
-                return str(getattr(e.status, "value", e.status or "")).upper()
-            except Exception:
-                return ""
+        TABLE_HEADER_STYLE = [
+            ("BACKGROUND", (0, 0), (-1, 0), TABLE_HDR),
+            ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
+            ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
+            ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]
+
+        def make_table(data, col_widths):
+            t = Table(data, colWidths=col_widths, repeatRows=1)
+            t.setStyle(TableStyle(TABLE_HEADER_STYLE))
+            return t
+
+        def render_section(title_text, headers, rows, col_widths, empty_text):
+            story.append(Paragraph(title_text, section_style))
+            if rows:
+                story.append(make_table([headers] + rows, col_widths))
+            else:
+                story.append(Paragraph(empty_text, empty_style))
 
         # ================= STORY =================
         story = []
 
         story.append(Paragraph("Equipment Management Report", title_style))
-        story.append(Spacer(1, 6))
-        story.append(Paragraph(f"Pune, Maharashtra | {now_str}", sub_style))
+        story.append(Paragraph(f"Generated on {now_str}", sub_style))
         story.append(
-            HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=12)
+            HRFlowable(width="100%", thickness=1, color=BORDER_CLR, spaceAfter=12)
         )
 
-        # ================= SUMMARY =================
-        good_count = sum(1 for e in equipments if safe_condition(e) == "GOOD")
+        # ---------------- Summary ----------------
+        good_count = sum(1 for e in equipments if safe_val(e, "condition") == "GOOD")
+        damaged_count = sum(
+            1 for e in equipments if safe_val(e, "condition") == "DAMAGED"
+        )
 
         summary_data = [
             [
                 Paragraph("Total Equipment", info_label),
-                Paragraph("Good Condition", info_label),
-                Paragraph("Maintenance Cost", info_label),
+                Paragraph("Good", info_label),
+                Paragraph("Damaged", info_label),
+                Paragraph("Maint. Cost", info_label),
                 Paragraph("Rental Cost", info_label),
+                Paragraph("Purchase Cost", info_label),
                 Paragraph("Grand Total", info_label),
             ],
             [
                 Paragraph(str(len(equipments)), bold_style),
                 Paragraph(str(good_count), bold_style),
+                Paragraph(str(damaged_count), bold_style),
                 Paragraph(f"Rs. {total_maint_cost:,.0f}", bold_style),
                 Paragraph(f"Rs. {total_rental_cost:,.0f}", bold_style),
+                Paragraph(f"Rs. {total_purchase_cost:,.0f}", bold_style),
                 Paragraph(f"Rs. {grand_total:,.0f}", bold_style),
             ],
         ]
-
-        sum_table = Table(summary_data, colWidths=[95, 95, 110, 110, 110])
+        sum_table = Table(summary_data, colWidths=[65, 50, 60, 75, 75, 80, 80])
         sum_table.setStyle(
-            TableStyle([
-                ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("FONTNAME", (0, 0), (-1, -1), FONT_BOLD),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ])
+            TableStyle(
+                [
+                    ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]
+            )
         )
-
         story.append(sum_table)
-        story.append(Spacer(1, 20))
 
-        # ================= EQUIPMENT TABLE =================
-        eq_data = [["#", "ID", "Code", "Name", "Condition", "Status", "Project"]]
-
+        # ---------------- Equipment ----------------
+        eq_headers = [
+            "#",
+            "Code",
+            "Name",
+            "Operator",
+            "Condition",
+            "Status",
+            "Hours",
+            "Fuel",
+            "Rental Cost",
+        ]
+        eq_rows = []
         for i, e in enumerate(equipments, 1):
-            cond = safe_condition(e)
-            status = safe_status(e)
-
-            eq_data.append([
-                str(i),
-                str(e.id or "-"),
-                str(e.equipment_code or "-"),
-                str(e.equipment_name or "-"),
-                cond or "-",
-                status or "-",
-                str(e.project_id or "-"),
-            ])
-
-        eq_table = Table(
-            eq_data,
-            colWidths=[25, 35, 90, 150, 75, 80, 65],
-            repeatRows=1,
+            eq_rows.append(
+                [
+                    str(i),
+                    str(e.equipment_code or "-"),
+                    str(e.equipment_name or "-"),
+                    str(e.operator_name or "-"),
+                    safe_val(e, "condition"),
+                    safe_val(e, "status"),
+                    f"{float(e.working_hours or 0):,.1f}",
+                    f"{float(e.fuel_used or 0):,.1f}",
+                    f"{float(e.rental_cost or 0):,.2f}",
+                ]
+            )
+        render_section(
+            "Equipment",
+            eq_headers,
+            eq_rows,
+            [20, 55, 95, 75, 60, 65, 45, 45, 65],
+            "No equipment found.",
         )
 
-        eq_table.setStyle(
-            TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), TABLE_HDR),
-                ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
-                ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
-                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ])
+        # ---------------- Usage ----------------
+        u_headers = ["Equip ID", "Hours", "Fuel", "Date", "Notes"]
+        u_rows = []
+        for u in usages:
+            u_rows.append(
+                [
+                    str(u.equipment_id or "-"),
+                    f"{float(u.working_hours or 0):,.1f}",
+                    f"{float(u.fuel_used or 0):,.1f}",
+                    str(u.usage_date or "-"),
+                    str(u.notes or "-"),
+                ]
+            )
+        render_section(
+            "Usage Records",
+            u_headers,
+            u_rows,
+            [55, 55, 55, 80, 280],
+            "No usage records found.",
         )
 
-        story.append(eq_table)
-        story.append(Spacer(1, 20))
-
-        # ================= MAINTENANCE TABLE =================
-        m_data = [["Equip ID", "Description", "Date", "Cost"]]
-
+        # ---------------- Maintenance ----------------
+        m_headers = ["Equip ID", "Description", "Date", "Cost", "Next Due"]
+        m_rows = []
         for m in maint:
-            m_data.append([
-                str(m.equipment_id or "-"),
-                str(m.description or "-"),
-                str(m.maintenance_date or "-"),
-                f"{float(m.cost or 0):,.2f}",
-            ])
-
-        m_table = Table(
-            m_data,
-            colWidths=[65, 220, 110, 100],
-            repeatRows=1,
+            m_rows.append(
+                [
+                    str(m.equipment_id or "-"),
+                    str(m.description or "-"),
+                    str(m.maintenance_date or "-"),
+                    f"{float(m.cost or 0):,.2f}",
+                    str(m.next_maintenance_date or "-"),
+                ]
+            )
+        render_section(
+            "Maintenance Records",
+            m_headers,
+            m_rows,
+            [55, 195, 80, 70, 80],
+            "No maintenance records found.",
         )
 
-        m_table.setStyle(
-            TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), GREEN_HDR),
-                ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
-                ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
-                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
-            ])
-        )
-
-        story.append(m_table)
-        story.append(Spacer(1, 20))
-
-        # ================= RENTAL TABLE =================
-        r_data = [["Equip ID", "Client", "Start", "End", "Cost"]]
-
+        # ---------------- Rentals ----------------
+        r_headers = ["Equip ID", "Client", "Start", "End", "Cost"]
+        r_rows = []
         for r in rentals:
-            r_data.append([
-                str(r.equipment_id or "-"),
-                str(r.client_name or "-"),
-                str(r.start_date or "-"),
-                str(r.end_date or "-"),
-                f"{float(r.rental_cost or 0):,.2f}",
-            ])
-
-        r_table = Table(
-            r_data,
-            colWidths=[65, 180, 80, 80, 95],
-            repeatRows=1,
+            r_rows.append(
+                [
+                    str(r.equipment_id or "-"),
+                    str(r.client_name or "-"),
+                    str(r.start_date or "-"),
+                    str(r.end_date or "-"),
+                    f"{float(r.rental_cost or 0):,.2f}",
+                ]
+            )
+        render_section(
+            "Rental Records",
+            r_headers,
+            r_rows,
+            [55, 180, 80, 80, 85],
+            "No rental records found.",
         )
 
-        r_table.setStyle(
-            TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), RED_HDR),
-                ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
-                ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
-                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
-            ])
+        # ---------------- Purchases ----------------
+        p_headers = [
+            "Asset ID",
+            "Type",
+            "Vendor",
+            "Invoice",
+            "Qty",
+            "Unit Price",
+            "Total",
+            "Date",
+        ]
+        p_rows = []
+        for p in purchases:
+            p_rows.append(
+                [
+                    str(p.asset_id or "-"),
+                    str(p.purchase_type or "-"),
+                    str(p.vendor_name or "-"),
+                    str(p.invoice_number or "-"),
+                    str(p.quantity or 0),
+                    f"{float(p.unit_price or 0):,.2f}",
+                    f"{float(p.total_amount or 0):,.2f}",
+                    str(p.purchase_date or "-"),
+                ]
+            )
+        render_section(
+            "Purchase Records",
+            p_headers,
+            p_rows,
+            [50, 55, 100, 75, 35, 65, 65, 70],
+            "No purchase records found.",
         )
 
-        story.append(r_table)
-
-        # ================= HEADER FOOTER =================
-        def draw_header_footer(canvas, doc):
+        # ================= SIMPLE FOOTER (page number only) =================
+        def draw_footer(canvas, doc):
             canvas.saveState()
             w, h = letter
-
-            canvas.setFillColor(DARK_NAVY)
-            canvas.rect(0, h - 52, w, 52, fill=1)
-
-            canvas.setFont(FONT_BOLD, 18)
-            canvas.setFillColor(colors.white)
-            canvas.drawString(36, h - 30, "INFRA")
-
-            canvas.setFillColor(ORANGE)
-            canvas.drawString(98, h - 30, "PILOT")
-
-            canvas.setFont(FONT, 7)
-            canvas.setFillColor(colors.HexColor("#CCCCCC"))
-            canvas.drawString(36, h - 44, "Construction Equipment Management")
-
             canvas.setFont(FONT, 8)
             canvas.setFillColor(colors.grey)
-            canvas.drawCentredString(w / 2, 10, "Generated by Infra Pilot System")
-            canvas.drawRightString(w - 36, 10, f"Page {doc.page}")
-
+            canvas.drawCentredString(w / 2, 20, f"Page {doc.page}")
             canvas.restoreState()
 
         # ================= BUILD PDF =================
-        doc.build(
-            story,
-            onFirstPage=draw_header_footer,
-            onLaterPages=draw_header_footer,
-        )
+        doc.build(story, onFirstPage=draw_footer, onLaterPages=draw_footer)
 
         buffer.seek(0)
         filename = f"equipment_report_{datetime.now().strftime('%Y%m%d')}.pdf"
@@ -2371,6 +3912,7 @@ async def equipment_full_pdf_report(
 
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
 
@@ -2383,6 +3925,11 @@ async def equipment_excel_report(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
+    """
+    NOTE: Make sure these are imported at the top of this router file
+    (alongside Equipment, EquipmentMaintenance, EquipmentRental):
+        from app.models.equipment import EquipmentUsage, EquipmentPurchase, EquipmentAuditLog
+    """
     try:
         import io
         from datetime import datetime
@@ -2398,266 +3945,222 @@ async def equipment_excel_report(
         stmt = select(Equipment).where(Equipment.is_deleted == False)
         equipments = (await db.execute(stmt)).scalars().all() or []
 
-        m_result = await db.execute(select(EquipmentMaintenance))
-        maint = m_result.scalars().all() or []
-
-        r_result = await db.execute(select(EquipmentRental))
-        rentals = r_result.scalars().all() or []
+        usages = (await db.execute(select(EquipmentUsage))).scalars().all() or []
+        maint = (await db.execute(select(EquipmentMaintenance))).scalars().all() or []
+        rentals = (await db.execute(select(EquipmentRental))).scalars().all() or []
+        purchases = (await db.execute(select(EquipmentPurchase))).scalars().all() or []
 
         # ================= SAFE TOTALS =================
         total_maint_cost = sum(float(m.cost or 0) for m in maint)
         total_rental_cost = sum(float(r.rental_cost or 0) for r in rentals)
-        grand_total = total_maint_cost + total_rental_cost
+        total_purchase_cost = sum(float(p.total_amount or 0) for p in purchases)
 
         now_str = datetime.now().strftime("%d %b %Y %I:%M %p")
-
-        # ================= COLORS =================
-        C_NAVY      = "1A2B4A"
-        C_WHITE     = "FFFFFF"
-        C_ALT       = "EFF3FB"
-        C_GREEN_BG  = "E8F5E9"
-        C_GREEN_FG  = "2E7D32"
-        C_GREEN_HDR = "2E7D32"
-        C_RED_BG    = "FFEBEE"
-        C_RED_FG    = "C62828"
-        C_RED_HDR   = "C62828"
-        C_BORDER    = "CCCCCC"
-        C_ORANGE    = "F5A623"
-
         CURRENCY_FMT = '"Rs." #,##0.00'
-        DEC_FMT      = "#,##0.00"
 
-        # ================= STYLE HELPERS =================
-        def fill(color):
-            return PatternFill("solid", fgColor=color)
+        # ================= SIMPLE, CONSISTENT STYLES =================
+        HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        HEADER_FILL = PatternFill("solid", fgColor="305496")
+        TITLE_FONT = Font(name="Arial", bold=True, size=14)
+        LABEL_FONT = Font(name="Arial", bold=True, size=10)
+        CELL_FONT = Font(name="Arial", size=10)
+        THIN = Side(style="thin", color="D9D9D9")
+        BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+        CENTER = Alignment(horizontal="center", vertical="center")
 
-        def font(bold=False, color="333333", size=10):
-            return Font(name="Arial", bold=bold, color=color, size=size)
+        def safe_val(obj, attr):
+            """Returns enum.value if it's an enum, else the raw value, else '-'."""
+            v = getattr(obj, attr, None)
+            if v is None:
+                return "-"
+            return getattr(v, "value", v)
 
-        def align(h="center", wrap=False):
-            return Alignment(horizontal=h, vertical="center", wrap_text=wrap)
+        def write_table(ws, headers, rows, currency_cols=None):
+            """Writes one header row + data rows with simple, uniform styling."""
+            currency_cols = currency_cols or []
 
-        def border():
-            s = Side(style="thin", color=C_BORDER)
-            return Border(left=s, right=s, top=s, bottom=s)
+            for col, header in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col, value=header)
+                cell.font = HEADER_FONT
+                cell.fill = HEADER_FILL
+                cell.alignment = CENTER
+                cell.border = BORDER
 
-        def safe_condition(e):
-            try:
-                return str(getattr(e.condition, "value", e.condition or "")).upper()
-            except Exception:
-                return ""
+            for r, row_values in enumerate(rows, 2):
+                for col, val in enumerate(row_values, 1):
+                    cell = ws.cell(row=r, column=col, value=val)
+                    cell.font = CELL_FONT
+                    cell.alignment = CENTER
+                    cell.border = BORDER
+                    if col in currency_cols:
+                        cell.number_format = CURRENCY_FMT
 
-        def safe_status(e):
-            try:
-                return str(getattr(e.status, "value", e.status or "")).upper()
-            except Exception:
-                return ""
+            # simple autosize based on header + content length
+            for col, header in enumerate(headers, 1):
+                max_len = len(str(header))
+                for row_values in rows:
+                    val = row_values[col - 1]
+                    max_len = max(max_len, len(str(val)))
+                ws.column_dimensions[get_column_letter(col)].width = min(
+                    max(max_len + 4, 12), 40
+                )
 
-        def write_section_title(ws, row, col_span, title, bg_color):
-            """Section heading — merged cell, colored background."""
-            ws.merge_cells(
-                start_row=row, start_column=1,
-                end_row=row, end_column=col_span,
-            )
-            cell = ws.cell(row=row, column=1, value=title)
-            cell.font = font(bold=True, color=C_WHITE, size=11)
-            cell.fill = fill(bg_color)
-            cell.alignment = align(h="left")
-            ws.row_dimensions[row].height = 22
+            ws.freeze_panes = "A2"
 
-        # ================= WORKBOOK — single sheet =================
+        # ================= WORKBOOK =================
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Equipment Report"
+        wb.remove(wb.active)  # we'll add named sheets explicitly
 
-        # Fixed column widths (widest table = equipment, 7 cols)
-        col_widths = [5, 10, 18, 26, 16, 20, 14, 20, 16, 18]
-        for i, w in enumerate(col_widths, 1):
-            ws.column_dimensions[get_column_letter(i)].width = w
-
-        current_row = 1
-
-        # =========================================================
-        # HEADER — rows 1-2
-        # =========================================================
-        ws.merge_cells(f"A{current_row}:J{current_row}")
-        c = ws.cell(row=current_row, column=1, value="INFRA PILOT - Equipment Management Report")
-        c.font = font(bold=True, color=C_WHITE, size=14)
-        c.fill = fill(C_NAVY)
-        c.alignment = align()
-        ws.row_dimensions[current_row].height = 28
-        current_row += 1
-
-        ws.merge_cells(f"A{current_row}:J{current_row}")
-        c = ws.cell(row=current_row, column=1, value=f"Generated: {now_str}")
-        c.font = font(bold=True, color=C_WHITE, size=10)
-        c.fill = fill(C_ORANGE)
-        c.alignment = align()
-        ws.row_dimensions[current_row].height = 18
-        current_row += 2  # blank gap
-
-        # =========================================================
-        # SUMMARY — row 4-5
-        # =========================================================
-        good_count    = sum(1 for e in equipments if safe_condition(e) == "GOOD")
-        damaged_count = sum(1 for e in equipments if safe_condition(e) == "DAMAGED")
-
-        summary_headers = [
-            "Total Equipment", "Good Condition", "Damaged",
-            "Maintenance Cost", "Rental Cost", "Grand Total",
+        # ---------------- Equipment ----------------
+        ws = wb.create_sheet("Equipment")
+        headers = [
+            "ID",
+            "Project ID",
+            "Code",
+            "Name",
+            "Operator",
+            "Condition",
+            "Status",
+            "Working Hours",
+            "Fuel Used",
+            "Rental Cost",
+            "Maintenance Date",
         ]
-        summary_values = [
-            len(equipments), good_count, damaged_count,
-            total_maint_cost, total_rental_cost, grand_total,
-        ]
-
-        for col, header in enumerate(summary_headers, 1):
-            cell = ws.cell(row=current_row, column=col, value=header)
-            cell.font = font(bold=True, color=C_WHITE)
-            cell.fill = fill(C_NAVY)
-            cell.alignment = align()
-            cell.border = border()
-        current_row += 1
-
-        for col, value in enumerate(summary_values, 1):
-            cell = ws.cell(row=current_row, column=col, value=value)
-            cell.font = font(bold=True)
-            cell.alignment = align()
-            cell.border = border()
-            if col >= 4:
-                cell.number_format = CURRENCY_FMT
-        current_row += 2  # blank gap
-
-        # =========================================================
-        # EQUIPMENT TABLE
-        # =========================================================
-        write_section_title(ws, current_row, 7, "  Equipment List", C_NAVY)
-        current_row += 1
-
-        eq_headers = ["#", "ID", "Code", "Name", "Condition", "Status", "Project"]
-        for col, header in enumerate(eq_headers, 1):
-            cell = ws.cell(row=current_row, column=col, value=header)
-            cell.font = font(bold=True, color=C_WHITE)
-            cell.fill = fill(C_NAVY)
-            cell.alignment = align()
-            cell.border = border()
-        current_row += 1
-
-        for i, e in enumerate(equipments, 1):
-            cond   = safe_condition(e)
-            status = safe_status(e)
-            bg     = C_WHITE if i % 2 != 0 else C_ALT
-
-            values = [
-                i,
-                e.id or "-",
+        rows = [
+            [
+                e.id,
+                e.project_id or "-",
                 e.equipment_code or "-",
                 e.equipment_name or "-",
-                cond or "-",
-                status or "-",
-                e.project_id or "-",
+                e.operator_name or "-",
+                safe_val(e, "condition"),
+                safe_val(e, "status"),
+                float(e.working_hours or 0),
+                float(e.fuel_used or 0),
+                float(e.rental_cost or 0),
+                str(e.maintenance_date) if e.maintenance_date else "-",
             ]
+            for e in equipments
+        ]
+        write_table(ws, headers, rows, currency_cols=[10])
 
-            for col, val in enumerate(values, 1):
-                cell = ws.cell(row=current_row, column=col, value=val)
-                cell.font = font()
-                cell.alignment = align()
-                cell.border = border()
-                cell.fill = fill(bg)
+        # ---------------- Usage ----------------
+        ws = wb.create_sheet("Usage")
+        headers = ["Equip ID", "Working Hours", "Fuel Used", "Usage Date", "Notes"]
+        rows = [
+            [
+                u.equipment_id,
+                float(u.working_hours or 0),
+                float(u.fuel_used or 0),
+                str(u.usage_date or "-"),
+                u.notes or "-",
+            ]
+            for u in usages
+        ]
+        write_table(ws, headers, rows)
 
-                if col == 5:  # Condition
-                    if cond == "GOOD":
-                        cell.fill = fill(C_GREEN_BG)
-                        cell.font = font(bold=True, color=C_GREEN_FG)
-                    elif cond == "DAMAGED":
-                        cell.fill = fill(C_RED_BG)
-                        cell.font = font(bold=True, color=C_RED_FG)
-
-                if col == 6:  # Status
-                    if status == "AVAILABLE":
-                        cell.fill = fill(C_GREEN_BG)
-                        cell.font = font(bold=True, color=C_GREEN_FG)
-                    elif status in ("UNDER_MAINTENANCE", "RENTED"):
-                        cell.fill = fill(C_RED_BG)
-                        cell.font = font(bold=True, color=C_RED_FG)
-
-            current_row += 1
-
-        current_row += 1  # blank gap
-
-        # =========================================================
-        # MAINTENANCE TABLE
-        # =========================================================
-        write_section_title(ws, current_row, 5, "  Maintenance Records", C_GREEN_HDR)
-        current_row += 1
-
-        m_headers = ["Equip ID", "Description", "Date", "Cost"]
-        m_col_count = len(m_headers)
-        for col, header in enumerate(m_headers, 1):
-            cell = ws.cell(row=current_row, column=col, value=header)
-            cell.font = font(bold=True, color=C_WHITE)
-            cell.fill = fill(C_GREEN_HDR)
-            cell.alignment = align()
-            cell.border = border()
-        current_row += 1
-
-        for i, m in enumerate(maint, 1):
-            bg = C_WHITE if i % 2 != 0 else C_ALT
-            values = [
-                m.equipment_id or "-",
+        # ---------------- Maintenance ----------------
+        ws = wb.create_sheet("Maintenance")
+        headers = ["Equip ID", "Description", "Date", "Cost", "Next Due"]
+        rows = [
+            [
+                m.equipment_id,
                 m.description or "-",
                 str(m.maintenance_date or "-"),
                 float(m.cost or 0),
+                str(m.next_maintenance_date or "-"),
             ]
-            for col, val in enumerate(values, 1):
-                cell = ws.cell(row=current_row, column=col, value=val)
-                cell.font = font()
-                cell.alignment = align()
-                cell.border = border()
-                cell.fill = fill(bg)
-                if col == 4:
-                    cell.number_format = CURRENCY_FMT
-            current_row += 1
+            for m in maint
+        ]
+        write_table(ws, headers, rows, currency_cols=[4])
 
-        current_row += 1  # blank gap
-
-        # =========================================================
-        # RENTAL TABLE
-        # =========================================================
-        write_section_title(ws, current_row, 6, "  Rental Records", C_RED_HDR)
-        current_row += 1
-
-        r_headers = ["Equip ID", "Client", "Start", "End", "Cost"]
-        for col, header in enumerate(r_headers, 1):
-            cell = ws.cell(row=current_row, column=col, value=header)
-            cell.font = font(bold=True, color=C_WHITE)
-            cell.fill = fill(C_RED_HDR)
-            cell.alignment = align()
-            cell.border = border()
-        current_row += 1
-
-        for i, r in enumerate(rentals, 1):
-            bg = C_WHITE if i % 2 != 0 else C_ALT
-            values = [
-                r.equipment_id or "-",
+        # ---------------- Rentals ----------------
+        ws = wb.create_sheet("Rentals")
+        headers = ["Equip ID", "Client", "Start", "End", "Cost", "Notes"]
+        rows = [
+            [
+                r.equipment_id,
                 r.client_name or "-",
                 str(r.start_date or "-"),
                 str(r.end_date or "-"),
                 float(r.rental_cost or 0),
+                r.notes or "-",
             ]
-            for col, val in enumerate(values, 1):
-                cell = ws.cell(row=current_row, column=col, value=val)
-                cell.font = font()
-                cell.alignment = align()
-                cell.border = border()
-                cell.fill = fill(bg)
-                if col == 5:
-                    cell.number_format = CURRENCY_FMT
-            current_row += 1
+            for r in rentals
+        ]
+        write_table(ws, headers, rows, currency_cols=[5])
 
-        # =========================================================
-        # SAVE FILE
-        # =========================================================
+        # ---------------- Purchases ----------------
+        ws = wb.create_sheet("Purchases")
+        headers = [
+            "Asset ID",
+            "Type",
+            "Vendor",
+            "Invoice",
+            "Qty",
+            "Unit Price",
+            "Total",
+            "Purchase Date",
+            "Warranty End",
+        ]
+        rows = [
+            [
+                p.asset_id,
+                p.purchase_type or "-",
+                p.vendor_name or "-",
+                p.invoice_number or "-",
+                p.quantity or 0,
+                float(p.unit_price or 0),
+                float(p.total_amount or 0),
+                str(p.purchase_date or "-"),
+                str(p.warranty_end_date or "-"),
+            ]
+            for p in purchases
+        ]
+        write_table(ws, headers, rows, currency_cols=[6, 7])
+
+        # ---------------- Summary (placed first) ----------------
+        good_count = sum(1 for e in equipments if safe_val(e, "condition") == "GOOD")
+        damaged_count = sum(
+            1 for e in equipments if safe_val(e, "condition") == "DAMAGED"
+        )
+
+        ws_summary = wb.create_sheet("Summary", 0)
+        ws_summary["A1"] = "Equipment Management Report"
+        ws_summary["A1"].font = TITLE_FONT
+        ws_summary["A2"] = f"Generated: {now_str}"
+        ws_summary["A2"].font = Font(name="Arial", italic=True, size=9, color="666666")
+
+        summary_rows = [
+            ("Total Equipment", len(equipments)),
+            ("Good Condition", good_count),
+            ("Damaged", damaged_count),
+            ("Usage Records", len(usages)),
+            ("Maintenance Records", len(maint)),
+            ("Rental Records", len(rentals)),
+            ("Purchase Records", len(purchases)),
+            ("Total Maintenance Cost", total_maint_cost),
+            ("Total Rental Cost", total_rental_cost),
+            ("Total Purchase Cost", total_purchase_cost),
+            (
+                "Grand Total (Maint + Rental + Purchase)",
+                total_maint_cost + total_rental_cost + total_purchase_cost,
+            ),
+        ]
+
+        row_num = 4
+        for label, value in summary_rows:
+            ws_summary.cell(row=row_num, column=1, value=label).font = LABEL_FONT
+            cell = ws_summary.cell(row=row_num, column=2, value=value)
+            cell.font = CELL_FONT
+            if "Cost" in label or "Total" in label and isinstance(value, float):
+                cell.number_format = CURRENCY_FMT
+            row_num += 1
+
+        ws_summary.column_dimensions["A"].width = 36
+        ws_summary.column_dimensions["B"].width = 18
+
+        # ================= SAVE FILE =================
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
@@ -2672,5 +4175,8 @@ async def equipment_excel_report(
 
     except Exception as e:
         import traceback
+
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Excel generation failed: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Excel generation failed: {str(e)}"
+        )

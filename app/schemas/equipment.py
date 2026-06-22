@@ -9,7 +9,7 @@ from pydantic import (
     validator,
 )
 
-from app.core.enums import EquipmentCondition
+from app.core.enums import EquipmentCondition, EquipmentStatus
 from app.schemas.base import BaseSchema
 
 from app.core.validators import (
@@ -312,6 +312,10 @@ class EquipmentMaintenanceOut(BaseModel):
     maintenance_date: date
     cost: float
     next_maintenance_date: Optional[date]
+
+    is_completed: bool = False
+    completed_at: Optional[datetime] = None
+
     created_at: datetime
     status: str
 
@@ -512,6 +516,11 @@ class EquipmentDeallocateRequest(BaseSchema):
         description="Single or multiple equipment ids",
     )
 
+    project_id: int = Field(
+        ...,
+        gt=0,
+    )
+
 
 class EquipmentAllocateResponse(BaseSchema):
     equipment_ids: List[int]
@@ -523,7 +532,210 @@ class EquipmentAllocateResponse(BaseSchema):
 
 
 class EquipmentDeallocateResponse(BaseSchema):
+    project_id: int
     success_count: int
     failed_count: int
     deallocated_ids: List[int]
     failed: List[dict] = []
+
+
+class EquipmentPurchaseCreate(BaseSchema):
+
+    purchase_type: str
+
+    asset_id: int = Field(..., gt=0, description="Equipment ID")
+
+    purchase_date: date
+
+    vendor_name: str = Field(
+        ...,
+        min_length=2,
+        max_length=255,
+    )
+
+    invoice_number: str = Field(
+        ...,
+        min_length=2,
+        max_length=100,
+    )
+
+    quantity: int = Field(..., gt=0)
+
+    unit_price: Decimal = Field(
+        ...,
+        gt=0,
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    warranty_end_date: Optional[date] = None
+
+    notes: Optional[str] = Field(
+        None,
+        max_length=1000,
+    )
+
+
+class EquipmentPurchaseOut(BaseSchema):
+
+    id: int
+
+    purchase_type: str
+    asset_id: int
+    asset_name: Optional[str] = None
+
+    purchase_date: date
+
+    vendor_name: str
+    invoice_number: str
+
+    quantity: int
+
+    unit_price: float
+    total_amount: float
+
+    warranty_end_date: Optional[date]
+
+    notes: Optional[str]
+
+    created_at: datetime
+
+
+class EquipmentPurchaseUpdate(BaseSchema):
+
+    vendor_name: Optional[str] = Field(
+        None,
+        max_length=255,
+    )
+
+    invoice_number: Optional[str] = Field(
+        None,
+        max_length=100,
+    )
+
+    quantity: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
+    unit_price: Optional[Decimal] = Field(
+        None,
+        gt=0,
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    warranty_end_date: Optional[date] = None
+
+    notes: Optional[str] = None
+
+
+class EquipmentPurchaseReportItem(BaseSchema):
+
+    purchase_type: str
+
+    asset_id: int
+
+    asset_name: str
+
+    purchase_count: int
+
+    total_quantity: int
+
+    total_purchase_amount: float
+
+
+class EquipmentTransferRequest(BaseSchema):
+    equipment_id: int = Field(..., gt=0)
+    to_project_id: int = Field(..., gt=0)
+
+
+class DeleteRentalResponse(BaseModel):
+    message: str
+    rental_id: int
+    equipment_id: int
+    equipment_status: str
+
+class EquipmentUsageUpdate(BaseSchema):
+
+    working_hours: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        max_digits=10,
+        decimal_places=2,
+    )
+
+    fuel_used: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        max_digits=10,
+        decimal_places=2,
+    )
+
+    usage_date: Optional[date] = None
+
+    notes: Optional[str] = Field(
+        None,
+        max_length=500,
+    )
+
+    @validator("usage_date")
+    def validate_usage_date(cls, v):
+
+        if v and v > date.today():
+            raise ValueError("Usage date cannot be future")
+
+        return v
+    
+class DeleteUsageResponse(BaseModel):
+    message: str
+    usage_id: int
+    equipment_id: int
+
+class EquipmentMaintenanceUpdate(BaseSchema):
+
+    description: Optional[str] = Field(
+        None,
+        max_length=1000,
+    )
+
+    maintenance_date: Optional[date] = None
+
+    cost: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    next_maintenance_date: Optional[date] = None
+    
+class EquipmentRentalUpdate(BaseSchema):
+
+    start_date: Optional[date] = None
+
+    end_date: Optional[date] = None
+
+    rental_cost: Optional[Decimal] = Field(
+        None,
+        gt=0,
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    client_name: Optional[str] = None
+
+    notes: Optional[str] = None
+    
+class EquipmentKPIOut(BaseSchema):
+    total_equipment: int
+    available: int
+    allocated: int
+    rented: int
+    maintenance: int
+    damaged: int
+
+    utilization_rate: float
+
+    total_rental_revenue: float
+    total_maintenance_cost: float

@@ -240,32 +240,21 @@ class TaskCreate(BaseSchema):
 # TASK CREATE FORM (multipart/form-data support)
 # =========================================================
 
+
 class TaskCreateForm:
 
     def __init__(
-
         self,
-
         title: str = Form(...),
-
         description: Optional[str] = Form(None),
-
         priority: Optional[Union[int, TaskPriority]] = Form(None),
-
         status: TaskStatus = Form(TaskStatus.PLANNED),
-
         start_date: Optional[date] = Form(None),
-
         end_date: Optional[date] = Form(None),
-
         assigned_user_ids: Optional[str] = Form(None),
-
         activity_type_id: Optional[int] = Form(None),
-
         milestone_id: Optional[int] = Form(None),
-
         boq_id: Optional[int] = Form(None),
-
     ):
 
         self.title = title
@@ -286,8 +275,12 @@ class TaskCreateForm:
                 parsed = json.loads(assigned_user_ids)
                 parsed_ids = parsed if isinstance(parsed, list) else [parsed]
             except json.JSONDecodeError:
-                parsed_ids = [int(x.strip()) for x in assigned_user_ids.split(",") if x.strip().isdigit()]
-        
+                parsed_ids = [
+                    int(x.strip())
+                    for x in assigned_user_ids.split(",")
+                    if x.strip().isdigit()
+                ]
+
         self.assigned_user_ids = parsed_ids
 
         self.activity_type_id = activity_type_id
@@ -303,25 +296,15 @@ class TaskCreateForm:
     def to_schema(self) -> TaskCreate:
 
         return TaskCreate(
-
             title=self.title,
-
             description=self.description,
-
             priority=self.priority,
-
             status=self.status,
-
             start_date=self.start_date,
-
             end_date=self.end_date,
-
             assigned_user_ids=self.assigned_user_ids,
-
             activity_type_id=self.activity_type_id,
-
             milestone_id=self.milestone_id,
-
             boq_id=self.boq_id,
         )
 
@@ -361,36 +344,23 @@ class TaskUpdate(BaseSchema):
 # TASK UPDATE FORM (multipart/form-data support)
 # =========================================================
 
+
 class TaskUpdateForm:
 
     def __init__(
-
         self,
-
         title: Optional[str] = Form(None),
-
         description: Optional[str] = Form(None),
-
         priority: Optional[int] = Form(None),
-
         start_date: Optional[date] = Form(None),
-
         end_date: Optional[date] = Form(None),
-
         status: Optional[TaskStatus] = Form(None),
-
         assigned_user_ids: Optional[str] = Form(None),
-
         activity_type_id: Optional[int] = Form(None),
-
         milestone_id: Optional[int] = Form(None),
-
         boq_id: Optional[int] = Form(None),
-
         remove_audio: bool = Form(False),
-
         remove_image: bool = Form(False),
-
     ):
 
         self.title = title
@@ -402,7 +372,7 @@ class TaskUpdateForm:
         self.start_date = start_date
 
         self.end_date = end_date
-        
+
         self.status = status
 
         parsed_ids = None
@@ -411,8 +381,12 @@ class TaskUpdateForm:
                 parsed = json.loads(assigned_user_ids)
                 parsed_ids = parsed if isinstance(parsed, list) else [parsed]
             except json.JSONDecodeError:
-                parsed_ids = [int(x.strip()) for x in assigned_user_ids.split(",") if x.strip().isdigit()]
-        
+                parsed_ids = [
+                    int(x.strip())
+                    for x in assigned_user_ids.split(",")
+                    if x.strip().isdigit()
+                ]
+
         self.assigned_user_ids = parsed_ids
 
         self.activity_type_id = activity_type_id
@@ -428,25 +402,15 @@ class TaskUpdateForm:
     def to_schema(self) -> TaskUpdate:
 
         return TaskUpdate(
-
             title=self.title,
-
             description=self.description,
-
             priority=self.priority,
-
             start_date=self.start_date,
-
             end_date=self.end_date,
-
             status=self.status,
-
             assigned_user_ids=self.assigned_user_ids,
-
             activity_type_id=self.activity_type_id,
-
             milestone_id=self.milestone_id,
-
             boq_id=self.boq_id,
         )
 
@@ -455,6 +419,7 @@ class AssignedUserOut(BaseSchema):
     id: int
     name: str
     role: Optional[str] = None
+
 
 class TaskOut(BaseSchema):
 
@@ -537,6 +502,7 @@ class TaskPass(BaseSchema):
 class TaskStatusUpdate(BaseSchema):
 
     status: TaskStatus
+
 
 # ===================== COMMENTS =====================
 
@@ -1338,7 +1304,10 @@ class ProjectOTPolicyCreate(BaseModel):
             if self.fixed_ot_rate is None or self.fixed_ot_rate <= 0:
                 raise ValueError("fixed_ot_rate must be > 0 for FixedRate policy")
         else:
-            if self.normal_day_multiplier is not None and self.normal_day_multiplier <= 0:
+            if (
+                self.normal_day_multiplier is not None
+                and self.normal_day_multiplier <= 0
+            ):
                 raise ValueError("normal_day_multiplier must be > 0")
             if self.sunday_multiplier is not None and self.sunday_multiplier <= 0:
                 raise ValueError("sunday_multiplier must be > 0")
@@ -1358,3 +1327,43 @@ class ProjectOTPolicyOut(ProjectOTPolicyCreate):
         from_attributes = True
 
         json_encoders = {Decimal: float}
+
+
+# =========================================
+# PROJECT MANAGER DASHBOARD ADDITIONS
+# =========================================
+
+
+class ProjectResourceSummaryOut(BaseModel):
+    labour: int
+    equipment: int
+    materials_cost: float
+
+
+class ProjectHealthScoreOut(BaseModel):
+    health: int
+    status: str
+
+
+class CalendarEvent(BaseModel):
+    title: str
+    date: date
+    type: str  # Task, Milestone, Site Visit, Approval, Delivery
+
+
+class PMCalendarOut(BaseModel):
+    events: List[CalendarEvent]
+
+
+class ChecklistUpdate(BaseSchema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    project_id: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class ChecklistItemUpdate(BaseSchema):
+    item_name: Optional[str] = None
+    description: Optional[str] = None
+    is_required: Optional[bool] = None
+    is_completed: Optional[bool] = None

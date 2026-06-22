@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 from typing import List, Optional
-from sqlalchemy import Column
+from sqlalchemy import Column, Integer
 
 from sqlalchemy import (
     Boolean,
@@ -28,17 +28,68 @@ class Material(Base, TimestampMixin):
     __tablename__ = "materials"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    material_code = Column(String(20), unique=True, index=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
 
-    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    material_code = mapped_column(
+        String(20),
+        unique=True,
+        index=True,
+    )
 
-    material_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    category: Mapped[str] = mapped_column(String(100), nullable=False)
-    unit: Mapped[str] = mapped_column(String(50), nullable=False)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id"),
+        nullable=False,
+    )
 
-    supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), nullable=False)
-    supplier = relationship("Supplier", lazy="selectin")
+    # NEW LINK WITH MASTER DATA
+    material_master_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "material_master.id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+        index=True,
+    )
+
+    material_master = relationship(
+        "MaterialMaster",
+        back_populates="materials",
+        lazy="joined",
+    )
+
+    is_deleted: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+
+    # KEEP THESE FOR NOW (Backward Compatibility)
+    material_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    category: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+
+    unit_id = Column(
+        Integer,
+        ForeignKey("units.id"),
+        nullable=False,
+    )
+
+    unit = relationship("Unit")
+
+    supplier_id: Mapped[int] = mapped_column(
+        ForeignKey("suppliers.id"),
+        nullable=False,
+    )
+
+    supplier = relationship(
+        "Supplier",
+        lazy="selectin",
+    )
 
     rate_type: Mapped[RateType] = mapped_column(
         SqlEnum(
@@ -50,32 +101,51 @@ class Material(Base, TimestampMixin):
         nullable=False,
     )
 
-    purchase_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), nullable=False)
+    purchase_rate: Mapped[Decimal] = mapped_column(
+        DECIMAL(18, 2),
+        nullable=False,
+    )
 
     quantity_purchased: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 3), nullable=False, server_default=text("0.000")
+        DECIMAL(18, 3),
+        nullable=False,
+        server_default=text("0.000"),
     )
+
     quantity_used: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 3), nullable=False, server_default=text("0.000")
+        DECIMAL(18, 3),
+        nullable=False,
+        server_default=text("0.000"),
     )
+
     remaining_stock: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 3), nullable=False, server_default=text("0.000")
+        DECIMAL(18, 3),
+        nullable=False,
+        server_default=text("0.000"),
     )
 
     payment_given: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 2), nullable=False, server_default=text("0.00")
-    )
-    payment_pending: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 2), nullable=False, server_default=text("0.00")
+        DECIMAL(18, 2),
+        nullable=False,
+        server_default=text("0.00"),
     )
 
-    # IMPORTANT: This is TOTAL PURCHASE COST (do NOT reduce it anywhere)
+    payment_pending: Mapped[Decimal] = mapped_column(
+        DECIMAL(18, 2),
+        nullable=False,
+        server_default=text("0.00"),
+    )
+
     total_amount: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 2), nullable=False, server_default=text("0.00")
+        DECIMAL(18, 2),
+        nullable=False,
+        server_default=text("0.00"),
     )
 
     advance_amount: Mapped[Decimal] = mapped_column(
-        DECIMAL(18, 2), nullable=False, server_default=text("0.00")
+        DECIMAL(18, 2),
+        nullable=False,
+        server_default=text("0.00"),
     )
 
     minimum_stock_level: Mapped[Decimal] = mapped_column(
@@ -85,24 +155,27 @@ class Material(Base, TimestampMixin):
     )
 
     usages: Mapped[List["MaterialUsage"]] = relationship(
-        "MaterialUsage", back_populates="material", cascade="all, delete"
+        "MaterialUsage",
+        back_populates="material",
+        cascade="all, delete",
     )
 
     transactions: Mapped[List["MaterialTransaction"]] = relationship(
-        "MaterialTransaction", back_populates="material", cascade="all, delete"
+        "MaterialTransaction",
+        back_populates="material",
+        cascade="all, delete",
     )
 
     ledger_entries: Mapped[List["MaterialLedger"]] = relationship(
-        "MaterialLedger", back_populates="material", cascade="all, delete"
+        "MaterialLedger",
+        back_populates="material",
+        cascade="all, delete",
     )
-
-    # NEW: Correct avg_rate calculation
 
     @property
     def avg_rate(self):
         if self.quantity_purchased and self.quantity_purchased > Decimal("0"):
             return self.total_amount / self.quantity_purchased
-
         return Decimal("0.00")
 
     @property
@@ -121,9 +194,9 @@ class Material(Base, TimestampMixin):
         Index("idx_material_supplier", "supplier_id"),
         UniqueConstraint(
             "project_id",
-            "material_name",
+            "material_master_id",
             "supplier_id",
-            name="unique_material_per_project_supplier",
+            name="uq_project_master_supplier",
         ),
         CheckConstraint(
             "remaining_stock >= 0",

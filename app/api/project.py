@@ -2652,6 +2652,141 @@ async def create_project(
     return out
 
 
+# =========================================
+# PM DASHBOARD ENDPOINTS
+# =========================================
+
+
+@router.get("/calendar", response_model=s.PMCalendarOut)
+async def get_pm_calendar(
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    # Get all project IDs this user has access to
+    from app.models.project import ProjectMember, Task, Milestone
+    from app.models.approval import Approval
+
+    project_ids = []
+    if current_user.role != UserRole.ADMIN:
+        memberships = await db.scalars(
+            select(ProjectMember.project_id).where(
+                ProjectMember.user_id == current_user.id
+            )
+        )
+        project_ids = list(memberships.all())
+    else:
+        projs = await db.scalars(select(m.Project.id))
+        project_ids = list(projs.all())
+
+    events = []
+
+    if project_ids:
+        # Tasks (Due Dates)
+        tasks = await db.scalars(
+            select(Task).where(
+                Task.project_id.in_(project_ids), Task.due_date.isnot(None)
+            )
+        )
+        for t in tasks:
+            events.append(
+                s.CalendarEvent(title=t.task_name, date=t.due_date, type="Task")
+            )
+
+        # Milestones (Due Dates)
+        milestones = await db.scalars(
+            select(Milestone).where(
+                Milestone.project_id.in_(project_ids),
+                Milestone.planned_end_date.isnot(None),
+            )
+        )
+        for ml in milestones:
+            events.append(
+                s.CalendarEvent(
+                    title=ml.milestone_name, date=ml.planned_end_date, type="Milestone"
+                )
+            )
+
+    return s.PMCalendarOut(events=events)
+
+
+@router.get(
+    "/{project_id}/resource-summary", response_model=s.ProjectResourceSummaryOut
+)
+async def get_project_resource_summary(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id, current_user)
+
+    from app.models.labour import LabourProject
+    from app.models.equipment import Equipment
+    from app.models.expense import Expense
+
+    labour_count = await db.scalar(
+        select(func.count(LabourProject.labour_id)).where(
+            LabourProject.project_id == project_id
+        )
+    )
+
+    equipment_count = await db.scalar(
+        select(func.count(Equipment.id)).where(Equipment.project_id == project_id)
+    )
+
+    material_expense = await db.scalar(
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id, Expense.category == "Material"
+        )
+    )
+
+    return s.ProjectResourceSummaryOut(
+        labour=labour_count or 0,
+        equipment=equipment_count or 0,
+        materials_cost=float(material_expense or 0.0),
+    )
+
+
+@router.get("/{project_id}/health-score", response_model=s.ProjectHealthScoreOut)
+async def get_project_health_score(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await assert_project_access(db, project_id, current_user)
+
+    from app.models.project import Issue
+
+    project = await db.get(m.Project, project_id)
+    if not project:
+        raise NotFoundError("Project not found")
+
+    score = 100
+    if project.status == "DELAYED":
+        score -= 20
+    elif project.status == "ON_HOLD":
+        score -= 15
+
+    open_critical_issues = await db.scalar(
+        select(func.count(Issue.id)).where(
+            Issue.project_id == project_id,
+            Issue.status == "Open",
+            Issue.priority == "High",
+        )
+    )
+    if open_critical_issues:
+        score -= open_critical_issues * 5
+
+    score = max(0, min(100, score))
+
+    status_str = "Good"
+    if score < 50:
+        status_str = "Poor"
+    elif score < 80:
+        status_str = "At Risk"
+
+    return s.ProjectHealthScoreOut(health=score, status=status_str)
+
+
 @router.get("", response_model=PaginatedResponse[s.ProjectOut])
 async def list_projects(
     limit: int = Query(20, ge=1, le=100),
@@ -8034,51 +8169,6 @@ async def delete_incident(
 checklist_router = APIRouter(prefix="/checklists", tags=["Checklist"])
 
 
-@checklist_router.post("")
-async def create_checklist(
-    data: s.ChecklistCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-):
-    obj = m.Checklist(**data.dict())
-    db.add(obj)
-    await db.commit()
-    await db.refresh(obj)
-    return obj
-
-
-@checklist_router.post("/items")
-async def add_item(
-    data: s.ChecklistItemCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-):
-    obj = m.ChecklistItem(**data.dict())
-    db.add(obj)
-    await db.commit()
-    return obj
-
-
-@checklist_router.get("")
-async def list_checklists(
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
-):
-    return (await db.execute(select(m.Checklist))).scalars().all()
-
-
-@checklist_router.post("/execute")
-async def execute_checklist(
-    data: s.ChecklistLogCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
-):
-    obj = m.ChecklistLog(**data.dict())
-    db.add(obj)
-    await db.commit()
-    return obj
-
-
 @checklist_router.get("/logs", response_model=PaginatedResponse[s.ChecklistLogOut])
 async def list_logs(
     project_id: Optional[int] = None,
@@ -8101,6 +8191,60 @@ async def list_logs(
         items=items, meta=PaginationMeta(total=count, limit=limit, offset=offset)
     )
 
+#=====================================================
+
+
+@checklist_router.post("")
+async def create_checklist(
+    data: s.ChecklistCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    obj = m.Checklist(**data.dict())
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+#=============================================
+
+@checklist_router.get("/{id}")
+async def get_checklist(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    return checklist
+
+#=============================================
+
+@checklist_router.put("/{id}")
+async def update_checklist(
+    id: int,
+    data: s.ChecklistUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    for key, value in data.dict(exclude_unset=True).items():
+        setattr(checklist, key, value)
+
+    await db.commit()
+    await db.refresh(checklist)
+
+    return checklist
+
+#=============================================
 
 @checklist_router.delete("/{id}")
 async def delete_checklist(
@@ -8108,10 +8252,180 @@ async def delete_checklist(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
-    obj = await db.get(m.Checklist, id)
-    await db.delete(obj)
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    await db.delete(checklist)
+
     await db.commit()
-    return {"message": "Checklist deleted"}
+
+    return {"message": "Checklist deleted successfully"}
+
+#=============================================
+
+@checklist_router.post("/items")
+async def add_item(
+    data: s.ChecklistItemCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    checklist = await db.get(m.Checklist, data.checklist_id)
+
+    if not checklist:
+        raise HTTPException(
+            status_code=404,
+            detail="Checklist not found"
+        )
+
+    existing = await db.scalar(
+        select(m.ChecklistItem).where(
+            m.ChecklistItem.checklist_id == data.checklist_id,
+            m.ChecklistItem.item == data.item
+        )
+    )
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Checklist item already exists"
+        )
+
+    obj = m.ChecklistItem(
+        checklist_id=data.checklist_id,
+        item=data.item
+    )
+
+    db.add(obj)
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return obj
+
+#=============================================
+
+
+@checklist_router.get("/{id}/items")
+async def get_items(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    result = await db.execute(
+        select(m.ChecklistItem)
+        .where(m.ChecklistItem.checklist_id == id)
+        .order_by(m.ChecklistItem.id)
+    )
+
+    return result.scalars().all()
+
+#=============================================
+
+
+@checklist_router.put("/items/{item_id}")
+async def update_item(
+    item_id: int,
+    data: s.ChecklistItemUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    item = await db.get(m.ChecklistItem, item_id)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+
+    for key, value in data.dict(exclude_unset=True).items():
+        setattr(item, key, value)
+
+    await db.commit()
+    await db.refresh(item)
+
+    return item
+
+#=============================================
+
+@checklist_router.get("/items/{checklist_id}")
+async def list_items(
+    checklist_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    checklist = await db.get(m.Checklist, checklist_id)
+
+    if not checklist:
+        raise HTTPException(404, "Checklist not found")
+
+    result = await db.execute(
+        select(m.ChecklistItem)
+        .where(m.ChecklistItem.checklist_id == checklist_id)
+        .order_by(m.ChecklistItem.id)
+    )
+
+    return result.scalars().all()
+
+#==========================================
+
+@checklist_router.delete("/items/{item_id}")
+async def delete_item(
+    item_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    item = await db.get(m.ChecklistItem, item_id)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+
+    await db.delete(item)
+
+    await db.commit()
+
+    return {"message": "Checklist item deleted"}
+
+#=============================================
+
+
+@checklist_router.get("")
+async def list_checklists(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(READ_ROLES)),
+):
+    return (await db.execute(select(m.Checklist))).scalars().all()
+
+#=============================================
+
+@checklist_router.post("/{id}/execute")
+async def execute_checklist(
+    id: int,
+    data: s.ChecklistLogCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+):
+    checklist = await db.get(m.Checklist, id)
+
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    log = m.ChecklistLog(
+        checklist_id=id,
+        project_id=data.project_id,
+        remarks=data.remarks,
+        executed_by=current_user.id,
+    )
+
+    db.add(log)
+
+    await db.commit()
+    await db.refresh(log)
+
+    return log
 
 
 # ===================== Site Photos =====================

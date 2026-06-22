@@ -185,6 +185,7 @@ class EquipmentStatus(str, Enum):
     IDLE = "IDLE"
     RENTED = "RENTED"
     MAINTENANCE = "MAINTENANCE"
+    DAMAGED = "DAMAGED"
 
 class AlertType(str, Enum):
     LOW_STOCK = "LOW_STOCK" 

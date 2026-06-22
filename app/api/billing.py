@@ -75,7 +75,7 @@ async def create_ra_bill(
         raise ValidationError("Future bill date not allowed")
 
     from app.models.final_measurement import FinalMeasurement
-    
+
     if payload.measurement_id:
         measurement = await db.get(FinalMeasurement, payload.measurement_id)
         if not measurement:
@@ -83,8 +83,10 @@ async def create_ra_bill(
         if measurement.project_id != payload.project_id:
             raise ValidationError("Measurement project mismatch")
         if measurement.status not in ["VERIFIED", "APPROVED"]:
-            raise ValidationError("Only VERIFIED or APPROVED measurements can be billed")
-        
+            raise ValidationError(
+                "Only VERIFIED or APPROVED measurements can be billed"
+            )
+
         # Prevent billing beyond certified quantity if needed
         # For now we just enforce the link status
 
