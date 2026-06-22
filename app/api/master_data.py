@@ -304,6 +304,24 @@ async def delete_unit(
     if not obj:
         raise NotFoundError("Unit not found")
 
+    material_exists = await db.scalar(
+        select(m.MaterialMaster.id).where(
+            m.MaterialMaster.unit_id == id, m.MaterialMaster.is_active == True
+        )
+    )
+
+    if material_exists:
+        raise ValidationError("Unit is being used in Material Master")
+
+    activity_exists = await db.scalar(
+        select(m.ActivityType.id).where(
+            m.ActivityType.default_unit_id == id, m.ActivityType.is_active == True
+        )
+    )
+
+    if activity_exists:
+        raise ValidationError("Unit is being used in Activity Type")
+
     obj.is_active = False
 
     await db.commit()
@@ -362,7 +380,9 @@ async def create_labour_type(
 
     # CHECK EXISTING LABOUR TYPE
     existing = await db.scalar(
-        select(m.LabourType).where(m.LabourType.name == payload.name)
+        select(m.LabourType).where(
+            func.lower(m.LabourType.name) == payload.name.strip().lower()
+        )
     )
 
     if existing:
@@ -502,7 +522,7 @@ async def create_activity_type(
     current_user: User = Depends(admin_required),
 ):
 
-    if payload.default_unit_id:
+    if payload.default_unit_id is not None:
 
         unit = await db.get(m.Unit, payload.default_unit_id)
 
@@ -511,7 +531,9 @@ async def create_activity_type(
 
     # CHECK EXISTING ACTIVITY TYPE
     existing = await db.scalar(
-        select(m.ActivityType).where(m.ActivityType.name == payload.name)
+        select(m.ActivityType).where(
+            func.lower(m.ActivityType.name) == payload.name.strip().lower()
+        )
     )
 
     if existing:
@@ -710,7 +732,8 @@ async def create_material_master(
     # ===== CHECK EXISTING MATERIAL =====
     existing = await db.scalar(
         select(m.MaterialMaster).where(
-            func.lower(m.MaterialMaster.name) == payload.name.strip().lower()
+            func.lower(m.MaterialMaster.name) == payload.name.strip().lower(),
+            m.MaterialMaster.is_active == True,
         )
     )
 
@@ -810,6 +833,7 @@ async def update_material_master(
                 func.lower(m.MaterialMaster.name)
                 == update_data["name"].strip().lower(),
                 m.MaterialMaster.id != id,
+                m.MaterialMaster.is_active == True,
             )
         )
 

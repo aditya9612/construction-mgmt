@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import List, Optional, Union
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Annotated
 from app.core.enums import (
     ChecklistStatus,
@@ -64,6 +64,8 @@ class ProjectCreate(BaseSchema):
     shift_end_time: Optional[time] = None
     grace_period_minutes: int = 15
 
+    budget_amount: Optional[Decimal] = None
+
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
 
@@ -90,6 +92,8 @@ class ProjectUpdate(BaseSchema):
     shift_start_time: Optional[time] = None
     shift_end_time: Optional[time] = None
     grace_period_minutes: Optional[int] = None
+
+    budget_amount: Optional[Decimal] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
@@ -159,6 +163,8 @@ class MilestoneCreate(BaseSchema):
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    actual_start_date: Optional[date] = None
+    actual_end_date: Optional[date] = None
     status: Optional[MilestoneStatus] = MilestoneStatus.PLANNED
 
     @field_validator("end_date")
@@ -172,6 +178,8 @@ class MilestoneUpdate(BaseSchema):
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    actual_start_date: Optional[date] = None
+    actual_end_date: Optional[date] = None
     status: Optional[MilestoneStatus] = None
 
     @field_validator("end_date")
@@ -320,7 +328,16 @@ class TaskUpdate(BaseSchema):
     start_date: Optional[date] = None
 
     end_date: Optional[date] = None
-    assigned_user_id: Optional[int] = None
+
+    status: Optional[TaskStatus] = None
+
+    assigned_user_ids: Optional[list[int]] = None
+
+    activity_type_id: Optional[int] = None
+
+    milestone_id: Optional[int] = None
+
+    boq_id: Optional[int] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
@@ -439,7 +456,9 @@ class TaskOut(BaseSchema):
     actual_end_date: Optional[date] = None
 
     created_by_user_id: int
-    assigned_user_id: Optional[int]
+
+    assigned_users: list[AssignedUserOut] = []
+
     completion_percentage: float
 
     is_delayed: bool
@@ -491,6 +510,41 @@ class TaskPass(BaseSchema):
 class TaskStatusUpdate(BaseSchema):
 
     status: TaskStatus
+
+
+class TaskRequestBase(BaseModel):
+    title: str
+    category: str
+    project_id: int
+    priority: str
+    description: Optional[str] = None
+    attachment_url: Optional[str] = None
+    assigned_to: Optional[int] = None
+
+
+class TaskRequestCreate(TaskRequestBase):
+    pass
+
+
+class TaskRequestUpdate(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    priority: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    attachment_url: Optional[str] = None
+    assigned_to: Optional[int] = None
+    is_deleted: Optional[bool] = None
+
+
+class TaskRequestResponse(TaskRequestBase):
+    id: int
+    status: str
+    is_deleted: bool
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ===================== COMMENTS =====================
@@ -837,6 +891,23 @@ class ChecklistLogOut(BaseModel):
     remarks: Optional[str]
 
     model_config = {"from_attributes": True}  #  VERY IMPORTANT
+
+
+class ChecklistUpdate(BaseSchema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    project_id: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class ChecklistItemUpdate(BaseSchema):
+    item_name: Optional[str] = None
+    description: Optional[str] = None
+    is_required: Optional[bool] = None
+    is_completed: Optional[bool] = None
+
+
+# ===================== SitePhoto =====================
 
 
 class SitePhotoCreate(BaseSchema):

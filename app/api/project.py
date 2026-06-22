@@ -147,7 +147,14 @@ TASK_WRITE_ROLES = [
 TASK_DELETE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
 
 TASK_REQUEST_ROLES = [
-    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER, UserRole.PROJECT_MANAGER , UserRole.LABOUR ]
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
+        UserRole.PROJECT_MANAGER,
+        UserRole.LABOUR,
+    ]
 ]
 
 DSR_WRITE_ROLES = [
@@ -1154,10 +1161,19 @@ class MilestonesService:
             raise ValidationError("title cannot be null")
 
         from datetime import date
+
         if "status" in data:
-            if data["status"] == MilestoneStatus.IN_PROGRESS and data.get("actual_start_date") is None and obj.actual_start_date is None:
+            if (
+                data["status"] == MilestoneStatus.IN_PROGRESS
+                and data.get("actual_start_date") is None
+                and obj.actual_start_date is None
+            ):
                 data["actual_start_date"] = date.today()
-            if data["status"] == MilestoneStatus.COMPLETED and data.get("actual_end_date") is None and obj.actual_end_date is None:
+            if (
+                data["status"] == MilestoneStatus.COMPLETED
+                and data.get("actual_end_date") is None
+                and obj.actual_end_date is None
+            ):
                 data["actual_end_date"] = date.today()
 
         try:
@@ -1373,9 +1389,7 @@ class TasksService:
             user_id = data.get("assigned_user_id")
 
             if user_id is not None:
-                assigned_user = await db.scalar(
-                    select(User).where(User.id == user_id)
-                )
+                assigned_user = await db.scalar(select(User).where(User.id == user_id))
                 if assigned_user is None:
                     raise NotFoundError("User not found")
         # Resolve all unique user IDs from either input method
@@ -1413,7 +1427,9 @@ class TasksService:
                 )
             except IntegrityError:
                 await db.rollback()
-                raise ConflictError("Task with this title already exists in this project")
+                raise ConflictError(
+                    "Task with this title already exists in this project"
+                )
 
             if user_id:
                 await create_notification(
@@ -1421,7 +1437,7 @@ class TasksService:
                     user_id=user_id,
                     title="New Task Assigned",
                     message=f"You have been assigned a new task: {obj.title}",
-                    type="info"
+                    type="info",
                 )
 
             return self._task_to_out(
@@ -1437,9 +1453,7 @@ class TasksService:
         for user_id in assigned_ids:
 
             if user_id is not None:
-                assigned_user = await db.scalar(
-                    select(User).where(User.id == user_id)
-                )
+                assigned_user = await db.scalar(select(User).where(User.id == user_id))
                 if assigned_user is None:
                     raise NotFoundError("User not found")
 
@@ -1464,7 +1478,9 @@ class TasksService:
                 )
             except IntegrityError:
                 await db.rollback()
-                raise ConflictError("Task with this title already exists in this project")
+                raise ConflictError(
+                    "Task with this title already exists in this project"
+                )
 
             if user_id:
                 await create_notification(
@@ -1472,7 +1488,7 @@ class TasksService:
                     user_id=user_id,
                     title="New Task Assigned",
                     message=f"You have been assigned a new task: {obj.title}",
-                    type="info"
+                    type="info",
                 )
 
             tasks.append(
@@ -2424,7 +2440,11 @@ class ReportsService:
             .unique()
             .all()
         )
-        tasks = (await db.execute(select(m.Task).where(m.Task.project_id == project_id))).scalars().all()
+        tasks = (
+            (await db.execute(select(m.Task).where(m.Task.project_id == project_id)))
+            .scalars()
+            .all()
+        )
         total_tasks = len(tasks)
         completed_tasks = sum(
             1
@@ -2579,21 +2599,47 @@ class ReportsService:
                 for ms in milestones
             ],
             "members": members_list,
-            "tasks": [{
-                "name": t.title,
-                "assignee": str(t.assigned_user_id) if t.assigned_user_id else "Unassigned",
-                "start_date": t.start_date,
-                "end_date": t.end_date,
-                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
-                "progress": getattr(t, "completion_percentage", 0)
-            } for t in tasks],
-            "milestones": [{
-                "name": ms.title,
-                "end_date": ms.end_date,
-                "status": ms.status.value if hasattr(ms.status, "value") else str(ms.status),
-                "completion": ms.completion_percentage if hasattr(ms, 'completion_percentage') else (100 if (hasattr(ms.status, "value") and ms.status.value == 'Completed') or str(ms.status) == 'Completed' else 0)
-            } for ms in milestones],
-            "members": members_list
+            "tasks": [
+                {
+                    "name": t.title,
+                    "assignee": (
+                        str(t.assigned_user_id) if t.assigned_user_id else "Unassigned"
+                    ),
+                    "start_date": t.start_date,
+                    "end_date": t.end_date,
+                    "status": (
+                        t.status.value if hasattr(t.status, "value") else str(t.status)
+                    ),
+                    "progress": getattr(t, "completion_percentage", 0),
+                }
+                for t in tasks
+            ],
+            "milestones": [
+                {
+                    "name": ms.title,
+                    "end_date": ms.end_date,
+                    "status": (
+                        ms.status.value
+                        if hasattr(ms.status, "value")
+                        else str(ms.status)
+                    ),
+                    "completion": (
+                        ms.completion_percentage
+                        if hasattr(ms, "completion_percentage")
+                        else (
+                            100
+                            if (
+                                hasattr(ms.status, "value")
+                                and ms.status.value == "Completed"
+                            )
+                            or str(ms.status) == "Completed"
+                            else 0
+                        )
+                    ),
+                }
+                for ms in milestones
+            ],
+            "members": members_list,
         }
 
         buffer = generate_project_report_pdf(data)
@@ -2651,10 +2697,14 @@ async def projects_module_summary(
     # 1. Summary
     total = await db.scalar(select(func.count(m.Project.id)))
     ongoing = await db.scalar(
-        select(func.count(m.Project.id)).where(m.Project.status == ProjectStatus.ONGOING.value)
+        select(func.count(m.Project.id)).where(
+            m.Project.status == ProjectStatus.ONGOING.value
+        )
     )
     completed = await db.scalar(
-        select(func.count(m.Project.id)).where(m.Project.status == ProjectStatus.COMPLETED.value)
+        select(func.count(m.Project.id)).where(
+            m.Project.status == ProjectStatus.COMPLETED.value
+        )
     )
     delayed = await db.scalar(
         select(func.count(m.Project.id)).where(
@@ -2773,9 +2823,11 @@ async def create_project(
 
     return out
 
+
 # =========================================
 # PM DASHBOARD ENDPOINTS
 # =========================================
+
 
 @router.get("/calendar", response_model=s.PMCalendarOut)
 async def get_pm_calendar(
@@ -2785,11 +2837,13 @@ async def get_pm_calendar(
     # Get all project IDs this user has access to
     from app.models.project import ProjectMember, Task, Milestone
     from app.models.approval import Approval
-    
+
     project_ids = []
     if current_user.role != UserRole.ADMIN:
         memberships = await db.scalars(
-            select(ProjectMember.project_id).where(ProjectMember.user_id == current_user.id)
+            select(ProjectMember.project_id).where(
+                ProjectMember.user_id == current_user.id
+            )
         )
         project_ids = list(memberships.all())
     else:
@@ -2797,61 +2851,70 @@ async def get_pm_calendar(
         project_ids = list(projs.all())
 
     events = []
-    
+
     if project_ids:
         # Tasks (Due Dates)
         tasks = await db.scalars(
-            select(Task).where(Task.project_id.in_(project_ids), Task.due_date.isnot(None))
+            select(Task).where(
+                Task.project_id.in_(project_ids), Task.due_date.isnot(None)
+            )
         )
         for t in tasks:
-            events.append(s.CalendarEvent(
-                title=t.task_name,
-                date=t.due_date,
-                type="Task"
-            ))
-            
+            events.append(
+                s.CalendarEvent(title=t.task_name, date=t.due_date, type="Task")
+            )
+
         # Milestones (Due Dates)
         milestones = await db.scalars(
-            select(Milestone).where(Milestone.project_id.in_(project_ids), Milestone.planned_end_date.isnot(None))
+            select(Milestone).where(
+                Milestone.project_id.in_(project_ids),
+                Milestone.planned_end_date.isnot(None),
+            )
         )
         for ml in milestones:
-            events.append(s.CalendarEvent(
-                title=ml.milestone_name,
-                date=ml.planned_end_date,
-                type="Milestone"
-            ))
+            events.append(
+                s.CalendarEvent(
+                    title=ml.milestone_name, date=ml.planned_end_date, type="Milestone"
+                )
+            )
 
     return s.PMCalendarOut(events=events)
 
 
-@router.get("/{project_id}/resource-summary", response_model=s.ProjectResourceSummaryOut)
+@router.get(
+    "/{project_id}/resource-summary", response_model=s.ProjectResourceSummaryOut
+)
 async def get_project_resource_summary(
     project_id: int,
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     await assert_project_access(db, project_id, current_user)
-    
+
     from app.models.labour import LabourProject
     from app.models.equipment import Equipment
     from app.models.expense import Expense
 
     labour_count = await db.scalar(
-        select(func.count(LabourProject.labour_id)).where(LabourProject.project_id == project_id)
+        select(func.count(LabourProject.labour_id)).where(
+            LabourProject.project_id == project_id
+        )
     )
-    
+
     equipment_count = await db.scalar(
         select(func.count(Equipment.id)).where(Equipment.project_id == project_id)
     )
-    
+
     material_expense = await db.scalar(
-        select(func.sum(Expense.amount)).where(Expense.project_id == project_id, Expense.category == "Material")
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id, Expense.category == "Material"
+        )
     )
 
     return s.ProjectResourceSummaryOut(
         labour=labour_count or 0,
         equipment=equipment_count or 0,
-        materials_cost=float(material_expense or 0.0)
+        materials_cost=float(material_expense or 0.0),
     )
 
 
@@ -2862,31 +2925,35 @@ async def get_project_health_score(
     db: AsyncSession = Depends(get_db_session),
 ):
     await assert_project_access(db, project_id, current_user)
-    
+
     from app.models.project import Issue
-    
+
     project = await db.get(m.Project, project_id)
     if not project:
         raise NotFoundError("Project not found")
 
     score = 100
-    if project.status == ProjectStatus.ONGOING.value and project.end_date and project.end_date < date.today():
+    if (
+        project.status == ProjectStatus.ONGOING.value
+        and project.end_date
+        and project.end_date < date.today()
+    ):
         score -= 20
     elif project.status == ProjectStatus.ON_HOLD.value:
         score -= 15
-        
+
     open_critical_issues = await db.scalar(
         select(func.count(Issue.id)).where(
             Issue.project_id == project_id,
             Issue.status == "Open",
-            Issue.priority == "High"
+            Issue.priority == "High",
         )
     )
     if open_critical_issues:
-        score -= (open_critical_issues * 5)
-        
+        score -= open_critical_issues * 5
+
     score = max(0, min(100, score))
-    
+
     status_str = "Good"
     if score < 50:
         status_str = "Poor"
@@ -2894,7 +2961,6 @@ async def get_project_health_score(
         status_str = "At Risk"
 
     return s.ProjectHealthScoreOut(health=score, status=status_str)
-
 
 
 # =========================================
@@ -3652,7 +3718,9 @@ async def list_tasks(
 
 
 @tasks_router.get("/{project_id}/tasks/{task_id}", response_model=s.TaskOut)
-@tasks_router.get("/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]])
+@tasks_router.get(
+    "/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]]
+)
 async def get_task(
     project_id: int,
     task_id: int,
@@ -3667,7 +3735,9 @@ async def get_task(
 
 
 @tasks_router.put("/{project_id}/tasks/{task_id}", response_model=s.TaskOut)
-@tasks_router.put("/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]])
+@tasks_router.put(
+    "/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]]
+)
 async def update_task(
     project_id: int,
     task_id: int,
@@ -3887,13 +3957,14 @@ async def list_task_progress_history(
 async def create_task_request(
     request: s.TaskRequestCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
     db_obj = m.TaskRequest(**request.model_dump())
     db.add(db_obj)
     await db.commit()
     await db.refresh(db_obj)
     return db_obj
+
 
 @tasks_router.get("/", response_model=List[s.TaskRequestResponse])
 async def get_task_requests(
@@ -3903,7 +3974,7 @@ async def get_task_requests(
     skip: int = Query(0, ge=0, description="Pagination skip"),
     limit: int = Query(100, ge=1, le=1000, description="Pagination limit"),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
     query = select(m.TaskRequest).where(m.TaskRequest.is_deleted == False)
     if project_id:
@@ -3912,51 +3983,62 @@ async def get_task_requests(
         query = query.where(m.TaskRequest.status == status)
     if priority:
         query = query.where(m.TaskRequest.priority == priority)
-        
+
     query = query.offset(skip).limit(limit)
-        
+
     result = await db.execute(query)
     task_requests = result.scalars().all()
     return list(task_requests)
+
 
 @tasks_router.put("/{request_id}", response_model=s.TaskRequestResponse)
 async def update_task_request(
     request_id: int,
     request: s.TaskRequestUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
-    result = await db.execute(select(m.TaskRequest).where(m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False))
+    result = await db.execute(
+        select(m.TaskRequest).where(
+            m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False
+        )
+    )
     db_obj = result.scalar_one_or_none()
-    
+
     if not db_obj:
         raise HTTPException(status_code=404, detail="Task request not found")
-    
+
     update_data = request.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(db_obj, key, value)
-        
+
     await db.commit()
     await db.refresh(db_obj)
     return db_obj
+
 
 @tasks_router.delete("/{request_id}", status_code=204)
 async def delete_task_request(
     request_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
-    result = await db.execute(select(m.TaskRequest).where(m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False))
+    result = await db.execute(
+        select(m.TaskRequest).where(
+            m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False
+        )
+    )
     db_obj = result.scalar_one_or_none()
-    
+
     if not db_obj:
         raise HTTPException(status_code=404, detail="Task request not found")
-        
+
     # Soft delete
     db_obj.is_deleted = True
     await db.commit()
-    
+
     return None
+
 
 @tasks_router.post(
     "/{project_id}/tasks/{task_id}/comments", response_model=s.CommentOut
@@ -8493,7 +8575,8 @@ async def list_logs(
         items=items, meta=PaginationMeta(total=count, limit=limit, offset=offset)
     )
 
-#=====================================================
+
+# =====================================================
 
 
 @checklist_router.post("")
@@ -8509,7 +8592,8 @@ async def create_checklist(
     return obj
 
 
-#=============================================
+# =============================================
+
 
 @checklist_router.get("/{id}")
 async def get_checklist(
@@ -8524,7 +8608,9 @@ async def get_checklist(
 
     return checklist
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.put("/{id}")
 async def update_checklist(
@@ -8546,7 +8632,9 @@ async def update_checklist(
 
     return checklist
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.delete("/{id}")
 async def delete_checklist(
@@ -8565,7 +8653,9 @@ async def delete_checklist(
 
     return {"message": "Checklist deleted successfully"}
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.post("/items")
 async def add_item(
@@ -8576,28 +8666,19 @@ async def add_item(
     checklist = await db.get(m.Checklist, data.checklist_id)
 
     if not checklist:
-        raise HTTPException(
-            status_code=404,
-            detail="Checklist not found"
-        )
+        raise HTTPException(status_code=404, detail="Checklist not found")
 
     existing = await db.scalar(
         select(m.ChecklistItem).where(
             m.ChecklistItem.checklist_id == data.checklist_id,
-            m.ChecklistItem.item == data.item
+            m.ChecklistItem.item == data.item,
         )
     )
 
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="Checklist item already exists"
-        )
+        raise HTTPException(status_code=400, detail="Checklist item already exists")
 
-    obj = m.ChecklistItem(
-        checklist_id=data.checklist_id,
-        item=data.item
-    )
+    obj = m.ChecklistItem(checklist_id=data.checklist_id, item=data.item)
 
     db.add(obj)
 
@@ -8606,7 +8687,8 @@ async def add_item(
 
     return obj
 
-#=============================================
+
+# =============================================
 
 
 @checklist_router.get("/{id}/items")
@@ -8628,7 +8710,8 @@ async def get_items(
 
     return result.scalars().all()
 
-#=============================================
+
+# =============================================
 
 
 @checklist_router.put("/items/{item_id}")
@@ -8651,7 +8734,9 @@ async def update_item(
 
     return item
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.get("/items/{checklist_id}")
 async def list_items(
@@ -8672,7 +8757,9 @@ async def list_items(
 
     return result.scalars().all()
 
-#==========================================
+
+# ==========================================
+
 
 @checklist_router.delete("/items/{item_id}")
 async def delete_item(
@@ -8691,7 +8778,8 @@ async def delete_item(
 
     return {"message": "Checklist item deleted"}
 
-#=============================================
+
+# =============================================
 
 
 @checklist_router.get("")
@@ -8701,7 +8789,9 @@ async def list_checklists(
 ):
     return (await db.execute(select(m.Checklist))).scalars().all()
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.post("/{id}/execute")
 async def execute_checklist(
@@ -9215,7 +9305,9 @@ async def list_requests(
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
-        select(m.SiteRequest).where(m.SiteRequest.project_id == project_id).order_by(m.SiteRequest.created_at.desc())
+        select(m.SiteRequest)
+        .where(m.SiteRequest.project_id == project_id)
+        .order_by(m.SiteRequest.created_at.desc())
     )
     return result.scalars().all()
 
@@ -9246,7 +9338,6 @@ async def reject_request(
 
     await db.commit()
     return {"message": "Rejected"}
-
 
 
 router.include_router(milestones_router)
