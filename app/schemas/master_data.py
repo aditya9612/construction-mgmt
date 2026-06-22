@@ -205,7 +205,7 @@ class ActivityTypeOut(MasterDataBase):
 
 class MaterialMasterCreate(MasterDataBase):
 
-    unit_id: int
+    unit: str
 
     brand: Optional[str] = None
 
@@ -224,7 +224,9 @@ class MaterialMasterUpdate(BaseModel):
 
     name: Optional[str] = None
 
-    unit_id: Optional[int] = None
+    unit: Optional[str] = None
+
+    # unique_code: Optional[str] = None
 
     category: Optional[str] = None
 
@@ -245,8 +247,8 @@ class MaterialMasterOut(MasterDataBase):
 
     id: int
 
-    unit_id: int
-    unit_name: Optional[str] = None
+    unit: str
+
     brand: Optional[str]
 
     unique_code: Optional[str]

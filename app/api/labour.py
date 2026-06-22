@@ -426,27 +426,18 @@ async def get_contractor_liability(
     return output
 
 
+
 @router.put("/{labour_id}", response_model=s.LabourOut)
 async def update_labour(
     labour_id: int,
-    aadhaar_number: Optional[str] = Form(None),
-    pan_number: Optional[str] = Form(None),
-    labour_name: Optional[str] = Form(None),
-    mobile_number: Optional[str] = Form(None),
-    email: Optional[EmailStr] = Form(None),
-    address: Optional[str] = Form(None),
-    labour_type_id: Optional[int] = Form(None),
-    custom_daily_wage_rate: Optional[Decimal] = Form(None),
-    custom_ot_rate_per_hour: Optional[Decimal] = Form(None),
-    contractor_id: Optional[int] = Form(None),
-    status: Optional[LabourStatus] = Form(None),
-    notes: Optional[str] = Form(None),
-    profile_image: UploadFile = File(None),
+    payload: s.LabourUpdate,
     current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
+    obj = await db.scalar(
+        select(Labour).where(Labour.id == labour_id)
+    )
 
     if not obj:
         raise NotFoundError("Labour record not found")
@@ -458,102 +449,29 @@ async def update_labour(
 
     project_ids = mappings.all()
 
-    # CHECK ANY ACCESS ONLY IF ASSIGNED
-    if project_ids:
+    if not project_ids:
+        raise ValidationError("Labour not assigned")
 
-        allowed = False
+    #  CHECK ANY ACCESS
+    allowed = False
+    for pid in project_ids:
+        try:
+            await assert_project_access(db, project_id=pid, current_user=current_user)
+            allowed = True
+            break
+        except:
+            continue
 
-        for pid in project_ids:
-            try:
-                await assert_project_access(
-                    db, project_id=pid, current_user=current_user
-                )
+    if not allowed:
+        raise PermissionDeniedError("No access to this labour")
 
-                allowed = True
-                break
-
-            except PermissionDeniedError:
-                continue
-
-        if not allowed:
-            raise PermissionDeniedError("No access to this labour")
-
-    # data = payload.model_dump(exclude_unset=True)
-
-    data = {
-        "aadhaar_number": aadhaar_number,
-        "pan_number": pan_number,
-        "labour_name": labour_name,
-        "mobile_number": mobile_number,
-        "email": email,
-        "address": address,
-        "labour_type_id": labour_type_id,
-        "custom_daily_wage_rate": custom_daily_wage_rate,
-        "custom_ot_rate_per_hour": custom_ot_rate_per_hour,
-        "contractor_id": contractor_id,
-        "status": status,
-        "notes": notes,
-    }
-
-    data = {k: v for k, v in data.items() if v is not None}
-
-    if labour_type_id is not None:
-
-        labour_type = await db.get(LabourType, labour_type_id)
-
-        if not labour_type:
-            raise ValidationError("Invalid labour_type_id")
-
-    # PROFILE IMAGE UPDATE
-    if profile_image:
-        image_path = await validate_and_save_image(
-            file=profile_image, upload_dir="uploads/labour", prefix="labour"
-        )
-
-        data["profile_image"] = image_path
+    data = payload.model_dump(exclude_unset=True)
 
     for k, v in data.items():
         setattr(obj, k, v)
 
-    # SYNC USER TABLE
-    if obj.user_id:
-        user = await db.get(User, obj.user_id)
-
-        if user:
-            if "labour_name" in data:
-                user.full_name = data["labour_name"]
-
-            if "mobile_number" in data:
-                user.mobile = data["mobile_number"]
-
-            if "email" in data:
-                user.email = data["email"]
-
-            if "aadhaar_number" in data:
-                user.aadhaar_number = data["aadhaar_number"]
-
-            if "profile_image" in data:
-                user.profile_image = data["profile_image"]
-
-            if "status" in data:
-                user.is_active = data["status"] == LabourStatus.ACTIVE
-
-            if "pan_number" in data:
-                user.pan_number = data["pan_number"]
-
-            if "address" in data:
-                user.address = data["address"]
-
     await db.flush()
-
-    await db.refresh(
-        obj,
-        attribute_names=[
-            "user",
-            "contractor",
-            "labour_type",
-        ],
-    )
+    await db.refresh(obj)
 
     await r.bump_cache_version(redis, VERSION_KEY)
     await r.bump_cache_version(redis, "dashboard_version")

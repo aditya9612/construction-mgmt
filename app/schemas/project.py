@@ -320,16 +320,7 @@ class TaskUpdate(BaseSchema):
     start_date: Optional[date] = None
 
     end_date: Optional[date] = None
-
-    status: Optional[TaskStatus] = None
-
-    assigned_user_ids: Optional[list[int]] = None
-
-    activity_type_id: Optional[int] = None
-
-    milestone_id: Optional[int] = None
-
-    boq_id: Optional[int] = None
+    assigned_user_id: Optional[int] = None
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
@@ -448,9 +439,7 @@ class TaskOut(BaseSchema):
     actual_end_date: Optional[date] = None
 
     created_by_user_id: int
-
-    assigned_users: list[AssignedUserOut] = []
-
+    assigned_user_id: Optional[int]
     completion_percentage: float
 
     is_delayed: bool

@@ -1302,9 +1302,7 @@ class TasksService:
         *,
         project_id: int,
         payload: s.TaskCreate,
-        audio_instruction_url: Optional[str] = None,
-        instruction_image_url: Optional[str] = None,
-    ) -> s.TaskOut:
+    ) -> s.TaskOut | list[s.TaskOut]:
 
         self._assert_task_mutation_role(current_user)
 
@@ -1356,6 +1354,17 @@ class TasksService:
         if assigned_ids == []:
             raise ValidationError("assigned_user_ids cannot be empty")
 
+        #  CASE 1: SINGLE / OLD FLOW
+        if assigned_ids is None:
+
+            user_id = data.get("assigned_user_id")
+
+            if user_id is not None:
+                assigned_user = await db.scalar(
+                    select(User).where(User.id == user_id)
+                )
+                if assigned_user is None:
+                    raise NotFoundError("User not found")
         # Resolve all unique user IDs from either input method
         final_user_ids = set()
 
@@ -1381,6 +1390,90 @@ class TasksService:
             if not is_member:
                 raise ValidationError(f"User {uid} not part of project")
 
+            data["created_by_user_id"] = current_user.id
+
+            try:
+                obj = await self.tasks_repo.create_task(
+                    db,
+                    project_id=project_id,
+                    data=data,
+                )
+            except IntegrityError:
+                await db.rollback()
+                raise ConflictError("Task with this title already exists in this project")
+
+            if user_id:
+                await create_notification(
+                    db,
+                    user_id=user_id,
+                    title="New Task Assigned",
+                    message=f"You have been assigned a new task: {obj.title}",
+                    type="info"
+                )
+
+            return self._task_to_out(
+                task=obj,
+                is_delayed=self._is_delayed(task=obj, current_date=date.today()),
+            )
+
+        # =========================
+        # CASE 2: MULTI-ASSIGN
+        # =========================
+        tasks = []
+
+        for user_id in assigned_ids:
+
+            if user_id is not None:
+                assigned_user = await db.scalar(
+                    select(User).where(User.id == user_id)
+                )
+                if assigned_user is None:
+                    raise NotFoundError("User not found")
+
+                is_member = await db.scalar(
+                    select(m.ProjectMember).where(
+                        m.ProjectMember.project_id == project_id,
+                        m.ProjectMember.user_id == user_id,
+                    )
+                )
+                if not is_member:
+                    raise ValidationError("User not part of project")
+
+            new_data = data.copy()
+            new_data["assigned_user_id"] = user_id
+            new_data["created_by_user_id"] = current_user.id
+
+            try:
+                obj = await self.tasks_repo.create_task(
+                    db,
+                    project_id=project_id,
+                    data=new_data,
+                )
+            except IntegrityError:
+                await db.rollback()
+                raise ConflictError("Task with this title already exists in this project")
+
+            if user_id:
+                await create_notification(
+                    db,
+                    user_id=user_id,
+                    title="New Task Assigned",
+                    message=f"You have been assigned a new task: {obj.title}",
+                    type="info"
+                )
+
+            tasks.append(
+                self._task_to_out(
+                    task=obj,
+                    is_delayed=self._is_delayed(task=obj, current_date=date.today()),
+                )
+            )
+
+        #  AFTER LOOP (correct place)
+        if len(tasks) == 1:
+            return tasks[0]
+
+        return tasks
         data["created_by_user_id"] = current_user.id
 
         # We no longer populate assigned_user_id
@@ -2318,6 +2411,7 @@ class ReportsService:
             .unique()
             .all()
         )
+        tasks = (await db.execute(select(m.Task).where(m.Task.project_id == project_id))).scalars().all()
         total_tasks = len(tasks)
         completed_tasks = sum(
             1
@@ -2472,6 +2566,21 @@ class ReportsService:
                 for ms in milestones
             ],
             "members": members_list,
+            "tasks": [{
+                "name": t.title,
+                "assignee": str(t.assigned_user_id) if t.assigned_user_id else "Unassigned",
+                "start_date": t.start_date,
+                "end_date": t.end_date,
+                "status": t.status.value if hasattr(t.status, "value") else str(t.status),
+                "progress": getattr(t, "completion_percentage", 0)
+            } for t in tasks],
+            "milestones": [{
+                "name": ms.title,
+                "end_date": ms.end_date,
+                "status": ms.status.value if hasattr(ms.status, "value") else str(ms.status),
+                "completion": ms.completion_percentage if hasattr(ms, 'completion_percentage') else (100 if (hasattr(ms.status, "value") and ms.status.value == 'Completed') or str(ms.status) == 'Completed' else 0)
+            } for ms in milestones],
+            "members": members_list
         }
 
         buffer = generate_project_report_pdf(data)
@@ -3427,6 +3536,7 @@ async def list_tasks(
 
 
 @tasks_router.get("/{project_id}/tasks/{task_id}", response_model=s.TaskOut)
+@tasks_router.get("/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]])
 async def get_task(
     project_id: int,
     task_id: int,
@@ -3441,6 +3551,7 @@ async def get_task(
 
 
 @tasks_router.put("/{project_id}/tasks/{task_id}", response_model=s.TaskOut)
+@tasks_router.put("/{project_id}/tasks/{task_id}", response_model=Union[s.TaskOut, List[s.TaskOut]])
 async def update_task(
     project_id: int,
     task_id: int,
@@ -3799,6 +3910,7 @@ async def create_dsr(
         if not contractor:
             raise ValidationError("Invalid contractor_id")
 
+    # Labour summary
     labour_result = await db.execute(
         select(
             LabourType.skill_category,
@@ -3833,7 +3945,6 @@ async def create_dsr(
     data = payload.model_dump()
 
     data["created_by_id"] = current_user.id
-
     data["total_labour"] = total_labour
     data["skilled_labour"] = skilled
     data["unskilled_labour"] = unskilled
