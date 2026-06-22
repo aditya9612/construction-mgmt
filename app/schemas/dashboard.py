@@ -2,13 +2,16 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import date, datetime
 
+
 class MaterialStockStatus(BaseModel):
     category: str
     status: str  # OK, Low, Out of Stock
 
+
 class IssueStats(BaseModel):
     total: int
     high_priority: int
+
 
 class TodayWorkSummary(BaseModel):
     activity_name: str
@@ -16,10 +19,12 @@ class TodayWorkSummary(BaseModel):
     start_time: Optional[str] = None
     finish_time: Optional[str] = None
 
+
 class DisciplineProgress(BaseModel):
     discipline: str
     planned_percent: float
     actual_percent: float
+
 
 class RecentExpense(BaseModel):
     date: date
@@ -28,12 +33,14 @@ class RecentExpense(BaseModel):
     note: Optional[str]
     amount: float
 
+
 class MilestoneTimelineEntry(BaseModel):
     id: int
     title: str
     status: str
     start_date: Optional[date]
     end_date: Optional[date]
+
 
 class DashboardVitals(BaseModel):
     total_labour_today: int
@@ -42,6 +49,7 @@ class DashboardVitals(BaseModel):
     active_activities: int
     open_issues: IssueStats
     material_stock_status: List[MaterialStockStatus]
+
 
 class EnhancedDashboardOut(BaseModel):
     project_id: int
@@ -57,12 +65,14 @@ class EnhancedDashboardOut(BaseModel):
     recent_expenses: List[RecentExpense]
     weather: Optional[dict] = None
 
+
 class AdminVitals(BaseModel):
     total_labour_today: int
     pending_approvals: int
     action_items: int  # High priority open issues
     material_used_today: int
     site_issues_open: int
+
 
 class AdminProjectOverview(BaseModel):
     id: int
@@ -73,6 +83,7 @@ class AdminProjectOverview(BaseModel):
     performance_score: float  # variance
     health: str  # Active, Delayed, etc.
 
+
 class ProjectActivity(BaseModel):
     type: str  # task_completion, invoice_submission, site_photo, issue_report
     user: str
@@ -80,15 +91,17 @@ class ProjectActivity(BaseModel):
     time: str
     project_name: Optional[str] = None
 
+
 class AdminDashboardOut(BaseModel):
     project_overview: dict  # {total, active, completed, delayed}
-    financial: dict       # {revenue, expense, profit}
+    financial: dict  # {revenue, expense, profit}
     vitals: AdminVitals
     active_users: int
     discipline_progress: List[DisciplineProgress]
     master_projects: List[AdminProjectOverview]
     recent_activities: List[ProjectActivity]
     kpi_comparison: Optional[dict] = None
+
 
 class ProjectsManagementDashboardOut(BaseModel):
     summary: dict  # {total, ongoing, completed, delayed}
@@ -106,15 +119,18 @@ class AccountantKpiCards(BaseModel):
     net_profit: float
     gst_due: float
 
+
 class RevenueExpenseTrend(BaseModel):
     month: str
     revenue: float
     expense: float
 
+
 class CashFlow(BaseModel):
     cash_inflow: float
     cash_outflow: float
     closing_balance: float
+
 
 class ProjectCostSummaryItem(BaseModel):
     project_name: str
@@ -122,24 +138,29 @@ class ProjectCostSummaryItem(BaseModel):
     spent: float
     remaining: float
 
+
 class OutstandingReceivable(BaseModel):
     client_invoice: str
     amount_due: float
     due_date: Optional[date]
+
 
 class PendingPayable(BaseModel):
     vendor_bill_no: str
     amount: float
     due_date: Optional[date]
 
+
 class UpcomingPayment(BaseModel):
-    category: str # Today, Tomorrow, 5 Days Later
+    category: str  # Today, Tomorrow, 5 Days Later
     description: str
     amount: float
+
 
 class RecentActivityItem(BaseModel):
     time: str
     activity: str
+
 
 class AccountantDashboardOut(BaseModel):
     kpi_cards: AccountantKpiCards
@@ -156,12 +177,14 @@ class AccountantDashboardOut(BaseModel):
 # PM COMMAND CENTER (NEW)
 # =========================================
 
+
 class PMKpiCards(BaseModel):
     total_managed_projects: int
     active_site_deployments: int
     avg_completion_percent: float
     delayed_sites_count: int
     pending_reviews_count: int
+
 
 class PMProjectPerformance(BaseModel):
     id: int
@@ -174,6 +197,7 @@ class PMProjectPerformance(BaseModel):
     budget_utilization_actual: float
     budget_utilization_total: float
 
+
 class PMResourceOrchestration(BaseModel):
     user_id: int
     full_name: str
@@ -182,16 +206,19 @@ class PMResourceOrchestration(BaseModel):
     status: str  # On Site, Travelling, Off Duty
     last_seen: str  # "10 mins ago"
 
+
 class PMCostTrackingItem(BaseModel):
     month: str
     actual_cost: float
     budget: float
 
+
 class PMDelayRiskAnalysis(BaseModel):
     project_name: str
     risk_type: str
     priority: str  # High, Medium, Low
-    status: str    # CRITICAL, WARNING, MONITORED
+    status: str  # CRITICAL, WARNING, MONITORED
+
 
 class PMCriticalAlert(BaseModel):
     id: int
@@ -200,12 +227,14 @@ class PMCriticalAlert(BaseModel):
     project_name: str
     timestamp: datetime
 
+
 class PMTaskOverview(BaseModel):
     id: int
     task_name: str
     engineer_name: str
     status: str  # In Progress, Pending, Completed
     due_date: Optional[date]
+
 
 class PMCommandCenterOut(BaseModel):
     header_date: str
@@ -220,9 +249,11 @@ class PMCommandCenterOut(BaseModel):
     task_management: List[PMTaskOverview]
     recent_activities: List[ProjectActivity]
 
+
 # =========================================
 # LABOUR DASHBOARD (NEW)
 # =========================================
+
 
 class LabourTaskItem(BaseModel):
     task_id: str
@@ -232,29 +263,33 @@ class LabourTaskItem(BaseModel):
     start_date: Optional[date]
     progress: float
 
+
 class LabourActivityItem(BaseModel):
     title: str
     description: str
     time: str
 
+
 class LabourDashboardOut(BaseModel):
     user_name: str
     project_name: Optional[str]
     contractor_name: Optional[str]
-    
+
     check_in_status: str
-    
+
     total_tasks: int
     completed_tasks: int
     pending_tasks: int
     this_month_earnings: float
-    
+
     recent_tasks: List[LabourTaskItem]
     recent_activity: List[LabourActivityItem]
+
 
 # =========================================
 # PROJECT MANAGER DASHBOARD
 # =========================================
+
 
 class PMSummaryOut(BaseModel):
     total_projects: int

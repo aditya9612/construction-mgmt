@@ -3,7 +3,7 @@ from typing import Optional
 from sqlalchemy import Column, Integer, String, ForeignKey, Date, DECIMAL
 from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin
-from sqlalchemy import UniqueConstraint
+
 
 class Expense(Base, TimestampMixin):
     __tablename__ = "expenses"
@@ -48,9 +48,3 @@ class Expense(Base, TimestampMixin):
 
     expense_date: Mapped[str] = mapped_column(Date, nullable=False, index=True)
     payment_mode: Mapped[str] = mapped_column(String(50), nullable=False)
-
-    source_type: Mapped[Optional[str]] = mapped_column(
-        String(50),
-        nullable=True,
-        index=True
-    )

@@ -3,16 +3,9 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import desc, select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date, datetime, timedelta
-from dateutil.relativedelta import relativedelta
 import io
 
-from app.core.enums import (
-    InvoiceStatus,
-    ProjectStatus,
-    IssueStatus,
-    IssuePriority,
-    MilestoneStatus,
-)
+from app.core.enums import InvoiceStatus
 from app.db.session import get_db_session
 from app.core import dependencies as d
 from app.models.user import User, UserRole
@@ -22,10 +15,8 @@ from app.models.invoice import Invoice, Transaction
 from app.models.accountant import Account, GSTReturn, VendorBill, JournalLine
 from app.models.user import UserAttendance
 from app.models.boq import BOQ
-from app.models.quotation import QuotationMaster
 from app.models.material import Material
 from app.models.project import (
-    TaskAssignment,
     WorkActivity,
     DailyProgressEntry,
     Issue,
@@ -121,72 +112,6 @@ async def get_user_project_ids(db, user: User):
     return [r[0] for r in result.all()]
 
 
-async def get_waterfall_budget(db: AsyncSession, project_ids: list[int]) -> float:
-    if not project_ids:
-        return 0.0
-    boq_res = await db.execute(
-        select(BOQ.project_id, func.sum(BOQ.total_cost))
-        .where(BOQ.project_id.in_(project_ids), BOQ.is_latest == True)
-        .group_by(BOQ.project_id)
-    )
-    boq_totals = {row[0]: float(row[1] or 0) for row in boq_res.all()}
-    proj_res = await db.execute(
-        select(m.Project.id, m.Project.budget_amount, QuotationMaster.grand_total)
-        .outerjoin(QuotationMaster, m.Project.quotation_id == QuotationMaster.id)
-        .where(m.Project.id.in_(project_ids))
-    )
-    total = 0.0
-    for row in proj_res.all():
-        pid = row[0]
-        budget_amt = float(row[1] or 0)
-        quotation_amt = float(row[2] or 0)
-        boq_amt = boq_totals.get(pid, 0.0)
-        if boq_amt > 0:
-            total += boq_amt
-        elif quotation_amt > 0:
-            total += quotation_amt
-        else:
-            total += budget_amt
-    return total
-
-
-async def get_waterfall_budget_dict(
-    db: AsyncSession, project_ids: list[int] = None
-) -> dict[int, float]:
-    boq_query = (
-        select(BOQ.project_id, func.sum(BOQ.total_cost))
-        .where(BOQ.is_latest == True)
-        .group_by(BOQ.project_id)
-    )
-    if project_ids is not None:
-        if not project_ids:
-            return {}
-        boq_query = boq_query.where(BOQ.project_id.in_(project_ids))
-    boq_res = await db.execute(boq_query)
-    boq_totals = {row[0]: float(row[1] or 0) for row in boq_res.all()}
-
-    proj_query = select(
-        m.Project.id, m.Project.budget_amount, QuotationMaster.grand_total
-    ).outerjoin(QuotationMaster, m.Project.quotation_id == QuotationMaster.id)
-    if project_ids is not None:
-        proj_query = proj_query.where(m.Project.id.in_(project_ids))
-    proj_res = await db.execute(proj_query)
-
-    result = {}
-    for row in proj_res.all():
-        pid = row[0]
-        budget_amt = float(row[1] or 0)
-        quotation_amt = float(row[2] or 0)
-        boq_amt = boq_totals.get(pid, 0.0)
-        if boq_amt > 0:
-            result[pid] = boq_amt
-        elif quotation_amt > 0:
-            result[pid] = quotation_amt
-        else:
-            result[pid] = budget_amt
-    return result
-
-
 async def cache_get_set(redis, key, version, func):
     cache_key = f"{key}:{version}"
     cached = await r.cache_get_json(redis, cache_key)
@@ -239,54 +164,23 @@ async def admin_dashboard(
         project_stats = await db.execute(
             select(
                 func.count(m.Project.id),
-                func.sum(
-                    case(
-                        (
-                            (m.Project.status == ProjectStatus.ONGOING.value)
-                            & (
-                                (m.Project.end_date >= today)
-                                | (m.Project.end_date == None)
-                            ),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                func.sum(
-                    case(
-                        (m.Project.status == ProjectStatus.COMPLETED.value, 1), else_=0
-                    )
-                ),
-                func.sum(
-                    case(
-                        (
-                            (m.Project.status == ProjectStatus.ONGOING.value)
-                            & (m.Project.end_date < today),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
+                func.sum(case((m.Project.status == "Active", 1), else_=0)),
+                func.sum(case((m.Project.status == "Completed", 1), else_=0)),
+                func.sum(case((m.Project.end_date < today, 1), else_=0)),
             )
         )
         total, active, completed, delayed = project_stats.one()
 
         # 2. Financials
         revenue = await db.scalar(
-            select(func.sum(Invoice.total_amount)).where(
-                Invoice.status == InvoiceStatus.PAID.value
-            )
+            select(func.sum(Invoice.total_amount)).where(Invoice.status == "paid")
         )
         expense = await db.scalar(select(func.sum(Expense.amount)))
 
         # 3. Vitals
         labour_today = await db.scalar(
-            select(func.count(func.distinct(UserAttendance.user_id)))
-            .join(User, User.id == UserAttendance.user_id)
-            .where(
-                UserAttendance.attendance_date == today,
-                UserAttendance.status != "absent",
-                User.role == UserRole.LABOUR.value,
+            select(func.sum(DailySiteReport.total_labour)).where(
+                DailySiteReport.report_date == today
             )
         )
         pending_approvals = await db.scalar(
@@ -294,8 +188,7 @@ async def admin_dashboard(
         )
         action_items = await db.scalar(
             select(func.count(Issue.id)).where(
-                Issue.priority == IssuePriority.HIGH.value,
-                Issue.status == IssueStatus.OPEN.value,
+                Issue.priority == "HIGH", Issue.status == "OPEN"
             )
         )
         material_reports = await db.scalar(
@@ -305,7 +198,7 @@ async def admin_dashboard(
             )
         )
         open_issues = await db.scalar(
-            select(func.count(Issue.id)).where(Issue.status == IssueStatus.OPEN.value)
+            select(func.count(Issue.id)).where(Issue.status == "OPEN")
         )
 
         vitals = AdminVitals(
@@ -444,13 +337,9 @@ async def engineer_dashboard(
         today = date.today()
 
         labour = await db.scalar(
-            select(func.count(func.distinct(UserAttendance.user_id)))
-            .join(User, User.id == UserAttendance.user_id)
-            .where(
+            select(func.count(UserAttendance.id)).where(
                 UserAttendance.project_id.in_(project_ids),
                 UserAttendance.attendance_date == today,
-                UserAttendance.status != "absent",
-                User.role == UserRole.LABOUR.value,
             )
         )
 
@@ -488,7 +377,11 @@ async def manager_dashboard(
         # ========================
         # BUDGET
         # ========================
-        budget = await get_waterfall_budget(db, project_ids)
+        budget = await db.scalar(
+            select(func.sum(BOQ.total_cost)).where(
+                BOQ.project_id.in_(project_ids), BOQ.is_latest == True
+            )
+        )
 
         # ========================
         # SPENT
@@ -549,7 +442,7 @@ async def accountant_dashboard(
         receivables = (
             await db.scalar(
                 select(func.sum(Invoice.total_amount)).where(
-                    Invoice.status == InvoiceStatus.PENDING.value
+                    Invoice.status == InvoiceStatus.PENDING
                 )
             )
             or 1200000.0
@@ -595,14 +488,14 @@ async def accountant_dashboard(
         # 2. Revenue vs Expense Trend
         rev_exp_trends = []
         for i in range(5, -1, -1):
-            target_date = datetime.utcnow() - relativedelta(months=i)
+            target_date = datetime.utcnow() - timedelta(days=i * 30)
             month_str = target_date.strftime("%b")
 
             month_start = target_date.replace(
                 day=1, hour=0, minute=0, second=0, microsecond=0
             )
             month_end = (
-                (month_start + relativedelta(months=1)) - timedelta(seconds=1)
+                (month_start + timedelta(days=32)).replace(day=1) - timedelta(seconds=1)
                 if i != 0
                 else datetime.utcnow()
             )
@@ -636,41 +529,9 @@ async def accountant_dashboard(
             )
 
         # 3. Cash Flow
-        cash_inflow_val = (
-            await db.scalar(
-                select(func.sum(Transaction.amount)).where(
-                    Transaction.type == "receipt",
-                    Transaction.created_at
-                    >= (
-                        datetime.utcnow().replace(
-                            day=1, hour=0, minute=0, second=0, microsecond=0
-                        )
-                        - relativedelta(months=5)
-                    ),
-                )
-            )
-            or 0.0
-        )
-
-        cash_outflow_val = (
-            await db.scalar(
-                select(func.sum(Transaction.amount)).where(
-                    Transaction.type == "payment",
-                    Transaction.created_at
-                    >= (
-                        datetime.utcnow().replace(
-                            day=1, hour=0, minute=0, second=0, microsecond=0
-                        )
-                        - relativedelta(months=5)
-                    ),
-                )
-            )
-            or 0.0
-        )
-
         cash_flow = CashFlow(
-            cash_inflow=float(cash_inflow_val),
-            cash_outflow=float(cash_outflow_val),
+            cash_inflow=sum(t.revenue for t in rev_exp_trends),
+            cash_outflow=sum(t.expense for t in rev_exp_trends),
             closing_balance=bank_balance + float(cash_balance),
         )
 
@@ -679,24 +540,21 @@ async def accountant_dashboard(
         projects_query = await db.execute(
             select(m.Project).where(m.Project.id.in_(project_ids))
         )
-
-        budget_query = await db.execute(
-            select(BOQ.project_id, func.sum(BOQ.total_cost))
-            .where(BOQ.project_id.in_(project_ids), BOQ.is_latest == True)
-            .group_by(BOQ.project_id)
-        )
-        acc_budget_map = {row[0]: row[1] or 0 for row in budget_query.all()}
-
-        actual_query = await db.execute(
-            select(Expense.project_id, func.sum(Expense.amount))
-            .where(Expense.project_id.in_(project_ids))
-            .group_by(Expense.project_id)
-        )
-        acc_actual_map = {row[0]: row[1] or 0 for row in actual_query.all()}
-
         for p in projects_query.scalars().all():
-            p_budget = acc_budget_map.get(p.id, 0)
-            p_actual = acc_actual_map.get(p.id, 0)
+            p_budget = (
+                await db.scalar(
+                    select(func.sum(BOQ.total_cost)).where(
+                        BOQ.project_id == p.id, BOQ.is_latest == True
+                    )
+                )
+                or 0
+            )
+            p_actual = (
+                await db.scalar(
+                    select(func.sum(Expense.amount)).where(Expense.project_id == p.id)
+                )
+                or 0
+            )
 
             project_cost_summary.append(
                 ProjectCostSummaryItem(
@@ -710,10 +568,7 @@ async def accountant_dashboard(
         # 5. Outstanding Receivables
         outstanding_receivables = []
         inv_query = await db.execute(
-            select(Invoice)
-            .where(Invoice.status == InvoiceStatus.PENDING.value)
-            .order_by(Invoice.created_at.asc())
-            .limit(5)
+            select(Invoice).where(Invoice.status == InvoiceStatus.PENDING).limit(5)
         )
         for inv in inv_query.scalars().all():
             outstanding_receivables.append(
@@ -816,6 +671,8 @@ async def accountant_dashboard(
 
 
 # =========================================
+# PM COMMAND CENTER (IMAGE MATCH)
+# =========================================
 # PROJECT MANAGER DASHBOARD
 # =========================================
 
@@ -887,32 +744,31 @@ async def pm_command_center(
         projects = projects_query.scalars().all()
         performance = []
 
-        # Bulk Queries
-        progress_query = await db.execute(
-            select(m.Task.project_id, func.avg(m.Task.completion_percentage))
-            .where(m.Task.project_id.in_(project_ids))
-            .group_by(m.Task.project_id)
-        )
-        progress_map = {row[0]: row[1] or 0 for row in progress_query.all()}
-
-        budget_query = await db.execute(
-            select(BOQ.project_id, func.sum(BOQ.total_cost))
-            .where(BOQ.project_id.in_(project_ids), BOQ.is_latest == True)
-            .group_by(BOQ.project_id)
-        )
-        budget_map = {row[0]: row[1] or 1 for row in budget_query.all()}
-
-        spent_query = await db.execute(
-            select(Expense.project_id, func.sum(Expense.amount))
-            .where(Expense.project_id.in_(project_ids))
-            .group_by(Expense.project_id)
-        )
-        spent_map = {row[0]: row[1] or 0 for row in spent_query.all()}
-
         for p in projects:
-            p_progress = progress_map.get(p.id, 0)
-            p_budget = budget_map.get(p.id, 1)
-            p_spent = spent_map.get(p.id, 0)
+            p_progress = (
+                await db.scalar(
+                    select(func.avg(m.Task.completion_percentage)).where(
+                        m.Task.project_id == p.id
+                    )
+                )
+                or 0
+            )
+
+            p_budget = (
+                await db.scalar(
+                    select(func.sum(BOQ.total_cost)).where(
+                        BOQ.project_id == p.id, BOQ.is_latest == True
+                    )
+                )
+                or 1
+            )  # avoid div by zero
+
+            p_spent = (
+                await db.scalar(
+                    select(func.sum(Expense.amount)).where(Expense.project_id == p.id)
+                )
+                or 0
+            )
 
             status = "ON TRACK"
             if p.end_date and p.end_date < today:
@@ -1017,10 +873,7 @@ async def pm_command_center(
         issues_query = await db.execute(
             select(Issue, m.Project.project_name)
             .join(m.Project, Issue.project_id == m.Project.id)
-            .where(
-                Issue.project_id.in_(project_ids),
-                Issue.status == IssueStatus.OPEN.value,
-            )
+            .where(Issue.project_id.in_(project_ids), Issue.status == "OPEN")
             .limit(4)
         )
         for issue, proj_name in issues_query.all():
@@ -1142,6 +995,9 @@ async def pm_command_center(
     return await cache_get_set(redis, "pm_command_center", version, logic)
 
 
+# =========================================
+
+
 @router.get("/project-manager-summary", response_model=PMSummaryOut)
 async def pm_summary(
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
@@ -1167,11 +1023,9 @@ async def pm_summary(
     p_statuses = list(projects)
 
     total = len(p_statuses)
-    active = sum(1 for s in p_statuses if s == ProjectStatus.ONGOING.value)
-    completed = sum(1 for s in p_statuses if s == ProjectStatus.COMPLETED.value)
-    delayed = sum(
-        1 for s in p_statuses if s in ("DELAYED", ProjectStatus.ON_HOLD.value)
-    )
+    active = sum(1 for s in p_statuses if s == "ONGOING")
+    completed = sum(1 for s in p_statuses if s == "COMPLETED")
+    delayed = sum(1 for s in p_statuses if s in ("DELAYED", "ON_HOLD"))
 
     # Approvals
     pending_approvals = await db.scalar(
@@ -1183,7 +1037,7 @@ async def pm_summary(
     # Issues
     open_issues = await db.scalar(
         select(func.count(Issue.id)).where(
-            Issue.project_id.in_(project_ids), Issue.status == IssueStatus.OPEN.value
+            Issue.project_id.in_(project_ids), Issue.status == "Open"
         )
     )
 
@@ -1409,7 +1263,12 @@ async def client_dashboard(
         # ========================
         # BUDGET
         # ========================
-        budget_total = await get_waterfall_budget(db, [db_project_id])
+        budget_total = await db.scalar(
+            select(func.sum(BOQ.total_cost)).where(
+                BOQ.project_id == db_project_id,
+                BOQ.is_latest == True,
+            )
+        )
 
         # ========================
         # EXPENSE
@@ -1437,7 +1296,7 @@ async def client_dashboard(
         milestones_completed = await db.scalar(
             select(func.count(m.Milestone.id)).where(
                 m.Milestone.project_id == db_project_id,
-                m.Milestone.status == MilestoneStatus.COMPLETED.value,
+                m.Milestone.status == "Completed",
             )
         )
 
@@ -1451,7 +1310,7 @@ async def client_dashboard(
         tasks_completed = await db.scalar(
             select(func.count(m.Task.id)).where(
                 m.Task.project_id == db_project_id,
-                m.Task.status == TaskStatus.COMPLETED.value,
+                m.Task.status == "Completed",
             )
         )
 
@@ -2095,9 +1954,8 @@ async def project_engineer_dashboard(
     # 3. Open Issues
     issue_stats_query = await db.execute(
         select(
-            func.count(Issue.id),
-            func.sum(case((Issue.priority == IssuePriority.HIGH.value, 1), else_=0)),
-        ).where(Issue.project_id == project_id, Issue.status == IssueStatus.OPEN.value)
+            func.count(Issue.id), func.sum(case((Issue.priority == "HIGH", 1), else_=0))
+        ).where(Issue.project_id == project_id, Issue.status == "OPEN")
     )
     total_issues, high_priority_issues = issue_stats_query.one()
 
@@ -2635,9 +2493,9 @@ async def get_labour_dashboard(
     # 3. Get Attendance Status for today
     today = date.today()
     att_res = await db.execute(
-        select(UserAttendance).where(
-            UserAttendance.user_id == current_user.id,
-            UserAttendance.attendance_date == today,
+        select(LabourAttendance).where(
+            LabourAttendance.labour_id == labour.id,
+            LabourAttendance.attendance_date == today,
         )
     )
     today_attendance = att_res.scalar_one_or_none()
@@ -2652,7 +2510,7 @@ async def get_labour_dashboard(
     # 4. Get Tasks (Assigned to this user)
     tasks_res = await db.execute(
         select(Task)
-        .where(Task.assignments.any(TaskAssignment.user_id == current_user.id))
+        .where(Task.assigned_user_id == current_user.id)
         .order_by(desc(Task.start_date))
     )
     all_tasks = tasks_res.scalars().all()
@@ -2691,10 +2549,11 @@ async def get_labour_dashboard(
     # If no payroll generated, fallback to attendance
     if this_month_earnings == 0:
         att_month_res = await db.execute(
-            select(UserAttendance).where(
-                UserAttendance.user_id == current_user.id,
-                func.extract("month", UserAttendance.attendance_date) == current_month,
-                func.extract("year", UserAttendance.attendance_date) == current_year,
+            select(LabourAttendance).where(
+                LabourAttendance.labour_id == labour.id,
+                func.extract("month", LabourAttendance.attendance_date)
+                == current_month,
+                func.extract("year", LabourAttendance.attendance_date) == current_year,
             )
         )
         month_attendances = att_month_res.scalars().all()

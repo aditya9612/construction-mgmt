@@ -64,7 +64,6 @@ class TransactionOut(BaseModel):
     reference: Optional[str]
 
 
-
 # ============================
 #  RECEIPT
 # ============================
@@ -144,6 +143,7 @@ class OfferOut(BaseModel):
 
 # ===================== NEW ACCOUNTING SCHEMAS =====================
 
+
 class BankTransactionCreate(BaseModel):
     bank_account_id: int
     transaction_date: date
@@ -151,6 +151,7 @@ class BankTransactionCreate(BaseModel):
     type: str
     description: Optional[str] = None
     reference_number: Optional[str] = None
+
 
 class BankTransactionOut(BankTransactionCreate):
     id: int
@@ -161,6 +162,7 @@ class BankTransactionOut(BankTransactionCreate):
     class Config:
         from_attributes = True
 
+
 class FundTransferCreate(BaseModel):
     from_account_id: int
     to_account_id: int
@@ -169,6 +171,7 @@ class FundTransferCreate(BaseModel):
     reference_number: Optional[str] = None
     remarks: Optional[str] = None
 
+
 class FundTransferOut(FundTransferCreate):
     id: int
     journal_entry_id: Optional[int]
@@ -176,6 +179,7 @@ class FundTransferOut(FundTransferCreate):
 
     class Config:
         from_attributes = True
+
 
 class GSTReturnCreate(BaseModel):
     filing_period: str
@@ -186,6 +190,7 @@ class GSTReturnCreate(BaseModel):
     net_gst_payable: float = 0
     status: str = "Draft"
     filing_date: Optional[date] = None
+
 
 class GSTReturnOut(GSTReturnCreate):
     id: int

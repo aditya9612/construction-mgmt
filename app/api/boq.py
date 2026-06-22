@@ -1103,7 +1103,7 @@ async def bulk_add_items(
 
             activity = await db.get(
                 ActivityType,
-                item.activity_type_id
+                item.activity_type_id,
             )
 
             if not activity:
@@ -1116,7 +1116,7 @@ async def bulk_add_items(
 
                 unit_obj = await db.get(
                     Unit,
-                    activity.default_unit_id
+                    activity.default_unit_id,
                 )
 
                 if unit_obj:
@@ -1127,7 +1127,7 @@ async def bulk_add_items(
 
             total_cost, variance = calculate_cost(
                 quantity,
-                unit_cost
+                unit_cost,
             )
 
             obj = BOQ(
@@ -1136,10 +1136,10 @@ async def bulk_add_items(
                 version_no=parent.version_no,
                 is_latest=True,
                 item_name=item.item_name,
-                category=activity.category,
+                category=item.category,
                 description=item.description,
                 quantity=quantity,
-                unit=unit_name,
+                unit=item.unit,
                 unit_cost=unit_cost,
                 total_cost=total_cost,
                 actual_quantity=Decimal("0"),
@@ -1157,19 +1157,19 @@ async def bulk_add_items(
         await db.flush()
         await db.commit()
 
+        await bump_cache_version(redis, VERSION_KEY)
+
+        return {
+            "message": f"{len(created_items)} items created",
+            "items": [
+                BOQOut.model_validate(item)
+                for item in created_items
+            ],
+        }
+
     except Exception:
         await db.rollback()
         raise
-
-    await bump_cache_version(redis, VERSION_KEY)
-
-    return {
-        "message": f"{len(created_items)} items created",
-        "items": [
-            BOQOut.model_validate(item)
-            for item in created_items
-        ],
-    }
 
 
 @router.delete("/items/{item_id}")

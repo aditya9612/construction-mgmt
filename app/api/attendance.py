@@ -269,7 +269,9 @@ async def check_out(
                     overtime_rate = policy.fixed_ot_rate or Decimal("0")
                 else:
                     if base_ot_rate <= 0:
-                        logger.warning(f"Labour {labour.id} has missing or zero base OT rate. OT calculated as 0.")
+                        logger.warning(
+                            f"Labour {labour.id} has missing or zero base OT rate. OT calculated as 0."
+                        )
                         overtime_rate = Decimal("0")
                     elif policy:
                         multiplier = policy.normal_day_multiplier or Decimal("1")
@@ -305,12 +307,12 @@ async def check_out(
             if existing_expense:
 
                 existing_expense.amount = total_wage
-                
+
                 existing_transaction = await db.scalar(
                     select(OwnerTransaction).where(
                         OwnerTransaction.reference_id == existing_expense.id,
                         OwnerTransaction.reference_type == "labour",
-                        OwnerTransaction.project_id == attendance.project_id
+                        OwnerTransaction.project_id == attendance.project_id,
                     )
                 )
                 if existing_transaction:

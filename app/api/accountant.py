@@ -7,8 +7,16 @@ from app.schemas.accountant import OfferCreate, OfferOut
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from app.core.enums import AccountType, PaymentMode
-from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine, BankTransaction, FundTransfer, GSTReturn
+from app.core.enums import PaymentMode
+from app.models.accountant import (
+    Account,
+    FixedAsset,
+    JournalEntry,
+    JournalLine,
+    BankTransaction,
+    FundTransfer,
+    GSTReturn,
+)
 from app.schemas.accountant import (
     AccountCreate,
     AccountOut,
@@ -16,9 +24,12 @@ from app.schemas.accountant import (
     JournalEntryCreate,
     PayablePaymentRequest,
     ReceiptCreate,
-    BankTransactionCreate, BankTransactionOut,
-    FundTransferCreate, FundTransferOut,
-    GSTReturnCreate, GSTReturnOut
+    BankTransactionCreate,
+    BankTransactionOut,
+    FundTransferCreate,
+    FundTransferOut,
+    GSTReturnCreate,
+    GSTReturnOut,
 )
 from app.db.session import get_db_session
 from app.models.billing import RABill
@@ -30,12 +41,18 @@ from app.utils.helpers import NotFoundError, ValidationError
 
 from app.models.user import UserRole
 
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image,
+)
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
 import os
-
 
 ACCOUNTANT_READ_ROLES = [
     r.value
@@ -57,7 +74,14 @@ ACCOUNTANT_WRITE_ROLES = [
 
 def generate_offer_pdf(offer):
     import os
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+    from reportlab.platypus import (
+        SimpleDocTemplate,
+        Paragraph,
+        Spacer,
+        Image,
+        Table,
+        TableStyle,
+    )
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -72,29 +96,49 @@ def generate_offer_pdf(offer):
     file_path = f"media/offers/offer_{offer.id}.pdf"
     os.makedirs("media/offers", exist_ok=True)
 
-    doc = SimpleDocTemplate(file_path, pagesize=A4, rightMargin=50, leftMargin=50, topMargin=80, bottomMargin=50)
+    doc = SimpleDocTemplate(
+        file_path,
+        pagesize=A4,
+        rightMargin=50,
+        leftMargin=50,
+        topMargin=80,
+        bottomMargin=50,
+    )
 
     styles = getSampleStyleSheet()
 
-    normal = ParagraphStyle(name='NormalSmall', fontSize=10, leading=16, spaceAfter=6)
-    bold = ParagraphStyle(name='Bold', fontSize=10, leading=16, spaceAfter=8, spaceBefore=6)
-    title = ParagraphStyle(name='Title', alignment=1, fontSize=14, spaceAfter=18)
+    normal = ParagraphStyle(name="NormalSmall", fontSize=10, leading=16, spaceAfter=6)
+    bold = ParagraphStyle(
+        name="Bold", fontSize=10, leading=16, spaceAfter=8, spaceBefore=6
+    )
+    title = ParagraphStyle(name="Title", alignment=1, fontSize=14, spaceAfter=18)
 
     content = []
 
     date_val = offer.created_at.strftime("%d-%m-%Y") if offer.created_at else "-"
 
     # ================= HEADER =================
-    header = Table([
+    header = Table(
         [
-            Image(logo_path, width=130, height=60) if os.path.exists(logo_path) else "",
-            Paragraph("<para align=right>Date : ______________</para>", normal)
-        ]
-    ], colWidths=[220, 275])
+            [
+                (
+                    Image(logo_path, width=130, height=60)
+                    if os.path.exists(logo_path)
+                    else ""
+                ),
+                Paragraph("<para align=right>Date : ______________</para>", normal),
+            ]
+        ],
+        colWidths=[220, 275],
+    )
 
-    header.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
+    header.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
 
     content.append(header)
     content.append(Spacer(1, 16))
@@ -104,9 +148,7 @@ def generate_offer_pdf(offer):
     content.append(Spacer(1, 8))
 
     # ================= SECOND DATE =================
-    content.append(
-        Paragraph(f"<para align=right>Date: {date_val}</para>", normal)
-    )
+    content.append(Paragraph(f"<para align=right>Date: {date_val}</para>", normal))
     content.append(Spacer(1, 12))
 
     # ================= ADDRESS =================
@@ -122,86 +164,131 @@ def generate_offer_pdf(offer):
     # ================= BODY =================
     content.append(Paragraph("Dear Sir/Madam,", normal))
 
-    content.append(Paragraph(
-        "It is my pleasure to write this letter and express my intent of re-developing your society/property.",
-        normal
-    ))
+    content.append(
+        Paragraph(
+            "It is my pleasure to write this letter and express my intent of re-developing your society/property.",
+            normal,
+        )
+    )
 
-    content.append(Paragraph(
-        f"To brief you about my company, <b>{offer.developer_name}</b> is a well-established name in business. "
-        "Its presence in central suburbs like Sinhagad Road, Pune. Since more than a decade, "
-        f"<b>{offer.developer_name}</b> has successfully ventured into real estate development.",
-        normal
-    ))
+    content.append(
+        Paragraph(
+            f"To brief you about my company, <b>{offer.developer_name}</b> is a well-established name in business. "
+            "Its presence in central suburbs like Sinhagad Road, Pune. Since more than a decade, "
+            f"<b>{offer.developer_name}</b> has successfully ventured into real estate development.",
+            normal,
+        )
+    )
 
-    content.append(Paragraph(
-        f"<b>{offer.developer_name}</b>, a well-crafted initiative by visionary leadership.",
-        normal
-    ))
+    content.append(
+        Paragraph(
+            f"<b>{offer.developer_name}</b>, a well-crafted initiative by visionary leadership.",
+            normal,
+        )
+    )
 
-    content.append(Paragraph(
-        "We have proudly made more than 1000+ families happy with commercial and residential spaces. "
-        "The purpose of this offer letter is to set forth our offers which are described below:",
-        normal
-    ))
+    content.append(
+        Paragraph(
+            "We have proudly made more than 1000+ families happy with commercial and residential spaces. "
+            "The purpose of this offer letter is to set forth our offers which are described below:",
+            normal,
+        )
+    )
 
-    content.append(Paragraph(
-        "If there is any query in any of the offer terms, amenities, requests, demands etc., "
-        "feel free to reach out to us and we will definitely resolve it.",
-        normal
-    ))
+    content.append(
+        Paragraph(
+            "If there is any query in any of the offer terms, amenities, requests, demands etc., "
+            "feel free to reach out to us and we will definitely resolve it.",
+            normal,
+        )
+    )
 
     content.append(Paragraph("<b>Our Re-Development offer includes:</b>", bold))
     content.append(Spacer(1, 12))
 
     # ================= TABLE =================
-    table = Table([
-        ["CARPET AREA", f"EXISTING FLAT OWNER WILL GET {offer.extra_carpet_percent}% EXTRA CARPET AREA."]
-    ], colWidths=[150, 340])
+    table = Table(
+        [
+            [
+                "CARPET AREA",
+                f"EXISTING FLAT OWNER WILL GET {offer.extra_carpet_percent}% EXTRA CARPET AREA.",
+            ]
+        ],
+        colWidths=[150, 340],
+    )
 
-    table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 1, colors.black),
-        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("PADDING", (0, 0), (-1, -1), 6),
-    ]))
+    table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("PADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
 
     content.append(table)
     content.append(Spacer(1, 16))
 
     # ================= NOTE =================
-    content.append(Paragraph(
-        "<b>Note:</b> Corpus fund, rent, shifting charges, and other expenses shall be mutually finalized.",
-        normal
-    ))
+    content.append(
+        Paragraph(
+            "<b>Note:</b> Corpus fund, rent, shifting charges, and other expenses shall be mutually finalized.",
+            normal,
+        )
+    )
 
     content.append(Spacer(1, 20))
 
     # ================= FOOTER =================
     content.append(Spacer(1, 12))  # small gap
-    
-    phone_img = f'<img src="{phone_icon}" width="10" height="10"/>' if os.path.exists(phone_icon) else ""
-    email_img = f'<img src="{email_icon}" width="10" height="10"/>' if os.path.exists(email_icon) else ""
-    loc_img = f'<img src="{loc_icon}" width="10" height="10"/>' if os.path.exists(loc_icon) else ""
 
-    footer = Table([
+    phone_img = (
+        f'<img src="{phone_icon}" width="10" height="10"/>'
+        if os.path.exists(phone_icon)
+        else ""
+    )
+    email_img = (
+        f'<img src="{email_icon}" width="10" height="10"/>'
+        if os.path.exists(email_icon)
+        else ""
+    )
+    loc_img = (
+        f'<img src="{loc_icon}" width="10" height="10"/>'
+        if os.path.exists(loc_icon)
+        else ""
+    )
+
+    footer = Table(
         [
-            Image(stamp_path, width=90, height=90) if os.path.exists(stamp_path) else "",
-            Paragraph(
-                f"<para align=right>"
-                f"{offer.contact_phone or '-'} {phone_img}<br/>"
-                f"{offer.contact_email or '-'} {email_img}<br/>"
-                f"SITE ADD: S.No.57/6B, Plot No.03, Abhiruchi Mall, Pune {loc_img}"
-                f"</para>",
-                normal
-            )
-        ]
-    ], colWidths=[180, 310])
+            [
+                (
+                    Image(stamp_path, width=90, height=90)
+                    if os.path.exists(stamp_path)
+                    else ""
+                ),
+                Paragraph(
+                    f"<para align=right>"
+                    f"{offer.contact_phone or '-'} {phone_img}<br/>"
+                    f"{offer.contact_email or '-'} {email_img}<br/>"
+                    f"SITE ADD: S.No.57/6B, Plot No.03, Abhiruchi Mall, Pune {loc_img}"
+                    f"</para>",
+                    normal,
+                ),
+            ]
+        ],
+        colWidths=[180, 310],
+    )
 
-    footer.setStyle(TableStyle([
-        ('LEFTPADDING', (0, 0), (0, 0), 50),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-    ]))
+    footer.setStyle(
+        TableStyle(
+            [
+                ("LEFTPADDING", (0, 0), (0, 0), 50),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
 
     content.append(footer)
 
@@ -214,7 +301,15 @@ def generate_offer_pdf(offer):
         # 1) WATERMARK
         if os.path.exists(logo_path):
             canvas.saveState()
-            canvas.drawImage(logo_path, W/2 - 250, H/2 - 120, width=500, height=240, preserveAspectRatio=True, anchor='c')
+            canvas.drawImage(
+                logo_path,
+                W / 2 - 250,
+                H / 2 - 120,
+                width=500,
+                height=240,
+                preserveAspectRatio=True,
+                anchor="c",
+            )
             canvas.setFillColor(colors.white)
             canvas.setFillAlpha(0.88)
             canvas.rect(0, 0, W, H, fill=1, stroke=0)
@@ -222,26 +317,26 @@ def generate_offer_pdf(offer):
 
         # 2) CORNER RIBBONS
         canvas.saveState()
-        
+
         gold = colors.HexColor("#D4AF37")
         grey = colors.HexColor("#666666")
 
         # Top Right
         canvas.setFillColor(gold)
         p = canvas.beginPath()
-        p.moveTo(W, H-40)
-        p.lineTo(W-40, H)
-        p.lineTo(W-100, H)
-        p.lineTo(W, H-100)
+        p.moveTo(W, H - 40)
+        p.lineTo(W - 40, H)
+        p.lineTo(W - 100, H)
+        p.lineTo(W, H - 100)
         p.close()
         canvas.drawPath(p, fill=1, stroke=0)
 
         canvas.setFillColor(grey)
         p = canvas.beginPath()
-        p.moveTo(W, H-120)
-        p.lineTo(W-120, H)
-        p.lineTo(W-140, H)
-        p.lineTo(W, H-140)
+        p.moveTo(W, H - 120)
+        p.lineTo(W - 120, H)
+        p.lineTo(W - 140, H)
+        p.lineTo(W, H - 140)
         p.close()
         canvas.drawPath(p, fill=1, stroke=0)
 
@@ -326,6 +421,7 @@ async def receipt_summary(
     )
 
     return {"total_receipts": float(total or 0)}
+
 
 @router.get("/payables")
 async def list_payables(
@@ -525,7 +621,6 @@ async def cashflow(
         "outflow": float(outflow or 0),
         "balance": float((inflow or 0) - (outflow or 0)),
     }
-
 
 
 @router.get("/payables/date-range")
@@ -787,7 +882,6 @@ async def balance_sheet(
             equity.append(item)
             total_equity += balance
 
-
     income = await db.scalar(
         select(func.sum(JournalLine.credit - JournalLine.debit))
         .join(Account, Account.id == JournalLine.account_id)
@@ -805,11 +899,9 @@ async def balance_sheet(
 
     profit = income - expense
 
-
     total_equity += profit
 
     equity.append({"account_name": "Retained Earnings", "balance": profit})
-
 
     return {
         "assets": {"items": assets, "total": total_assets},
@@ -834,6 +926,7 @@ async def create_offer(
     await db.refresh(obj)
 
     return obj
+
 
 @router.get("/offers/{offer_id}/generate")
 async def generate_offer_letter(
@@ -878,10 +971,7 @@ Contact:
 {offer.contact_email or '-'}
 """
 
-    return {
-        "offer_id": offer.id,
-        "letter": letter
-    }
+    return {"offer_id": offer.id, "letter": letter}
 
 
 @router.get("/offers/{offer_id}/pdf")
@@ -907,17 +997,18 @@ async def download_offer_pdf(
     return FileResponse(
         path=file_path,
         filename=os.path.basename(file_path),
-        media_type="application/pdf"
+        media_type="application/pdf",
     )
 
 
 # ===================== BANK RECONCILIATION =====================
 
+
 @router.post("/bank/transactions", response_model=BankTransactionOut)
 async def create_bank_transaction(
     payload: BankTransactionCreate,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     bt = BankTransaction(**payload.model_dump())
     db.add(bt)
@@ -925,83 +1016,90 @@ async def create_bank_transaction(
     await db.refresh(bt)
     return bt
 
+
 @router.get("/bank/reconciliation/pending", response_model=list[BankTransactionOut])
 async def get_pending_reconciliations(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.scalars(
         select(BankTransaction).where(BankTransaction.is_reconciled == 0)
     )
     return result.all()
 
+
 @router.post("/bank/reconciliation/{transaction_id}/match/{journal_id}")
 async def match_bank_transaction(
     transaction_id: int,
     journal_id: int,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     bt = await db.get(BankTransaction, transaction_id)
     je = await db.get(JournalEntry, journal_id)
     if not bt or not je:
         raise NotFoundError("Transaction or Journal Entry not found")
-        
+
     bt.is_reconciled = 1
     bt.matched_journal_id = je.id
     await db.commit()
     return {"message": "Matched successfully"}
 
+
 # ===================== FUND TRANSFERS =====================
+
 
 @router.post("/transfers", response_model=FundTransferOut)
 async def create_fund_transfer(
     payload: FundTransferCreate,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     from app.utils.accounting import auto_post_journal
-    
+
     # Validation logic to ensure accounts exist
     from_acc = await db.get(Account, payload.from_account_id)
     to_acc = await db.get(Account, payload.to_account_id)
-    
+
     if not from_acc or not to_acc:
         raise NotFoundError("Accounts not found")
 
     # Post auto journal
     je = await auto_post_journal(
-        db, 
-        amount=payload.amount, 
-        debit_code=to_acc.code, 
-        credit_code=from_acc.code, 
-        description=f"Fund transfer: {payload.remarks}"
+        db,
+        amount=payload.amount,
+        debit_code=to_acc.code,
+        credit_code=from_acc.code,
+        description=f"Fund transfer: {payload.remarks}",
     )
 
     ft = FundTransfer(**payload.model_dump())
     if je:
         ft.journal_entry_id = je.id
-        
+
     db.add(ft)
     await db.commit()
     await db.refresh(ft)
     return ft
 
+
 @router.get("/transfers", response_model=list[FundTransferOut])
 async def list_fund_transfers(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.scalars(select(FundTransfer))
     return result.all()
 
+
 # ===================== GST & TAXATION =====================
+
 
 @router.post("/gst/returns", response_model=GSTReturnOut)
 async def create_gst_return(
     payload: GSTReturnCreate,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     gstr = GSTReturn(**payload.model_dump())
     db.add(gstr)
@@ -1009,10 +1107,11 @@ async def create_gst_return(
     await db.refresh(gstr)
     return gstr
 
+
 @router.get("/gst/returns", response_model=list[GSTReturnOut])
 async def list_gst_returns(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
     return result.all()

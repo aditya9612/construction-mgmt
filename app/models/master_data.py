@@ -1,13 +1,5 @@
-from sqlalchemy import (
-    Boolean,
-    Column,
-    DECIMAL,
-    ForeignKey,
-    Integer,
-    String,
-)
+from sqlalchemy import DECIMAL, Boolean, Column, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
-
 from app.core.enums import SkillType
 from app.models.base import Base
 from sqlalchemy import Enum as SAEnum

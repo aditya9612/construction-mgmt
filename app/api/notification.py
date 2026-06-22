@@ -19,7 +19,7 @@ async def get_notifications(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
 ):
     result = await db.execute(
         select(Notification)
@@ -48,20 +48,26 @@ async def get_pm_notifications(
 
     notifications = result.scalars().all()
     pm_notifications = []
-    
+
     for n in notifications:
         # standard fallback if type not properly categorized
-        n_type = n.type if n.type in ["Delay", "Budget", "Material", "Safety", "QC"] else "General"
-        
-        pm_notifications.append(PMNotificationOut(
-            id=n.id,
-            title=n.title,
-            message=n.message,
-            type=n_type,
-            project_name=None, # Extract from link or title if possible, or null
-            created_at=n.created_at,
-            is_read=n.is_read
-        ))
+        n_type = (
+            n.type
+            if n.type in ["Delay", "Budget", "Material", "Safety", "QC"]
+            else "General"
+        )
+
+        pm_notifications.append(
+            PMNotificationOut(
+                id=n.id,
+                title=n.title,
+                message=n.message,
+                type=n_type,
+                project_name=None,  # Extract from link or title if possible, or null
+                created_at=n.created_at,
+                is_read=n.is_read,
+            )
+        )
 
     return pm_notifications
 

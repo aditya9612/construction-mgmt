@@ -138,14 +138,14 @@ def create_app() -> FastAPI:
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("uploads/profile", exist_ok=True)
     os.makedirs("uploads/qc", exist_ok=True)
-    
+
     # chat uploads
     os.makedirs("uploads/chats/images", exist_ok=True)
     os.makedirs("uploads/chats/videos", exist_ok=True)
     os.makedirs("uploads/chats/files", exist_ok=True)
     os.makedirs("uploads/chats/voice", exist_ok=True)
     os.makedirs("uploads/chats/thumbnails", exist_ok=True)
-    
+
     # voice task assignments
     os.makedirs("uploads/voice_instructions/raw", exist_ok=True)
     os.makedirs("uploads/voice_instructions/generated", exist_ok=True)
@@ -191,7 +191,6 @@ def create_app() -> FastAPI:
             )
             raise
 
-    
     @application.middleware("http")
     async def track_user_activity(request: Request, call_next):
         response = await call_next(request)
@@ -207,23 +206,16 @@ def create_app() -> FastAPI:
 
                 try:
                     payload = jwt.decode(
-                        token,
-                        settings.SECRET_KEY,
-                        algorithms=["HS256"]
+                        token, settings.SECRET_KEY, algorithms=["HS256"]
                     )
 
                     user_id = int(payload.get("sub"))
 
                     if user_id and redis:
-                        await redis.set(
-                            f"user:{user_id}:online",
-                            1,
-                            ex=60
-                        )
+                        await redis.set(f"user:{user_id}:online", 1, ex=60)
 
                         await redis.set(
-                            f"user:{user_id}:last_seen",
-                            datetime.utcnow().isoformat()
+                            f"user:{user_id}:last_seen", datetime.utcnow().isoformat()
                         )
 
                 except JWTError:
@@ -233,8 +225,6 @@ def create_app() -> FastAPI:
             pass
 
         return response
-
-
 
     @application.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):
@@ -290,14 +280,13 @@ def create_app() -> FastAPI:
     api_router.include_router(work_progress_router)
     api_router.include_router(quotation_router)
     api_router.include_router(reports_router)
-    api_router.include_router(alert_router) 
+    api_router.include_router(alert_router)
     api_router.include_router(cad_router)
     api_router.include_router(settings_router)
     api_router.include_router(agreement_router)
     api_router.include_router(visualization_router)
     api_router.include_router(attendance_router)
     api_router.include_router(notification_router)
-
 
     application.include_router(api_router, prefix="/api/v1")
 
@@ -336,10 +325,9 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
 
     #  send full active users list on connect
     users = await redis.smembers(f"chat:{chat_id}:online_users")
-    await websocket.send_json({
-        "type": "active_users",
-        "users": [int(u) for u in users]
-    })
+    await websocket.send_json(
+        {"type": "active_users", "users": [int(u) for u in users]}
+    )
 
     #  mark online + last seen
     await redis.set(f"user:{user_id}:online", 1, ex=60)
@@ -348,11 +336,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
     #  broadcast presence (online)
     await redis.publish(
         f"chat:{chat_id}",
-        json.dumps({
-            "type": "presence",
-            "user_id": user_id,
-            "status": "online"
-        })
+        json.dumps({"type": "presence", "user_id": user_id, "status": "online"}),
     )
 
     #  heartbeat
@@ -366,10 +350,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
 
     #  subscribe
     pubsub = redis.pubsub()
-    await pubsub.subscribe(
-        f"chat:{chat_id}",
-        f"project:{chat_id}"
-    )
+    await pubsub.subscribe(f"chat:{chat_id}", f"project:{chat_id}")
 
     try:
         # =========================
@@ -400,11 +381,13 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
                         #  broadcast delivered event (NEW)
                         await redis.publish(
                             f"chat:{chat_id}",
-                            json.dumps({
-                                "type": "delivered",
-                                "chat_id": chat_id,
-                                "message_id": msg_id
-                            })
+                            json.dumps(
+                                {
+                                    "type": "delivered",
+                                    "chat_id": chat_id,
+                                    "message_id": msg_id,
+                                }
+                            ),
                         )
 
                 #  broadcast ALL event types
@@ -433,11 +416,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
         # broadcast offline presence
         await redis.publish(
             f"chat:{chat_id}",
-            json.dumps({
-                "type": "presence",
-                "user_id": user_id,
-                "status": "offline"
-            })
+            json.dumps({"type": "presence", "user_id": user_id, "status": "offline"}),
         )
 
         # cleanup

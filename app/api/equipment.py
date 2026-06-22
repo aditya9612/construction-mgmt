@@ -608,11 +608,14 @@ async def maintenance_alerts(
                 EquipmentMaintenance.next_maintenance_date.isnot(None),
                 EquipmentMaintenance.is_completed == False,
                 Equipment.is_deleted == False,
+
                 # Show all overdue and upcoming maintenance within next 30 days
                 EquipmentMaintenance.next_maintenance_date <= upcoming_date,
             )
         )
-        .order_by(EquipmentMaintenance.next_maintenance_date.asc())
+        .order_by(
+            EquipmentMaintenance.next_maintenance_date.asc()
+        )
     )
 
     result = await db.execute(stmt)
@@ -3413,8 +3416,7 @@ async def get_equipment(
     return EquipmentOut.model_validate(obj)
 
 
-# =============================update_equipment=======================
-
+#=============================update_equipment=======================
 
 @router.put("/{equipment_id}", response_model=EquipmentOut)
 async def update_equipment(
@@ -3445,7 +3447,10 @@ async def update_equipment(
 
     update_data = payload.model_dump(exclude_unset=True)
 
-    old_data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+    old_data = {
+        c.name: getattr(obj, c.name)
+        for c in obj.__table__.columns
+    }
 
     # Apply updates
     for field, value in update_data.items():
@@ -3471,9 +3476,15 @@ async def update_equipment(
     if not changed_fields:
         return EquipmentOut.model_validate(obj)
 
-    old_values = {k: v["old"] for k, v in changed_fields.items()}
+    old_values = {
+        k: v["old"]
+        for k, v in changed_fields.items()
+    }
 
-    new_values = {k: v["new"] for k, v in changed_fields.items()}
+    new_values = {
+        k: v["new"]
+        for k, v in changed_fields.items()
+    }
 
     await create_audit_log(
         db,
