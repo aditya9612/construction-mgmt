@@ -2741,7 +2741,7 @@ async def get_project_resource_summary(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id, current_user)
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     
     from app.models.labour import LabourProject
     from app.models.equipment import Equipment

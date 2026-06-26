@@ -958,6 +958,8 @@ class DrawingCreate(BaseSchema):
 
     @field_validator("drawing_name", "version")
     def validate_fields(cls, v):
+        if v is None:
+            return v
         return validate_non_empty_string(v)
 
 
