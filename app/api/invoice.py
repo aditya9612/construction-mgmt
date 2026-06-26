@@ -22,7 +22,7 @@ from app.models.project import Project, Task
 from app.db.session import get_db_session
 from app.models.invoice import Invoice, Transaction
 from app.models.owner import OwnerTransaction
-from app.models.user import User
+from app.models.user import User, ActivityLog
 from app.schemas.invoice import (
     AnalyticsSummaryOut,
     InvoiceCreate,
@@ -1005,6 +1005,15 @@ async def create_invoice_from_quotation(
                 f"has been generated for project {project.project_name}."
             ),
         )
+        
+        db.add(ActivityLog(
+            action="INVOICE_GENERATED",
+            entity="project",
+            entity_id=quotation.project_id,
+            performed_by=current_user.id,
+            details={"message": f"Invoice of Rs. {invoice.total_amount:,.2f} generated from QTN-{quotation.id}"}
+        ))
+        
         await db.commit()
 
     except Exception:
@@ -1239,73 +1248,73 @@ async def generate_invoice_pdf(
     if not obj:
         raise NotFoundError("Invoice not found")
 
-    from app.models.owner import Owner
-    from app.models.project import Project
-    from app.models.settings import CompanySettings, UserSettings
-    from app.utils.invoice_pdf import build_infapilot_invoice
-    
-    owner = await db.get(Owner, obj.owner_id)
-    project = await db.get(Project, obj.project_id)
-    settings = await db.scalar(select(CompanySettings))
-    user_settings = await db.scalar(select(UserSettings))
-    
-    balance_due = float(obj.total_amount) - float(obj.paid_amount)
-    
-    import datetime
-    from dateutil.relativedelta import relativedelta
-    due_date_dt = obj.created_at + relativedelta(days=30) if obj.created_at else datetime.date.today()
-    
-    invoice_data = {
-        "invoice_no": f"INV/{datetime.date.today().year}-{datetime.date.today().year+1}/{obj.id:04d}",
-        "date": obj.created_at.strftime("%d/%m/%Y") if obj.created_at else datetime.date.today().strftime("%d/%m/%Y"),
-        "due_date": due_date_dt.strftime("%d/%m/%Y"),
-        "payment_terms": user_settings.payment_terms if user_settings and user_settings.payment_terms else "30 Days",
-        "work_order_no": f"PRJ-{project.id}" if project else "N/A",
-        "client_name": owner.owner_name if owner else "Unknown Client",
-        "client_address": owner.address if owner else "Address Not Provided",
-        "client_mobile": owner.mobile if owner else "N/A",
-        "client_gst": owner.pan if owner else "N/A",
-        "items": [
-            {
-                "desc_title": f"{obj.type.value.capitalize()} Billing", 
-                "desc_subtitle": obj.description or "General Construction Work",
-                "unit": "LS",
-                "qty": 1.0,
-                "rate": float(obj.amount),
-                "amount": float(obj.amount)
-            }
-        ],
-        "subtotal": float(obj.amount),
-        "cgst": float(obj.gst_amount) / 2 if obj.gst_amount else 0.0,
-        "sgst": float(obj.gst_amount) / 2 if obj.gst_amount else 0.0,
-        "discount": 0.00,
-        "grand_total": float(obj.total_amount),
-        "advance_paid": float(obj.paid_amount),
-        "balance_due": balance_due,
-        "company": {
-            "name": settings.company_name if settings else "INFAPILOT",
-            "logo": settings.company_logo if settings else None,
-            "address": settings.address if settings else "Indore, Madhya Pradesh",
-            "mobile": settings.mobile_number if settings else "+91 98765 43210",
-            "email": settings.email if settings else "info@infapilot.com",
-            "website": settings.website if settings else "www.infapilot.com",
-            "bank_name": settings.bank_name if settings else "HDFC Bank",
-            "account_number": settings.account_number if settings else "50200012345678",
-            "ifsc": settings.ifsc_code if settings else "HDFC0001234",
-            "branch": "Head Office", # Branch missing in model, default it
-            "terms": settings.terms_conditions if settings else "Payment to be made within the due date.",
-            "signature": settings.signature_image if settings else None
-        }
-    }
-    
-    buffer = build_infapilot_invoice(invoice_data)
+    #  Register Unicode font (₹ support)
+    pdfmetrics.registerFont(TTFont("DejaVu", "app/fonts/DejaVuSans.ttf"))
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer)
+
+    styles = getSampleStyleSheet()
+
+    #  Apply font to ALL styles
+    for style in styles.byName.values():
+        style.fontName = "DejaVu"
+
+    elements = []
+
+    # Title
+    elements.append(
+        Paragraph(f"Invoice #{obj.id}", styles["Title"])
+    )
+
+    elements.append(Spacer(1, 12))
+
+    # Details
+    elements.append(
+        Paragraph(f"Type: {obj.type.value}", styles["Normal"])
+    )
+
+    if obj.source_type:
+        elements.append(
+            Paragraph(
+                f"Source: {obj.source_type.value}",
+                styles["Normal"]
+            )
+        )
+
+    elements.append(
+        Paragraph(f"Amount: ₹{float(obj.amount):,.2f}", styles["Normal"])
+    )
+    elements.append(Spacer(1, 4))
+    elements.append(
+        Paragraph(f"GST: ₹{float(obj.gst_amount):,.2f}", styles["Normal"])
+    )
+    elements.append(Spacer(1, 4))
+
+    elements.append(
+        Paragraph(f"Tax: ₹{float(obj.tax_amount):,.2f}", styles["Normal"])
+    )
+    elements.append(Spacer(1, 4))
+    elements.append(
+        Paragraph(f"Total: ₹{float(obj.total_amount):,.2f}", styles["Normal"])
+    )
+    elements.append(Spacer(1, 4))
+    # Status
+    elements.append(
+        Paragraph(
+            f"Status: {obj.status.value.capitalize()}",
+            styles["Normal"]
+        )
+    )
+
+    doc.build(elements)
+    buffer.seek(0)
 
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=invoice_{obj.id}.pdf"},
     )
-
 
 @router.post("/labour", response_model=InvoiceOut)
 async def create_labour_invoice(

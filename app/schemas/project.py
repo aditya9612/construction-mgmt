@@ -257,9 +257,7 @@ class TaskCreateForm:
         title: str = Form(...),
 
         description: Optional[str] = Form(None),
-
-        priority: Optional[Union[int, TaskPriority]] = Form(None),
-
+        priority: Union[int, TaskPriority] = Form(...),
         status: TaskStatus = Form(TaskStatus.PLANNED),
 
         start_date: Optional[date] = Form(None),
@@ -335,12 +333,9 @@ class TaskCreateForm:
 
 
 class TaskUpdate(BaseSchema):
-
-    title: Optional[str] = None
-
+    title: str
     description: Optional[str] = None
-
-    priority: Optional[Union[int, TaskPriority]] = None
+    priority: Union[int, TaskPriority]
 
     start_date: Optional[date] = None
 
@@ -375,11 +370,11 @@ class TaskUpdateForm:
 
         self,
 
-        title: Optional[str] = Form(None),
+        title: str = Form(...),
 
         description: Optional[str] = Form(None),
 
-        priority: Optional[int] = Form(None),
+        priority: Union[int, TaskPriority] = Form(...),
 
         start_date: Optional[date] = Form(None),
 
@@ -981,13 +976,24 @@ class DrawingUpdate(BaseSchema):
 
 class DrawingOut(DrawingCreate):
     id: int
-    file_url: str
+    file_url: Optional[str] = None
+    version: Optional[str] = None
+    is_folder: bool = False
+    parent_id: Optional[int] = None
 
     approval_status: Optional[DocumentStatus] = None
     approval_id: Optional[int] = None
 
     class Config:
         from_attributes = True
+
+class DrawingFolderCreate(BaseSchema):
+    drawing_name: str
+    parent_id: Optional[int] = None
+
+    @field_validator("drawing_name")
+    def validate_fields(cls, v):
+        return validate_non_empty_string(v)
 
 
 # ===================== CREATE =====================

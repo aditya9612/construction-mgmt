@@ -42,24 +42,10 @@ class EquipmentCreate(BaseSchema):
         max_length=255,
     )
 
-    working_hours: Optional[Decimal] = Field(
-        None,
-        ge=0,
-        max_digits=10,
-        decimal_places=2,
-    )
+    condition: EquipmentCondition = EquipmentCondition.GOOD
 
-    fuel_used: Optional[Decimal] = Field(
-        None,
-        ge=0,
-        max_digits=10,
-        decimal_places=2,
-    )
-
-    condition: Optional[EquipmentCondition] = None
-
-    rental_cost: Optional[Decimal] = Field(
-        None,
+    rental_cost: Decimal = Field(
+        default=0,
         ge=0,
         max_digits=12,
         decimal_places=2,
@@ -113,20 +99,6 @@ class EquipmentUpdate(BaseSchema):
     operator_name: Optional[str] = Field(
         None,
         max_length=255,
-    )
-
-    working_hours: Optional[Decimal] = Field(
-        None,
-        ge=0,
-        max_digits=10,
-        decimal_places=2,
-    )
-
-    fuel_used: Optional[Decimal] = Field(
-        None,
-        ge=0,
-        max_digits=10,
-        decimal_places=2,
     )
 
     condition: Optional[EquipmentCondition] = None
@@ -223,6 +195,8 @@ class EquipmentUsageCreate(BaseSchema):
         max_length=500,
     )
 
+    boq_item_id: Optional[int] = None
+
     @validator("usage_date")
     def validate_usage_date(cls, v):
 
@@ -248,12 +222,15 @@ class EquipmentUsageOut(BaseSchema):
     usage_date: date
     notes: Optional[str]
     created_at: datetime
+    boq_item_id: Optional[int]
 
 
 # === MAINTENANCE SCHEMAS ===
 
 
 class EquipmentMaintenanceCreate(BaseSchema):
+
+    equipment_id: int
 
     description: str = Field(
         ...,
@@ -270,6 +247,8 @@ class EquipmentMaintenanceCreate(BaseSchema):
     )
 
     next_maintenance_date: Optional[date] = None
+    project_id: int
+    boq_item_id: Optional[int] = None
 
     @validator("description")
     def validate_maintenance_description(cls, v):
@@ -307,6 +286,8 @@ class EquipmentMaintenanceCreate(BaseSchema):
 class EquipmentMaintenanceOut(BaseModel):
 
     id: int
+    project_id: int
+    boq_item_id: Optional[int]
     equipment_id: int
     description: str
     maintenance_date: date
@@ -350,6 +331,8 @@ class EquipmentRentalCreate(BaseSchema):
         None,
         max_length=1000,
     )
+    project_id: Optional[int] = None
+    boq_item_id: Optional[int] = None
 
     @validator("client_name")
     def validate_rental_client(cls, v):
@@ -394,6 +377,8 @@ class EquipmentRentalOut(BaseSchema):
     status: Optional[str] = None
     duration: Optional[int] = None
     per_day_cost: Optional[float] = None
+    project_id: Optional[int]
+    boq_item_id: Optional[int]
 
 
 class EquipmentUsageReportOut(BaseModel):
@@ -575,11 +560,16 @@ class EquipmentPurchaseCreate(BaseSchema):
         max_length=1000,
     )
 
+    project_id: int
+
+    boq_item_id: Optional[int] = None
+
 
 class EquipmentPurchaseOut(BaseSchema):
 
     id: int
-
+    project_id: int
+    boq_item_id: Optional[int]
     purchase_type: str
     asset_id: int
     asset_name: Optional[str] = None
@@ -629,6 +619,10 @@ class EquipmentPurchaseUpdate(BaseSchema):
 
     notes: Optional[str] = None
 
+    project_id: Optional[int] = None
+
+    boq_item_id: Optional[int] = None
+
 
 class EquipmentPurchaseReportItem(BaseSchema):
 
@@ -656,8 +650,10 @@ class DeleteRentalResponse(BaseModel):
     equipment_id: int
     equipment_status: str
 
+
 class EquipmentUsageUpdate(BaseSchema):
 
+    boq_item_id: Optional[int] = None
     working_hours: Optional[Decimal] = Field(
         None,
         ge=0,
@@ -686,11 +682,13 @@ class EquipmentUsageUpdate(BaseSchema):
             raise ValueError("Usage date cannot be future")
 
         return v
-    
+
+
 class DeleteUsageResponse(BaseModel):
     message: str
     usage_id: int
     equipment_id: int
+
 
 class EquipmentMaintenanceUpdate(BaseSchema):
 
@@ -709,7 +707,10 @@ class EquipmentMaintenanceUpdate(BaseSchema):
     )
 
     next_maintenance_date: Optional[date] = None
-    
+    project_id: Optional[int] = None
+    boq_item_id: Optional[int] = None
+
+
 class EquipmentRentalUpdate(BaseSchema):
 
     start_date: Optional[date] = None
@@ -726,7 +727,10 @@ class EquipmentRentalUpdate(BaseSchema):
     client_name: Optional[str] = None
 
     notes: Optional[str] = None
-    
+    project_id: Optional[int]
+    boq_item_id: Optional[int]
+
+
 class EquipmentKPIOut(BaseSchema):
     total_equipment: int
     available: int

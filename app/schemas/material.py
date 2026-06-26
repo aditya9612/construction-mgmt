@@ -1,9 +1,10 @@
 from decimal import Decimal
 from typing import Optional
 from datetime import datetime
-
+from app.models.boq import BOQ
 import re
 
+from PIL.XVThumbImagePlugin import r
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -203,6 +204,11 @@ class PurchaseMaterial(BaseSchema):
 
     issue_type: Optional[IssueType] = None
 
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
     @field_validator("quantity")
     def quantity_positive(cls, v):
 
@@ -237,6 +243,7 @@ class UsageMaterial(BaseSchema):
     task_id: Optional[int] = None
 
     issue_type: Optional[IssueType] = None
+    boq_item_id: Optional[int] = None
 
     @field_validator("quantity")
     def positive(cls, v):
@@ -361,6 +368,14 @@ class SupplierOut(BaseSchema):
     address: Optional[str]
 
 
+class SupplierUpdate(BaseSchema):
+    supplier_name: Optional[str] = Field(None, min_length=3, max_length=255)
+    contact_person: Optional[str] = Field(None, max_length=255)
+    phone_email: Optional[str] = Field(None, max_length=100)
+    gst_number: Optional[str] = Field(None, max_length=20)
+    address: Optional[str] = Field(None, max_length=255)
+
+
 # ================= PURCHASE ORDER =================
 class PurchaseOrderCreate(BaseSchema):
 
@@ -378,7 +393,7 @@ class PurchaseOrderCreate(BaseSchema):
         ...,
         gt=0,
     )
-
+    boq_item_id: Optional[int] = None
     quantity: Decimal = Field(
         ...,
         gt=0,
@@ -541,7 +556,7 @@ class InventoryOut(BaseSchema):
 class MaterialLogOut(BaseSchema):
 
     id: int
-
+    boq_item_id: Optional[int]
     material_id: int
 
     type: TransactionType
@@ -577,7 +592,7 @@ class SummaryOut(BaseSchema):
 # ================= REPORT =================
 class MaterialReport(BaseSchema):
     material_id: int
-
+    material_code: Optional[str] = None
     material_master_id: Optional[int] = None
     material_master_name: Optional[str] = None
 
@@ -639,7 +654,7 @@ class PriceHistoryOut(BaseSchema):
 
     rate: float
 
-    date: datetime
+    date: str
 
 
 # ================= LOW STOCK =================
@@ -659,5 +674,104 @@ class LowStockResponse(BaseSchema):
     payment_pending: float
 
     unit: str
+
+    project_id: int
+
+
+class PurchaseOrderUpdate(BaseSchema):
+    quantity: Optional[Decimal] = None
+    rate: Optional[Decimal] = None
+    status: Optional[str] = None
+
+
+class PurchaseMaterialOut(BaseSchema):
+    id: int
+    boq_item_id: Optional[int]
+    project_id: int
+    material_id: int
+    quantity: float
+    rate: float
+    total_amount: float
+    amount_paid: float
+    created_at: datetime
+
+
+class UsageMaterialOut(BaseSchema):
+    id: int
+    material_id: int
+    boq_item_id: Optional[int]
+    quantity: float
+    project_id: int
+    task_id: Optional[int]
+    issue_type: Optional[str]
+    created_at: datetime
+
+
+class MaterialLedgerOut(BaseSchema):
+    id: int
+    material_id: int
+    transaction_type: TransactionType
+    quantity: float
+    balance_stock: float
+    created_at: datetime
+
+
+class MaterialTransactionOut(BaseSchema):
+    id: int
+    material_id: int
+    boq_item_id: Optional[int]
+    project_id: Optional[int]
+    type: TransactionType
+    quantity: float
+    rate: float
+    total_amount: float
+    created_at: datetime
+
+
+class InventoryAdjustResponse(BaseSchema):
+    material_id: int
+    material_name: str
+
+    old_stock: float
+    new_stock: float
+    difference: float
+
+    avg_rate: float
+
+    reason: str
+    reference_id: str
+
+    message: str
+
+
+class ProjectTransactionOut(BaseSchema):
+    id: int
+
+    type: str
+
+    material_id: int
+    material_name: str
+
+    supplier_name: Optional[str]
+
+    quantity: float
+    total_amount: float
+
+    project_id: int
+
+    created_at: datetime
+
+
+class InventoryItemOut(BaseSchema):
+    material_id: int
+    material_name: str
+
+    remaining_stock: float
+
+    unit: Optional[str]
+
+    avg_rate: float
+
+    total_value: float
 
     project_id: int

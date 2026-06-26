@@ -32,3 +32,5 @@ class ExpenseOut(ExpenseBase):
 
     class Config:
         from_attributes = True
+        
+    boq_item_id: Optional[int]

@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, logger
 from fastapi.responses import StreamingResponse
-from sqlalchemy import desc, select, func, case
+from sqlalchemy import desc, select, func, case, cast, Date
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import io
+from typing import Optional, List, Dict, Any
 
 from app.core.enums import (
     InvoiceStatus,
@@ -12,6 +13,7 @@ from app.core.enums import (
     IssueStatus,
     IssuePriority,
     MilestoneStatus,
+    SafetyChecklistStatus,
 )
 from app.db.session import get_db_session
 from app.core import dependencies as d
@@ -86,7 +88,9 @@ import pandas as pd
 import csv
 
 from app.utils.common import assert_project_access
-from app.utils.helpers import NotFoundError
+from app.utils.helpers import NotFoundError, safe_divide, validate_percentage
+from app.utils.timezone import get_naive_utc_now
+from datetime import timezone
 from app.models.labour import Labour, LabourProject, LabourAttendance, LabourPayroll
 from app.core.enums import TaskStatus
 
@@ -822,7 +826,7 @@ async def accountant_dashboard(
 
 @router.get("/pm-command-center", response_model=PMCommandCenterOut)
 async def pm_command_center(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(d.require_roles([UserRole.PROJECT_MANAGER.value])),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -835,7 +839,7 @@ async def pm_command_center(
         total_projects = len(project_ids)
         active_deployments = (
             await db.scalar(
-                select(func.count(DailySiteReport.id)).where(
+                select(func.count(func.distinct(DailySiteReport.project_id))).where(
                     DailySiteReport.project_id.in_(project_ids),
                     DailySiteReport.report_date == today,
                 )
@@ -857,20 +861,30 @@ async def pm_command_center(
                 select(func.count(m.Project.id)).where(
                     m.Project.id.in_(project_ids),
                     m.Project.end_date < today,
-                    m.Project.status != "Completed",
+                    m.Project.status != ProjectStatus.COMPLETED.value,
                 )
             )
             or 0
         )
 
-        pending_reviews = (
-            await db.scalar(
-                select(func.count(Approval.id)).where(
-                    Approval.status == "Pending"
-                )  # Should ideally filter by project, but model lacks project_id directly
-            )
-            or 0
-        )
+        # Pending Reviews - Application Level Filtering
+        all_pending_approvals = (
+            await db.execute(select(Approval).where(Approval.status == "Pending"))
+        ).scalars().all()
+        
+        expense_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "expense"]
+        material_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "material"]
+        bill_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "bill"]
+        
+        valid_reviews = 0
+        if expense_ids:
+            valid_reviews += (await db.scalar(select(func.count(Expense.id)).where(Expense.id.in_(expense_ids), Expense.project_id.in_(project_ids)))) or 0
+        if material_ids:
+            valid_reviews += (await db.scalar(select(func.count(Material.id)).where(Material.id.in_(material_ids), Material.project_id.in_(project_ids)))) or 0
+        if bill_ids:
+            valid_reviews += (await db.scalar(select(func.count(VendorBill.id)).where(VendorBill.id.in_(bill_ids), VendorBill.project_id.in_(project_ids)))) or 0
+            
+        pending_reviews = valid_reviews
 
         kpis = PMKpiCards(
             total_managed_projects=total_projects,
@@ -900,7 +914,7 @@ async def pm_command_center(
             .where(BOQ.project_id.in_(project_ids), BOQ.is_latest == True)
             .group_by(BOQ.project_id)
         )
-        budget_map = {row[0]: row[1] or 1 for row in budget_query.all()}
+        budget_map = {row[0]: row[1] or 0 for row in budget_query.all()}
 
         spent_query = await db.execute(
             select(Expense.project_id, func.sum(Expense.amount))
@@ -944,48 +958,38 @@ async def pm_command_center(
             or 85
         )  # Default high for demo if no data
 
-        safety_score = 95  # Placeholder as SafetyIncident doesn't have a numerical score field easily aggregatable
+        # -------------------------------------------------------------------------
+        # Safety Score Calculation
+        #
+        # Business Rule:
+        # - Every project starts with a Safety Score of 100.
+        # - Each SafetyIncident represents an actual safety violation/incident.
+        # - Deduct penalty points for every incident.
+        # - Apply additional penalties for PPE non-compliance and failed safety
+        #   checklists.
+        # - The final score is clamped between 0 and 100.
+        #
+        # Note:
+        # These penalty values are business weights and can be adjusted in the
+        # future if the organization defines a different safety scoring policy.
+        # -------------------------------------------------------------------------
+        BASE_INCIDENT_PENALTY = 5
+        PPE_NON_COMPLIANCE_PENALTY = 3
+        CHECKLIST_FAILURE_PENALTY = 2
 
-        # 4. Resource Orchestration
-        engineers_query = await db.execute(
-            select(User, m.Project.project_name)
-            .join(m.ProjectMember, User.id == m.ProjectMember.user_id)
-            .join(m.Project, m.ProjectMember.project_id == m.Project.id)
-            .where(
-                User.role == UserRole.SITE_ENGINEER.value, m.Project.id.in_(project_ids)
-            )
-            .limit(5)
+        penalty_expr = (
+            BASE_INCIDENT_PENALTY 
+            + case((m.SafetyIncident.ppe_compliance == False, PPE_NON_COMPLIANCE_PENALTY), else_=0) 
+            + case((m.SafetyIncident.safety_checklist_status == SafetyChecklistStatus.FAILED, CHECKLIST_FAILURE_PENALTY), else_=0)
         )
-        resources = []
-        for eng, proj_name in engineers_query.all():
-            # Infer status from activity
-            last_activity = await db.scalar(
-                select(ActivityLog.created_at)
-                .where(ActivityLog.performed_by == eng.id)
-                .order_by(ActivityLog.created_at.desc())
-            )
 
-            status = "Off Duty"
-            last_seen = "Yesterday"
-            if last_activity:
-                diff = datetime.utcnow() - last_activity
-                if diff.total_seconds() < 3600:
-                    status = "On Site"
-                    last_seen = f"{int(diff.total_seconds()/60)} mins ago"
-                elif diff.total_seconds() < 86400:
-                    status = "Travelling"
-                    last_seen = f"{int(diff.total_seconds()/3600)} hours ago"
+        total_penalty = await db.scalar(
+            select(func.sum(penalty_expr)).where(m.SafetyIncident.project_id.in_(project_ids))
+        )
+        
+        safety_score = max(0, 100 - int(total_penalty or 0))
 
-            resources.append(
-                PMResourceOrchestration(
-                    user_id=eng.id,
-                    full_name=eng.full_name or "Unknown",
-                    initials="".join([n[0] for n in (eng.full_name or "U").split()]),
-                    assigned_project=proj_name,
-                    status=status,
-                    last_seen=last_seen,
-                )
-            )
+
 
         # 5. Cost Tracking (Last 7 months)
         cost_tracking = []
@@ -1045,7 +1049,7 @@ async def pm_command_center(
         alerts = []
         # Budget alert check
         for p in performance:
-            if p.budget_utilization_actual > p.budget_utilization_total:
+            if p.budget_utilization_total > 0 and p.budget_utilization_actual > p.budget_utilization_total:
                 alerts.append(
                     PMCriticalAlert(
                         id=len(alerts) + 1,
@@ -1063,7 +1067,7 @@ async def pm_command_center(
                     PMCriticalAlert(
                         id=len(alerts) + 1,
                         alert_type="Project Delay",
-                        message="Foundation work is behind schedule.",
+                        message=f"Project deadline ({p.end_date}) has passed.",
                         project_name=p.name,
                         timestamp=now,
                     )
@@ -1100,8 +1104,9 @@ async def pm_command_center(
 
         # 9. Recent Activity Feed
         activities_query = await db.execute(
-            select(ActivityLog, User.full_name)
+            select(ActivityLog, User.full_name, m.Project.project_name)
             .join(User, ActivityLog.performed_by == User.id)
+            .outerjoin(m.Project, ActivityLog.entity_id == m.Project.id)
             .where(
                 ActivityLog.entity == "project", ActivityLog.entity_id.in_(project_ids)
             )
@@ -1109,7 +1114,7 @@ async def pm_command_center(
             .limit(10)
         )
         recent_activities = []
-        for log, user_name in activities_query.all():
+        for log, user_name, proj_name in activities_query.all():
             recent_activities.append(
                 ProjectActivity(
                     type=log.action,
@@ -1119,8 +1124,8 @@ async def pm_command_center(
                         if log.details
                         else log.action
                     ),
-                    time=log.created_at.strftime("%H:%M"),
-                    project_name="Project",
+                    time=log.created_at.strftime("%b %d, %H:%M"),
+                    project_name=proj_name or "Project",
                 )
             )
 
@@ -1130,7 +1135,6 @@ async def pm_command_center(
             project_performance=performance,
             quality_score=int(qc_score),
             safety_score=int(safety_score),
-            resource_orchestration=resources,
             cost_tracking=cost_tracking,
             risk_analysis=risks,
             critical_alerts=alerts,
@@ -1144,7 +1148,7 @@ async def pm_command_center(
 
 @router.get("/project-manager-summary", response_model=PMSummaryOut)
 async def pm_summary(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(d.require_roles([UserRole.PROJECT_MANAGER.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
     project_ids = await get_user_project_ids(db, current_user)
@@ -1174,11 +1178,21 @@ async def pm_summary(
     )
 
     # Approvals
-    pending_approvals = await db.scalar(
-        select(func.count(Approval.id)).where(Approval.status == "Pending")
-        # Assuming we scope approvals, but PM might see approvals they need to act on
-        # For simplicity, if they can read the dashboard, we count all pending they have access to.
-    )
+    all_pending_approvals = (
+        await db.execute(select(Approval).where(Approval.status == "Pending"))
+    ).scalars().all()
+    
+    expense_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "expense"]
+    material_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "material"]
+    bill_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "bill"]
+    
+    pending_approvals = 0
+    if expense_ids:
+        pending_approvals += (await db.scalar(select(func.count(Expense.id)).where(Expense.id.in_(expense_ids), Expense.project_id.in_(project_ids)))) or 0
+    if material_ids:
+        pending_approvals += (await db.scalar(select(func.count(Material.id)).where(Material.id.in_(material_ids), Material.project_id.in_(project_ids)))) or 0
+    if bill_ids:
+        pending_approvals += (await db.scalar(select(func.count(VendorBill.id)).where(VendorBill.id.in_(bill_ids), VendorBill.project_id.in_(project_ids)))) or 0
 
     # Issues
     open_issues = await db.scalar(
@@ -1190,8 +1204,8 @@ async def pm_summary(
     # Budget Utilized
     total_budget = (
         await db.scalar(
-            select(func.sum(m.Project.budget_amount)).where(
-                m.Project.id.in_(project_ids)
+            select(func.sum(BOQ.total_cost)).where(
+                BOQ.project_id.in_(project_ids), BOQ.is_latest == True
             )
         )
         or 0
@@ -1211,7 +1225,11 @@ async def pm_summary(
     today_dt = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     todays_activities = (
         await db.scalar(
-            select(func.count(ActivityLog.id)).where(ActivityLog.created_at >= today_dt)
+            select(func.count(ActivityLog.id)).where(
+                ActivityLog.created_at >= today_dt,
+                ActivityLog.entity == "project",
+                ActivityLog.entity_id.in_(project_ids)
+            )
         )
         or 0
     )
@@ -1961,7 +1979,7 @@ async def ml_forecast(
     # =========================
     values = [float(r[2] or 0) for r in rows]
 
-    # X = time index (0,1,2,...)
+    # X = time index (0₹,2,...)
     X = np.arange(len(values))
     y = np.array(values)
 
@@ -2021,83 +2039,121 @@ async def ml_forecast(
 
 
 @router.get("/engineer/{project_id}", response_model=EnhancedDashboardOut)
-async def project_engineer_dashboard(
-    project_id: int,
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+@router.get("/engineer/details", response_model=EnhancedDashboardOut)
+async def site_engineer_dashboard(
+    current_user: User = Depends(d.require_roles([UserRole.SITE_ENGINEER.value])),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
+    project_id: Optional[int] = None,
 ):
-    # Check access
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    project_ids = await get_user_project_ids(db, current_user)
 
-    project = await db.get(m.Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found")
-
-    today = date.today()
+    if project_id is not None:
+        if project_id not in project_ids:
+            raise NotFoundError("Project not found or access denied")
+        filter_cond = m.DailySiteReport.project_id == project_id
+        att_filter_cond = UserAttendance.project_id == project_id
+        issue_filter_cond = Issue.project_id == project_id
+        task_filter_cond = m.Task.project_id == project_id
+        mat_filter_cond = Material.project_id == project_id
+        wa_filter_cond = WorkActivity.project_id == project_id
+        ms_filter_cond = Milestone.project_id == project_id
+        exp_filter_cond = Expense.project_id == project_id
+        
+        project = await db.get(m.Project, project_id)
+        if not project:
+            raise NotFoundError("Project not found")
+        project_name = project.project_name
+        status = str(project.status)
+        
+        # Planned progress for single project
+        planned_progress = 0
+        today = date.today()
+        if project.start_date and project.end_date:
+            total_days = (project.end_date - project.start_date).days
+            elapsed_days = (today - project.start_date).days
+            if total_days > 0:
+                planned_progress = max(0, min(100, (elapsed_days / total_days) * 100))
+    else:
+        if not project_ids:
+            # User has no projects
+            return EnhancedDashboardOut(
+                project_id=0,
+                project_name="All Assigned Projects",
+                status="N/A",
+                progress=0.0,
+                planned_progress=0.0,
+                variance=0.0,
+                vitals=DashboardVitals(
+                    total_labour_today=0,
+                    active_activities=0,
+                    open_issues=IssueStats(total=0, high_priority=0),
+                    material_stock_status=[]
+                ),
+                today_work_summary=[],
+                discipline_progress=[],
+                timeline=[],
+                recent_expenses=[],
+                weather=None
+            )
+        filter_cond = m.DailySiteReport.project_id.in_(project_ids)
+        att_filter_cond = UserAttendance.project_id.in_(project_ids)
+        issue_filter_cond = Issue.project_id.in_(project_ids)
+        task_filter_cond = m.Task.project_id.in_(project_ids)
+        mat_filter_cond = Material.project_id.in_(project_ids)
+        wa_filter_cond = WorkActivity.project_id.in_(project_ids)
+        ms_filter_cond = Milestone.project_id.in_(project_ids)
+        exp_filter_cond = Expense.project_id.in_(project_ids)
+        
+        project_name = "All Assigned Projects"
+        status = "Multiple"
+        project_id = 0
+        
+        # Calculate avg planned progress across all assigned projects
+        projects_query = await db.execute(select(m.Project).where(m.Project.id.in_(project_ids)))
+        projects = projects_query.scalars().all()
+        today = date.today()
+        total_planned = 0
+        valid_projs = 0
+        for p in projects:
+            if p.start_date and p.end_date:
+                t_days = (p.end_date - p.start_date).days
+                e_days = (today - p.start_date).days
+                if t_days > 0:
+                    total_planned += max(0, min(100, (e_days / t_days) * 100))
+                    valid_projs += 1
+        planned_progress = total_planned / valid_projs if valid_projs > 0 else 0
 
     # 1. Labor Today
     labor_stats = await db.execute(
-        select(
-            func.sum(
-                case(
-                    (
-                        m.DailySiteReport.skilled_labour > 0,
-                        m.DailySiteReport.skilled_labour,
-                    ),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (
-                        m.DailySiteReport.unskilled_labour > 0,
-                        m.DailySiteReport.unskilled_labour,
-                    ),
-                    else_=0,
-                )
-            ),
-            func.sum(
-                case(
-                    (
-                        m.DailySiteReport.total_labour > 0,
-                        m.DailySiteReport.total_labour,
-                    ),
-                    else_=0,
-                )
-            ),
-        ).where(
-            m.DailySiteReport.project_id == project_id,
-            m.DailySiteReport.report_date == today,
+        select(func.count(UserAttendance.id)).where(
+            att_filter_cond,
+            UserAttendance.attendance_date == today,
+            UserAttendance.in_time.is_not(None)
         )
     )
-    skilled, unskilled, total_labour = labor_stats.one()
+    total_labour = labor_stats.scalar() or 0
 
     # 2. Material Stock Status
     material_stats = await db.execute(
-        select(
-            Material.category, Material.remaining_stock, Material.minimum_stock_level
-        ).where(Material.project_id == project_id, Material.is_deleted == False)
+        select(Material.category, Material.remaining_stock, Material.minimum_stock_level)
+        .where(mat_filter_cond, Material.is_deleted == False)
     )
     materials = []
     for cat, stock, min_level in material_stats.all():
-        status = "OK"
+        m_status = "OK"
         if stock <= 0:
-            status = "Out of Stock"
+            m_status = "Out of Stock"
         elif stock < min_level:
-            status = "Low"
-        materials.append(MaterialStockStatus(category=cat, status=status))
+            m_status = "Low"
+        materials.append(MaterialStockStatus(category=cat, status=m_status))
 
     # 3. Open Issues
     issue_stats_query = await db.execute(
         select(
             func.count(Issue.id),
             func.sum(case((Issue.priority == IssuePriority.HIGH.value, 1), else_=0)),
-        ).where(Issue.project_id == project_id, Issue.status == IssueStatus.OPEN.value)
+        ).where(issue_filter_cond, Issue.status == IssueStatus.OPEN.value)
     )
     total_issues, high_priority_issues = issue_stats_query.one()
 
@@ -2106,7 +2162,7 @@ async def project_engineer_dashboard(
         select(WorkActivity.activity_name, WorkActivity.status)
         .join(DailyProgressEntry, WorkActivity.id == DailyProgressEntry.activity_id)
         .where(
-            WorkActivity.project_id == project_id,
+            wa_filter_cond,
             DailyProgressEntry.entry_date == today,
         )
     )
@@ -2118,7 +2174,7 @@ async def project_engineer_dashboard(
     # 5. Discipline-wise Progress
     discipline_query = await db.execute(
         select(WorkActivity.discipline, func.avg(WorkActivity.completion_percentage))
-        .where(WorkActivity.project_id == project_id)
+        .where(wa_filter_cond)
         .group_by(WorkActivity.discipline)
     )
     discipline_progress = [
@@ -2132,9 +2188,7 @@ async def project_engineer_dashboard(
 
     # 6. Timeline (Milestones)
     milestones_query = await db.execute(
-        select(Milestone)
-        .where(Milestone.project_id == project_id)
-        .order_by(Milestone.start_date)
+        select(Milestone).where(ms_filter_cond).order_by(Milestone.start_date)
     )
     timeline = [
         MilestoneTimelineEntry(
@@ -2149,10 +2203,7 @@ async def project_engineer_dashboard(
 
     # 7. Recent Expenses
     expenses_query = await db.execute(
-        select(Expense)
-        .where(Expense.project_id == project_id)
-        .order_by(Expense.expense_date.desc())
-        .limit(5)
+        select(Expense).where(exp_filter_cond).order_by(Expense.expense_date.desc()).limit(5)
     )
     recent_expenses = [
         RecentExpense(
@@ -2166,27 +2217,13 @@ async def project_engineer_dashboard(
     ]
 
     # 8. Overall Progress & Planned
-    progress = await db.scalar(
-        select(func.avg(m.Task.completion_percentage)).where(
-            m.Task.project_id == project_id
-        )
-    )
-
-    # Simple planned calculation based on timeline
-    planned_progress = 0
-    if project.start_date and project.end_date:
-        total_days = (project.end_date - project.start_date).days
-        elapsed_days = (today - project.start_date).days
-        if total_days > 0:
-            planned_progress = max(0, min(100, (elapsed_days / total_days) * 100))
-
+    progress = await db.scalar(select(func.avg(m.Task.completion_percentage)).where(task_filter_cond))
+    
     variance = float(progress or 0) - planned_progress
 
     # 9. Vitals Aggregation
     vitals = DashboardVitals(
         total_labour_today=int(total_labour or 0),
-        skilled_labour=int(skilled or 0),
-        unskilled_labour=int(unskilled or 0),
         active_activities=len(today_work),
         open_issues=IssueStats(
             total=int(total_issues or 0), high_priority=int(high_priority_issues or 0)
@@ -2196,8 +2233,8 @@ async def project_engineer_dashboard(
 
     return EnhancedDashboardOut(
         project_id=project_id,
-        project_name=project.project_name,
-        status=str(project.status),
+        project_name=project_name,
+        status=status,
         progress=float(progress or 0),
         planned_progress=round(planned_progress, 2),
         variance=round(variance, 2),
@@ -2208,25 +2245,6 @@ async def project_engineer_dashboard(
         recent_expenses=recent_expenses,
         weather={"condition": "Clear", "temperature": 32},  # Placeholder
     )
-
-
-# =========================================
-# COMMON HELPERS
-# =========================================
-
-
-def safe_divide(a, b):
-
-    if not b:
-        return 0
-
-    return round(a / b, 2)
-
-
-def validate_percentage(value):
-
-    if value < 0:
-        return 0
 
     if value > 100:
         return 100
@@ -2621,11 +2639,13 @@ async def get_labour_dashboard(
         .where(LabourProject.labour_id == labour.id)
         .order_by(desc(LabourProject.assigned_date))
     )
-    labour_project = lp_result.scalars().first()
+    labour_projects = lp_result.scalars().all()
 
     project_name = None
-    if labour_project:
-        project_id = labour_project.project_id
+    if len(labour_projects) > 1:
+        project_name = "Multiple Active Sites"
+    elif len(labour_projects) == 1:
+        project_id = labour_projects[0].project_id
         # get project name
         proj_res = await db.execute(
             select(m.Project.project_name).where(m.Project.id == project_id)
@@ -2650,8 +2670,10 @@ async def get_labour_dashboard(
             check_in_status = "CHECKED IN"
 
     # 4. Get Tasks (Assigned to this user)
+    from sqlalchemy.orm import selectinload
     tasks_res = await db.execute(
         select(Task)
+        .options(selectinload(Task.project))
         .where(Task.assignments.any(TaskAssignment.user_id == current_user.id))
         .order_by(desc(Task.start_date))
     )
@@ -2665,15 +2687,24 @@ async def get_labour_dashboard(
     recent_tasks_models = all_tasks[:5]
     recent_tasks = [
         LabourTaskItem(
-            task_id=f"T-{t.id:03d}",
+            task_id=t.id,
             title=t.title,
             status=t.status.value,
             priority=str(t.priority),
             start_date=t.start_date,
+            end_date=t.end_date,
             progress=t.completion_percentage,
+            project_name=t.project.project_name if getattr(t, "project", None) else "Project",
         )
         for t in recent_tasks_models
     ]
+
+    if not project_name and all_tasks:
+        active_project_names = list(set([t.project.project_name for t in all_tasks if getattr(t, "project", None)]))
+        if len(active_project_names) > 1:
+            project_name = "Multiple Active Sites"
+        elif len(active_project_names) == 1:
+            project_name = active_project_names[0]
 
     # 5. This Month Earnings
     current_month = today.month
@@ -2705,19 +2736,50 @@ async def get_labour_dashboard(
             this_month_earnings += float(ot_rate) * float(a.overtime_hours)
 
     # 6. Recent Activity
-    activity_res = await db.execute(
-        select(ActivityLog)
-        .where(ActivityLog.performed_by == current_user.id)
-        .order_by(desc(ActivityLog.created_at))
-        .limit(5)
+    recent_activity = []
+    
+    # Task Assignments
+    for t in all_tasks[:2]:
+        recent_activity.append({
+            "title": "Task Assigned",
+            "description": f"Assigned to {t.title}",
+            "time": t.start_date.strftime("%d %b %Y") if t.start_date else "Recent",
+            "timestamp": getattr(t, "created_at", datetime.utcnow()) or datetime.utcnow()
+        })
+        
+    # Attendance events
+    att_res = await db.execute(
+        select(UserAttendance).where(
+            UserAttendance.user_id == current_user.id
+        ).order_by(desc(UserAttendance.attendance_date)).limit(2)
     )
-    activities = activity_res.scalars().all()
-
-    recent_activity = [
+    for a in att_res.scalars().all():
+        recent_activity.append({
+            "title": "Attendance Logged",
+            "description": f"Present on {a.attendance_date.strftime('%d %b')}",
+            "time": a.in_time.strftime("%I:%M %p") if a.in_time else "Logged",
+            "timestamp": a.in_time if a.in_time else datetime.combine(a.attendance_date, datetime.min.time())
+        })
+        
+    # Payroll Updates
+    for p in payrolls[:2]:
+        recent_activity.append({
+            "title": "Payroll Generated",
+            "description": f"Wage ₹{p.total_wage} for {p.month}/{p.year}",
+            "time": p.created_at.strftime("%d %b") if getattr(p, "created_at", None) else "Recent",
+            "timestamp": getattr(p, "created_at", datetime.utcnow()) or datetime.utcnow()
+        })
+        
+    # Sort and take top 5
+    recent_activity.sort(key=lambda x: x["timestamp"], reverse=True)
+    
+    recent_activity_items = [
         LabourActivityItem(
-            title=a.action, description=a.entity, time=a.created_at.strftime("%I:%M %p")
+            title=item["title"],
+            description=item["description"],
+            time=item["time"]
         )
-        for a in activities
+        for item in recent_activity[:5]
     ]
 
     data = LabourDashboardOut(
@@ -2730,9 +2792,220 @@ async def get_labour_dashboard(
         pending_tasks=pending_tasks,
         this_month_earnings=float(this_month_earnings),
         recent_tasks=recent_tasks,
-        recent_activity=recent_activity,
+        recent_activity=recent_activity_items,
     )
 
     return success_response(
         message="Labour dashboard fetched successfully", data=data.model_dump()
     )
+
+
+def apply_payroll_time_filter(stmt, time_filter: Optional[str], month: Optional[int], year: Optional[int]):
+    if time_filter:
+        today = get_naive_utc_now().replace(tzinfo=timezone.utc).date()
+        start_date = None
+        if time_filter == "daily":
+            start_date = today
+        elif time_filter == "weekly":
+            start_date = today - timedelta(days=7)
+        elif time_filter == "monthly":
+            start_date = today - timedelta(days=30)
+        elif time_filter == "3_months":
+            start_date = today - timedelta(days=90)
+        elif time_filter == "6_months":
+            start_date = today - timedelta(days=180)
+        elif time_filter == "1_year":
+            start_date = today - timedelta(days=365)
+            
+        if start_date is not None:
+            stmt = stmt.where(cast(LabourPayroll.created_at, Date) >= start_date)
+    else:
+        if month:
+            stmt = stmt.where(LabourPayroll.month == month)
+        if year:
+            stmt = stmt.where(LabourPayroll.year == year)
+    return stmt
+
+@router.get("/labour/payments", response_model=dict)
+async def get_labour_payments(
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    time_filter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 10,
+    current_user: User = Depends(d.get_current_active_user),
+    db: AsyncSession = Depends(get_db_session)
+):
+    labour_res = await db.execute(select(Labour).where(Labour.user_id == current_user.id))
+    labour = labour_res.scalars().first()
+    if not labour:
+        raise HTTPException(status_code=404, detail="Labour profile not found for user")
+
+    # Metrics
+    metrics_stmt = select(
+        func.sum(LabourPayroll.total_wage).label("total_payout"),
+        func.sum(case((LabourPayroll.total_wage > 5000, 1), else_=0)).label("high_payouts"),
+        func.sum(case((LabourPayroll.total_overtime_hours > 0, 1), else_=0)).label("ot_intensive"),
+        func.sum(LabourPayroll.advance_adjusted).label("advance_adjusted")
+    ).where(LabourPayroll.labour_id == labour.id)
+    
+    metrics_stmt = apply_payroll_time_filter(metrics_stmt, time_filter, month, year)
+
+    metrics_res = await db.execute(metrics_stmt)
+    metrics_row = metrics_res.first()
+
+    summary = {
+        "total_payout": float(metrics_row.total_payout or 0),
+        "high_payouts": int(metrics_row.high_payouts or 0),
+        "ot_intensive": int(metrics_row.ot_intensive or 0),
+        "advance_adjusted": float(metrics_row.advance_adjusted or 0)
+    }
+
+    # Records
+    from sqlalchemy.orm import selectinload
+    records_stmt = (
+        select(LabourPayroll, Labour)
+        .join(Labour, LabourPayroll.labour_id == Labour.id)
+        .options(selectinload(Labour.labour_type))
+        .where(LabourPayroll.labour_id == labour.id)
+    )
+    records_stmt = apply_payroll_time_filter(records_stmt, time_filter, month, year)
+
+    count_stmt = select(func.count(LabourPayroll.id)).where(LabourPayroll.labour_id == labour.id)
+    count_stmt = apply_payroll_time_filter(count_stmt, time_filter, month, year)
+        
+    count_res = await db.execute(count_stmt)
+    total_records = count_res.scalar() or 0
+
+    records_stmt = records_stmt.order_by(desc(LabourPayroll.created_at)).offset((page - 1) * page_size).limit(page_size)
+    records_res = await db.execute(records_stmt)
+
+    records_data = []
+    for pr, lab in records_res.all():
+        date_str = pr.created_at.strftime("%d %b %Y") if pr.created_at else f"{pr.month}/{pr.year}"
+        skill_type = lab.skill_category.value if hasattr(lab.skill_category, "value") else str(lab.skill_category)
+        
+        records_data.append({
+            "id": f"{pr.id:03d}",
+            "date": date_str,
+            "skill_type": skill_type.capitalize(),
+            "daily_wage": f"₹{lab.daily_wage_rate}" if hasattr(lab, 'daily_wage_rate') and lab.daily_wage_rate else "₹800",
+            "ot_hours": f"{int(pr.total_overtime_hours)}h" if pr.total_overtime_hours else "0h",
+            "total_wage_earned": f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
+            "remarks": pr.remarks or ("STANDARD PAYOUT" if hasattr(pr.status, "value") and pr.status.value == "PAID" else "PENDING"),
+            "status": pr.status.value if hasattr(pr.status, "value") else str(pr.status)
+        })
+
+    return success_response(
+        message="Labour payments fetched",
+        data={
+            "summary": summary,
+            "records": records_data,
+            "total_records": total_records,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total_records + page_size - 1) // page_size if page_size > 0 else 0
+        }
+    )
+
+@router.get("/labour/payments/export")
+async def export_labour_payments(
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    time_filter: Optional[str] = None,
+    export_format: str = Query("csv", description="csv or pdf"),
+    current_user: User = Depends(d.get_current_active_user),
+    db: AsyncSession = Depends(get_db_session)
+):
+    labour_res = await db.execute(select(Labour).where(Labour.user_id == current_user.id))
+    labour = labour_res.scalars().first()
+    if not labour:
+        raise HTTPException(status_code=404, detail="Labour profile not found for user")
+
+    from sqlalchemy.orm import selectinload
+    records_stmt = (
+        select(LabourPayroll, Labour)
+        .join(Labour, LabourPayroll.labour_id == Labour.id)
+        .options(selectinload(Labour.labour_type))
+        .where(LabourPayroll.labour_id == labour.id)
+    )
+    records_stmt = apply_payroll_time_filter(records_stmt, time_filter, month, year)
+    records_stmt = records_stmt.order_by(desc(LabourPayroll.created_at))
+    records_res = await db.execute(records_stmt)
+    records = records_res.all()
+
+    import io, csv
+    if export_format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["ID", "Date", "Skill Type", "Daily Wage", "OT Hours", "Total Wage Earned", "Remarks", "Status"])
+        for pr, lab in records:
+            date_str = pr.created_at.strftime("%d %b %Y") if pr.created_at else f"{pr.month}/{pr.year}"
+            skill_type = lab.skill_category.value if hasattr(lab.skill_category, "value") else str(lab.skill_category)
+            writer.writerow([
+                f"{pr.id:03d}",
+                date_str,
+                skill_type.capitalize(),
+                f"₹{lab.daily_wage_rate}" if hasattr(lab, 'daily_wage_rate') and lab.daily_wage_rate else "₹800",
+                f"{int(pr.total_overtime_hours)}h" if pr.total_overtime_hours else "0h",
+                f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
+                pr.remarks or ("STANDARD PAYOUT" if hasattr(pr.status, "value") and pr.status.value == "PAID" else "PENDING"),
+                pr.status.value if hasattr(pr.status, "value") else str(pr.status)
+            ])
+        output.seek(0)
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            iter([output.getvalue()]), 
+            media_type="text/csv", 
+            headers={"Content-Disposition": f"attachment; filename=labour_payments.csv"}
+        )
+    elif export_format == "pdf":
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
+        from fastapi.responses import StreamingResponse
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=18)
+        elements = []
+        styles = getSampleStyleSheet()
+        
+        elements.append(Paragraph(f"Labour Payments Report: {current_user.full_name}", styles['Heading1']))
+        elements.append(Spacer(1, 0.2 * inch))
+        
+        data = [["ID", "Date", "Skill", "Wage", "OT", "Total", "Status"]]
+        for pr, lab in records:
+            date_str = pr.created_at.strftime("%d %b %Y") if pr.created_at else f"{pr.month}/{pr.year}"
+            skill_type = lab.skill_category.value if hasattr(lab.skill_category, "value") else str(lab.skill_category)
+            data.append([
+                f"{pr.id:03d}",
+                date_str,
+                skill_type.capitalize()[:10],
+                f"₹{lab.daily_wage_rate}" if hasattr(lab, 'daily_wage_rate') and lab.daily_wage_rate else "₹800",
+                f"{int(pr.total_overtime_hours)}h" if pr.total_overtime_hours else "0h",
+                f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
+                pr.status.value if hasattr(pr.status, "value") else str(pr.status)
+            ])
+            
+        t = Table(data)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0,0), (-1,0), 12),
+            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+            ('GRID', (0,0), (-1,-1), 1, colors.black)
+        ]))
+        elements.append(t)
+        doc.build(elements)
+        buffer.seek(0)
+        return StreamingResponse(
+            buffer, 
+            media_type="application/pdf", 
+            headers={"Content-Disposition": f"attachment; filename=labour_payments.pdf"}
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Invalid export format")

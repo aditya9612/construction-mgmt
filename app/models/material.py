@@ -220,6 +220,11 @@ class MaterialUsage(Base, TimestampMixin):
     )
     material = relationship("Material", back_populates="usages")
 
+    boq_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
 
     task_id: Mapped[Optional[int]] = mapped_column(
@@ -247,6 +252,11 @@ class MaterialTransaction(Base, TimestampMixin):
     )
     material = relationship("Material", back_populates="transactions")
 
+    boq_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     project_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("projects.id"), nullable=True
     )
@@ -324,7 +334,12 @@ class PurchaseOrder(Base, TimestampMixin):
     __tablename__ = "purchase_orders"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-
+    boq_item_id = Column(
+        Integer,
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"))
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
 
@@ -367,6 +382,12 @@ class MaterialLedger(Base, TimestampMixin):
     __tablename__ = "material_ledger"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+
+    boq_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     material_id: Mapped[int] = mapped_column(
         ForeignKey("materials.id", ondelete="CASCADE")

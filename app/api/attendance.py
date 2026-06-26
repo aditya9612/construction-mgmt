@@ -7,11 +7,12 @@ from sqlalchemy import desc, func, select
 from app.core.dependencies import get_current_user, require_roles
 from app.core.enums import AttendanceStatus
 from app.db.session import get_db_session
-from app.models.user import User, UserAttendance
+from app.models.user import User, UserAttendance, ActivityLog
 from app.models.project import Project
-from app.schemas.user import UserAttendanceOut
-from datetime import datetime, date, timedelta
+from app.schemas.user import UserAttendanceOut, ProxyBulkCheckInForm, ProxyBulkCheckOutForm
+from datetime import datetime, date, timedelta, timezone
 from app.utils.helpers import calculate_distance
+from app.utils.timezone import get_naive_utc_now, localize_datetime, make_naive_utc
 from app.core.validators import (
     validate_and_save_image,
     validate_and_save_document,
@@ -36,10 +37,7 @@ UPLOAD_DIR = "uploads/attendance"
 
 @router.post("/check-in", response_model=UserAttendanceOut)
 async def check_in(
-    attendance_date: date = Form(...),
     project_id: Optional[int] = Form(None),
-    status: str = Form(AttendanceStatus.PRESENT.value),
-    in_time: Optional[datetime] = Form(None),
     check_in_latitude: Optional[float] = Form(None),
     check_in_longitude: Optional[float] = Form(None),
     check_in_address: Optional[str] = Form(None),
@@ -51,6 +49,17 @@ async def check_in(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    # Auto-generate UTC in_time
+    actual_in_time = get_naive_utc_now()
+    
+    # Auto-generate local attendance_date from the server timestamp
+    actual_in_time_aware = actual_in_time.replace(tzinfo=timezone.utc)
+    actual_in_time_local = localize_datetime(actual_in_time_aware).replace(tzinfo=None)
+    attendance_date = actual_in_time_local.date()
+
+    # Hardcode status
+    status = AttendanceStatus.PRESENT.value
+
     # Check if already checked in today
     result = await db.execute(
         select(UserAttendance).where(
@@ -63,7 +72,6 @@ async def check_in(
     if existing:
         raise HTTPException(status_code=400, detail="Already checked in for this date")
 
-    actual_in_time = in_time or datetime.now()
     is_outside_geofence = False
     is_late = False
     late_minutes = 0
@@ -92,27 +100,25 @@ async def check_in(
                     is_outside_geofence = True
 
             # Late Detection Logic
-            # Normalize timezone-aware datetime
-            if actual_in_time.tzinfo is not None:
-                actual_in_time = actual_in_time.astimezone().replace(tzinfo=None)
-
-            # Late Detection Logic
             if project.shift_start_time:
 
-                shift_start_dt = datetime.combine(
+                shift_start_dt_local = datetime.combine(
                     attendance_date, project.shift_start_time
                 )
+                
+                actual_in_time_aware = actual_in_time.replace(tzinfo=timezone.utc)
+                actual_in_time_local = localize_datetime(actual_in_time_aware).replace(tzinfo=None)
 
                 grace_mins = project.grace_period_minutes or 15
 
-                shift_start_with_grace = shift_start_dt + timedelta(minutes=grace_mins)
+                shift_start_with_grace = shift_start_dt_local + timedelta(minutes=grace_mins)
 
-                if actual_in_time > shift_start_with_grace:
+                if actual_in_time_local > shift_start_with_grace:
 
                     is_late = True
 
                     late_minutes = int(
-                        (actual_in_time - shift_start_dt).total_seconds() / 60
+                        (actual_in_time_local - shift_start_dt_local).total_seconds() / 60
                     )
 
     # Save check-in image if uploaded
@@ -152,7 +158,6 @@ async def check_in(
 @router.put("/check-out/{attendance_id}", response_model=UserAttendanceOut)
 async def check_out(
     attendance_id: int,
-    out_time: Optional[datetime] = Form(None),
     check_out_latitude: Optional[float] = Form(None),
     check_out_longitude: Optional[float] = Form(None),
     check_out_address: Optional[str] = Form(None),
@@ -179,10 +184,8 @@ async def check_out(
     if attendance.out_time:
         raise HTTPException(status_code=400, detail="Already checked out")
 
-    actual_out_time = out_time or datetime.now()
-
-    if actual_out_time.tzinfo is not None:
-        actual_out_time = actual_out_time.replace(tzinfo=None)
+    # Auto-generate out_time from secure server clock
+    actual_out_time = get_naive_utc_now()
 
     # Early Departure Detection
     is_early_departure = False
@@ -193,13 +196,17 @@ async def check_out(
         )
         project = project_result.scalars().first()
         if project and project.shift_end_time:
-            shift_end_dt = datetime.combine(
+            shift_end_dt_local = datetime.combine(
                 attendance.attendance_date, project.shift_end_time
             )
-            if actual_out_time < shift_end_dt:
+            
+            actual_out_time_aware = actual_out_time.replace(tzinfo=timezone.utc)
+            actual_out_time_local = localize_datetime(actual_out_time_aware).replace(tzinfo=None)
+
+            if actual_out_time_local < shift_end_dt_local:
                 is_early_departure = True
                 early_minutes = int(
-                    (shift_end_dt - actual_out_time).total_seconds() / 60
+                    (shift_end_dt_local - actual_out_time_local).total_seconds() / 60
                 )
 
     # Save check-out image if uploaded
@@ -374,7 +381,11 @@ async def today_status(
     db: AsyncSession = Depends(get_db_session),
 ):
     """Get current user's attendance status for today."""
-    today = date.today()
+    # today = date.today()
+
+    today = localize_datetime(
+        get_naive_utc_now().replace(tzinfo=timezone.utc)
+    ).date()
 
     result = await db.execute(
         select(UserAttendance).where(
@@ -398,12 +409,12 @@ async def today_status(
 
     if attendance.in_time and not attendance.out_time:
 
-        now = datetime.now()
+        now = get_naive_utc_now()
 
         in_time = attendance.in_time
 
         if in_time and in_time.tzinfo is not None:
-            in_time = in_time.replace(tzinfo=None)
+            in_time = in_time.astimezone(timezone.utc).replace(tzinfo=None)
 
         delta = now - in_time
 
@@ -514,3 +525,308 @@ async def list_attendance(
             (total_count + page_size - 1) // page_size if page_size > 0 else 0
         ),
     }
+
+# ===================== PROXY BULK CHECK-IN =====================
+@router.post("/proxy-check-in", dependencies=[Depends(require_roles(APPROVE_ROLES))])
+async def proxy_check_in(
+    payload: ProxyBulkCheckInForm,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    actual_in_time = get_naive_utc_now()
+    actual_in_time_aware = actual_in_time.replace(tzinfo=timezone.utc)
+    actual_in_time_local = localize_datetime(actual_in_time_aware).replace(tzinfo=None)
+    attendance_date = actual_in_time_local.date()
+
+    checked_in_count = 0
+    for uid in payload.user_ids:
+        # Check if already checked in today
+        result = await db.execute(
+            select(UserAttendance).where(
+                UserAttendance.user_id == uid,
+                UserAttendance.attendance_date == attendance_date,
+            )
+        )
+        existing = result.scalars().first()
+
+        if not existing:
+            new_att = UserAttendance(
+                user_id=uid,
+                project_id=payload.project_id,
+                attendance_date=attendance_date,
+                in_time=actual_in_time,
+                status=AttendanceStatus.PRESENT.value,
+                remarks=payload.remarks,
+                is_outside_geofence=False,  # Proxy bypasses geofencing
+                is_late=False,
+            )
+            db.add(new_att)
+            checked_in_count += 1
+
+    # Activity Log
+    if checked_in_count > 0:
+        log = ActivityLog(
+            action="BULK_CHECK_IN",
+            entity="Attendance",
+            performed_by=current_user.id,
+        )
+        db.add(log)
+    
+    await db.flush()
+    return {"success": True, "message": f"Checked in {checked_in_count} users successfully."}
+
+
+# ===================== PROXY BULK CHECK-OUT =====================
+@router.put("/proxy-check-out", dependencies=[Depends(require_roles(APPROVE_ROLES))])
+async def proxy_check_out(
+    payload: ProxyBulkCheckOutForm,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    actual_out_time = get_naive_utc_now()
+    checked_out_count = 0
+
+    for aid in payload.attendance_ids:
+        result = await db.execute(
+            select(UserAttendance).where(UserAttendance.id == aid)
+        )
+        att = result.scalars().first()
+
+        if att and not att.out_time:
+            att.out_time = actual_out_time
+            if payload.remarks:
+                att.remarks = (att.remarks + " | " + payload.remarks) if att.remarks else payload.remarks
+            
+            # Recalculate hours
+            if att.in_time:
+                delta = actual_out_time - att.in_time
+                hrs = delta.total_seconds() / 3600.0
+                att.working_hours = round(hrs, 2)
+
+                if hrs > 8.0:
+                    att.overtime_hours = round(hrs - 8.0, 2)
+            
+            checked_out_count += 1
+
+    # Activity Log
+    if checked_out_count > 0:
+        log = ActivityLog(
+            action="BULK_CHECK_OUT",
+            entity="Attendance",
+            performed_by=current_user.id,
+        )
+        db.add(log)
+
+    await db.flush()
+    return {"success": True, "message": f"Checked out {checked_out_count} users successfully."}
+
+import io
+import csv
+import pandas as pd
+from fastapi.responses import StreamingResponse
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image as RLImage, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+
+# ===================== EXPORT APIS =====================
+
+@router.get("/export/csv")
+async def export_attendance_csv(
+    start_date: date,
+    end_date: date,
+    project_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    role: Optional[str] = None,
+    is_approved: Optional[bool] = None,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in APPROVE_ROLES:
+        user_id = current_user.id
+
+    query = select(UserAttendance, User, Project).join(User, UserAttendance.user_id == User.id).outerjoin(Project, UserAttendance.project_id == Project.id)
+    
+    query = query.where(UserAttendance.attendance_date >= start_date)
+    query = query.where(UserAttendance.attendance_date <= end_date)
+    
+    if project_id:
+        query = query.where(UserAttendance.project_id == project_id)
+    if user_id:
+        query = query.where(UserAttendance.user_id == user_id)
+    if role:
+        query = query.where(User.role == role)
+    if is_approved is not None:
+        query = query.where(UserAttendance.is_approved == is_approved)
+        
+    result = await db.execute(query.order_by(UserAttendance.attendance_date.desc()))
+    records = result.all()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Date", "Employee ID", "Name", "Role", "Project Name", 
+        "Status", "In-Time", "Out-Time", "Total Hours", "Overtime Hours", "Overtime Payout", "Remarks"
+    ])
+    
+    for att, user, proj in records:
+        proj_name = proj.project_name if proj else "N/A"
+        payout = (att.overtime_hours or 0) * (att.overtime_rate or 0)
+        in_t = att.in_time.strftime("%H:%M:%S") if att.in_time else ""
+        out_t = att.out_time.strftime("%H:%M:%S") if att.out_time else ""
+        
+        writer.writerow([
+            att.attendance_date,
+            user.id,
+            user.full_name,
+            user.role,
+            proj_name,
+            att.status,
+            in_t,
+            out_t,
+            round(att.working_hours or 0, 2),
+            round(att.overtime_hours or 0, 2),
+            round(payout, 2),
+            att.remarks or ""
+        ])
+    
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]), 
+        media_type="text/csv", 
+        headers={"Content-Disposition": f"attachment; filename=attendance_{start_date}_to_{end_date}.csv"}
+    )
+
+
+@router.get("/export/pdf/audit")
+async def export_attendance_pdf_audit(
+    start_date: date,
+    end_date: date,
+    project_id: int,
+    user_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in APPROVE_ROLES:
+        user_id = current_user.id
+
+    query = select(UserAttendance, User, Project).join(User, UserAttendance.user_id == User.id).outerjoin(Project, UserAttendance.project_id == Project.id)
+    query = query.where(
+        UserAttendance.attendance_date >= start_date,
+        UserAttendance.attendance_date <= end_date,
+        UserAttendance.project_id == project_id
+    )
+    if user_id:
+        query = query.where(UserAttendance.user_id == user_id)
+        
+    result = await db.execute(query.order_by(UserAttendance.attendance_date.desc()))
+    records = result.all()
+    
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=18)
+    elements = []
+    styles = getSampleStyleSheet()
+    
+    title = Paragraph(f"Audit Report: Project {project_id} ({start_date} to {end_date})", styles['Heading1'])
+    elements.append(title)
+    elements.append(Spacer(1, 0.2 * inch))
+    
+    data = [["Date", "Name", "Check-In Time", "Check-In Location", "Check-Out Time", "Check-Out Location"]]
+    
+    for att, user, proj in records:
+        in_t = att.in_time.strftime("%H:%M:%S") if att.in_time else "N/A"
+        out_t = att.out_time.strftime("%H:%M:%S") if att.out_time else "N/A"
+        
+        in_loc = att.check_in_address or "N/A"
+        out_loc = att.check_out_address or "N/A"
+        
+        data.append([
+            str(att.attendance_date),
+            user.full_name,
+            in_t,
+            in_loc,
+            out_t,
+            out_loc
+        ])
+    
+    t = Table(data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 12),
+        ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+        ('GRID', (0,0), (-1,-1), 1, colors.black)
+    ]))
+    elements.append(t)
+    
+    doc.build(elements)
+    buffer.seek(0)
+    
+    return StreamingResponse(
+        buffer, 
+        media_type="application/pdf", 
+        headers={"Content-Disposition": f"attachment; filename=audit_{project_id}_{start_date}.pdf"}
+    )
+
+
+@router.get("/export/payroll")
+async def export_attendance_payroll(
+    start_date: date,
+    end_date: date,
+    project_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    role: Optional[str] = None,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in APPROVE_ROLES:
+        user_id = current_user.id
+
+    query = select(
+        User.id,
+        User.full_name,
+        User.role,
+        func.sum(UserAttendance.working_hours).label('total_hours'),
+        func.sum(UserAttendance.overtime_hours).label('total_overtime'),
+        func.sum(UserAttendance.overtime_hours * UserAttendance.overtime_rate).label('total_payout')
+    ).join(UserAttendance, UserAttendance.user_id == User.id)
+    
+    query = query.where(
+        UserAttendance.attendance_date >= start_date,
+        UserAttendance.attendance_date <= end_date
+    )
+    
+    if project_id:
+        query = query.where(UserAttendance.project_id == project_id)
+    if user_id:
+        query = query.where(User.id == user_id)
+    if role:
+        query = query.where(User.role == role)
+        
+    query = query.group_by(User.id, User.full_name, User.role)
+    result = await db.execute(query)
+    records = result.all()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Employee ID", "Name", "Role", "Total Hours", "Total Overtime Hours", "Overtime Payout"])
+    
+    for row in records:
+        writer.writerow([
+            row.id,
+            row.full_name,
+            row.role,
+            round(row.total_hours or 0, 2),
+            round(row.total_overtime or 0, 2),
+            round(row.total_payout or 0, 2)
+        ])
+        
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]), 
+        media_type="text/csv", 
+        headers={"Content-Disposition": f"attachment; filename=payroll_{start_date}_to_{end_date}.csv"}
+    )

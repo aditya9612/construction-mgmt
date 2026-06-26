@@ -1,5 +1,5 @@
-from datetime import date, datetime
-from typing import Any, Optional
+from datetime import date, datetime, timezone
+from typing import Any, Optional, List
 from pydantic import EmailStr, Field, field_validator, model_validator
 from app.schemas.base import BaseSchema
 from app.core.validators import (
@@ -208,3 +208,20 @@ class UserAttendanceOut(BaseSchema):
     is_early_departure: bool = False
     early_minutes: int = 0
     work_location_type: Optional[str] = None
+
+    @model_validator(mode="after")
+    def ensure_timezone_aware(self):
+        if self.in_time and self.in_time.tzinfo is None:
+            self.in_time = self.in_time.replace(tzinfo=timezone.utc)
+        if self.out_time and self.out_time.tzinfo is None:
+            self.out_time = self.out_time.replace(tzinfo=timezone.utc)
+        return self
+
+class ProxyBulkCheckInForm(BaseSchema):
+    project_id: Optional[int] = None
+    user_ids: List[int]
+    remarks: Optional[str] = None
+
+class ProxyBulkCheckOutForm(BaseSchema):
+    attendance_ids: List[int]
+    remarks: Optional[str] = None

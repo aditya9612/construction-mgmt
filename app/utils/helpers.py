@@ -90,3 +90,15 @@ def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     c = 2 * math.asin(math.sqrt(a))
     r = 6371 # Radius of earth in kilometers
     return c * r * 1000 # Convert to meters
+
+def safe_divide(numerator, denominator):
+    if not denominator:
+        return 0.0
+    return float(numerator) / float(denominator)
+
+def validate_percentage(value):
+    if value < 0:
+        return 0.0
+    if value > 100:
+        return 100.0
+    return float(value)

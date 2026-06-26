@@ -359,43 +359,20 @@ async def list_users(
 
     return result
 
-@router.get("/role-counts")
-async def get_role_counts(
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
-):
-    rows = (
-        await db.execute(
-            select(User.role, func.count(User.id))
-            .where(
-                User.is_deleted == False,
-                User.is_active == True,
-            )
-            .group_by(User.role)
-        )
-    ).all()
-
-    # Initialize all roles with 0
-    result = {role: 0 for role in ROLES}
-
-    # Fill actual counts
-    for role, count in rows:
-        result[role] = count
-
-    return result
-
 @router.get("/roles")
-async def list_roles_by_status(
+async def list_roles(
     status: str = Query(
         "all",
         pattern="^(all|active|inactive)$",
         description="Filter roles by user status: all, active, inactive"
     ),
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    role: Optional[str] = Query(None, description="Filter by a specific role"),
+    current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
-    Return unique roles based on user active/inactive status.
+    Return role counts, optionally filtered by status and specific role.
+    Always includes all roles with 0 counts if no specific role is requested.
     """
 
     # Base query
@@ -410,24 +387,38 @@ async def list_roles_by_status(
     # Apply status filter
     if status == "active":
         query = query.where(User.is_active == True)
-
     elif status == "inactive":
         query = query.where(User.is_active == False)
 
+    # Apply role filter
+    if role:
+        query = query.where(User.role == role)
+
     # Group by role
-    query = query.group_by(User.role).order_by(User.role)
+    query = query.group_by(User.role)
 
     # Execute query
     rows = (await db.execute(query)).all()
 
+    # Convert results to a dictionary
+    counts = {r: count for r, count in rows}
+
     # Format response
-    items = [
-        {
-            "role": role,
-            "user_count": count
-        }
-        for role, count in rows
-    ]
+    if role:
+        items = [
+            {
+                "role": role,
+                "user_count": counts.get(role, 0)
+            }
+        ]
+    else:
+        items = [
+            {
+                "role": r,
+                "user_count": counts.get(r, 0)
+            }
+            for r in ROLES
+        ]
 
     return {
         "items": items

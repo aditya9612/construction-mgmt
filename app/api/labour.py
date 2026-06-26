@@ -1069,7 +1069,7 @@ async def generate_payroll(
         # =========================
         for row, labour in rows:
 
-            hourly_rate = labour.effective_daily_wage / Decimal("8")
+            hourly_rate = Decimal(str(labour.effective_daily_wage or 0)) / Decimal("8")
 
             #  STATUS-BASED WAGE FIX
             if row.status == AttendanceStatus.ABSENT:
@@ -1080,17 +1080,17 @@ async def generate_payroll(
 
                 working_hours = Decimal("4")
 
-                ot_rate = row.overtime_rate or Decimal("0")
-                ot_hours = row.overtime_hours or Decimal("0")
+                ot_rate = Decimal(str(row.overtime_rate or 0))
+                ot_hours = Decimal(str(row.overtime_hours or 0))
 
                 wage = hourly_rate * working_hours + ot_rate * ot_hours
 
             else:
 
-                working_hours = row.working_hours or Decimal("0")
+                working_hours = Decimal(str(row.working_hours or 0))
 
-                ot_rate = row.overtime_rate or Decimal("0")
-                ot_hours = row.overtime_hours or Decimal("0")
+                ot_rate = Decimal(str(row.overtime_rate or 0))
+                ot_hours = Decimal(str(row.overtime_hours or 0))
 
                 wage = hourly_rate * working_hours + ot_rate * ot_hours
 

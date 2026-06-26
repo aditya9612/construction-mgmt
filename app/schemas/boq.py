@@ -48,10 +48,8 @@ class BOQCreate(BaseSchema):
 
 class BOQUpdate(BaseSchema):
     item_name: Optional[str] = None
-    category: Optional[str] = None
     description: Optional[str] = None
     quantity: Optional[Decimal] = None
-    unit: Optional[str] = None
     unit_cost: Optional[Decimal] = None
     is_completed: Optional[bool] = None
     status: Optional[str] = None

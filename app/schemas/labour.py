@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from datetime import date, time, datetime
 from fastapi import Form
 from pydantic import BaseModel, field_validator
@@ -381,3 +381,27 @@ class AggregateReportOut(BaseModel):
 
     class Config:
         json_encoders = {Decimal: float}
+
+class LabourPaymentSummary(BaseModel):
+    total_payout: float
+    high_payouts: int
+    ot_intensive: int
+    advance_adjusted: float
+
+class LabourPaymentRecord(BaseModel):
+    id: str
+    date: str
+    skill_type: str
+    daily_wage: str
+    ot_hours: str
+    total_wage_earned: str
+    remarks: Optional[str]
+    status: str
+
+class LabourPaymentResponse(BaseModel):
+    summary: LabourPaymentSummary
+    records: List[LabourPaymentRecord]
+    total_records: int
+    page: int
+    page_size: int
+    total_pages: int

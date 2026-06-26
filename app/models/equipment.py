@@ -1,21 +1,22 @@
 from datetime import date, datetime
-from typing import Optional, List
 from decimal import Decimal
+from typing import List, Optional
+
 from pydantic import Field
 from sqlalchemy import (
+    JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     DECIMAL,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
-    CheckConstraint,
-    Index,
-    Enum as SqlEnum,
-    JSON,
     UniqueConstraint,
+    Enum as SqlEnum,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -29,10 +30,17 @@ class Equipment(Base, TimestampMixin):
     __tablename__ = "equipment"
 
     __table_args__ = (
-        CheckConstraint("working_hours >= 0", name="check_working_hours_positive"),
-        CheckConstraint("fuel_used >= 0", name="check_fuel_used_positive"),
         CheckConstraint(
-            "rental_cost >= 0", name="check_equipment_rental_cost_positive"
+            "working_hours >= 0",
+            name="check_working_hours_positive",
+        ),
+        CheckConstraint(
+            "fuel_used >= 0",
+            name="check_fuel_used_positive",
+        ),
+        CheckConstraint(
+            "rental_cost >= 0",
+            name="check_equipment_rental_cost_positive",
         ),
         Index(
             "ix_equipment_code_unique_active",
@@ -40,10 +48,18 @@ class Equipment(Base, TimestampMixin):
             unique=True,
             postgresql_where=text("is_deleted = false"),
         ),
-        Index("ix_equipment_project_condition", "project_id", "condition"),
+        Index(
+            "ix_equipment_project_condition",
+            "project_id",
+            "condition",
+        ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
 
     project_id: Mapped[Optional[int]] = mapped_column(
         Integer,
@@ -52,16 +68,33 @@ class Equipment(Base, TimestampMixin):
         index=True,
     )
 
-    equipment_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    equipment_code: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    operator_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    equipment_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+    )
+
+    equipment_code: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        index=True,
+    )
+
+    operator_name: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+    )
 
     working_hours: Mapped[Decimal] = mapped_column(
-        DECIMAL(10, 2), nullable=False, default=0
+        DECIMAL(10, 2),
+        nullable=False,
+        default=0,
     )
 
     fuel_used: Mapped[Decimal] = mapped_column(
-        DECIMAL(10, 2), nullable=False, default=0
+        DECIMAL(10, 2),
+        nullable=False,
+        default=0,
     )
 
     condition: Mapped[Optional[EquipmentCondition]] = mapped_column(
@@ -71,14 +104,18 @@ class Equipment(Base, TimestampMixin):
     )
 
     rental_cost: Mapped[Decimal] = mapped_column(
-        DECIMAL(10, 2), nullable=False, default=0
+        DECIMAL(10, 2),
+        nullable=False,
+        default=0,
     )
 
     maintenance_date: Mapped[Optional[date]] = mapped_column(
-        Date, nullable=True, index=True
+        Date,
+        nullable=True,
+        index=True,
     )
 
-    # 🔥 MAIN FIELD (CONTROL EVERYTHING)
+    # Main Status
     status: Mapped[EquipmentStatus] = mapped_column(
         SqlEnum(EquipmentStatus),
         default=EquipmentStatus.AVAILABLE,
@@ -86,12 +123,23 @@ class Equipment(Base, TimestampMixin):
         index=True,
     )
 
-    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    deleted_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    deleted_by: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    is_deleted: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        index=True,
+    )
 
-    # ================= RELATIONSHIPS =================
+    deleted_at: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+    )
 
+    deleted_by: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    # Relationships
     usages: Mapped[List["EquipmentUsage"]] = relationship(
         "EquipmentUsage",
         back_populates="equipment",
@@ -122,7 +170,10 @@ class Equipment(Base, TimestampMixin):
 
     def __repr__(self):
         return (
-            f"<Equipment id={self.id} code={self.equipment_code} status={self.status}>"
+            f"<Equipment "
+            f"id={self.id} "
+            f"code={self.equipment_code} "
+            f"status={self.status}>"
         )
 
 
@@ -150,19 +201,45 @@ class EquipmentUsage(Base, TimestampMixin):
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    equipment_id: Mapped[int] = mapped_column(
-        ForeignKey("equipment.id", ondelete="CASCADE"), index=True
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
     )
 
-    working_hours: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False)
-    fuel_used: Mapped[Decimal] = mapped_column(DECIMAL(10, 2), nullable=False)
+    equipment_id: Mapped[int] = mapped_column(
+        ForeignKey("equipment.id", ondelete="CASCADE"),
+        index=True,
+    )
 
-    usage_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
-    notes: Mapped[Optional[str]] = mapped_column(String(500))
+    boq_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    working_hours: Mapped[Decimal] = mapped_column(
+        DECIMAL(10, 2),
+        nullable=False,
+    )
+
+    fuel_used: Mapped[Decimal] = mapped_column(
+        DECIMAL(10, 2),
+        nullable=False,
+    )
+
+    usage_date: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+        index=True,
+    )
+
+    notes: Mapped[Optional[str]] = mapped_column(
+        String(500),
+    )
 
     equipment: Mapped["Equipment"] = relationship(
-        back_populates="usages", lazy="selectin"
+        back_populates="usages",
+        lazy="selectin",
     )
 
 
@@ -177,7 +254,21 @@ class EquipmentMaintenance(Base, TimestampMixin):
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id"),
+        nullable=False,
+    )
+
+    boq_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
 
     equipment_id: Mapped[int] = mapped_column(
         ForeignKey("equipment.id", ondelete="CASCADE"),
@@ -194,15 +285,18 @@ class EquipmentMaintenance(Base, TimestampMixin):
         nullable=False,
     )
 
-    cost: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(10, 2))
+    cost: Mapped[Optional[Decimal]] = mapped_column(
+        DECIMAL(10, 2),
+    )
 
-    next_maintenance_date: Mapped[Optional[date]] = mapped_column(Date)
+    next_maintenance_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+    )
 
-    # NEW FIELDS
     is_completed: Mapped[bool] = mapped_column(
         Boolean,
-        nullable=False,
         default=False,
+        nullable=False,
         index=True,
     )
 
@@ -221,55 +315,128 @@ class EquipmentRental(Base, TimestampMixin):
     __tablename__ = "equipment_rental"
 
     __table_args__ = (
-        CheckConstraint("rental_cost >= 0", name="check_rental_cost_positive"),
-        Index("ix_equipment_rental_dates", "equipment_id", "start_date", "end_date"),
+        CheckConstraint(
+            "rental_cost >= 0",
+            name="check_rental_cost_positive",
+        ),
+        Index(
+            "ix_equipment_rental_dates",
+            "equipment_id",
+            "start_date",
+            "end_date",
+        ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    project_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("projects.id"),
+        nullable=True,
+    )
+
     equipment_id: Mapped[int] = mapped_column(
-        ForeignKey("equipment.id", ondelete="CASCADE"), index=True
+        ForeignKey("equipment.id", ondelete="CASCADE"),
+        index=True,
     )
 
-    start_date: Mapped[date] = mapped_column(Date, nullable=False)
-    end_date: Mapped[Optional[date]] = mapped_column(Date)
+    start_date: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+    )
 
-    rental_cost: Mapped[Decimal] = mapped_column(DECIMAL(12, 2), nullable=False)
+    end_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+    )
 
-    client_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    notes: Mapped[Optional[str]] = mapped_column(Text)
+    rental_cost: Mapped[Decimal] = mapped_column(
+        DECIMAL(12, 2),
+        nullable=False,
+    )
+
+    client_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    notes: Mapped[Optional[str]] = mapped_column(
+        Text,
+    )
+
+    boq_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     equipment: Mapped["Equipment"] = relationship(
-        back_populates="rentals", lazy="selectin"
+        back_populates="rentals",
+        lazy="selectin",
     )
 
 
 class EquipmentAuditLog(Base, TimestampMixin):
     __tablename__ = "equipment_audit_log"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    equipment_id: Mapped[int] = mapped_column(
-        ForeignKey("equipment.id", ondelete="CASCADE"), index=True
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
     )
 
-    action: Mapped[str] = mapped_column(String(50), nullable=False)
+    equipment_id: Mapped[int] = mapped_column(
+        ForeignKey("equipment.id", ondelete="CASCADE"),
+        index=True,
+    )
 
-    old_values: Mapped[Optional[dict]] = mapped_column(JSON)
-    new_values: Mapped[Optional[dict]] = mapped_column(JSON)
+    action: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+    )
 
-    user_id: Mapped[Optional[int]] = mapped_column(Integer)
-    ip_address: Mapped[Optional[str]] = mapped_column(String(45))
+    old_values: Mapped[Optional[dict]] = mapped_column(
+        JSON,
+    )
+
+    new_values: Mapped[Optional[dict]] = mapped_column(
+        JSON,
+    )
+
+    user_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+    )
+
+    ip_address: Mapped[Optional[str]] = mapped_column(
+        String(45),
+    )
 
     equipment: Mapped["Equipment"] = relationship(
-        back_populates="audit_logs", lazy="selectin"
+        back_populates="audit_logs",
+        lazy="selectin",
     )
 
 
 class EquipmentPurchase(Base, TimestampMixin):
     __tablename__ = "equipment_purchase"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
 
-    purchase_type = mapped_column(
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id"),
+        nullable=False,
+    )
+
+    boq_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("boq_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    purchase_type: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
         index=True,
@@ -281,9 +448,14 @@ class EquipmentPurchase(Base, TimestampMixin):
         index=True,
     )
 
-    equipment: Mapped["Equipment"] = relationship(lazy="selectin")
+    equipment: Mapped["Equipment"] = relationship(
+        lazy="selectin",
+    )
 
-    purchase_date: Mapped[date] = mapped_column(Date, nullable=False)
+    purchase_date: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+    )
 
     vendor_name: Mapped[str] = mapped_column(
         String(255),

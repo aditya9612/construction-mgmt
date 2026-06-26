@@ -901,6 +901,20 @@ class DrawingDocument(Base, TimestampMixin):
         index=True,
     )
 
+    is_folder = Column(
+        Boolean,
+        default=False,
+        server_default='0',
+        nullable=False,
+        index=True,
+    )
+
+    parent_id = Column(
+        Integer,
+        ForeignKey("drawing_documents.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     drawing_name = Column(
         String(255),
         nullable=False,
@@ -909,12 +923,12 @@ class DrawingDocument(Base, TimestampMixin):
 
     version = Column(
         String(50),
-        nullable=False,
+        nullable=True,
     )
 
     file_url = Column(
         String(500),
-        nullable=False,
+        nullable=True,
     )
 
     date = Column(

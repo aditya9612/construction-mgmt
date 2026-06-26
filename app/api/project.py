@@ -26,7 +26,7 @@ from sqlalchemy.orm import selectinload
 import traceback
 from app.models.approval import Approval
 from app.models.labour import Labour
-from app.models.user import UserAttendance
+from app.models.user import UserAttendance, ActivityLog
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.cache.redis import (
     bump_cache_version,
@@ -610,6 +610,16 @@ class ProjectsService:
                 )
 
                 obj = await self.projects_repo.create_project(db, data)
+                
+                db.add(ActivityLog(
+                    action="CREATE_PROJECT",
+                    entity="project",
+                    entity_id=obj.id,
+                    performed_by=current_user.id,
+                    details={"message": f"Project '{obj.project_name}' created"}
+                ))
+                await db.flush()
+
                 break
 
             except IntegrityError as e:
@@ -1811,6 +1821,16 @@ class TasksService:
             obj=obj,
             data={"status": status},
         )
+
+        if (hasattr(status, "value") and status.value.upper() == "COMPLETED") or str(status).upper() == "COMPLETED" or str(status).upper() == "TASKSTATUS.COMPLETED":
+            db.add(ActivityLog(
+                action="TASK_COMPLETED",
+                entity="project",
+                entity_id=project_id,
+                performed_by=current_user.id,
+                details={"message": f"Task '{obj.title}' completed"}
+            ))
+            await db.flush()
 
         await db.refresh(obj)
 
@@ -4422,18 +4442,24 @@ async def export_dsr_excel(
     if not rows:
         raise NotFoundError("No DSR data found")
 
+    project_result = await db.execute(select(Project).where(Project.id == project_id))
+    project = project_result.scalars().first()
+    project_name = project.project_name if project else str(project_id)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "DSR Report"
 
     headers = [
         "Date",
-        "Project ID",
+        "Project Name",
         "Contractor",
         "Weather",
         "Work Done",
         "Work Planned",
-        "Labour Count",
+        "Total Labour",
+        "Skilled Labour",
+        "Unskilled Labour",
         "Material Used",
         "Issues",
         "Remarks",
@@ -4445,7 +4471,7 @@ async def export_dsr_excel(
         ws.append(
             [
                 str(r.report_date),
-                r.project_id,
+                project_name,
                 contractor_name,
                 r.weather,
                 r.work_done,
@@ -4494,6 +4520,14 @@ async def submit_dsr(
         raise ValidationError("Only draft DSR can be submitted")
 
     obj.status = "Submitted"
+    
+    db.add(ActivityLog(
+        action="SUBMIT_DSR",
+        entity="project",
+        entity_id=obj.project_id,
+        performed_by=current_user.id,
+        details={"message": f"Daily Site Report submitted for {obj.report_date}"}
+    ))
 
     await db.flush()
 
@@ -4522,6 +4556,14 @@ async def approve_dsr(
 
     obj.status = "Approved"
 
+    db.add(ActivityLog(
+        action="APPROVE_DSR",
+        entity="project",
+        entity_id=obj.project_id,
+        performed_by=current_user.id,
+        details={"message": f"Daily Site Report approved for {obj.report_date}"}
+    ))
+
     await db.commit()
     await db.refresh(obj)
 
@@ -4549,6 +4591,14 @@ async def reject_dsr(
         raise ValidationError("Only submitted DSR can be rejected")
 
     obj.status = "Draft"
+
+    db.add(ActivityLog(
+        action="REJECT_DSR",
+        entity="project",
+        entity_id=obj.project_id,
+        performed_by=current_user.id,
+        details={"message": f"Daily Site Report rejected for {obj.report_date}"}
+    ))
 
     await db.commit()
     await db.refresh(obj)
@@ -4607,6 +4657,15 @@ async def create_issue(
                 obj = m.Issue(**data)
 
                 db.add(obj)
+                await db.flush()
+                
+                db.add(ActivityLog(
+                    action="RAISE_ISSUE",
+                    entity="project",
+                    entity_id=payload.project_id,
+                    performed_by=current_user.id,
+                    details={"message": f"Issue '{obj.title}' raised"}
+                ))
                 await db.flush()
 
                 if getattr(obj.priority, "value", str(obj.priority)) == "HIGH":
@@ -8608,11 +8667,34 @@ async def delete_photo(
 
 # ===================== Drawings & Documents =====================
 
-drawing_router = APIRouter(prefix="/drawings", tags=["Drawings & Documents"])
+drawing_router = APIRouter(prefix="/drawings", tags=["Drawings"])
 
 
 # ===================== Upload =====================
 
+
+# ===================== DRAWING FOLDERS =====================
+@drawing_router.post("/folders", response_model=s.DrawingOut)
+async def create_folder(
+    data: s.DrawingFolderCreate,
+    project_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(DRAWING_WRITE_ROLES)),
+):
+    obj = m.DrawingDocument(
+        project_id=project_id,
+        drawing_name=data.drawing_name,
+        is_folder=True,
+        parent_id=data.parent_id,
+        approval_status=DocumentStatus.APPROVED,
+        is_latest_version=True,
+    )
+
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+
+    return obj
 
 @drawing_router.post("/upload", response_model=s.DrawingOut)
 async def upload_drawing(
@@ -8621,6 +8703,7 @@ async def upload_drawing(
     version: str = Form(...),
     date: Optional[date] = Form(None),
     remarks: Optional[str] = Form(None),
+    parent_id: Optional[int] = Form(None),
     file: UploadFile = File(...),
     current_user: User = Depends(require_roles(DRAWING_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
@@ -8686,6 +8769,8 @@ async def upload_drawing(
             approval_status=DocumentStatus.UNDER_REVIEW,
             revision_no=next_revision,
             is_latest_version=True,
+            parent_id=parent_id,
+            is_folder=False,
         )
 
         db.add(obj)
@@ -8802,18 +8887,27 @@ async def get_drawing_approval_history(
 # ===================== Version History =====================
 
 
+@drawing_router.get("/versions", response_model=list[s.DrawingOut])
 @drawing_router.get("/{project_id}/versions", response_model=list[s.DrawingOut])
 async def get_versions(
-    project_id: int,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    project_id: Optional[int] = None,
+    parent_id: Optional[int] = Query(None),
     skip: int = 0,
     limit: int = 50,
 ):
+    query = select(m.DrawingDocument)
+    if project_id is not None:
+        query = query.where(m.DrawingDocument.project_id == project_id)
+        
+    if parent_id is not None:
+        query = query.where(m.DrawingDocument.parent_id == parent_id)
+    else:
+        query = query.where(m.DrawingDocument.parent_id == None)
+
     result = await db.execute(
-        select(m.DrawingDocument)
-        .where(m.DrawingDocument.project_id == project_id)
-        .order_by(
+        query.order_by(
             m.DrawingDocument.drawing_name.asc(),
             m.DrawingDocument.revision_no.desc(),
             m.DrawingDocument.id.desc(),
@@ -8830,19 +8924,27 @@ async def get_versions(
 # ===================== Latest =====================
 
 
+@drawing_router.get("/latest", response_model=list[s.DrawingOut])
 @drawing_router.get("/{project_id}/latest", response_model=list[s.DrawingOut])
 async def get_latest(
-    project_id: int,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    project_id: Optional[int] = None,
+    parent_id: Optional[int] = Query(None),
 ):
+    query = select(m.DrawingDocument).where(
+        m.DrawingDocument.is_latest_version == True,
+    )
+    if project_id is not None:
+        query = query.where(m.DrawingDocument.project_id == project_id)
+        
+    if parent_id is not None:
+        query = query.where(m.DrawingDocument.parent_id == parent_id)
+    else:
+        query = query.where(m.DrawingDocument.parent_id == None)
+
     result = await db.execute(
-        select(m.DrawingDocument)
-        .where(
-            m.DrawingDocument.project_id == project_id,
-            m.DrawingDocument.is_latest_version == True,
-        )
-        .order_by(
+        query.order_by(
             m.DrawingDocument.drawing_name.asc(),
             m.DrawingDocument.revision_no.desc(),
         )

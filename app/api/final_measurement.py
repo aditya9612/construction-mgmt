@@ -152,7 +152,8 @@ async def update_measurement(
 
     invoice_exists = await db.scalar(
         select(Invoice).where(
-            Invoice.project_id == obj.project_id, Invoice.type == "owner"
+            Invoice.source_type == InvoiceSourceType.MEASUREMENT,
+            Invoice.reference_id == obj.id
         )
     )
     if invoice_exists:
@@ -216,7 +217,8 @@ async def delete_measurement(
 
     invoice_exists = await db.scalar(
         select(Invoice).where(
-            Invoice.project_id == obj.project_id, Invoice.type == "owner"
+            Invoice.source_type == InvoiceSourceType.MEASUREMENT,
+            Invoice.reference_id == obj.id
         )
     )
 

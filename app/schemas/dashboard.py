@@ -37,16 +37,14 @@ class MilestoneTimelineEntry(BaseModel):
 
 class DashboardVitals(BaseModel):
     total_labour_today: int
-    skilled_labour: int
-    unskilled_labour: int
     active_activities: int
     open_issues: IssueStats
     material_stock_status: List[MaterialStockStatus]
 
 class EnhancedDashboardOut(BaseModel):
-    project_id: int
-    project_name: str
-    status: str
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
+    status: Optional[str] = None
     progress: float
     planned_progress: float
     variance: float
@@ -213,7 +211,6 @@ class PMCommandCenterOut(BaseModel):
     project_performance: List[PMProjectPerformance]
     quality_score: int
     safety_score: int
-    resource_orchestration: List[PMResourceOrchestration]
     cost_tracking: List[PMCostTrackingItem]
     risk_analysis: List[PMDelayRiskAnalysis]
     critical_alerts: List[PMCriticalAlert]
@@ -225,12 +222,14 @@ class PMCommandCenterOut(BaseModel):
 # =========================================
 
 class LabourTaskItem(BaseModel):
-    task_id: str
+    task_id: int
     title: str
     status: str
     priority: str
     start_date: Optional[date]
+    end_date: Optional[date] = None
     progress: float
+    project_name: Optional[str] = None
 
 class LabourActivityItem(BaseModel):
     title: str

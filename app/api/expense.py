@@ -133,10 +133,15 @@ async def get_by_date_range(
 
 @router.get("", response_model=list[ExpenseOut])
 async def list_expenses(
+    category: Optional[str] = Query(None, description="Filter expenses by category"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
 ):
-    result = await db.execute(select(Expense).order_by(Expense.created_at.desc()))
+    query = select(Expense)
+    if category:
+        query = query.where(Expense.category == category)
+    
+    result = await db.execute(query.order_by(Expense.created_at.desc()))
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 

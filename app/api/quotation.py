@@ -24,6 +24,8 @@ from app.models.quotation import (
     QuotationStatus,
     QuotationLabour,
 )
+from app.models.user import User, ActivityLog
+from app.core.dependencies import get_current_active_user
 
 import app.schemas.quotation as s
 from decimal import Decimal
@@ -1577,7 +1579,9 @@ async def preview_quotation(
 
 @router.put("/{quotation_id}/approve")
 async def approve_quotation(
-    quotation_id: int, db: AsyncSession = Depends(get_db_session)
+    quotation_id: int, 
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user)
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
@@ -1587,6 +1591,14 @@ async def approve_quotation(
     quotation.approved_at = datetime.utcnow()
 
     quotation.status = QuotationStatus.APPROVED
+    
+    db.add(ActivityLog(
+        action="APPROVE_QUOTATION",
+        entity="project",
+        entity_id=quotation.project_id,
+        performed_by=current_user.id,
+        details={"message": f"Quotation QTN-{quotation.id} approved"}
+    ))
 
     await db.commit()
 

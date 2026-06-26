@@ -255,6 +255,9 @@ class LabourPayroll(Base, TimestampMixin):
     total_overtime_hours = Column(DECIMAL(10, 2))
 
     total_wage = Column(DECIMAL(18, 2))
+    
+    advance_adjusted = Column(DECIMAL(18, 2), default=0, server_default="0")
+    remarks = Column(String(500), nullable=True)
 
     paid_amount = Column(DECIMAL(18, 2), default=0)
     remaining_amount = Column(DECIMAL(18, 2), default=0)
