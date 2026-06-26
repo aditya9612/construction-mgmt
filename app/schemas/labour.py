@@ -149,7 +149,7 @@ class LabourOut(BaseModel):
     profile_image: Optional[str]
     # skill_type: e.SkillType
     # daily_wage_rate: Decimal
-    labour_type_id: int
+    labour_type_id: Optional[int] = None
     labour_type_name: Optional[str] = None
     skill_category: Optional[e.SkillType] = None
     default_daily_wage: Optional[Decimal] = None

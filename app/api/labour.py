@@ -1624,7 +1624,6 @@ async def export_payroll_excel(
         )
 
     if format == "pdf":
-        import io
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
         from reportlab.lib.pagesizes import landscape, letter
         from reportlab.lib import colors
