@@ -109,16 +109,16 @@ def compute_project_status(project):
 def compute_milestone_status(milestone):
     today = date.today()
 
-    if milestone.status == MilestoneStatus.COMPLETED:
+    if milestone.status == MilestoneStatus.COMPLETED or milestone.actual_end_date:
         return "Completed"
-
-    if milestone.start_date and today < milestone.start_date:
-        return "Planned"
 
     if milestone.end_date and today > milestone.end_date:
         return "Delayed"
 
-    return "In Progress"
+    if milestone.actual_start_date:
+        return "In Progress"
+
+    return "Planned"
 
 
 def get_pagination(
@@ -2712,23 +2712,23 @@ async def get_pm_calendar(
     if project_ids:
         # Tasks (Due Dates)
         tasks = await db.scalars(
-            select(Task).where(Task.project_id.in_(project_ids), Task.due_date.isnot(None))
+            select(Task).where(Task.project_id.in_(project_ids), Task.end_date.isnot(None))
         )
         for t in tasks:
             events.append(s.CalendarEvent(
-                title=t.task_name,
-                date=t.due_date,
+                title=t.title,
+                date=t.end_date,
                 type="Task"
             ))
             
         # Milestones (Due Dates)
         milestones = await db.scalars(
-            select(Milestone).where(Milestone.project_id.in_(project_ids), Milestone.planned_end_date.isnot(None))
+            select(Milestone).where(Milestone.project_id.in_(project_ids), Milestone.end_date.isnot(None))
         )
         for ml in milestones:
             events.append(s.CalendarEvent(
-                title=ml.milestone_name,
-                date=ml.planned_end_date,
+                title=ml.title,
+                date=ml.end_date,
                 type="Milestone"
             ))
 
@@ -2772,7 +2772,7 @@ async def get_project_health_score(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id, current_user)
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     
     from app.models.project import Issue
     

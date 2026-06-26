@@ -60,8 +60,8 @@ class ProjectCreate(BaseSchema):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
-    shift_start_time: Optional[time] = None
-    shift_end_time: Optional[time] = None
+    shift_start_time: Optional[time] = Field(default=time(9, 0), description="Default shift start time (09:00 IST)")
+    shift_end_time: Optional[time] = Field(default=time(18, 0), description="Default shift end time (18:00 IST)")
     grace_period_minutes: int = 15
 
     budget_amount: Optional[Decimal] = None
@@ -163,8 +163,6 @@ class MilestoneCreate(BaseSchema):
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    actual_start_date: Optional[date] = None
-    actual_end_date: Optional[date] = None
     status: Optional[MilestoneStatus] = MilestoneStatus.PLANNED
 
     @field_validator("end_date")

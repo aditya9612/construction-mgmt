@@ -3095,7 +3095,7 @@ async def utilization_report(
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    MAX_HOURS = 240  # configurable later
+    MAX_HOURS = 26 * 8  # configurable later
 
     stmt = (
         select(

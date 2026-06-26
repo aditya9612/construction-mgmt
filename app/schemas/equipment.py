@@ -230,7 +230,7 @@ class EquipmentUsageOut(BaseSchema):
 
 class EquipmentMaintenanceCreate(BaseSchema):
 
-    equipment_id: int
+    # equipment_id: int
 
     description: str = Field(
         ...,
