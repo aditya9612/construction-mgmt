@@ -403,7 +403,7 @@ def generate_quotation_pdf(
         pagesize=A4,
         leftMargin=20,
         rightMargin=20,
-        topMargin=20,
+        topMargin=100,
         bottomMargin=110,   # Reserve space for fixed footer
     )
 
@@ -490,8 +490,6 @@ def generate_quotation_pdf(
         )
     )
 
-    elements.append(header_table)
-    elements.append(Spacer(1, 15))
     # =====================================================
     # COMPANY DETAILS
     # =====================================================
@@ -988,20 +986,22 @@ def generate_quotation_pdf(
     )
 
     # =====================================================
-    # DRAW FIXED FOOTER ON EVERY PAGE
+    # DRAW FIXED HEADER & FOOTER ON EVERY PAGE
     # =====================================================
 
-    def draw_footer(canvas, doc):
+    def draw_header_footer(canvas, doc):
         """
-        Draw footer at fixed position at the bottom of every page.
+        Draw header and footer at fixed positions on every page.
         """
         canvas.saveState()
 
-        # Position from bottom of page
+        # Draw Header
+        header_table.wrapOn(canvas, doc.width, doc.topMargin)
+        header_table.drawOn(canvas, doc.leftMargin, A4[1] - 90)
+
+        # Draw Footer
         x = doc.leftMargin
         y = 15
-
-        # Calculate size and draw
         footer_table.wrapOn(canvas, doc.width, 80)
         footer_table.drawOn(canvas, x, y)
 
@@ -1013,8 +1013,8 @@ def generate_quotation_pdf(
 
     doc.build(
         elements,
-        onFirstPage=draw_footer,
-        onLaterPages=draw_footer,
+        onFirstPage=draw_header_footer,
+        onLaterPages=draw_header_footer,
     )
 
     buffer.seek(0)

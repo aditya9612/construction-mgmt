@@ -298,7 +298,12 @@ async def list_users(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     search: Optional[str] = None,
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(
+        require_roles([
+            UserRole.ADMIN.value,
+            UserRole.PROJECT_MANAGER.value,
+        ])
+    ),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
