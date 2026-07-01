@@ -920,6 +920,8 @@ class ProjectMembersService:
         user_id: int,
     ) -> s.ProjectMemberOut:
 
+        from app.utils.common import assert_project_access
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
         self._assert_member_mutation_role(current_user)
 
         project = await self.projects_repo.get_project(db, project_id=project_id)
@@ -991,6 +993,8 @@ class ProjectMembersService:
         project_id: int,
         user_id: int,
     ) -> None:
+        from app.utils.common import assert_project_access
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
         self._assert_member_mutation_role(current_user)
 
         project = await self.projects_repo.get_project(db, project_id=project_id)
@@ -3057,9 +3061,11 @@ async def remove_project_member(
     return {"success": True, "message": "Member Remove successfully"}
 
 
-@router.get("/{project_id}/logs")
+@router.get("/{project_id}/logs", response_model=list[s.ProjectLogItem])
 async def get_project_logs(
     project_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -3069,11 +3075,70 @@ async def get_project_logs(
         current_user=current_user,
     )
 
-    return {
-        "project_id": project_id,
-        "message": "Logs available in logging system (file/ELK)",
-    }
+    from app.models.project import ActivityHistory, WorkActivity
+    from app.models.boq import BOQAudit, BOQ
+    from app.models.equipment import EquipmentAuditLog, Equipment
 
+    logs = []
+
+    # 1. ActivityHistory (via WorkActivity)
+    act_res = await db.execute(
+        select(ActivityHistory, WorkActivity.activity_name)
+        .join(WorkActivity, ActivityHistory.activity_id == WorkActivity.id)
+        .where(WorkActivity.project_id == project_id)
+        .order_by(ActivityHistory.created_at.desc())
+        .limit(limit)
+    )
+    for act, title in act_res.all():
+        logs.append(s.ProjectLogItem(
+            timestamp=act.created_at,
+            module="Activity",
+            action=act.action,
+            message=f"Activity '{title}' updated",
+            user_id=act.changed_by,
+            details={"remarks": act.remarks}
+        ))
+
+    # 2. BOQAudit
+    boq_res = await db.execute(
+        select(BOQAudit)
+        .join(BOQ, BOQAudit.boq_id == BOQ.id)
+        .where(BOQ.project_id == project_id)
+        .order_by(BOQAudit.created_at.desc())
+        .limit(limit)
+    )
+    for ba in boq_res.scalars().all():
+        logs.append(s.ProjectLogItem(
+            timestamp=ba.created_at,
+            module="BOQ",
+            action=ba.action,
+            message=ba.message,
+            user_id=ba.user_id,
+            details=ba.changes
+        ))
+
+    # 3. EquipmentAuditLog
+    eq_res = await db.execute(
+        select(EquipmentAuditLog, Equipment.equipment_name)
+        .join(Equipment, EquipmentAuditLog.equipment_id == Equipment.id)
+        .where(Equipment.project_id == project_id)
+        .order_by(EquipmentAuditLog.created_at.desc())
+        .limit(limit)
+    )
+    for ea, eq_name in eq_res.all():
+        logs.append(s.ProjectLogItem(
+            timestamp=ea.created_at,
+            module="Equipment",
+            action=ea.action,
+            message=f"Equipment '{eq_name}' updated",
+            user_id=ea.user_id,
+            details={"old": ea.old_values, "new": ea.new_values}
+        ))
+
+    # Sort all by timestamp descending and slice
+    logs.sort(key=lambda x: x.timestamp, reverse=True)
+    
+    return logs[offset:offset+limit]
 
 @router.get("/projects/{project_id}/photos")
 async def get_project_photos(

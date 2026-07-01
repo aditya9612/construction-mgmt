@@ -1439,3 +1439,12 @@ class CalendarEvent(BaseModel):
 
 class PMCalendarOut(BaseModel):
     events: List[CalendarEvent]
+
+class ProjectLogItem(BaseModel):
+    timestamp: datetime
+    module: str
+    action: str
+    message: str
+    user_id: int | None = None
+    details: dict | None = None
+

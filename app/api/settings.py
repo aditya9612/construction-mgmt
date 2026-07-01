@@ -93,12 +93,17 @@ async def update_profile(
 
     joining_date: Optional[date] = Form(None),
 
-
     # =========================================
     # FILE
     # =========================================
 
     profile_image: UploadFile = File(None),
+
+    # =========================================
+    # REMOVE PROFILE IMAGE
+    # =========================================
+
+    remove_profile_image: bool = Form(False),
 
     current_user: User = Depends(get_current_active_user),
 
@@ -114,6 +119,7 @@ async def update_profile(
     pan_number = pan_number or None
     aadhaar_number = aadhaar_number or None
     designation = designation or None
+
     # =========================================
     # VALIDATE + UPDATE TEXT FIELDS
     # =========================================
@@ -145,10 +151,37 @@ async def update_profile(
         )
 
     # =========================================
-    # PROFILE IMAGE VALIDATION + UPLOAD
+    # VALIDATE IMAGE REQUEST
     # =========================================
 
-    if profile_image:
+    if remove_profile_image and profile_image is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot remove and upload a profile image in the same request."
+        )
+
+    # =========================================
+    # PROFILE IMAGE
+    # =========================================
+
+    if remove_profile_image:
+
+        if (
+            current_user.profile_image
+            and os.path.exists(current_user.profile_image)
+        ):
+            os.remove(current_user.profile_image)
+
+        current_user.profile_image = None
+
+    elif profile_image is not None:
+
+        # Remove old image if it exists
+        if (
+            current_user.profile_image
+            and os.path.exists(current_user.profile_image)
+        ):
+            os.remove(current_user.profile_image)
 
         file_path = await validate_and_save_image(
             file=profile_image,
@@ -167,6 +200,103 @@ async def update_profile(
     await db.refresh(current_user)
 
     return current_user
+
+# @router.put(
+#     "/profile",
+#     response_model=UserOut
+# )
+# async def update_profile(
+
+#     # =========================================
+#     # FORM FIELDS
+#     # =========================================
+
+#     full_name: Optional[str] = Form(None),
+
+#     address: Optional[str] = Form(None),
+
+#     pan_number: Optional[str] = Form(None),
+
+#     aadhaar_number: Optional[str] = Form(None),
+
+#     designation: Optional[str] = Form(None),
+
+#     joining_date: Optional[date] = Form(None),
+
+
+#     # =========================================
+#     # FILE
+#     # =========================================
+
+#     profile_image: UploadFile = File(None),
+
+#     current_user: User = Depends(get_current_active_user),
+
+#     db: AsyncSession = Depends(get_db_session),
+# ):
+
+#     # =========================================
+#     # NORMALIZE EMPTY STRINGS
+#     # =========================================
+
+#     full_name = full_name or None
+#     address = address or None
+#     pan_number = pan_number or None
+#     aadhaar_number = aadhaar_number or None
+#     designation = designation or None
+#     # =========================================
+#     # VALIDATE + UPDATE TEXT FIELDS
+#     # =========================================
+
+#     if full_name is not None:
+#         current_user.full_name = validate_full_name(
+#             full_name
+#         )
+
+#     if address is not None:
+#         current_user.address = address.strip()
+
+#     if pan_number is not None:
+#         current_user.pan_number = validate_pan(
+#             pan_number
+#         )
+
+#     if aadhaar_number is not None:
+#         current_user.aadhaar_number = validate_aadhaar(
+#             aadhaar_number
+#         )
+
+#     if designation is not None:
+#         current_user.designation = designation.strip()
+
+#     if joining_date is not None:
+#         current_user.joining_date = validate_joining_date(
+#             joining_date
+#         )
+
+#     # =========================================
+#     # PROFILE IMAGE VALIDATION + UPLOAD
+#     # =========================================
+
+#     if profile_image:
+
+#         file_path = await validate_and_save_image(
+#             file=profile_image,
+#             upload_dir=PROFILE_UPLOAD_DIR,
+#             prefix="profile"
+#         )
+
+#         current_user.profile_image = file_path
+
+#     # =========================================
+#     # SAVE
+#     # =========================================
+
+#     await db.commit()
+
+#     await db.refresh(current_user)
+
+#     return current_user
 
 
 @router.get("/profile", response_model=UserOut)

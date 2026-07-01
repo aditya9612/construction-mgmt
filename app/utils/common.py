@@ -16,7 +16,7 @@ async def assert_project_access(
     project_id: int,
     current_user: User,
 ):
-    if current_user.role in ( UserRole.ADMIN.value, UserRole.PROJECT_MANAGER.value, ):
+    if current_user.role == UserRole.ADMIN.value:
         return
 
     exists = await db.scalar(
