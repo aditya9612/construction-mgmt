@@ -29,6 +29,20 @@ from app.models.user import User, UserRole, ActivityLog
 from fastapi import BackgroundTasks
 from app.utils.helpers import NotFoundError
 from app.utils.whatsapp import send_report_template
+from io import BytesIO
+
+from fastapi import Depends
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+from app.db.session import get_db_session
+from app.models.material import Material
+from app.models.master_data import MaterialMaster
+from app.models.user import User
+
 
 REPORT_READ_ROLES = [role.value for role in UserRole]
 
@@ -1534,14 +1548,20 @@ async def export_material_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(select(Material).where(Material.project_id == project_id).order_by(Material.created_at.desc()))
+    stmt = (
+        select(Material)
+        .options(joinedload(Material.material_master).joinedload(MaterialMaster.unit))
+        .where(Material.project_id == project_id)
+        .order_by(Material.created_at.desc())
+    )
+
+    result = await db.execute(stmt)
     materials = result.scalars().all()
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Materials"
 
-    # Headers
     ws.append(
         [
             "Material Name",
@@ -1555,13 +1575,18 @@ async def export_material_excel(
         ]
     )
 
-    # Data
     for mat in materials:
+
+        unit_name = ""
+
+        if mat.material_master and mat.material_master.unit:
+            unit_name = mat.material_master.unit.name
+
         ws.append(
             [
                 mat.material_name or "",
                 mat.category or "",
-                mat.unit or "",
+                unit_name,
                 float(mat.quantity_purchased or 0),
                 float(mat.quantity_used or 0),
                 float(mat.remaining_stock or 0),
@@ -1570,7 +1595,7 @@ async def export_material_excel(
             ]
         )
 
-    buffer = io.BytesIO()
+    buffer = BytesIO()
     wb.save(buffer)
     buffer.seek(0)
 
@@ -1578,10 +1603,11 @@ async def export_material_excel(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": f"attachment; filename=materials_project_{project_id}.xlsx"
+            "Content-Disposition": (
+                f'attachment; filename="materials_project_{project_id}.xlsx"'
+            ),
         },
     )
-
 
 # ===================== ISSUE REPORT =====================
 

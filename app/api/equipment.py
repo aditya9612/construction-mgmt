@@ -307,6 +307,104 @@ async def recalculate_equipment_status(
 MAX_MONTHLY_HOURS = 240
 
 
+# ============================== EQUIPMENT PURCHASE HISTORY ========================
+# Added optional filters + pagination.
+
+@router.get(
+    "/purchase/history",
+    response_model=List[EquipmentPurchaseOut],
+)
+async def get_equipment_purchase_history(
+    equipment_id: Optional[int] = Query(None),
+    purchase_type: Optional[str] = Query(None),
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+
+    stmt = select(EquipmentPurchase)
+
+    # Equipment filter (optional)
+    if equipment_id is not None:
+
+        await get_active_equipment_or_404(
+            db,
+            equipment_id,
+        )
+
+        stmt = stmt.where(
+            EquipmentPurchase.asset_id == equipment_id,
+        )
+
+    # Purchase Type filter
+    if purchase_type:
+
+        stmt = stmt.where(
+            EquipmentPurchase.purchase_type == PurchaseType(purchase_type),
+        )
+
+    # Date filters
+    if date_from:
+
+        stmt = stmt.where(
+            EquipmentPurchase.purchase_date >= date_from,
+        )
+
+    if date_to:
+
+        stmt = stmt.where(
+            EquipmentPurchase.purchase_date <= date_to,
+        )
+
+    stmt = (
+        stmt.order_by(
+            EquipmentPurchase.purchase_date.desc(),
+            EquipmentPurchase.created_at.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+
+    result = await db.execute(stmt)
+
+    purchases = result.scalars().all()
+
+    response = []
+
+    for purchase in purchases:
+
+        asset_name = (
+            purchase.equipment.equipment_name
+            if purchase.equipment
+            else None
+        )
+
+        response.append(
+            EquipmentPurchaseOut(
+                id=purchase.id,
+                project_id=purchase.project_id,
+                boq_item_id=purchase.boq_item_id,
+                purchase_type=purchase.purchase_type,
+                asset_id=purchase.asset_id,
+                asset_name=asset_name,
+                purchase_date=purchase.purchase_date,
+                vendor_name=purchase.vendor_name,
+                invoice_number=purchase.invoice_number,
+                quantity=purchase.quantity,
+                unit_price=float(purchase.unit_price),
+                total_amount=float(purchase.total_amount),
+                warranty_end_date=purchase.warranty_end_date,
+                notes=purchase.notes,
+                created_at=purchase.created_at,
+            )
+        )
+
+    return response
+
+
 @router.get("/kpi", response_model=EquipmentKPIOut)
 async def equipment_kpi(
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
@@ -4706,77 +4804,6 @@ async def update_equipment(
     await db.refresh(obj)
 
     return EquipmentOut.model_validate(obj)
-
-
-# ============================== EQUIPMENT PURCHASE HISTORY ========================
-# Added optional filters + pagination.
-
-
-@router.get(
-    "/purchase/history",
-    response_model=List[EquipmentPurchaseOut],
-)
-async def get_equipment_purchase_history(
-    equipment_id: Optional[int] = Query(None),
-    purchase_type: Optional[str] = Query(None),
-    date_from: Optional[date] = Query(None),
-    date_to: Optional[date] = Query(None),
-    limit: int = Query(50, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    equipment = await get_active_equipment_or_404(
-        db,
-        equipment_id,
-    )
-
-    stmt = select(EquipmentPurchase).where(
-        EquipmentPurchase.asset_id == equipment_id,
-    )
-
-    if purchase_type:
-        stmt = stmt.where(EquipmentPurchase.purchase_type == purchase_type)
-
-    if date_from:
-        stmt = stmt.where(EquipmentPurchase.purchase_date >= date_from)
-
-    if date_to:
-        stmt = stmt.where(EquipmentPurchase.purchase_date <= date_to)
-
-    stmt = (
-        stmt.order_by(
-            EquipmentPurchase.purchase_date.desc(),
-            EquipmentPurchase.created_at.desc(),
-        )
-        .limit(limit)
-        .offset(offset)
-    )
-
-    result = await db.execute(stmt)
-
-    purchases = result.scalars().all()
-
-    return [
-        EquipmentPurchaseOut(
-            id=purchase.id,
-            project_id=purchase.project_id,
-            boq_item_id=purchase.boq_item_id,
-            purchase_type=purchase.purchase_type.value,
-            asset_id=purchase.asset_id,
-            asset_name=equipment.equipment_name,
-            purchase_date=purchase.purchase_date,
-            vendor_name=purchase.vendor_name,
-            invoice_number=purchase.invoice_number,
-            quantity=purchase.quantity,
-            unit_price=float(purchase.unit_price),
-            total_amount=float(purchase.total_amount),
-            warranty_end_date=purchase.warranty_end_date,
-            notes=purchase.notes,
-            created_at=purchase.created_at,
-        )
-        for purchase in purchases
-    ]
 
 
 # ======================== REPORTS PDF========================

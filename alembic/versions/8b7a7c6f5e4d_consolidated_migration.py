@@ -369,8 +369,16 @@ def upgrade():
 
     op.create_foreign_key("fk_equipment_purchase_asset_id", "equipment_purchase", "equipment", ["asset_id"], ["id"], ondelete="SET NULL")
 
+    op.add_column("checklist_logs", sa.Column("executed_by", sa.Integer(), nullable=True))
+
+    op.create_foreign_key("fk_checklist_logs_executed_by", "checklist_logs", "users", ["executed_by"], ["id"])
+
 
 def downgrade():
+
+    op.drop_constraint("fk_checklist_logs_executed_by", "checklist_logs", type_="foreignkey")
+
+    op.drop_column("checklist_logs", "executed_by")
 
     op.alter_column("message_reads", "read_at", existing_type=sa.DateTime(), nullable=True, server_default=sa.text("CURRENT_TIMESTAMP"))
 
