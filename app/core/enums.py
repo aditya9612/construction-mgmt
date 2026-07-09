@@ -5,6 +5,7 @@ class InvoiceStatus(str, Enum):
     PENDING = "pending"
     PARTIAL = "partial"
     PAID = "paid"
+    # CANCELLED = "CANCELLED"
 
 
 class AccountType(str, Enum):
@@ -96,6 +97,7 @@ class ProjectStatus(str, Enum):
     COMPLETED = "COMPLETED"
     ON_HOLD = "ON_HOLD"
     DELAYED = "DELAYED"
+    CANCELLED = "CANCELLED"
 
 
 class IssuePriority(str, Enum):

@@ -15,6 +15,7 @@ from app.models.settings import CompanySettings
 from sqlalchemy import select
 from app.models.material import Material
 from app.models.project import Project
+from app.models.notification import Notification
 from app.models.quotation import (
     QuotationExtraCharge,
     QuotationMaster,
@@ -1037,6 +1038,7 @@ async def create_quotation(
     quotation = QuotationMaster(
         quotation_no=quotation_no,
         # CLIENT DETAILS
+        client_user_id=payload.client_user_id,
         client_name=payload.client_name,
         company_name=payload.company_name,
         mobile_number=payload.mobile_number,
@@ -1240,7 +1242,24 @@ async def create_quotation(
 
     calculate_quotation_totals(quotation)
 
+    # =====================================================
+    # CLIENT NOTIFICATION
+    # =====================================================
+    notification = Notification(
+        user_id=quotation.client_user_id,
+        title="New Quotation Received",
+        message=(
+            f"Quotation {quotation.quotation_no} has been shared with you. "
+            "Please review and approve/reject it."
+        ),
+        type="Quotation",
+        link=f"/quotation/{quotation.id}",
+    )
+    db.add(notification)
+
     await db.commit()
+
+    await db.refresh(quotation)
 
     return await get_quotation_or_404(quotation.id, db)
 

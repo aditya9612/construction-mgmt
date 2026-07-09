@@ -262,6 +262,13 @@ def upgrade():
         sa.PrimaryKeyConstraint("id"),
     )
 
+    # Quotation -> Client mapping
+    op.add_column("quotation_master", sa.Column("client_user_id", sa.Integer(), nullable=True))
+
+    op.create_index(op.f("ix_quotation_master_client_user_id"), "quotation_master", ["client_user_id"], unique=False)
+
+    op.create_foreign_key("fk_quotation_master_client_user_id", "quotation_master", "users", ["client_user_id"], ["id"])
+
     op.create_table(
         "client_payments",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
@@ -476,3 +483,9 @@ def downgrade():
     op.drop_index("ix_client_payments_payment_no", table_name="client_payments")
 
     op.drop_table("client_payments")
+
+    op.drop_constraint("fk_quotation_master_client_user_id", "quotation_master", type_="foreignkey")
+
+    op.drop_index(op.f("ix_quotation_master_client_user_id"), table_name="quotation_master")
+
+    op.drop_column("quotation_master", "client_user_id")

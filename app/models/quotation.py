@@ -46,6 +46,15 @@ class QuotationMaster(Base):
 
     # ================= CLIENT =================
 
+    client_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+
+    client = relationship(
+        "User", foreign_keys=[client_user_id], back_populates="quotations", lazy="selectin"
+    )
+
+
     client_name: Mapped[str] = mapped_column(String(150))
 
     company_name: Mapped[str | None] = mapped_column(String(150))

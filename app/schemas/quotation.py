@@ -283,6 +283,8 @@ class QuotationItemOut(BaseModel):
 
 class CreateQuotation(BaseModel):
 
+    client_user_id: int
+
     client_name: str
 
     company_name: Optional[str] = None

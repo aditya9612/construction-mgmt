@@ -100,823 +100,120 @@ PAYMENT_ROLES = INVOICE_WRITE_ROLES + [UserRole.CLIENT.value]
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
-# =========================================================
-# CLIENT PAYMENT HISTORY API
-# FINAL UPDATED WORKING VERSION
-# =========================================================
-
-
-@router.get("/client/payments")
-async def get_client_payment_history(
-    # =====================================================
-    # FILTERS
-    # =====================================================
-    project_id: int | None = None,
-    status: str | None = None,
-    payment_method: str | None = None,
-    search: str | None = None,
-    # =====================================================
-    # PAGINATION
-    # =====================================================
-    limit: int = Query(default=10, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
-    # =====================================================
-    # AUTH
-    # =====================================================
-    current_user: User = Depends(require_roles(["Client"])),
-    # =====================================================
-    # DB
-    # =====================================================
-    db: AsyncSession = Depends(get_db_session),
-):
-
-    try:
-
-        # =================================================
-        # VALID PAYMENT METHODS
-        # =================================================
-
-        VALID_PAYMENT_METHODS = [
-            "cash",
-            "rtgs",
-            "neft",
-            "upi",
-            "bank_transfer",
-            "cheque",
-            "owner",
-            "labour",
-            "material",
-            "contractor",
-        ]
-
-        # =================================================
-        # VALIDATE SEARCH
-        # =================================================
-
-        if search:
-
-            search = search.strip()
-
-            if search == "":
-
-                search = None
-
-            elif len(search) > 100:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Search text too long",
-                )
-
-        # =================================================
-        # VALIDATE PAYMENT METHOD
-        # =================================================
-
-        if payment_method:
-
-            payment_method = payment_method.lower().strip()
-
-            if payment_method not in VALID_PAYMENT_METHODS:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid payment method",
-                )
-
-        # =================================================
-        # VALIDATE STATUS
-        # =================================================
-
-        status_enum = None
-
-        if status:
-
-            try:
-
-                status_enum = InvoiceStatus(status.lower().strip())
-
-            except Exception:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid status value",
-                )
-
-        # =================================================
-        # GET CLIENT PROJECT IDS FROM INVOICES
-        # =================================================
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
-
-        project_ids = [project_id]
-
-        # =================================================
-        # NO PROJECTS FOUND
-        # =================================================
-
-        if not project_ids:
-
-            return {
-                "success": True,
-                "message": "No payment history found",
-                "limit": limit,
-                "offset": offset,
-                "page_count": 0,
-                "total_count": 0,
-                "total_paid_amount": 0,
-                "data": [],
-            }
-
-        # =================================================
-        # VALIDATE PROJECT ACCESS
-        # =================================================
-
-        if project_id:
-
-            if project_id not in project_ids:
-
-                raise HTTPException(
-                    status_code=403,
-                    detail="Project access denied",
-                )
-
-        # =================================================
-        # BASE QUERY
-        # =================================================
-
-        stmt = select(Invoice).where(Invoice.project_id.in_(project_ids))
-
-        count_stmt = (
-            select(func.count())
-            .select_from(Invoice)
-            .where(Invoice.project_id.in_(project_ids))
-        )
-
-        # =================================================
-        # PROJECT FILTER
-        # =================================================
-
-        if project_id:
-
-            stmt = stmt.where(Invoice.project_id == project_id)
-
-            count_stmt = count_stmt.where(Invoice.project_id == project_id)
-
-        # =================================================
-        # STATUS FILTER
-        # =================================================
-
-        if status_enum:
-
-            stmt = stmt.where(Invoice.status == status_enum)
-
-            count_stmt = count_stmt.where(Invoice.status == status_enum)
-
-        # =================================================
-        # PAYMENT METHOD FILTER
-        # =================================================
-
-        if payment_method:
-
-            stmt = stmt.where(Invoice.type == InvoiceType(payment_method))
-
-            count_stmt = count_stmt.where(Invoice.type == InvoiceType(payment_method))
-
-        # =================================================
-        # SEARCH FILTER
-        # =================================================
-
-        if search:
-
-            stmt = stmt.where(
-                or_(
-                    Invoice.description.ilike(f"%{search}%"),
-                )
-            )
-
-            count_stmt = count_stmt.where(
-                or_(
-                    Invoice.description.ilike(f"%{search}%"),
-                )
-            )
-
-        # =================================================
-        # ORDERING
-        # =================================================
-
-        stmt = stmt.order_by(Invoice.created_at.desc())
-
-        # =================================================
-        # PAGINATION
-        # =================================================
-
-        stmt = stmt.offset(offset).limit(limit)
-
-        # =================================================
-        # EXECUTE QUERY
-        # =================================================
-
-        result = await db.execute(stmt)
-
-        invoices = result.scalars().all()
-
-        # =================================================
-        # TOTAL COUNT
-        # =================================================
-
-        total_result = await db.execute(count_stmt)
-
-        total_count = total_result.scalar() or 0
-
-        # =================================================
-        # TOTAL PAID AMOUNT
-        # =================================================
-
-        total_paid_amount = sum(
-            max(float(invoice.paid_amount or 0), 0) for invoice in invoices
-        )
-
-        # =================================================
-        # FORMAT RESPONSE
-        # =================================================
-
-        response_data = []
-
-        for invoice in invoices:
-
-            # =============================================
-            # PAYMENT METHOD
-            # =============================================
-
-            payment_method_value = "BANK TRANSFER"
-
-            if invoice.type:
-
-                payment_method_value = invoice.type.value.replace("_", " ").upper()
-
-            if payment_method_value == "OWNER":
-
-                payment_method_value = "BANK TRANSFER"
-
-            # =============================================
-            # INVOICE NUMBER
-            # =============================================
-
-            invoice_number = f"INV-{datetime.now().year}-{invoice.id:04d}"
-
-            # =============================================
-            # STATUS
-            # =============================================
-
-            invoice_status = "COMPLETED"
-
-            if invoice.status:
-
-                try:
-
-                    invoice_status = invoice.status.value.upper()
-
-                except Exception:
-
-                    invoice_status = str(invoice.status).upper()
-
-            # =============================================
-            # APPEND RESPONSE
-            # =============================================
-
-            response_data.append(
-                {
-                    "payment_id": f"PAY-{1000 + invoice.id}",
-                    "linked_invoice": invoice_number,
-                    "project_id": invoice.project_id,
-                    "amount_paid": max(
-                        float(invoice.paid_amount or 0),
-                        0,
-                    ),
-                    "payment_date": (
-                        invoice.created_at.strftime("%d %b %Y")
-                        if invoice.created_at
-                        else None
-                    ),
-                    "method": payment_method_value,
-                    "status": invoice_status,
-                }
-            )
-
-        # =================================================
-        # RESPONSE
-        # =================================================
-
-        return {
-            "success": True,
-            "message": "Client payment history fetched successfully",
-            "limit": limit,
-            "offset": offset,
-            "page_count": len(response_data),
-            "total_count": total_count,
-            "total_paid_amount": total_paid_amount,
-            "data": response_data,
-        }
-
-    # =====================================================
-    # HANDLE HTTP ERRORS
-    # =====================================================
-
-    except HTTPException:
-
-        raise
-
-    # =====================================================
-    # HANDLE UNKNOWN ERRORS
-    # =====================================================
-
-    except Exception as e:
-
-        print("CLIENT PAYMENT HISTORY ERROR =>", str(e))
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
-
-
-# =========================================================
-# CLIENT PAYMENTS PDF API
-# FINAL UPDATED WORKING VERSION
-# =========================================================
-
-
-@router.get("/client/payments/pdf")
-async def client_payments_pdf(
-    # =====================================================
-    # FILTERS
-    # =====================================================
-    project_id: int,
-    invoice_id: int | None = None,
-    # =====================================================
-    # AUTH
-    # =====================================================
-    current_user: User = Depends(require_roles(["Client"])),
-    # =====================================================
-    # DB
-    # =====================================================
-    db: AsyncSession = Depends(get_db_session),
-):
-
-    try:
-
-        # =================================================
-        # VALIDATE PROJECT ACCESS USING INVOICE TABLE
-        # =================================================
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
-        # =================================================
-        # PDF SETUP
-        # =================================================
-
-        buffer = io.BytesIO()
-
-        doc = SimpleDocTemplate(
-            buffer,
-            pagesize=A4,
-            rightMargin=35,
-            leftMargin=35,
-            topMargin=35,
-            bottomMargin=30,
-        )
-
-        styles = getSampleStyleSheet()
-
-        content = []
-
-        # =================================================
-        # SINGLE PAYMENT RECEIPT PDF
-        # =================================================
-
-        if invoice_id:
-
-            result = await db.execute(
-                select(Invoice).where(
-                    Invoice.id == invoice_id,
-                    Invoice.project_id == project_id,
-                )
-            )
-
-            invoice = result.scalar_one_or_none()
-
-            # =============================================
-            # INVOICE NOT FOUND
-            # =============================================
-
-            if not invoice:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Invoice not found",
-                )
-
-            # =============================================
-            # PAYMENT METHOD
-            # =============================================
-
-            payment_method = "BANK TRANSFER"
-
-            if invoice.type:
-
-                payment_method = invoice.type.value.replace("_", " ").upper()
-
-            if payment_method == "OWNER":
-
-                payment_method = "BANK TRANSFER"
-
-            # =============================================
-            # PAYMENT ID
-            # =============================================
-
-            payment_id = f"PAY-{1000 + invoice.id}"
-
-            # =============================================
-            # INVOICE NUMBER
-            # =============================================
-
-            invoice_number = f"INV-{datetime.now().year}-{invoice.id:04d}"
-
-            # =============================================
-            # TITLE
-            # =============================================
-
-            content.append(
-                Paragraph(
-                    "<b>Project Transparency Portal</b>",
-                    styles["Title"],
-                )
-            )
-
-            content.append(Spacer(1, 20))
-
-            content.append(
-                Paragraph(
-                    "<b>Payment Receipt</b>",
-                    styles["Heading1"],
-                )
-            )
-
-            content.append(Spacer(1, 18))
-
-            # =============================================
-            # RECEIPT TABLE
-            # =============================================
-
-            receipt_data = [
-                ["Payment ID", payment_id],
-                ["Invoice Number", invoice_number],
-                ["Project ID", str(invoice.project_id)],
-                ["Owner ID", str(invoice.owner_id)],
-                ["Payment Method", payment_method],
-                [
-                    "Payment Status",
-                    (invoice.status.value.upper() if invoice.status else "COMPLETED"),
-                ],
-                [
-                    "Created Date",
-                    (
-                        invoice.created_at.strftime("%d %b %Y")
-                        if invoice.created_at
-                        else "N/A"
-                    ),
-                ],
-            ]
-
-            receipt_table = Table(
-                receipt_data,
-                colWidths=[180, 300],
-            )
-
-            receipt_table.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
-                        ("GRID", (0, 0), (-1, -1), 1, colors.grey),
-                        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                        ("TOPPADDING", (0, 0), (-1, -1), 8),
-                    ]
-                )
-            )
-
-            content.append(receipt_table)
-
-            content.append(Spacer(1, 25))
-
-            # =============================================
-            # PAYMENT SUMMARY
-            # =============================================
-
-            content.append(
-                Paragraph(
-                    "<b>Payment Summary</b>",
-                    styles["Heading2"],
-                )
-            )
-
-            content.append(Spacer(1, 12))
-
-            summary_data = [
-                ["Description", "Amount"],
-                ["Base Amount", f"Rs. {float(invoice.amount or 0):,.2f}"],
-                ["GST Amount", f"Rs. {float(invoice.gst_amount or 0):,.2f}"],
-                ["Tax Amount", f"Rs. {float(invoice.tax_amount or 0):,.2f}"],
-                ["Total Amount", f"Rs. {float(invoice.total_amount or 0):,.2f}"],
-                ["Paid Amount", f"Rs. {float(invoice.paid_amount or 0):,.2f}"],
-                ["Pending Amount", f"Rs. {float(invoice.pending_amount or 0):,.2f}"],
-            ]
-
-            summary_table = Table(
-                summary_data,
-                colWidths=[240, 240],
-            )
-
-            summary_table.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbeafe")),
-                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                        ("GRID", (0, 0), (-1, -1), 1, colors.grey),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                        ("TOPPADDING", (0, 0), (-1, -1), 8),
-                    ]
-                )
-            )
-
-            content.append(summary_table)
-
-            content.append(Spacer(1, 25))
-
-            # =============================================
-            # DESCRIPTION
-            # =============================================
-
-            content.append(
-                Paragraph(
-                    "<b>Invoice Description</b>",
-                    styles["Heading2"],
-                )
-            )
-
-            content.append(Spacer(1, 8))
-
-            content.append(
-                Paragraph(
-                    (invoice.description or "Payment made by client to contractor."),
-                    styles["BodyText"],
-                )
-            )
-
-            content.append(Spacer(1, 30))
-
-            # =============================================
-            # FOOTER
-            # =============================================
-
-            content.append(
-                Paragraph(
-                    "This is a system generated payment receipt.",
-                    styles["Italic"],
-                )
-            )
-
-            content.append(Spacer(1, 8))
-
-            content.append(
-                Paragraph(
-                    f"Generated On: " f"{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
-                    styles["Italic"],
-                )
-            )
-
-            # =============================================
-            # BUILD PDF
-            # =============================================
-
-            doc.build(content)
-
-            buffer.seek(0)
-
-            return StreamingResponse(
-                buffer,
-                media_type="application/pdf",
-                headers={
-                    "Content-Disposition": f"attachment; filename=payment_receipt_{invoice.id}.pdf"
-                },
-            )
-
-        # =================================================
-        # PAYMENT HISTORY REPORT PDF
-        # =================================================
-
-        result = await db.execute(
-            select(Invoice)
-            .where(
-                Invoice.project_id == project_id,
-            )
-            .order_by(Invoice.created_at.desc())
-        )
-
-        invoices = result.scalars().all()
-
-        # =================================================
-        # TITLE
-        # =================================================
-
-        content.append(
-            Paragraph(
-                "<b>Payment History Report</b>",
-                styles["Title"],
-            )
-        )
-
-        content.append(Spacer(1, 20))
-
-        # =================================================
-        # TABLE HEADER
-        # =================================================
-
-        table_data = [
-            [
-                "Payment ID",
-                "Invoice",
-                "Amount Paid",
-                "Payment Date",
-                "Method",
-                "Status",
-            ]
-        ]
-
-        total_paid = 0
-
-        # =================================================
-        # TABLE DATA
-        # =================================================
-
-        for invoice in invoices:
-
-            paid_amount = max(
-                float(invoice.paid_amount or 0),
-                0,
-            )
-
-            total_paid += paid_amount
-
-            payment_method = "BANK TRANSFER"
-
-            if invoice.type:
-
-                payment_method = invoice.type.value.replace("_", " ").upper()
-
-            if payment_method == "OWNER":
-
-                payment_method = "BANK TRANSFER"
-
-            invoice_status = "COMPLETED"
-
-            if invoice.status:
-
-                try:
-
-                    invoice_status = invoice.status.value.upper()
-
-                except Exception:
-
-                    invoice_status = str(invoice.status).upper()
-
-            table_data.append(
-                [
-                    f"PAY-{1000 + invoice.id}",
-                    f"INV-{datetime.now().year}-{invoice.id:04d}",
-                    f"Rs. {paid_amount:,.2f}",
-                    (
-                        invoice.created_at.strftime("%d %b %Y")
-                        if invoice.created_at
-                        else "N/A"
-                    ),
-                    payment_method,
-                    invoice_status,
-                ]
-            )
-
-        # =================================================
-        # PAYMENT TABLE
-        # =================================================
-
-        payment_table = Table(
-            table_data,
-            colWidths=[80, 110, 110, 100, 100, 80],
-        )
-
-        payment_table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbeafe")),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("GRID", (0, 0), (-1, -1), 1, colors.grey),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                    ("TOPPADDING", (0, 0), (-1, -1), 8),
-                    ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ]
-            )
-        )
-
-        content.append(payment_table)
-
-        content.append(Spacer(1, 25))
-
-        # =================================================
-        # TOTAL SUMMARY
-        # =================================================
-
-        content.append(
-            Paragraph(
-                f"<b>Total Payments:</b> {len(invoices)}",
-                styles["Heading2"],
-            )
-        )
-
-        content.append(Spacer(1, 8))
-
-        content.append(
-            Paragraph(
-                f"<b>Total Amount Paid:</b> " f"Rs. {total_paid:,.2f}",
-                styles["Heading2"],
-            )
-        )
-
-        content.append(Spacer(1, 25))
-
-        # =================================================
-        # FOOTER
-        # =================================================
-
-        content.append(
-            Paragraph(
-                "This is a system generated payment history report.",
-                styles["Italic"],
-            )
-        )
-
-        content.append(Spacer(1, 8))
-
-        content.append(
-            Paragraph(
-                f"Generated On: " f"{datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
-                styles["Italic"],
-            )
-        )
-
-        # =================================================
-        # BUILD PDF
-        # =================================================
-
-        doc.build(content)
-
-        buffer.seek(0)
-
-        return StreamingResponse(
-            buffer,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename=payments_report_{project_id}.pdf"
-            },
-        )
-
-    # =====================================================
-    # HANDLE HTTP ERRORS
-    # =====================================================
-
-    except HTTPException:
-
-        raise
-
-    # =====================================================
-    # HANDLE UNKNOWN ERRORS
-    # =====================================================
-
-    except Exception as e:
-
-        print("CLIENT PAYMENT PDF ERROR =>", str(e))
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
-
+# @router.post("", response_model=InvoiceOut, status_code=status.HTTP_201_CREATED)
+# async def create_invoice(
+#     payload: CreateInvoice,
+#     db: AsyncSession = Depends(get_db_session),
+#     current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+# ):
+#     """Create a new manual invoice."""
+#     # Validate Project
+#     project = await db.get(Project, payload.project_id)
+#     if not project:
+#         raise NotFoundError("Project not found")
+
+#     # Validate Owner
+#     if project.owner_id != payload.owner_id:
+#         raise ValidationError("Owner does not belong to this project")
+
+#     # Validate Client Assignment
+#     client_member = await db.scalar(
+#         select(ProjectMember)
+#         .join(User, User.id == ProjectMember.user_id)
+#         .where(
+#             ProjectMember.project_id == payload.project_id,
+#             User.role == UserRole.CLIENT.value,
+#             User.is_active == True,
+#             User.is_deleted == False,
+#         )
+#     )
+#     if not client_member:
+#         raise ValidationError("No active client assigned to this project.")
+
+#     # Validate Amount
+#     if payload.amount <= 0:
+#         raise ValidationError("Invoice amount must be greater than zero.")
+
+#     # Duplicate Invoice Check
+#     duplicate_invoice = await db.scalar(
+#         select(Invoice).where(
+#             Invoice.project_id == payload.project_id,
+#             Invoice.owner_id == payload.owner_id,
+#             Invoice.description == payload.description,
+#             Invoice.status != InvoiceStatus.CANCELLED,
+#         )
+#     )
+#     if duplicate_invoice:
+#         raise ValidationError("Similar invoice already exists.")
+
+#     # GST Calculation
+#     amount = Decimal(str(payload.amount))
+#     gst_percent = Decimal(str(payload.gst_percent or 0))
+#     tax_percent = Decimal(str(payload.tax_percent or 0))
+
+#     gst_amount = (amount * gst_percent) / Decimal("100")
+#     tax_amount = (amount * tax_percent) / Decimal("100")
+#     total_amount = amount + gst_amount - tax_amount
+
+#     invoice = Invoice(
+#         project_id=payload.project_id,
+#         owner_id=payload.owner_id,
+#         quotation_id=None,
+#         type=InvoiceType.OWNER,
+#         source_type=InvoiceSourceType.MANUAL,
+#         reference_id=None,
+#         amount=amount,
+#         gst_percent=gst_percent,
+#         gst_amount=gst_amount,
+#         tax_percent=tax_percent,
+#         tax_amount=tax_amount,
+#         total_amount=total_amount,
+#         paid_amount=Decimal("0"),
+#         pending_amount=total_amount,
+#         status=InvoiceStatus.PENDING,
+#         description=payload.description,
+#     )
+
+#     try:
+#         db.add(invoice)
+#         await db.flush()
+
+#         owner_txn = OwnerTransaction(
+#             owner_id=payload.owner_id,
+#             project_id=payload.project_id,
+#             type="credit",
+#             amount=total_amount,
+#             reference_type="invoice",
+#             reference_id=invoice.id,
+#             description=f"Manual Invoice #{invoice.id}",
+#         )
+#         db.add(owner_txn)
+
+#         db.add(
+#             ActivityLog(
+#                 action="INVOICE_CREATED",
+#                 entity="invoice",
+#                 entity_id=invoice.id,
+#                 performed_by=current_user.id,
+#                 details={
+#                     "invoice_id": invoice.id,
+#                     "project_id": payload.project_id,
+#                     "owner_id": payload.owner_id,
+#                     "client_user_id": client_member.user_id,
+#                     "amount": float(total_amount),
+#                     "source": "manual",
+#                 },
+#             )
+#         )
+
+#         await db.commit()
+#     except Exception:
+#         await db.rollback()
+#         logger.exception("Failed to create invoice")
+#         raise
+
+#     await db.refresh(invoice)
+#     return InvoiceOut.model_validate(invoice)
 
 
 @router.post("/from-quotation/{quotation_id}", response_model=InvoiceOut)
