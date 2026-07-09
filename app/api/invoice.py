@@ -35,6 +35,7 @@ from app.schemas.invoice import (
     CollectionOut,
     ClientLedgerTransactionOut,
 )
+from fastapi import APIRouter, Depends, status
 from app.models.billing import RABill
 from app.models.accountant import JournalEntry, JournalLine, Account
 from app.utils.accounting import get_accounts_receivable, get_revenue_account, get_primary_cash_account
@@ -100,120 +101,120 @@ PAYMENT_ROLES = INVOICE_WRITE_ROLES + [UserRole.CLIENT.value]
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
-# @router.post("", response_model=InvoiceOut, status_code=status.HTTP_201_CREATED)
-# async def create_invoice(
-#     payload: CreateInvoice,
-#     db: AsyncSession = Depends(get_db_session),
-#     current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
-# ):
-#     """Create a new manual invoice."""
-#     # Validate Project
-#     project = await db.get(Project, payload.project_id)
-#     if not project:
-#         raise NotFoundError("Project not found")
+@router.post("", response_model=InvoiceOut, status_code=status.HTTP_201_CREATED)
+async def create_invoice(
+    payload: CreateInvoice,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+):
+    """Create a new manual invoice."""
+    # Validate Project
+    project = await db.get(Project, payload.project_id)
+    if not project:
+        raise NotFoundError("Project not found")
 
-#     # Validate Owner
-#     if project.owner_id != payload.owner_id:
-#         raise ValidationError("Owner does not belong to this project")
+    # Validate Owner
+    if project.owner_id != payload.owner_id:
+        raise ValidationError("Owner does not belong to this project")
 
-#     # Validate Client Assignment
-#     client_member = await db.scalar(
-#         select(ProjectMember)
-#         .join(User, User.id == ProjectMember.user_id)
-#         .where(
-#             ProjectMember.project_id == payload.project_id,
-#             User.role == UserRole.CLIENT.value,
-#             User.is_active == True,
-#             User.is_deleted == False,
-#         )
-#     )
-#     if not client_member:
-#         raise ValidationError("No active client assigned to this project.")
+    # Validate Client Assignment
+    client_member = await db.scalar(
+        select(ProjectMember)
+        .join(User, User.id == ProjectMember.user_id)
+        .where(
+            ProjectMember.project_id == payload.project_id,
+            User.role == UserRole.CLIENT.value,
+            User.is_active == True,
+            User.is_deleted == False,
+        )
+    )
+    if not client_member:
+        raise ValidationError("No active client assigned to this project.")
 
-#     # Validate Amount
-#     if payload.amount <= 0:
-#         raise ValidationError("Invoice amount must be greater than zero.")
+    # Validate Amount
+    if payload.amount <= 0:
+        raise ValidationError("Invoice amount must be greater than zero.")
 
-#     # Duplicate Invoice Check
-#     duplicate_invoice = await db.scalar(
-#         select(Invoice).where(
-#             Invoice.project_id == payload.project_id,
-#             Invoice.owner_id == payload.owner_id,
-#             Invoice.description == payload.description,
-#             Invoice.status != InvoiceStatus.CANCELLED,
-#         )
-#     )
-#     if duplicate_invoice:
-#         raise ValidationError("Similar invoice already exists.")
+    # Duplicate Invoice Check
+    duplicate_invoice = await db.scalar(
+        select(Invoice).where(
+            Invoice.project_id == payload.project_id,
+            Invoice.owner_id == payload.owner_id,
+            Invoice.description == payload.description,
+            Invoice.status != InvoiceStatus.CANCELLED,
+        )
+    )
+    if duplicate_invoice:
+        raise ValidationError("Similar invoice already exists.")
 
-#     # GST Calculation
-#     amount = Decimal(str(payload.amount))
-#     gst_percent = Decimal(str(payload.gst_percent or 0))
-#     tax_percent = Decimal(str(payload.tax_percent or 0))
+    # GST Calculation
+    amount = Decimal(str(payload.amount))
+    gst_percent = Decimal(str(payload.gst_percent or 0))
+    tax_percent = Decimal(str(payload.tax_percent or 0))
 
-#     gst_amount = (amount * gst_percent) / Decimal("100")
-#     tax_amount = (amount * tax_percent) / Decimal("100")
-#     total_amount = amount + gst_amount - tax_amount
+    gst_amount = (amount * gst_percent) / Decimal("100")
+    tax_amount = (amount * tax_percent) / Decimal("100")
+    total_amount = amount + gst_amount - tax_amount
 
-#     invoice = Invoice(
-#         project_id=payload.project_id,
-#         owner_id=payload.owner_id,
-#         quotation_id=None,
-#         type=InvoiceType.OWNER,
-#         source_type=InvoiceSourceType.MANUAL,
-#         reference_id=None,
-#         amount=amount,
-#         gst_percent=gst_percent,
-#         gst_amount=gst_amount,
-#         tax_percent=tax_percent,
-#         tax_amount=tax_amount,
-#         total_amount=total_amount,
-#         paid_amount=Decimal("0"),
-#         pending_amount=total_amount,
-#         status=InvoiceStatus.PENDING,
-#         description=payload.description,
-#     )
+    invoice = Invoice(
+        project_id=payload.project_id,
+        owner_id=payload.owner_id,
+        quotation_id=None,
+        type=InvoiceType.OWNER,
+        source_type=InvoiceSourceType.MANUAL,
+        reference_id=None,
+        amount=amount,
+        gst_percent=gst_percent,
+        gst_amount=gst_amount,
+        tax_percent=tax_percent,
+        tax_amount=tax_amount,
+        total_amount=total_amount,
+        paid_amount=Decimal("0"),
+        pending_amount=total_amount,
+        status=InvoiceStatus.PENDING,
+        description=payload.description,
+    )
 
-#     try:
-#         db.add(invoice)
-#         await db.flush()
+    try:
+        db.add(invoice)
+        await db.flush()
 
-#         owner_txn = OwnerTransaction(
-#             owner_id=payload.owner_id,
-#             project_id=payload.project_id,
-#             type="credit",
-#             amount=total_amount,
-#             reference_type="invoice",
-#             reference_id=invoice.id,
-#             description=f"Manual Invoice #{invoice.id}",
-#         )
-#         db.add(owner_txn)
+        owner_txn = OwnerTransaction(
+            owner_id=payload.owner_id,
+            project_id=payload.project_id,
+            type="credit",
+            amount=total_amount,
+            reference_type="invoice",
+            reference_id=invoice.id,
+            description=f"Manual Invoice #{invoice.id}",
+        )
+        db.add(owner_txn)
 
-#         db.add(
-#             ActivityLog(
-#                 action="INVOICE_CREATED",
-#                 entity="invoice",
-#                 entity_id=invoice.id,
-#                 performed_by=current_user.id,
-#                 details={
-#                     "invoice_id": invoice.id,
-#                     "project_id": payload.project_id,
-#                     "owner_id": payload.owner_id,
-#                     "client_user_id": client_member.user_id,
-#                     "amount": float(total_amount),
-#                     "source": "manual",
-#                 },
-#             )
-#         )
+        db.add(
+            ActivityLog(
+                action="INVOICE_CREATED",
+                entity="invoice",
+                entity_id=invoice.id,
+                performed_by=current_user.id,
+                details={
+                    "invoice_id": invoice.id,
+                    "project_id": payload.project_id,
+                    "owner_id": payload.owner_id,
+                    "client_user_id": client_member.user_id,
+                    "amount": float(total_amount),
+                    "source": "manual",
+                },
+            )
+        )
 
-#         await db.commit()
-#     except Exception:
-#         await db.rollback()
-#         logger.exception("Failed to create invoice")
-#         raise
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to create invoice")
+        raise
 
-#     await db.refresh(invoice)
-#     return InvoiceOut.model_validate(invoice)
+    await db.refresh(invoice)
+    return InvoiceOut.model_validate(invoice)
 
 
 @router.post("/from-quotation/{quotation_id}", response_model=InvoiceOut)

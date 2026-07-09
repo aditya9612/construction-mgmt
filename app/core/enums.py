@@ -5,7 +5,7 @@ class InvoiceStatus(str, Enum):
     PENDING = "pending"
     PARTIAL = "partial"
     PAID = "paid"
-    # CANCELLED = "CANCELLED"
+    CANCELLED = "CANCELLED"
 
 
 class AccountType(str, Enum):
