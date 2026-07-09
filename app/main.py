@@ -1,4 +1,5 @@
 from datetime import datetime
+from app.utils.timezone import get_naive_local_now
 import logging
 import time
 import uuid
@@ -36,6 +37,7 @@ from app.api.project import (
     drawing_router,
     site_request_router,
 )
+from app.api.client_payment import router as client_payment_router
 from app.api.boq import router as boq_router
 from app.api.user import router as user_router
 from app.api.owner import router as owner_router
@@ -151,6 +153,8 @@ def create_app() -> FastAPI:
     os.makedirs("uploads/voice_instructions/generated", exist_ok=True)
     os.makedirs("uploads/task_icons", exist_ok=True)
 
+    os.makedirs("uploads/payments", exist_ok=True)
+
     application.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
     @application.middleware("http")
@@ -223,7 +227,7 @@ def create_app() -> FastAPI:
 
                         await redis.set(
                             f"user:{user_id}:last_seen",
-                            datetime.utcnow().isoformat()
+                            get_naive_local_now().isoformat()
                         )
 
                 except JWTError:
@@ -256,6 +260,8 @@ def create_app() -> FastAPI:
 
     api_router = APIRouter(dependencies=[default_rate_limiter_dependency()])
     from app.api.project import qc_router, safety_router, checklist_router
+    from app.api.payroll import router as payroll_router
+    from app.api.journal import router as journal_router
 
     api_router.include_router(auth_router)
     api_router.include_router(user_router)
@@ -267,6 +273,7 @@ def create_app() -> FastAPI:
     api_router.include_router(site_photo_router)
     api_router.include_router(drawing_router)
     api_router.include_router(boq_router)
+    api_router.include_router(client_payment_router)
     api_router.include_router(material_router)
     api_router.include_router(labour_router)
     api_router.include_router(master_router)
@@ -297,6 +304,8 @@ def create_app() -> FastAPI:
     api_router.include_router(visualization_router)
     api_router.include_router(attendance_router)
     api_router.include_router(notification_router)
+    api_router.include_router(payroll_router)
+    api_router.include_router(journal_router)
 
 
     application.include_router(api_router, prefix="/api/v1")
@@ -343,7 +352,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
 
     #  mark online + last seen
     await redis.set(f"user:{user_id}:online", 1, ex=60)
-    await redis.set(f"user:{user_id}:last_seen", datetime.utcnow().isoformat())
+    await redis.set(f"user:{user_id}:last_seen", get_naive_local_now().isoformat())
 
     #  broadcast presence (online)
     await redis.publish(
@@ -359,7 +368,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
     async def heartbeat():
         while True:
             await redis.set(f"user:{user_id}:online", 1, ex=60)
-            await redis.set(f"user:{user_id}:last_seen", datetime.utcnow().isoformat())
+            await redis.set(f"user:{user_id}:last_seen", get_naive_local_now().isoformat())
             await asyncio.sleep(30)
 
     heartbeat_task = asyncio.create_task(heartbeat())

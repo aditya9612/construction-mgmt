@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 import os
@@ -84,8 +85,11 @@ async def upload_agreement(
     file_name = f"{doc_id}{file_ext}"
     file_path = os.path.join(UPLOAD_DIR, file_name)
 
-    with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
+    def _save_agreement():
+        with open(file_path, "wb") as buffer:
+            buffer.write(file.file.read())
+            
+    await run_in_threadpool(_save_agreement)
 
     file_url = f"/uploads/agreements/{file_name}"
 

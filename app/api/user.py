@@ -302,6 +302,7 @@ async def list_users(
         require_roles([
             UserRole.ADMIN.value,
             UserRole.PROJECT_MANAGER.value,
+            UserRole.SITE_ENGINEER.value,
         ])
     ),
     db: AsyncSession = Depends(get_db_session),

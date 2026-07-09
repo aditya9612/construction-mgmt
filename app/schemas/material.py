@@ -4,7 +4,7 @@ from datetime import datetime
 from app.models.boq import BOQ
 import re
 
-from PIL.XVThumbImagePlugin import r
+
 from pydantic import (
     BaseModel,
     ConfigDict,

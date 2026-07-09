@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import case, or_, select, func, text, update
 from datetime import datetime
+from app.utils.timezone import get_naive_local_now
 from datetime import timedelta
 from app.db.session import get_db_session
 from app.models.chat import (
@@ -287,7 +289,7 @@ async def send_message(
         raise HTTPException(404, "Chat not found")
 
     chat.last_message = payload.message if payload.message else "📎 Attachment"
-    chat.last_message_at = datetime.utcnow()
+    chat.last_message_at = get_naive_local_now()
 
     #  4. REDIS FAIL SAFETY
     try:
@@ -390,7 +392,7 @@ async def upload_chat_file(
     # DIRECTORY
     # =========================
 
-    now = datetime.utcnow()
+    now = get_naive_local_now()
 
     year = str(now.year)
     month = str(now.month).zfill(2)
@@ -436,8 +438,11 @@ async def upload_chat_file(
 
         save_path = upload_dir / filename
 
-        with open(save_path, "wb") as f:
-            f.write(content)
+        def _save_video():
+            with open(save_path, "wb") as f:
+                f.write(content)
+                
+        await run_in_threadpool(_save_video)
 
         file_url = f"/uploads/chats/videos/{year}/{month}/{filename}"
 
@@ -453,8 +458,11 @@ async def upload_chat_file(
 
         save_path = upload_dir / filename
 
-        with open(save_path, "wb") as f:
-            f.write(content)
+        def _save_doc():
+            with open(save_path, "wb") as f:
+                f.write(content)
+                
+        await run_in_threadpool(_save_doc)
 
         file_url = f"/uploads/chats/files/{year}/{month}/{filename}"
 
@@ -519,7 +527,7 @@ async def mark_delivered(
     if delivery:
 
         if not delivery.delivered_at:
-            delivery.delivered_at = datetime.utcnow()
+            delivery.delivered_at = get_naive_local_now()
 
     else:
 
@@ -527,7 +535,7 @@ async def mark_delivered(
             MessageDelivery(
                 message_id=message_id,
                 user_id=current_user.id,
-                delivered_at=datetime.utcnow(),
+                delivered_at=get_naive_local_now(),
             )
         )
 
@@ -665,18 +673,18 @@ async def get_messages(
             if delivery:
 
                 if not delivery.read_at:
-                    delivery.read_at = datetime.utcnow()
+                    delivery.read_at = get_naive_local_now()
 
                 if not delivery.delivered_at:
-                    delivery.delivered_at = datetime.utcnow()
+                    delivery.delivered_at = get_naive_local_now()
 
             else:
                 new_deliveries.append(
                     MessageDelivery(
                         message_id=mid,
                         user_id=current_user.id,
-                        delivered_at=datetime.utcnow(),
-                        read_at=datetime.utcnow(),
+                        delivered_at=get_naive_local_now(),
+                        read_at=get_naive_local_now(),
                     )
                 )
 
@@ -1329,7 +1337,7 @@ async def delete_chat(
         raise HTTPException(404, "Chat not found")
 
     member.is_deleted = True
-    member.deleted_at = datetime.utcnow()
+    member.deleted_at = get_naive_local_now()
 
     await db.commit()
 
@@ -2194,7 +2202,7 @@ async def edit_message(
         raise HTTPException(403, "Not allowed")
 
     # EDIT LIMIT
-    if datetime.utcnow() - msg.created_at > timedelta(minutes=15):
+    if get_naive_local_now() - msg.created_at > timedelta(minutes=15):
         raise HTTPException(403, "Edit time expired")
 
     # EMPTY VALIDATION
@@ -2233,7 +2241,7 @@ async def delete_message(
         raise HTTPException(403, "Not allowed")
 
     # DELETE LIMIT
-    if datetime.utcnow() - msg.created_at > timedelta(minutes=60):
+    if get_naive_local_now() - msg.created_at > timedelta(minutes=60):
         raise HTTPException(403, "Delete time expired")
 
     #  soft delete
@@ -2518,7 +2526,7 @@ async def pin_chat(
         raise HTTPException(404, "Chat not found")
 
     member.is_pinned = True
-    member.pinned_at = datetime.utcnow()
+    member.pinned_at = get_naive_local_now()
 
     await db.commit()
 
@@ -2619,7 +2627,7 @@ async def forward_message(
         chat.last_message = (
             original.message if original.message else "📎 Forwarded Attachment"
         )
-        chat.last_message_at = datetime.utcnow()
+        chat.last_message_at = get_naive_local_now()
 
     # realtime websocket event
     redis = getattr(request.app.state, "redis", None)

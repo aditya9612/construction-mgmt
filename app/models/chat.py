@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, ForeignKey, Index, String, Text, Integer, DateTime, Enum, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Index, String, Text, Integer, DateTime, Enum, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from datetime import datetime
 import enum
@@ -32,7 +32,7 @@ class ChatSession(Base):
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     last_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -87,7 +87,7 @@ class ChatMember(Base):
 
     last_read_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
-    joined_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    joined_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     chat = relationship("ChatSession", back_populates="members")
 
@@ -116,7 +116,7 @@ class ChatMessage(Base):
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("chat_messages.id"), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     is_deleted: Mapped[bool] = mapped_column(default=False)
 
@@ -181,7 +181,7 @@ class MessageRead(Base):
     message_id: Mapped[int] = mapped_column(ForeignKey("chat_messages.id"))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
 
-    read_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    read_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class MessageReaction(Base):
@@ -222,7 +222,7 @@ class MessageAttachment(Base):
 
     uploaded_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
 
-    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     message = relationship("ChatMessage", back_populates="attachments")
 
@@ -259,7 +259,7 @@ class MessageMention(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        default=datetime.utcnow
+        server_default=func.now()
     )
 
     message = relationship(

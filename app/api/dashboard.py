@@ -18,10 +18,12 @@ from app.core.enums import (
 from app.db.session import get_db_session
 from app.core import dependencies as d
 from app.models.user import User, UserRole
+from app.models.owner import Owner
+from app.models.material import Supplier
 from app.models import project as m
 from app.models.expense import Expense
 from app.models.invoice import Invoice, Transaction
-from app.models.accountant import Account, GSTReturn, VendorBill, JournalLine
+from app.models.accountant import Account, GSTReturn, VendorBill, JournalLine, JournalEntry
 from app.models.user import UserAttendance
 from app.models.boq import BOQ
 from app.models.quotation import QuotationMaster
@@ -43,6 +45,8 @@ import logging
 logger = logging.getLogger(__name__)
 from app.models.approval import Approval
 from app.models.user import User, UserRole, ActivityLog
+from app.models.owner import Owner
+from app.models.material import Supplier
 from app.cache import redis as r
 from app.schemas.dashboard import (
     EnhancedDashboardOut,
@@ -60,11 +64,10 @@ from app.schemas.dashboard import (
     AccountantDashboardOut,
     AccountantKpiCards,
     RevenueExpenseTrend,
-    CashFlow,
+    CashFlowTrend,
     ProjectCostSummaryItem,
-    OutstandingReceivable,
-    PendingPayable,
-    UpcomingPayment,
+    AgingBucket,
+    UpcomingTransactionItem,
     RecentActivityItem,
     PMCommandCenterOut,
     PMKpiCards,
@@ -536,17 +539,25 @@ async def accountant_dashboard(
         project_ids = await get_user_project_ids(db, current_user)
 
         # 1. KPIs
-        cash_balance_query = await db.scalar(
-            select(func.sum(JournalLine.debit - JournalLine.credit))
-            .join(Account, JournalLine.account_id == Account.id)
-            .where(Account.name.ilike("%cash%"))
-        )
-        cash_balance = float(cash_balance_query or 0.0)
+        from app.utils.accounting import get_primary_cash_account
+        try:
+            cash_acc = await get_primary_cash_account(db)
+            cash_balance_query = await db.scalar(
+                select(func.sum(JournalLine.debit - JournalLine.credit))
+                .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
+                .where(JournalLine.account_id == cash_acc.id)
+                .where(JournalEntry.status == "Posted")
+            )
+            cash_balance = float(cash_balance_query or 0.0)
+        except ValueError:
+            cash_balance = 0.0
 
         bank_balance_query = await db.scalar(
             select(func.sum(JournalLine.debit - JournalLine.credit))
             .join(Account, JournalLine.account_id == Account.id)
+            .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
             .where(Account.name.ilike("%bank%"))
+            .where(JournalEntry.status == "Posted")
         )
         bank_balance = float(bank_balance_query or 0.0)
 
@@ -639,44 +650,44 @@ async def accountant_dashboard(
                 )
             )
 
-        # 3. Cash Flow
-        cash_inflow_val = (
-            await db.scalar(
+                # 3. Cash Flow (Monthly Trend)
+        cash_flow = []
+        for i in range(5, -1, -1):
+            target_date = datetime.utcnow() - relativedelta(months=i)
+            month_str = target_date.strftime("%b")
+
+            month_start = target_date.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+            month_end = (
+                (month_start + relativedelta(months=1)) - timedelta(seconds=1)
+                if i != 0
+                else datetime.utcnow()
+            )
+
+            c_inflow = await db.scalar(
                 select(func.sum(Transaction.amount)).where(
                     Transaction.type == "receipt",
-                    Transaction.created_at
-                    >= (
-                        datetime.utcnow().replace(
-                            day=1, hour=0, minute=0, second=0, microsecond=0
-                        )
-                        - relativedelta(months=5)
-                    ),
+                    Transaction.created_at >= month_start,
+                    Transaction.created_at <= month_end,
                 )
-            )
-            or 0.0
-        )
+            ) or 0.0
 
-        cash_outflow_val = (
-            await db.scalar(
+            c_outflow = await db.scalar(
                 select(func.sum(Transaction.amount)).where(
                     Transaction.type == "payment",
-                    Transaction.created_at
-                    >= (
-                        datetime.utcnow().replace(
-                            day=1, hour=0, minute=0, second=0, microsecond=0
-                        )
-                        - relativedelta(months=5)
-                    ),
+                    Transaction.created_at >= month_start,
+                    Transaction.created_at <= month_end,
+                )
+            ) or 0.0
+
+            cash_flow.append(
+                CashFlowTrend(
+                    month=month_str,
+                    inflow=float(c_inflow),
+                    outflow=float(c_outflow)
                 )
             )
-            or 0.0
-        )
-
-        cash_flow = CashFlow(
-            cash_inflow=float(cash_inflow_val),
-            cash_outflow=float(cash_outflow_val),
-            closing_balance=bank_balance + float(cash_balance),
-        )
 
         # 4. Project Cost Summary
         project_cost_summary = []
@@ -711,88 +722,102 @@ async def accountant_dashboard(
                 )
             )
 
-        # 5. Outstanding Receivables
-        outstanding_receivables = []
-        inv_query = await db.execute(
-            select(Invoice)
-            .where(Invoice.status == InvoiceStatus.PENDING.value)
-            .order_by(Invoice.created_at.asc())
-            .limit(5)
-        )
+        # 5. Receivable Aging
+        today_date = datetime.utcnow().date()
+        inv_query = await db.execute(select(Invoice).where(Invoice.status == InvoiceStatus.PENDING.value))
+        
+        r_buckets = {"0-30 Days": 0.0, "31-60 Days": 0.0, "61-90 Days": 0.0, "> 90 Days": 0.0}
+        total_r = 0.0
         for inv in inv_query.scalars().all():
-            outstanding_receivables.append(
-                OutstandingReceivable(
-                    client_invoice=f"INV-{inv.id}",
-                    amount_due=float(inv.total_amount),
-                    due_date=inv.created_at.date() + timedelta(days=30),
-                )
-            )
+            days_old = (today_date - inv.created_at.date()).days
+            amt = float(inv.pending_amount if inv.pending_amount else inv.total_amount)
+            total_r += amt
+            if days_old <= 30: r_buckets["0-30 Days"] += amt
+            elif days_old <= 60: r_buckets["31-60 Days"] += amt
+            elif days_old <= 90: r_buckets["61-90 Days"] += amt
+            else: r_buckets["> 90 Days"] += amt
 
-        # 6. Pending Payables
-        pending_payables = []
-        vendor_bills_query = await db.execute(
-            select(VendorBill)
+        receivable_aging = [
+            AgingBucket(
+                period=k, 
+                amount=v, 
+                percentage=round((v/total_r)*100) if total_r > 0 else 0
+            ) for k, v in r_buckets.items()
+        ]
+
+        # 6. Payable Aging
+        vb_query = await db.execute(select(VendorBill).where(VendorBill.status == "PENDING"))
+        p_buckets = {"0-30 Days": 0.0, "31-60 Days": 0.0, "61-90 Days": 0.0, "> 90 Days": 0.0}
+        total_p = 0.0
+        for vb in vb_query.scalars().all():
+            days_old = (today_date - vb.bill_date).days
+            amt = float(vb.total_amount - vb.amount_paid)
+            total_p += amt
+            if days_old <= 30: p_buckets["0-30 Days"] += amt
+            elif days_old <= 60: p_buckets["31-60 Days"] += amt
+            elif days_old <= 90: p_buckets["61-90 Days"] += amt
+            else: p_buckets["> 90 Days"] += amt
+
+        payable_aging = [
+            AgingBucket(
+                period=k, 
+                amount=v, 
+                percentage=round((v/total_p)*100) if total_p > 0 else 0
+            ) for k, v in p_buckets.items()
+        ]
+
+        # 7. Upcoming Payments
+        upcoming_payments_query = await db.execute(
+            select(VendorBill, Supplier)
+            .join(Supplier, VendorBill.supplier_id == Supplier.id)
             .where(VendorBill.status == "PENDING")
             .order_by(VendorBill.due_date.asc())
             .limit(5)
         )
-        for vb in vendor_bills_query.scalars().all():
-            pending_payables.append(
-                PendingPayable(
-                    vendor_bill_no=vb.bill_number,
-                    amount=float(vb.total_amount - vb.amount_paid),
-                    due_date=vb.due_date,
-                )
-            )
-
-        # 7. Upcoming Payments
         upcoming_payments = []
-        today_date = datetime.utcnow().date()
-
-        vb_today = await db.scalar(
-            select(func.sum(VendorBill.total_amount - VendorBill.amount_paid)).where(
-                VendorBill.status == "PENDING", VendorBill.due_date == today_date
-            )
-        )
-        if vb_today:
+        for vb, sup in upcoming_payments_query.all():
             upcoming_payments.append(
-                UpcomingPayment(
-                    category="Today",
-                    description="Vendor Payments",
-                    amount=float(vb_today),
+                UpcomingTransactionItem(
+                    entity_name=sup.supplier_name,
+                    date=vb.due_date.strftime("%d %b %Y"),
+                    amount=float(vb.total_amount - vb.amount_paid)
                 )
             )
 
-        tomorrow = today_date + timedelta(days=1)
-        vb_tomorrow = await db.scalar(
-            select(func.sum(VendorBill.total_amount - VendorBill.amount_paid)).where(
-                VendorBill.status == "PENDING", VendorBill.due_date == tomorrow
-            )
+        # 8. Upcoming Collections
+        upcoming_cols_query = await db.execute(
+            select(Invoice, Owner)
+            .join(Owner, Invoice.owner_id == Owner.id)
+            .where(Invoice.status == InvoiceStatus.PENDING.value)
+            .order_by(Invoice.created_at.asc())
+            .limit(5)
         )
-        if vb_tomorrow:
-            upcoming_payments.append(
-                UpcomingPayment(
-                    category="Tomorrow",
-                    description="Vendor Payments",
-                    amount=float(vb_tomorrow),
+        upcoming_collections = []
+        for inv, own in upcoming_cols_query.all():
+            due = (inv.created_at + timedelta(days=30)).strftime("%d %b %Y")
+            upcoming_collections.append(
+                UpcomingTransactionItem(
+                    entity_name=own.owner_name,
+                    date=due,
+                    amount=float(inv.pending_amount if inv.pending_amount else inv.total_amount)
                 )
             )
 
+        # 9. Notifications
+        notifications = []
         gst_due_upcoming = await db.scalar(
-            select(func.sum(GSTReturn.net_gst_payable)).where(
-                GSTReturn.status == "Draft"
-            )
+            select(func.count(GSTReturn.id)).where(GSTReturn.status == "Draft")
         )
-        if gst_due_upcoming:
-            upcoming_payments.append(
-                UpcomingPayment(
-                    category="Upcoming",
-                    description="GST Liability",
-                    amount=float(gst_due_upcoming),
-                )
-            )
+        if gst_due_upcoming and gst_due_upcoming > 0:
+            notifications.append(f"GST Return filing due for {gst_due_upcoming} periods.")
+            
+        pending_approvals = await db.scalar(
+            select(func.count(Approval.id)).where(Approval.status == "Pending")
+        )
+        if pending_approvals and pending_approvals > 0:
+            notifications.append(f"Pending approval for {pending_approvals} vouchers.")
 
-        # 8. Recent Activities
+        # 10. Recent Activities
         recent_activities = []
         activities_query = await db.execute(
             select(ActivityLog).order_by(ActivityLog.created_at.desc()).limit(5)
@@ -809,10 +834,12 @@ async def accountant_dashboard(
             revenue_vs_expense=rev_exp_trends,
             cash_flow=cash_flow,
             project_cost_summary=project_cost_summary,
-            outstanding_receivables=outstanding_receivables,
-            pending_payables=pending_payables,
+            receivable_aging=receivable_aging,
+            payable_aging=payable_aging,
             upcoming_payments=upcoming_payments,
+            upcoming_collections=upcoming_collections,
             recent_activities=recent_activities,
+            notifications=notifications,
         )
 
     version = await r.get_cache_version(redis, VERSION_KEY)
@@ -1247,43 +1274,80 @@ async def pm_summary(
 
 
 # =========================================
-# EXPORT API (PDF + EXCEL)
+# REFRESH DASHBOARD
 # =========================================
-@router.get("/export")
+@router.post("/refresh")
+async def refresh_dashboard(
+    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    redis=Depends(d.get_request_redis)
+):
+    await r.bump_cache_version(redis, VERSION_KEY)
+    return {"message": "Dashboard cache invalidated successfully"}
+
+
+# =========================================
+# EXPORT API (CSV)
+# =========================================
+import csv
+import io
+
+@router.get("/accountant/export")
 async def export_dashboard(
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(d.get_request_redis),
 ):
+    dash_out = await accountant_dashboard(current_user=current_user, db=db, redis=redis)
 
-    data = {
-        "user": current_user.id,
-        "role": current_user.role,
-        "date": str(datetime.utcnow()),
-    }
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
 
-    # ===== PDF =====
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    styles = getSampleStyleSheet()
+    # A) Financial Summary
+    writer.writerow(["=== FINANCIAL SUMMARY ==="])
+    kpi = dash_out.kpi_cards
+    writer.writerow(["Cash", "Bank", "Receivable", "Payable", "GST Due", "Profit"])
+    writer.writerow([kpi.cash_balance, kpi.bank_balance, kpi.receivables, kpi.payables, kpi.gst_due, kpi.net_profit])
+    writer.writerow([])
 
-    content = [
-        Paragraph("Dashboard Export", styles["Title"]),
-        Paragraph(str(data), styles["Normal"]),
-    ]
+    # B) Revenue vs Expense
+    writer.writerow(["=== REVENUE VS EXPENSE ==="])
+    writer.writerow(["Month", "Revenue", "Expense"])
+    for row in dash_out.revenue_vs_expense:
+        writer.writerow([row.month, row.revenue, row.expense])
+    writer.writerow([])
 
-    doc.build(content)
+    # C) Cash Flow
+    writer.writerow(["=== CASH FLOW ==="])
+    writer.writerow(["Month", "Inflow", "Outflow"])
+    for row in dash_out.cash_flow:
+        writer.writerow([row.month, row.inflow, row.outflow])
+    writer.writerow([])
+
+    # D) Aging Reports
+    writer.writerow(["=== RECEIVABLE AGING ==="])
+    writer.writerow(["Period", "Amount", "% of Total"])
+    for row in dash_out.receivable_aging:
+        writer.writerow([row.period, row.amount, f"{row.percentage}%"])
+    writer.writerow([])
+
+    writer.writerow(["=== PAYABLE AGING ==="])
+    writer.writerow(["Period", "Amount", "% of Total"])
+    for row in dash_out.payable_aging:
+        writer.writerow([row.period, row.amount, f"{row.percentage}%"])
+    writer.writerow([])
+
+    # E) Project Cost Summary
+    writer.writerow(["=== PROJECT COST SUMMARY ==="])
+    writer.writerow(["Project", "Budget", "Expense", "Remaining"])
+    for row in dash_out.project_cost_summary:
+        writer.writerow([row.project_name, row.budgeted, row.spent, row.remaining])
+    writer.writerow([])
+
     buffer.seek(0)
-
-    # ===== EXCEL =====
-    df = pd.DataFrame([data])
-    excel_buffer = io.BytesIO()
-    df.to_excel(excel_buffer, index=False)
-    excel_buffer.seek(0)
-
     return StreamingResponse(
-        buffer,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=dashboard.pdf"},
+        iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=accountant_dashboard.csv"},
     )
 
 

@@ -1258,7 +1258,13 @@ async def pay_salary(
 
     #  replace with real IDs later
     EXPENSE_ACCOUNT_ID = 1  # Salary Expense
-    CASH_ACCOUNT_ID = 2  # Cash / Bank
+    
+    from app.utils.accounting import get_primary_cash_account
+    try:
+        cash_acc = await get_primary_cash_account(db)
+    except ValueError:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Primary Cash Account not configured")
 
     db.add(
         JournalLine(
@@ -1272,7 +1278,7 @@ async def pay_salary(
     db.add(
         JournalLine(
             entry_id=entry.id,
-            account_id=CASH_ACCOUNT_ID,
+            account_id=cash_acc.id,
             debit=0,
             credit=payload.amount,
         )

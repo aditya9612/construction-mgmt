@@ -20,7 +20,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
+from app.core.enums import PurchaseType
 from app.core.enums import EquipmentCondition, EquipmentStatus
 from app.models.base import Base, TimestampMixin
 from app.schemas.base import BaseSchema
@@ -211,6 +211,11 @@ class EquipmentUsage(Base, TimestampMixin):
         index=True,
     )
 
+    equipment: Mapped["Equipment"] = relationship(
+        back_populates="usages",
+        lazy="selectin",
+    )
+
     boq_item_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("boq_items.id", ondelete="SET NULL"),
         nullable=True,
@@ -235,11 +240,6 @@ class EquipmentUsage(Base, TimestampMixin):
 
     notes: Mapped[Optional[str]] = mapped_column(
         String(500),
-    )
-
-    equipment: Mapped["Equipment"] = relationship(
-        back_populates="usages",
-        lazy="selectin",
     )
 
 
@@ -385,8 +385,9 @@ class EquipmentAuditLog(Base, TimestampMixin):
         primary_key=True,
     )
 
-    equipment_id: Mapped[int] = mapped_column(
-        ForeignKey("equipment.id", ondelete="CASCADE"),
+    equipment_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("equipment.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 
@@ -411,7 +412,7 @@ class EquipmentAuditLog(Base, TimestampMixin):
         String(45),
     )
 
-    equipment: Mapped["Equipment"] = relationship(
+    equipment: Mapped[Optional["Equipment"]] = relationship(
         back_populates="audit_logs",
         lazy="selectin",
     )
@@ -436,19 +437,19 @@ class EquipmentPurchase(Base, TimestampMixin):
         index=True,
     )
 
-    purchase_type: Mapped[str] = mapped_column(
-        String(20),
+    purchase_type: Mapped[PurchaseType] = mapped_column(
+        SqlEnum(PurchaseType),
         nullable=False,
         index=True,
     )
 
-    asset_id: Mapped[int] = mapped_column(
-        ForeignKey("equipment.id", ondelete="RESTRICT"),
-        nullable=False,
+    asset_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("equipment.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 
-    equipment: Mapped["Equipment"] = relationship(
+    equipment: Mapped[Optional["Equipment"]] = relationship(
         lazy="selectin",
     )
 

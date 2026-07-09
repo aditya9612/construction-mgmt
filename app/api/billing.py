@@ -8,6 +8,8 @@ from app.models.billing import RABill
 from app.models.project import Project
 from app.models.contractor import Contractor
 from app.models.owner import OwnerTransaction
+from app.models.accountant import JournalEntry, JournalLine
+from app.utils.accounting import get_accounts_receivable, get_revenue_account
 
 from app.schemas.billing import RABillCreate, RABillUpdate, RABillOut
 from app.schemas.base import PaginatedResponse, PaginationMeta
@@ -442,6 +444,37 @@ async def approve_bill(
         approval.status = "Approved"
 
     await db.flush()
+
+    # 3. Create Journal Entry
+    je = JournalEntry(
+        entry_type="Invoice", # RA Bill behaves as an invoice to AR
+        journal_number=f"J-RAB-{obj.id}",
+        entry_date=date.today(),
+        description=f"RA Bill {obj.ra_bill_no} Approved",
+        status="Posted"
+    )
+    db.add(je)
+    await db.flush()
+
+    ar_acc = await get_accounts_receivable(db)
+    rev_acc = await get_revenue_account(db)
+
+    db.add(JournalLine(entry_id=je.id, account_id=ar_acc.id, debit=obj.net_payable, credit=Decimal(0)))
+    
+    # Revenue is gross amount minus GST, wait, the instruction says:
+    # Credit: Project Revenue
+    # Credit: GST Payable if applicable
+    # If net_payable is the total, total_with_gst is the total. Let's look at schema to be sure, or just use net_payable and gross_amount.
+    # Instruction example for invoice: 118000 total, 100000 revenue, 18000 GST.
+    
+    db.add(JournalLine(entry_id=je.id, account_id=rev_acc.id, debit=Decimal(0), credit=obj.gross_amount))
+    
+    if obj.gst_amount and obj.gst_amount > 0:
+        from app.utils.accounting import resolve_tax_accounts
+        gst_acc = await resolve_tax_accounts(db, "output_gst")
+        db.add(JournalLine(entry_id=je.id, account_id=gst_acc.id, debit=Decimal(0), credit=obj.gst_amount))
+        
+    await db.commit()
 
     return {"message": "Approved"}
 

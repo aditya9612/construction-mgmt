@@ -18,7 +18,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from datetime import datetime
 from typing import Optional
 from app.models.base import Base, TimestampMixin
-from sqlalchemy import ForeignKey, DateTime
+from sqlalchemy import ForeignKey, DateTime, func
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from typing import Optional
@@ -102,6 +102,12 @@ class User(Base, TimestampMixin):
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     deleted_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
+	
+    quotations = relationship(
+    "QuotationMaster",
+    foreign_keys="QuotationMaster.client_user_id",
+    back_populates="client")
+
     @property
     def user_id(self) -> int:
         return self.id
@@ -141,7 +147,7 @@ class ActivityLog(Base):
     performed_by = mapped_column(ForeignKey("users.id"), index=True)
     details: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class UserAttendance(Base, TimestampMixin):

@@ -38,6 +38,7 @@ from app.models.accountant import Account
 from app.models.accountant import JournalEntry
 from app.models.accountant import JournalLine
 from app.models.accountant import FixedAsset
+from app.models.accountant import BankAccount, RecurringJournal, TDSDeduction, BankTransaction, FundTransfer, GSTReturn, VendorBill
 from app.models.alert import Alert
 from app.models.cad_conversion import CADConversion
 from app.models.master_data import Unit
@@ -51,3 +52,4 @@ from app.models.project_visualization import ProjectVisualization
 from app.models.agreement import Agreement
 from app.models.notification import Notification
 from app.models.rbac import Permission , RolePermission
+from app.models.client_payment import ClientPayment  # noqa: F401

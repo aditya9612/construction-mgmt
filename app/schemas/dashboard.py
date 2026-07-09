@@ -109,10 +109,10 @@ class RevenueExpenseTrend(BaseModel):
     revenue: float
     expense: float
 
-class CashFlow(BaseModel):
-    cash_inflow: float
-    cash_outflow: float
-    closing_balance: float
+class CashFlowTrend(BaseModel):
+    month: str
+    inflow: float
+    outflow: float
 
 class ProjectCostSummaryItem(BaseModel):
     project_name: str
@@ -120,19 +120,14 @@ class ProjectCostSummaryItem(BaseModel):
     spent: float
     remaining: float
 
-class OutstandingReceivable(BaseModel):
-    client_invoice: str
-    amount_due: float
-    due_date: Optional[date]
-
-class PendingPayable(BaseModel):
-    vendor_bill_no: str
+class AgingBucket(BaseModel):
+    period: str
     amount: float
-    due_date: Optional[date]
+    percentage: float
 
-class UpcomingPayment(BaseModel):
-    category: str # Today, Tomorrow, 5 Days Later
-    description: str
+class UpcomingTransactionItem(BaseModel):
+    entity_name: str
+    date: str
     amount: float
 
 class RecentActivityItem(BaseModel):
@@ -142,12 +137,14 @@ class RecentActivityItem(BaseModel):
 class AccountantDashboardOut(BaseModel):
     kpi_cards: AccountantKpiCards
     revenue_vs_expense: List[RevenueExpenseTrend]
-    cash_flow: CashFlow
+    cash_flow: List[CashFlowTrend]
     project_cost_summary: List[ProjectCostSummaryItem]
-    outstanding_receivables: List[OutstandingReceivable]
-    pending_payables: List[PendingPayable]
-    upcoming_payments: List[UpcomingPayment]
+    receivable_aging: List[AgingBucket]
+    payable_aging: List[AgingBucket]
+    upcoming_payments: List[UpcomingTransactionItem]
+    upcoming_collections: List[UpcomingTransactionItem]
     recent_activities: List[RecentActivityItem]
+    notifications: List[str]
 
 
 # =========================================

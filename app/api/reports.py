@@ -39,51 +39,134 @@ router = APIRouter(prefix="/reports", tags=["Reports"])
 
 @router.get("/projects/excel")
 async def export_projects_excel(
-    project_id: Optional[int] = Query(None, description="Project ID to filter. If none, exports all projects."),
+    project_id: Optional[int] = Query(
+        None,
+        description="Project ID to filter. If none, exports all projects.",
+    ),
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     from app.api.project import get_reports_service
+
     service = get_reports_service()
-    
+
+    # ======================================================
+    # Single Project Report (Same Logic as PDF)
+    # ======================================================
     if project_id:
-        return await service.export_excel(db, project_id, current_user)
-        
-    # Export ALL projects
-    projects_query = select(m.Project)
-    projects = (await db.execute(projects_query)).scalars().all()
-    
+        return await service.export_excel(
+            db=db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+
+    # ======================================================
+    # Company Portfolio Report
+    # ======================================================
+
+    projects = (
+        (
+            await db.execute(
+                select(m.Project).order_by(m.Project.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     wb = Workbook()
     ws = wb.active
-    ws.title = "All Projects Portfolio"
-    
+    ws.title = "Company Portfolio"
+
+    total_projects = len(projects)
+
+    ongoing = sum(
+        1
+        for p in projects
+        if str(getattr(p.status, "value", p.status)) == "Ongoing"
+    )
+
+    completed = sum(
+        1
+        for p in projects
+        if str(getattr(p.status, "value", p.status)) == "Completed"
+    )
+
+    ws.append(["Company Portfolio Overview"])
+    ws.append([])
+    ws.append(["Generated On", str(date.today())])
+    ws.append(["Total Projects", total_projects])
+    ws.append(["Ongoing", ongoing])
+    ws.append(["Completed", completed])
+    ws.append([])
+
     headers = [
-        "ID", "Business ID", "Project Name", "Status", "Type", 
-        "Location", "Start Date", "End Date"
+        "Business ID",
+        "Project Name",
+        "Status",
+        "Start Date",
+        "End Date",
     ]
+
     ws.append(headers)
-    
+
     for p in projects:
-        ws.append([
-            p.id,
-            p.business_id,
-            p.project_name,
-            str(p.status.value if hasattr(p.status, "value") else p.status),
-            str(p.type.value if hasattr(p.type, "value") else p.type) if p.type else "N/A",
-            f"{p.city or ''}, {p.state or ''}".strip(", "),
-            str(p.start_date) if p.start_date else "N/A",
-            str(p.end_date) if p.end_date else "N/A",
-        ])
-        
+        ws.append(
+            [
+                p.business_id,
+                (
+                    p.project_name[:30] + "..."
+                    if p.project_name and len(p.project_name) > 30
+                    else (p.project_name or "N/A")
+                ),
+                (
+                    p.status.value
+                    if hasattr(p.status, "value")
+                    else str(p.status)
+                ),
+                str(p.start_date) if p.start_date else "N/A",
+                str(p.end_date) if p.end_date else "N/A",
+            ]
+        )
+
+    from openpyxl.utils import get_column_letter
+
+    for col in range(1, ws.max_column + 1):
+
+        max_length = 0
+        column_letter = get_column_letter(col)
+
+        for row in range(1, ws.max_row + 1):
+
+            cell = ws.cell(row=row, column=col)
+
+            if cell.value is not None:
+                max_length = max(
+                    max_length,
+                    len(str(cell.value))
+                )
+
+        ws.column_dimensions[column_letter].width = min(
+            max_length + 4,
+            40
+        )
+
     stream = io.BytesIO()
     wb.save(stream)
     stream.seek(0)
-    
+
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=all_projects_report.xlsx"},
+        headers={
+            "Content-Disposition": (
+                "attachment; filename=all_projects_report.xlsx"
+            )
+        },
     )
+
+#=====================================================================
+
 
 @router.get("/projects/pdf")
 async def export_projects_pdf(
@@ -102,7 +185,10 @@ async def export_projects_pdf(
     from reportlab.platypus import Table, TableStyle
     from reportlab.lib import colors
     
-    projects_query = select(m.Project)
+    projects_query = (
+    select(m.Project)
+    .order_by(m.Project.id.desc())
+)
     projects = (await db.execute(projects_query)).scalars().all()
     
     stream = io.BytesIO()

@@ -112,13 +112,17 @@ class Project(Base, TimestampMixin):
         "ProjectMember", back_populates="project", cascade="all, delete-orphan"
     )
     milestones = relationship(
-        "Milestone",back_populates="project",
-        cascade="all, delete-orphan",lazy="selectin",
+        "Milestone",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
     tasks = relationship(
-        "Task",back_populates="project",
-        cascade="all, delete-orphan",lazy="selectin",
+        "Task",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
     dsr_entries = relationship(
         "DailySiteReport", back_populates="project", cascade="all, delete-orphan"
@@ -137,7 +141,12 @@ class Project(Base, TimestampMixin):
         "ProjectOTPolicy",
         uselist=False,
         back_populates="project",
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
+    )
+
+    client_payments = relationship(
+        "ClientPayment",
+        back_populates="project",
     )
 
     @property
@@ -331,7 +340,7 @@ class Task(Base):
     actual_end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
     assigned_user_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("users.id")
+        Integer, ForeignKey("users.id"), index=True
     )
     completion_percentage: Mapped[float] = mapped_column(Float, default=0)
     discipline: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
@@ -424,7 +433,7 @@ class Task(Base):
 
 class TaskAssignment(Base):
     __tablename__ = "task_assignments"
-    
+
     __table_args__ = (
         UniqueConstraint("task_id", "user_id", name="uq_task_assignment"),
     )
@@ -479,15 +488,19 @@ class TaskRequest(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     category: Mapped[str] = mapped_column(String(100), nullable=False)
-    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    project_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
     priority: Mapped[str] = mapped_column(String(50), nullable=False, default="LOW")
     description: Mapped[str] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="PENDING")
-    
+
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    assigned_to: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    assigned_to: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     attachment_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    
+
     # Relationships
     project = relationship("Project")
     assignee = relationship("User")
@@ -904,7 +917,7 @@ class DrawingDocument(Base, TimestampMixin):
     is_folder = Column(
         Boolean,
         default=False,
-        server_default='0',
+        server_default="0",
         nullable=False,
         index=True,
     )

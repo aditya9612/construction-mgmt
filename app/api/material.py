@@ -3,7 +3,6 @@ from typing import Optional, List
 from decimal import Decimal, InvalidOperation
 import uuid
 import os
-from ezdxf.units import unit_name
 from sqlalchemy.exc import IntegrityError
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import exists, func, or_, select
@@ -161,6 +160,8 @@ def build_material_response(
     else:
         alert = "IN_STOCK"
 
+    resolved_unit_name = unit_name if unit_name else (obj.unit.name if obj.unit else "")
+
     return MaterialOut(
         id=obj.id,
         material_code=obj.material_code,
@@ -181,7 +182,7 @@ def build_material_response(
         material_name=(obj.material_name or "").strip().title(),
         category=obj.category,
         unit_id=obj.unit_id,
-        unit_name=(obj.unit.name if obj.unit else ""),
+        unit_name=resolved_unit_name,
         supplier_id=obj.supplier_id,
         supplier_name=(supplier_name if supplier_name else "N/A"),
         purchase_rate=round(
@@ -313,13 +314,7 @@ def calculate_payment(total, paid):
 
 
 def calculate_avg_rate(material):
-    qty = material.quantity_purchased or Decimal("0")
-    total = material.total_amount or Decimal("0")
-
-    return total / qty if qty > 0 else Decimal("0")
-
-
-def calculate_wac(material):
+    """Weighted average purchase rate = total_amount / quantity_purchased."""
     qty = material.quantity_purchased or Decimal("0")
     total = material.total_amount or Decimal("0")
 
@@ -356,15 +351,10 @@ async def material_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
-    import traceback
     from decimal import Decimal
     from fastapi import HTTPException
 
     try:
-        print("\n" + "=" * 80)
-        print("DEBUG: /materials/summary API called")
-        print("=" * 80)
-
         # ==========================================================
         # BASE QUERY
         # ==========================================================
@@ -425,7 +415,7 @@ async def material_summary(
         }
 
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("Material summary failed")
 
         raise HTTPException(
             status_code=500,
@@ -483,8 +473,6 @@ async def get_supplier(
 
 # ================Create_supplier===============
 
-from sqlalchemy import or_
-
 
 @router.post("/suppliers", response_model=SupplierOut, status_code=201)
 async def create_supplier(
@@ -494,12 +482,12 @@ async def create_supplier(
 ):
     import re
 
-    # 🔹 Name validation
+    # Name validation
     supplier_name = payload.supplier_name.strip().title()
     if len(supplier_name) < 3:
         raise HTTPException(400, "Supplier name must be at least 3 characters")
 
-    # 🔹 Contact person validation
+    # Contact person validation
     contact_person = (
         payload.contact_person.strip().title() if payload.contact_person else None
     )
@@ -507,7 +495,7 @@ async def create_supplier(
     if contact_person and not re.fullmatch(r"[A-Za-z ]{3,}", contact_person):
         raise HTTPException(400, "Invalid contact person name")
 
-    # 🔹 Phone / Email validation
+    # Phone / Email validation
     phone_email = payload.phone_email.strip() if payload.phone_email else None
 
     if phone_email:
@@ -529,7 +517,7 @@ async def create_supplier(
         else:
             raise HTTPException(400, "Enter valid phone number or email")
 
-    # 🔹 GST validation
+    # GST validation
     gst_number = payload.gst_number.strip().upper() if payload.gst_number else None
 
     if gst_number and not re.fullmatch(
@@ -538,14 +526,14 @@ async def create_supplier(
     ):
         raise HTTPException(400, "Invalid GST number format")
 
-    # 🔹 Address validation
+    # Address validation
     address = payload.address.strip() if payload.address else None
 
     if address and len(address) < 3:
         raise HTTPException(400, "Address too short")
 
     # ==================================================
-    # 🔹 Duplicate Check (FIXED)
+    # Duplicate Check
     # ==================================================
     conditions = []
 
@@ -571,7 +559,7 @@ async def create_supplier(
             detail="Supplier with same GST or phone/email already exists",
         )
 
-    # 🔹 Create supplier
+    # Create supplier
     supplier = Supplier(
         supplier_name=supplier_name,
         contact_person=contact_person,
@@ -749,10 +737,10 @@ async def delete_supplier(
     if not obj or obj.is_deleted:
         raise HTTPException(404, "Supplier not found")
 
-    # ✅ FIX: ignore deleted materials
+    # ignore deleted materials
     in_use = await db.scalar(
         select(func.count()).where(
-            Material.supplier_id == id, Material.is_deleted == False  # 🔥 important fix
+            Material.supplier_id == id, Material.is_deleted == False
         )
     )
 
@@ -766,9 +754,6 @@ async def delete_supplier(
 
 
 # ================= supplier materials =================
-
-
-from sqlalchemy.orm import selectinload
 
 
 @router.get(
@@ -915,6 +900,11 @@ async def create_po(
     if payload.quantity <= 0 or payload.rate <= 0:
         raise HTTPException(400, "Quantity and rate must be greater than 0")
 
+    if current_user.role != UserRole.ADMIN.value and payload.project_id not in (
+        current_user.allowed_projects or []
+    ):
+        raise HTTPException(403, "Access denied")
+
     material = await db.get(Material, payload.material_id)
     if not material:
         raise HTTPException(404, "Material not found")
@@ -973,6 +963,11 @@ async def get_po(
     if not po or po.is_deleted:
         raise HTTPException(404, "PO not found")
 
+    if current_user.role != UserRole.ADMIN.value and po.project_id not in (
+        current_user.allowed_projects or []
+    ):
+        raise HTTPException(403, "Access denied")
+
     return build_po_response(po)
 
 
@@ -989,6 +984,13 @@ async def list_po(
 ):
     limit = min(max(limit, 1), 100)
 
+    if (
+        project_id is not None
+        and current_user.role != UserRole.ADMIN.value
+        and (project_id not in (current_user.allowed_projects or []))
+    ):
+        raise HTTPException(403, "Access denied")
+
     query = (
         select(PurchaseOrder)
         .where(PurchaseOrder.is_deleted == False)
@@ -997,6 +999,10 @@ async def list_po(
 
     if project_id is not None:
         query = query.where(PurchaseOrder.project_id == project_id)
+    elif current_user.role != UserRole.ADMIN.value:
+        query = query.where(
+            PurchaseOrder.project_id.in_(current_user.allowed_projects or [])
+        )
 
     query = query.offset(skip).limit(limit)
 
@@ -1019,6 +1025,11 @@ async def update_po(
 
     if not obj or obj.is_deleted:
         raise HTTPException(404, "PO not found")
+
+    if current_user.role != UserRole.ADMIN.value and obj.project_id not in (
+        current_user.allowed_projects or []
+    ):
+        raise HTTPException(403, "Access denied")
 
     if obj.status in ["PENDING", "APPROVED"]:
         raise HTTPException(
@@ -1066,6 +1077,11 @@ async def delete_po(
 
     if not obj or obj.is_deleted:
         raise HTTPException(404, "PO not found")
+
+    if current_user.role != UserRole.ADMIN.value and obj.project_id not in (
+        current_user.allowed_projects or []
+    ):
+        raise HTTPException(403, "Access denied")
 
     if obj.status in ["PENDING", "APPROVED"]:
         raise HTTPException(
@@ -1139,10 +1155,15 @@ async def get_material_transactions(
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
 
-    # ✅ validation
+    # validation
     material = await db.get(Material, material_id)
     if not material or material.is_deleted:
         raise HTTPException(404, "Material not found")
+
+    if current_user.role != UserRole.ADMIN.value and material.project_id not in (
+        current_user.allowed_projects or []
+    ):
+        raise HTTPException(403, "Access denied")
 
     result = await db.execute(
         select(MaterialTransaction)
@@ -1207,6 +1228,15 @@ async def create_transfer(
                 detail="Source and destination project cannot be same",
             )
 
+        if current_user.role != UserRole.ADMIN.value and (
+            payload.from_project_id not in (current_user.allowed_projects or [])
+            or payload.to_project_id not in (current_user.allowed_projects or [])
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied",
+            )
+
         from_project = await db.get(
             Project,
             payload.from_project_id,
@@ -1234,6 +1264,11 @@ async def create_transfer(
         # =====================================================
         # SOURCE MATERIAL
         # =====================================================
+        # NOTE: to reduce deadlock risk when two transfers cross-reference
+        # projects (A->B and B->A concurrently), always lock the lower
+        # material id first would require knowing destination id up front,
+        # which isn't possible before this point (it may not exist yet).
+        # Kept as-is; flagged as a known limitation.
 
         material = await db.scalar(
             select(Material)
@@ -1454,6 +1489,13 @@ async def list_transfers(
     skip = max(skip, 0)
     limit = min(max(limit, 1), 100)
 
+    if (
+        project_id is not None
+        and current_user.role != UserRole.ADMIN.value
+        and (project_id not in (current_user.allowed_projects or []))
+    ):
+        raise HTTPException(403, "Access denied")
+
     FromProject = aliased(Project)
     ToProject = aliased(Project)
 
@@ -1550,6 +1592,12 @@ async def get_transfer(
 
     obj, material, from_project, to_project = row
 
+    if current_user.role != UserRole.ADMIN.value and (
+        obj.from_project_id not in (current_user.allowed_projects or [])
+        and obj.to_project_id not in (current_user.allowed_projects or [])
+    ):
+        raise HTTPException(403, "Access denied")
+
     return build_transfer_response(obj, material, from_project, to_project)
 
 
@@ -1578,6 +1626,21 @@ async def update_transfer_status(
 
     if not obj:
         raise HTTPException(404, "Transfer not found")
+
+    # NOTE: create_transfer() applies the stock/ledger movement immediately
+    # and marks the transfer COMPLETED. This endpoint only flips the status
+    # label — it does NOT reverse quantity_used/quantity_purchased or the
+    # ledger entries. Changing status away from COMPLETED here will leave
+    # inventory numbers out of sync with the displayed status. Block that
+    # until a proper reversal flow exists.
+    if obj.status == "COMPLETED" and status != "COMPLETED":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cannot change status of a completed transfer: stock has "
+                "already moved. Create a reverse transfer instead."
+            ),
+        )
 
     obj.status = status
 
@@ -1771,7 +1834,18 @@ async def usage(
 
         await db.commit()
 
-        await db.refresh(obj)
+        # Re-fetch with relationships eagerly loaded instead of db.refresh(),
+        # which can leave relationship attributes expired and trigger a
+        # MissingGreenlet lazy-load error under AsyncSession.
+        obj = await db.scalar(
+            select(Material)
+            .options(
+                selectinload(Material.supplier),
+                selectinload(Material.unit),
+                selectinload(Material.material_master),
+            )
+            .where(Material.id == material_id)
+        )
 
     except Exception:
         await db.rollback()
@@ -1874,7 +1948,6 @@ async def purchase(
 ):
     import uuid
     from decimal import Decimal, ROUND_HALF_UP
-    from sqlalchemy.orm import selectinload
 
     try:
 
@@ -2243,7 +2316,7 @@ async def adjust_inventory(
             Decimal("0"),
         )
 
-        audit_remark = f"Stock adjusted: " f"{old_stock} → {new_stock} | {reason}"
+        audit_remark = f"Stock adjusted: {old_stock} -> {new_stock} | {reason}"
 
         adjustment_total = abs(diff) * avg_rate
 
@@ -2319,17 +2392,30 @@ async def get_all_inventory(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
-    result = await db.execute(
+    # NOTE: `Material.unit` is a relationship, not a column - selecting it
+    # directly used to be a bug. Fixed by selecting `Material.unit_id` and
+    # joining Unit for the human-readable name.
+    query = (
         select(
             Material.id,
             Material.material_name,
             Material.remaining_stock,
-            Material.unit,
+            Material.unit_id,
+            Unit.name.label("unit_name"),
             Material.project_id,
             Material.total_amount,
             Material.quantity_purchased,
-        ).where(Material.is_deleted == False)
+        )
+        .outerjoin(Unit, Unit.id == Material.unit_id)
+        .where(Material.is_deleted == False)
     )
+
+    if current_user.role != UserRole.ADMIN.value:
+        query = query.where(
+            Material.project_id.in_(current_user.allowed_projects or [])
+        )
+
+    result = await db.execute(query)
 
     rows = result.all()
 
@@ -2353,7 +2439,8 @@ async def get_all_inventory(
                 "material_id": r.id,
                 "material_name": (r.material_name or "").strip().title(),
                 "remaining_stock": float(remaining),
-                "unit": r.unit,
+                "unit_id": r.unit_id,
+                "unit_name": r.unit_name or "",
                 "avg_rate": float(avg_rate),
                 "total_value": float(total_value),
                 "project_id": r.project_id,
@@ -2470,6 +2557,13 @@ async def logs(
 ):
     limit = min(max(limit, 1), 100)
 
+    if (
+        project_id is not None
+        and current_user.role != UserRole.ADMIN.value
+        and (project_id not in (current_user.allowed_projects or []))
+    ):
+        raise HTTPException(403, "Access denied")
+
     query = select(MaterialTransaction)
 
     if material_id is not None:
@@ -2477,6 +2571,10 @@ async def logs(
 
     if project_id is not None:
         query = query.where(MaterialTransaction.project_id == project_id)
+    elif current_user.role != UserRole.ADMIN.value:
+        query = query.where(
+            MaterialTransaction.project_id.in_(current_user.allowed_projects or [])
+        )
 
     if type is not None:
         query = query.where(MaterialTransaction.type == type.value)
@@ -2501,7 +2599,7 @@ async def logs(
             MaterialLogOut(
                 id=r.id,
                 material_id=r.material_id,
-                boq_item_id=r.boq_item_id,  # <-- Add this
+                boq_item_id=r.boq_item_id,
                 type=r.type.value,
                 quantity=float(round(quantity, 3)),
                 rate=float(round(rate, 2)),
@@ -2521,11 +2619,6 @@ async def logs(
 # ================= REPORTS =================
 
 
-from sqlalchemy.orm import selectinload
-from decimal import Decimal
-from typing import Optional
-
-
 @router.get(
     "/reports",
     response_model=MaterialReportResponse,
@@ -2542,6 +2635,11 @@ async def material_report(
 ):
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
+
+    if current_user.role != UserRole.ADMIN.value and project_id not in (
+        current_user.allowed_projects or []
+    ):
+        raise HTTPException(403, "Access denied")
 
     query = (
         select(Material)
@@ -2668,38 +2766,8 @@ async def material_report(
 
 # ======================PDF REPORT=============================================
 
-import os
-import uuid
 import tempfile
-from datetime import datetime
-from decimal import Decimal
-from typing import Optional
-
-from fastapi import APIRouter, Query, Depends, HTTPException
-from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import (
-    BaseDocTemplate,
-    Frame,
-    PageTemplate,
-    Paragraph,
-    Spacer,
-    Table,
-    TableStyle,
-)
-
-from app.db.session import get_db_session
-from app.models.material import Material, Supplier
-from app.models.master_data import Unit
-from app.models.project import Project
-from app.models.user import User
+from app.models.master_data import Unit as _UnitAlias  # noqa: F401 (kept for compat)
 
 # ─────────────────────────── SIMPLE COLOR PALETTE ─────────────────────────
 
@@ -2731,14 +2799,6 @@ def fmt(val, dec: int = 2) -> str:
 
 def rs(val, dec: int = 2) -> str:
     return f"\u20b9 {fmt(val, dec)}"
-
-
-def safe_delete(path: str):
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
 
 
 def alert_to_status(alert_type: str) -> str:
@@ -2916,7 +2976,6 @@ def _draw_simple_header(canvas_obj, doc):
     canvas_obj.saveState()
     w, h = A4
 
-    # Single flat header bar - no double-stacked bands
     canvas_obj.setFillColor(PRIMARY_DARK)
     canvas_obj.rect(0, h - 40, w, 40, fill=1, stroke=0)
 
@@ -2953,7 +3012,6 @@ def _draw_simple_header(canvas_obj, doc):
             w / 2, sub_y, datetime.utcnow().strftime("%d %B %Y")
         )
 
-    # Simple footer - one line only
     canvas_obj.setStrokeColor(BORDER_LIGHT)
     canvas_obj.setLineWidth(0.5)
     canvas_obj.line(18 * mm, 18, w - 18 * mm, 18)
@@ -3037,9 +3095,6 @@ def _build_pdf(
         given = m.payment_given or Decimal("0")
         advance = m.advance_amount or Decimal("0")
 
-        # Stock valuation basis: WEIGHTED AVERAGE COST (total_amount / qty purchased).
-        # Intentionally NOT material.purchase_rate, which is just one rate and
-        # doesn't reflect blended cost across multiple purchase orders.
         avg_rate = compute_avg_rate(total_amt, purchased)
         value = remaining * avg_rate
 
@@ -3128,7 +3183,7 @@ def _build_pdf(
     )
     elements.append(Spacer(1, 16))
 
-    # ── MATERIAL DETAILS TABLE (cleaned up: clearer columns, less crowding) ─
+    # ── MATERIAL DETAILS TABLE ───────────────────────────────────────────
     elements.append(_section_header("MATERIAL DETAILS", s, DW))
     elements.append(Spacer(1, 8))
 
@@ -3345,6 +3400,11 @@ async def export_pdf(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
     try:
+        if current_user.role != UserRole.ADMIN.value and project_id not in (
+            current_user.allowed_projects or []
+        ):
+            raise HTTPException(403, "Access denied")
+
         query = (
             select(Material, Supplier.supplier_name, Unit.name)
             .join(Supplier, Supplier.id == Material.supplier_id, isouter=True)
@@ -3388,8 +3448,6 @@ async def export_pdf(
 
 
 # ─────────────────────────── EXCEL ENDPOINT ──────────────────────────────
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 
 
@@ -3403,6 +3461,11 @@ async def export_excel(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
     try:
+        if current_user.role != UserRole.ADMIN.value and project_id not in (
+            current_user.allowed_projects or []
+        ):
+            raise HTTPException(403, "Access denied")
+
         project = await db.get(Project, project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
@@ -3445,7 +3508,7 @@ async def export_excel(
         title_font = Font(bold=True, size=14, color="1F2937")
         subtitle_font = Font(size=10, color="6B7280")
 
-        # ── TITLE (simple, 2 lines only) ────────────────────────────────────
+        # ── TITLE ────────────────────────────────────────────────────
         ws.merge_cells("A1:K1")
         ws["A1"] = "MATERIAL INVENTORY REPORT"
         ws["A1"].font = title_font
@@ -3462,11 +3525,6 @@ async def export_excel(
 
         row = 4
 
-        # ── CALCULATE TOTALS (single pass, all keys tracked correctly) ─────
-        # NOTE: stock valuation uses WEIGHTED AVERAGE COST
-        #   avg_rate = total_amount / quantity_purchased
-        #   stock_value = remaining_stock * avg_rate
-        # This is intentional — see compute_avg_rate() docstring above.
         totals = {
             k: Decimal("0")
             for k in [
@@ -3498,15 +3556,13 @@ async def export_excel(
             totals["paid"] += material.payment_given or Decimal("0")
             totals["pending"] += material.payment_pending or Decimal("0")
             totals["advance"] += material.advance_amount or Decimal("0")
-            totals[
-                "purchase_cost"
-            ] += total_amt  # FIX: accumulate real cost, not qty*last_rate
+            totals["purchase_cost"] += total_amt
 
             status = alert_to_status(material.alert_type)
             status_counts[status] += 1
             computed_rows.append((material, supplier_name, unit_name, avg_rate, value))
 
-        # ── SUMMARY (one compact row) ───────────────────────────────────────
+        # ── SUMMARY ───────────────────────────────────────
         ws.merge_cells(f"A{row}:D{row}")
         ws[f"A{row}"] = "INVENTORY SUMMARY"
         ws[f"A{row}"].font = Font(bold=True, size=10, color="1F2937")
@@ -3531,7 +3587,7 @@ async def export_excel(
 
         row += 3
 
-        # ── DATA TABLE (trimmed to the columns that matter) ─────────────────
+        # ── DATA TABLE ─────────────────────────────────────────
         headers = [
             "ID",
             "Material",
@@ -3588,7 +3644,7 @@ async def export_excel(
                     cell.fill = fill
             row += 1
 
-        # ── TOTALS ROW (FIXED: uses accumulated totals, not stray avg_rate) ─
+        # ── TOTALS ROW ─────────────────────────────────────
         total_row = row
         ws.cell(total_row, 2, "TOTAL").font = Font(bold=True, color="1F2937")
         ws.cell(total_row, 6, float(totals["purchased"])).font = Font(bold=True)
@@ -3667,12 +3723,12 @@ async def price_history(
     for rate, created_at in rows:
         rate = rate or Decimal("0")
 
-        #  avoid float precision issue
+        # avoid float precision issue
         if last_rate is None or rate != last_rate:
             history.append(
                 {
                     "rate": float(round(rate, 2)),
-                    "date": created_at.strftime("%Y-%m-%d %H:%M"),  # ✅ clean format
+                    "date": created_at.strftime("%Y-%m-%d %H:%M"),
                 }
             )
             last_rate = rate
@@ -3704,6 +3760,11 @@ async def create_material(
             status_code=404,
             detail="Project not found",
         )
+
+    if current_user.role != UserRole.ADMIN.value and payload.project_id not in (
+        current_user.allowed_projects or []
+    ):
+        raise HTTPException(403, "Access denied")
 
     # ================= SUPPLIER VALIDATION =================
 
@@ -3783,6 +3844,9 @@ async def create_material(
     data["material_name"] = material_master.name
     data["category"] = material_master.category or "GENERAL"
     data["unit_id"] = material_master.unit_id
+    data["purchase_rate"] = (
+        rate  # keep the quantized/validated Decimal, not raw payload value
+    )
 
     # ================= GENERATE MATERIAL CODE =================
 
@@ -3913,8 +3977,6 @@ async def create_material(
 
 # =================list_materials=========================
 
-from sqlalchemy.orm import selectinload
-
 
 @router.get("", response_model=list[MaterialOut])
 async def list_materials(
@@ -3928,7 +3990,7 @@ async def list_materials(
     limit = min(max(limit, 1), 100)
 
     if (
-        project_id
+        project_id is not None
         and current_user.role != UserRole.ADMIN.value
         and project_id not in (current_user.allowed_projects or [])
     ):
@@ -3956,9 +4018,13 @@ async def list_materials(
         )
     )
 
-    if project_id:
+    if project_id is not None:
         query = query.where(
             Material.project_id == project_id,
+        )
+    elif current_user.role != UserRole.ADMIN.value:
+        query = query.where(
+            Material.project_id.in_(current_user.allowed_projects or [])
         )
 
     query = query.order_by(Material.id.desc()).offset(skip).limit(limit)
@@ -3976,9 +4042,6 @@ async def list_materials(
 
 
 # ==============get_material=================
-
-
-from sqlalchemy.orm import selectinload
 
 
 @router.get("/{material_id}", response_model=MaterialOut)
@@ -4033,9 +4096,6 @@ async def get_material(
 
 
 # =============update_material==================
-
-
-from sqlalchemy.orm import selectinload
 
 
 @router.put("/{material_id}", response_model=MaterialOut)
@@ -4297,6 +4357,7 @@ async def delete_material(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     redis=Depends(get_request_redis),
 ):
+
     obj = await db.scalar(
         select(Material).where(
             Material.id == material_id,
@@ -4310,43 +4371,19 @@ async def delete_material(
             detail="Material not found",
         )
 
-    # =====================================================
-    # OPTIONAL PROJECT ACCESS CHECK
-    # =====================================================
-
-    if (
-        hasattr(current_user, "allowed_projects")
-        and current_user.role != UserRole.ADMIN.value
-        and current_user.allowed_projects
-        and obj.project_id not in current_user.allowed_projects
+    if current_user.role != UserRole.ADMIN.value and obj.project_id not in (
+        current_user.allowed_projects or []
     ):
         raise HTTPException(
             status_code=403,
             detail="Access denied",
         )
 
-    # =====================================================
-    # CHECK TRANSACTIONS EXIST
-    # =====================================================
-
-    transaction_exists = await db.scalar(
-        select(exists().where(MaterialTransaction.material_id == obj.id))
-    )
-
-    if transaction_exists:
-        raise HTTPException(
-            status_code=400,
-            detail=("Cannot delete material. " "Transactions already exist."),
-        )
-
     try:
-
         obj.is_deleted = True
-
         await db.commit()
 
     except Exception:
-
         await db.rollback()
         raise
 

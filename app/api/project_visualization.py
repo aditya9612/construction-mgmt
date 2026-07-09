@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, UploadFile, File, Form, Query
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import os
@@ -40,8 +41,11 @@ async def upload_visualization(
     file_name = f"{viz_id}{file_ext}"
     file_path = os.path.join(UPLOAD_DIR, file_name)
     
-    with open(file_path, "wb") as buffer:
-        buffer.write(await image_file.read())
+    def _save_vis():
+        with open(file_path, "wb") as buffer:
+            buffer.write(image_file.file.read())
+            
+    await run_in_threadpool(_save_vis)
     
     image_url = f"/uploads/visualizations/{file_name}"
 

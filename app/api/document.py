@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query, File, UploadFile, Form
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.responses import StreamingResponse, FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
 from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
@@ -92,8 +93,11 @@ async def create_document(
     file_path = UPLOAD_DIR / unique_filename
 
     # Save file
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    def _save_file():
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+    await run_in_threadpool(_save_file)
 
     file_size = os.path.getsize(file_path)
 
@@ -300,8 +304,11 @@ async def update_document(
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         file_path = UPLOAD_DIR / unique_filename
 
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        def _save_updated_file():
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+                
+        await run_in_threadpool(_save_updated_file)
 
         obj.file_url = str(file_path)
         obj.file_size = os.path.getsize(file_path)

@@ -135,6 +135,12 @@ async def approve(
         if bill:
             bill.status = "Approved"
 
+    elif obj.entity_type == "journal_entry":
+        from app.models.accountant import JournalEntry
+        journal = await db.get(JournalEntry, obj.entity_id)
+        if journal:
+            journal.status = "Posted"
+
     elif obj.entity_type == "boq":
         from app.models.boq import BOQ
 
@@ -223,6 +229,12 @@ async def reject(
         bill = await db.get(RABill, obj.entity_id)
         if bill:
             bill.status = "Rejected"
+
+    elif obj.entity_type == "journal_entry":
+        from app.models.accountant import JournalEntry
+        journal = await db.get(JournalEntry, obj.entity_id)
+        if journal:
+            journal.status = "Rejected"
 
     elif obj.entity_type == "boq":
         from app.models.boq import BOQ

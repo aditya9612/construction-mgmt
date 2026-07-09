@@ -8,6 +8,17 @@ def get_utc_now() -> datetime:
     """Returns the current aware UTC datetime."""
     return datetime.now(timezone.utc)
 
+def get_local_now() -> datetime:
+    """Returns the current aware local datetime."""
+    return datetime.now(LOCAL_TZ)
+
+def get_naive_local_now() -> datetime:
+    """
+    Returns the current local datetime as a naive datetime object.
+    Used for inserting directly into naive MySQL DATETIME columns.
+    """
+    return datetime.now(LOCAL_TZ).replace(tzinfo=None)
+
 def normalize_to_utc(dt: datetime) -> datetime:
     """
     Normalizes a datetime to an aware UTC datetime.

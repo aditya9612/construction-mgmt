@@ -84,6 +84,7 @@ class Invoice(Base):
     # Meta
     description = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     # Relationships
     transactions = relationship(
@@ -93,6 +94,12 @@ class Invoice(Base):
     )
 
     quotation = relationship("QuotationMaster", lazy="selectin")
+
+    payments = relationship(
+        "ClientPayment",
+        back_populates="invoice",
+        cascade="all, delete-orphan",
+    )
 
 
 # ===================== TRANSACTION =====================
@@ -120,6 +127,7 @@ class Transaction(Base):
     # Audit
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     # Relationship
     invoice = relationship("Invoice", back_populates="transactions")

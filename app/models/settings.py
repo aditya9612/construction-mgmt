@@ -71,3 +71,12 @@ class CompanySettings(Base, TimestampMixin):
     signature_image: Mapped[str | None] = mapped_column(String(500))
 
     terms_conditions: Mapped[str | None] = mapped_column(Text)
+
+    primary_cash_account_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("accounts.id"), nullable=True)
+    petty_cash_account_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("accounts.id"), nullable=True)
+
+    wages_account_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("accounts.id"), nullable=True)
+    staff_salary_account_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("accounts.id"), nullable=True)
+    contractor_expense_account_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("accounts.id"), nullable=True)
+    tds_payable_account_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("accounts.id"), nullable=True)
+    retention_payable_account_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("accounts.id"), nullable=True)

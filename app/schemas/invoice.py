@@ -1,12 +1,12 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date, datetime
-from app.core.enums import InvoiceStatus
 from app.core.enums import (
     InvoiceStatus,
     InvoiceType,
     InvoiceSourceType,
 )
+from decimal import Decimal
 
 
 class InvoiceBase(BaseModel):
@@ -75,3 +75,78 @@ class AnalyticsSummaryOut(BaseModel):
     financial_progress_percent: float
     total_expense: float
     total_revenue: float
+
+class ReceivablesSummaryOut(BaseModel):
+    portfolio_value: float
+    total_billed: float
+    total_received: float
+    pending_amount: float
+    overdue_amount: float
+
+class ManualReceivableCreate(BaseModel):
+    client_id: int
+    amount: float
+    description: str
+    due_date: date
+    reference: Optional[str] = None
+
+class ClientLedgerTransactionOut(BaseModel):
+    date: datetime
+    particulars: str
+    debit: float
+    credit: float
+    running_balance: float
+
+class ClientLedgerResponse(BaseModel):
+    total_billed: float
+    total_received: float
+    outstanding: float
+    transactions: list[ClientLedgerTransactionOut]
+
+class CollectionOut(BaseModel):
+    invoice_no: str
+    client: str
+    amount_received: float
+    received_on: datetime
+    mode: str
+    reference: str
+    status: str
+
+
+class CreateInvoice(BaseModel):
+    project_id: int
+
+    owner_id: int
+
+    amount: Decimal = Field(gt=0)
+
+    gst_percent: Decimal = Field(default=0)
+
+    tax_percent: Decimal = Field(default=0)
+
+    description: Optional[str] = None
+
+
+class SendInvoiceResponse(BaseModel):
+
+    message: str
+
+    invoice_id: int
+
+    client_user_id: int
+
+
+class InvoiceList(BaseModel):
+
+    total: int
+
+    items: list[InvoiceOut]
+
+
+class InvoiceFilter(BaseModel):
+
+    project_id: Optional[int] = None
+
+    owner_id: Optional[int] = None
+
+    status: Optional[InvoiceStatus] = None

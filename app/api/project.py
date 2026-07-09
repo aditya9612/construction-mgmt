@@ -7,6 +7,7 @@ from ezdxf import colors
 from openpyxl import Workbook
 from typing import Annotated, List, Optional, Union
 from fastapi import APIRouter, Depends, Query, Request, Form
+from starlette.concurrency import run_in_threadpool
 from openpyxl.styles import Alignment, Font, PatternFill
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import (
@@ -147,7 +148,7 @@ TASK_WRITE_ROLES = [
 TASK_DELETE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
 
 TASK_REQUEST_ROLES = [
-    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER, UserRole.PROJECT_MANAGER , UserRole.LABOUR ]
+    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER, UserRole.LABOUR ]
 ]
 
 DSR_WRITE_ROLES = [
@@ -2261,34 +2262,624 @@ class ReportsService:
         project_id: int,
         current_user: User,
     ):
-        data = await self.get_project_data(db, project_id, current_user)
+        from app.models.boq import BOQ
+        from app.models.expense import Expense
+        from app.models.invoice import Invoice
+        from app.models.owner import Owner
+        from sqlalchemy import select, func
+        from sqlalchemy.orm import selectinload
+        from app.models import project as m
+        from app.models.user import User as UserModel, UserRole
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        project = await self.projects_repo.get_project(db, project_id)
+
+        if not project:
+            raise NotFoundError("Project not found")
+
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+
+        owner = None
+
+        if project.owner_id:
+            owner = await db.scalar(
+                select(Owner).where(
+                    Owner.id == project.owner_id
+                )
+            )
+
+        # =====================================
+        # Financial Data
+        # =====================================
+
+        total_boq = await db.scalar(
+            select(func.sum(BOQ.total_cost))
+            .where(BOQ.project_id == project_id)
+        )
+
+        total_invoice = await db.scalar(
+            select(func.sum(Invoice.total_amount))
+            .where(Invoice.project_id == project_id)
+        )
+
+        total_expense = await db.scalar(
+            select(func.sum(Expense.amount))
+            .where(Expense.project_id == project_id)
+        )
+
+        boq_value = float(total_boq or 0)
+        invoice_value = float(total_invoice or 0)
+        expense_value = float(total_expense or 0)
+
+        profit = invoice_value - expense_value
+        outstanding = boq_value - invoice_value
+
+        # =====================================
+        # Tasks
+        # =====================================
+
+        tasks = (
+            (
+                await db.execute(
+                    select(m.Task)
+                    .options(
+                        selectinload(m.Task.assignments)
+                        .joinedload(m.TaskAssignment.user)
+                    )
+                    .where(m.Task.project_id == project_id)
+                )
+            )
+            .scalars()
+            .unique()
+            .all()
+        )
+
+        total_tasks = len(tasks)
+
+        completed_tasks = sum(
+            1
+            for t in tasks
+            if (
+                hasattr(t.status, "value")
+                and t.status.value == "Completed"
+            )
+            or str(t.status) == "Completed"
+        )
+
+        pending_tasks = sum(
+            1
+            for t in tasks
+            if (
+                hasattr(t.status, "value")
+                and t.status.value in [
+                    "Pending",
+                    "In Progress",
+                ]
+            )
+            or str(t.status) in [
+                "Pending",
+                "In Progress",
+            ]
+        )
+
+        delayed_tasks = sum(
+            1
+            for t in tasks
+            if (
+                hasattr(t.status, "value")
+                and t.status.value == "Delayed"
+            )
+            or str(t.status) == "Delayed"
+        )
+
+        average_progress = (
+            sum(
+                getattr(
+                    t,
+                    "completion_percentage",
+                    0,
+                )
+                for t in tasks
+            )
+            / total_tasks
+            if total_tasks
+            else 0
+        )
+
+        # =====================================
+        # Milestones
+        # =====================================
+
+        milestones = (
+            (
+                await db.execute(
+                    select(m.Milestone)
+                    .where(
+                        m.Milestone.project_id == project_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        total_milestones = len(milestones)
+
+        completed_milestones = sum(
+            1
+            for ms in milestones
+            if (
+                hasattr(ms.status, "value")
+                and ms.status.value == "Completed"
+            )
+            or str(ms.status) == "Completed"
+        )
+
+        # =====================================
+        # Team Members
+        # =====================================
+
+        members_query = (
+            select(UserModel)
+            .join(
+                m.ProjectMember,
+                m.ProjectMember.user_id == UserModel.id,
+            )
+            .where(
+                m.ProjectMember.project_id == project_id
+            )
+        )
+
+        members_result = await db.execute(
+            members_query
+        )
+
+        members = []
+
+        manager = "N/A"
+        supervisor = "N/A"
+
+        for user in members_result.scalars().all():
+
+            role = (
+                user.role.value
+                if hasattr(user.role, "value")
+                else str(user.role)
+            )
+
+            members.append(
+                {
+                    "name": user.full_name,
+                    "role": role,
+                    "phone": getattr(
+                        user,
+                        "phone",
+                        "N/A",
+                    ),
+                    "email": user.email,
+                }
+            )
+
+            if role == UserRole.PROJECT_MANAGER.value:
+                manager = user.full_name
+
+            elif role == UserRole.SITE_ENGINEER.value:
+                supervisor = user.full_name
+
+        # =====================================
+        # Workbook
+        # =====================================
 
         wb = Workbook()
         ws = wb.active
         ws.title = "Project Report"
 
-        headers = ["ID", "Name", "Status", "Start Date", "End Date"]
-        ws.append(headers)
+        # =====================================
+        # Styles
+        # =====================================
 
-        ws.append(
-            [
-                data["id"],
-                data["name"],
-                str(data["status"]),
-                str(data["start_date"]),
-                str(data["end_date"]),
-            ]
+        title_font = Font(
+            bold=True,
+            size=18,
+            color="1F4E78",
         )
 
+        section_font = Font(
+            bold=True,
+            color="FFFFFF",
+        )
+
+        header_font = Font(
+            bold=True,
+        )
+
+        blue_fill = PatternFill(
+            fill_type="solid",
+            fgColor="1F4E78",
+        )
+
+        header_fill = PatternFill(
+            fill_type="solid",
+            fgColor="D9EAD3",
+        )
+
+        center = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+
+        left = Alignment(
+            horizontal="left",
+            vertical="center",
+        )
+
+        # =====================================
+        # Title
+        # =====================================
+
+        ws.merge_cells("A1:F1")
+
+        cell = ws["A1"]
+        cell.value = "PROJECT REPORT"
+        cell.font = title_font
+        cell.alignment = center
+
+        row = 3
+
+        # =====================================
+        # Project Information
+        # =====================================
+
+        ws.merge_cells(f"A{row}:F{row}")
+
+        cell = ws[f"A{row}"]
+        cell.value = "1. PROJECT INFORMATION"
+        cell.fill = blue_fill
+        cell.font = section_font
+
+        row += 1
+
+        project_rows = [
+            [
+                "Project Name",
+                project.project_name,
+                "Project Code",
+                project.business_id,
+            ],
+            [
+                "Client Name",
+                owner.owner_name if owner else "N/A",
+                "Project Type",
+                str(project.type) if project.type else "N/A",
+            ],
+            [
+                "Location",
+                f"{project.city or ''}, {project.state or ''}",
+                "Current Status",
+                str(project.status),
+            ],
+            [
+                "Start Date",
+                str(project.start_date),
+                "Planned End Date",
+                str(project.end_date),
+            ],
+            [
+                "Project Manager",
+                manager,
+                "Site Supervisor",
+                supervisor,
+            ],
+        ]
+
+        for data in project_rows:
+
+            ws.append(data)
+
+            current = ws.max_row
+
+            ws[f"A{current}"].font = header_font
+            ws[f"C{current}"].font = header_font
+
+        # =====================================
+        # Executive Summary
+        # =====================================
+
+        row = ws.max_row + 2
+
+        ws.merge_cells(f"A{row}:F{row}")
+
+        cell = ws[f"A{row}"]
+        cell.value = "2. EXECUTIVE SUMMARY"
+        cell.fill = blue_fill
+        cell.font = section_font
+
+        row += 1
+
+        summary_rows = [
+            [
+                "Overall Progress",
+                f"{round(average_progress)}%",
+            ],
+            [
+                "Total Tasks",
+                total_tasks,
+            ],
+            [
+                "Completed Tasks",
+                completed_tasks,
+            ],
+            [
+                "Milestones",
+                f"{completed_milestones} / {total_milestones}",
+            ],
+            [
+                "Team Members",
+                len(members),
+            ],
+        ]
+
+        for item in summary_rows:
+
+            ws.append(item)
+
+            current = ws.max_row
+
+            ws[f"A{current}"].font = header_font
+
+        # =====================================
+        # Financial Overview
+        # =====================================
+
+        row = ws.max_row + 2
+
+        ws.merge_cells(f"A{row}:F{row}")
+
+        cell = ws[f"A{row}"]
+        cell.value = "3. FINANCIAL OVERVIEW"
+        cell.fill = blue_fill
+        cell.font = section_font
+
+        row += 1
+
+        financial_rows = [
+            [
+                "Total BOQ Value",
+                boq_value,
+            ],
+            [
+                "Total Invoiced",
+                invoice_value,
+            ],
+            [
+                "Total Expenses",
+                expense_value,
+            ],
+            [
+                "Net Profit",
+                profit,
+            ],
+            [
+                "Outstanding Amount",
+                outstanding,
+            ],
+        ]
+
+        for item in financial_rows:
+
+            ws.append(item)
+
+            current = ws.max_row
+
+            ws[f"A{current}"].font = header_font
+
+        # =====================================
+        # Tasks
+        # =====================================
+
+        row = ws.max_row + 2
+
+        ws.merge_cells(f"A{row}:F{row}")
+
+        cell = ws[f"A{row}"]
+        cell.value = "4. TASK DETAILS"
+        cell.fill = blue_fill
+        cell.font = section_font
+
+        row += 1
+
+        task_headers = [
+            "Task",
+            "Assigned To",
+            "Start Date",
+            "End Date",
+            "Status",
+            "Progress %",
+        ]
+
+        ws.append(task_headers)
+
+        header_row = ws.max_row
+
+        for col in range(1, 7):
+            c = ws.cell(row=header_row, column=col)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+
+        for task in tasks:
+
+            assignee = (
+                ", ".join(
+                    [
+                        a.user.full_name
+                        for a in task.assignments
+                        if a.user and a.user.full_name
+                    ]
+                )
+                if task.assignments
+                else "Unassigned"
+            )
+
+            ws.append(
+                [
+                    task.title,
+                    assignee,
+                    str(task.start_date or ""),
+                    str(task.end_date or ""),
+                    task.status.value
+                    if hasattr(task.status, "value")
+                    else str(task.status),
+                    getattr(task, "completion_percentage", 0),
+                ]
+            )
+
+        # =====================================
+        # Milestones
+        # =====================================
+
+        row = ws.max_row + 2
+
+        ws.merge_cells(f"A{row}:E{row}")
+
+        cell = ws[f"A{row}"]
+        cell.value = "5. MILESTONES"
+        cell.fill = blue_fill
+        cell.font = section_font
+
+        row += 1
+
+        milestone_headers = [
+            "Milestone",
+            "End Date",
+            "Status",
+            "Completion %",
+        ]
+
+        ws.append(milestone_headers)
+
+        header_row = ws.max_row
+
+        for col in range(1, 5):
+            c = ws.cell(row=header_row, column=col)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+
+        for ms in milestones:
+
+            ws.append(
+                [
+                    ms.title,
+                    str(ms.end_date or ""),
+                    ms.status.value
+                    if hasattr(ms.status, "value")
+                    else str(ms.status),
+                    getattr(ms, "completion_percentage", 0),
+                ]
+            )
+
+        # =====================================
+        # Team Members
+        # =====================================
+
+        row = ws.max_row + 2
+
+        ws.merge_cells(f"A{row}:E{row}")
+
+        cell = ws[f"A{row}"]
+        cell.value = "6. TEAM MEMBERS"
+        cell.fill = blue_fill
+        cell.font = section_font
+
+        row += 1
+
+        member_headers = [
+            "Name",
+            "Role",
+            "Phone",
+            "Email",
+        ]
+
+        ws.append(member_headers)
+
+        header_row = ws.max_row
+
+        for col in range(1, 5):
+            c = ws.cell(row=header_row, column=col)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+
+        for member in members:
+
+            ws.append(
+                [
+                    member["name"],
+                    member["role"],
+                    member["phone"],
+                    member["email"],
+                ]
+            )
+
+        # =====================================
+        # Auto Width
+        # =====================================
+        from openpyxl.utils import get_column_letter
+
+        for col in range(1, ws.max_column + 1):
+
+            max_length = 0
+            column_letter = get_column_letter(col)
+
+            for row in range(1, ws.max_row + 1):
+
+                cell = ws.cell(row=row, column=col)
+
+                if cell.value is not None:
+
+                    max_length = max(
+                        max_length,
+                        len(str(cell.value))
+                    )
+
+            ws.column_dimensions[column_letter].width = min(
+                max_length + 4,
+                40,
+            )
+
+        # =====================================
+        # Freeze Header
+        # =====================================
+
+        ws.freeze_panes = "A2"
+
+        # =====================================
+        # Save Workbook
+        # =====================================
+
         stream = io.BytesIO()
+
         wb.save(stream)
+
         stream.seek(0)
 
         return StreamingResponse(
             stream,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=project.xlsx"},
+            headers={
+                "Content-Disposition": (
+                    f"attachment; "
+                    f"filename=Project_Report_{project.business_id}.xlsx"
+                )
+            },
         )
+
 
     async def export_pdf(
         self,
@@ -3140,7 +3731,7 @@ async def get_project_logs(
     
     return logs[offset:offset+limit]
 
-@router.get("/projects/{project_id}/photos")
+@router.get("/{project_id}/photos")
 async def get_project_photos(
     project_id: int,
     current_user: User = Depends(require_roles(READ_ROLES)),
@@ -3404,9 +3995,11 @@ async def create_task(
 
         filepath = os.path.join(AUDIO_DIR, filename)
 
-        with open(filepath, "wb") as buffer:
-
-            shutil.copyfileobj(audio_file.file, buffer)
+        def _save_audio():
+            with open(filepath, "wb") as buffer:
+                shutil.copyfileobj(audio_file.file, buffer)
+                
+        await run_in_threadpool(_save_audio)
 
         audio_instruction_url = filepath.replace("\\", "/")
 
@@ -3434,9 +4027,11 @@ async def create_task(
 
         filepath = os.path.join(IMAGE_DIR, filename)
 
-        with open(filepath, "wb") as buffer:
-
-            shutil.copyfileobj(instruction_image.file, buffer)
+        def _save_image():
+            with open(filepath, "wb") as buffer:
+                shutil.copyfileobj(instruction_image.file, buffer)
+                
+        await run_in_threadpool(_save_image)
 
         instruction_image_url = filepath.replace("\\", "/")
 
@@ -3547,9 +4142,11 @@ async def update_task(
 
         filepath = os.path.join(AUDIO_DIR, filename)
 
-        with open(filepath, "wb") as buffer:
-
-            shutil.copyfileobj(audio_file.file, buffer)
+        def _save_update_audio():
+            with open(filepath, "wb") as buffer:
+                shutil.copyfileobj(audio_file.file, buffer)
+                
+        await run_in_threadpool(_save_update_audio)
 
         audio_instruction_url = filepath.replace("\\", "/")
 
@@ -3576,9 +4173,11 @@ async def update_task(
 
         filepath = os.path.join(IMAGE_DIR, filename)
 
-        with open(filepath, "wb") as buffer:
-
-            shutil.copyfileobj(instruction_image.file, buffer)
+        def _save_update_image():
+            with open(filepath, "wb") as buffer:
+                shutil.copyfileobj(instruction_image.file, buffer)
+                
+        await run_in_threadpool(_save_update_image)
 
         instruction_image_url = filepath.replace("\\", "/")
 
@@ -3614,7 +4213,7 @@ async def update_status(
     project_id: int,
     task_id: int,
     payload: s.TaskStatusUpdate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     service: TasksService = Depends(get_tasks_service),
 ):
@@ -3722,7 +4321,7 @@ async def list_task_progress_history(
     )
 
 
-@tasks_router.post("/", response_model=s.TaskRequestResponse)
+@tasks_router.post("/task-requests", response_model=s.TaskRequestResponse)
 async def create_task_request(
     request: s.TaskRequestCreate,
     db: AsyncSession = Depends(get_db_session),
@@ -3734,7 +4333,7 @@ async def create_task_request(
     await db.refresh(db_obj)
     return db_obj
 
-@tasks_router.get("/", response_model=List[s.TaskRequestResponse])
+@tasks_router.get("/task-requests", response_model=List[s.TaskRequestResponse])
 async def get_task_requests(
     project_id: int = Query(None, description="Filter by project ID"),
     status: str = Query(None, description="Filter by status"),
@@ -3758,7 +4357,7 @@ async def get_task_requests(
     task_requests = result.scalars().all()
     return list(task_requests)
 
-@tasks_router.put("/{request_id}", response_model=s.TaskRequestResponse)
+@tasks_router.put("/task-requests/{request_id}", response_model=s.TaskRequestResponse)
 async def update_task_request(
     request_id: int,
     request: s.TaskRequestUpdate,
@@ -3779,7 +4378,7 @@ async def update_task_request(
     await db.refresh(db_obj)
     return db_obj
 
-@tasks_router.delete("/{request_id}", status_code=204)
+@tasks_router.delete("/task-requests/{request_id}", status_code=204)
 async def delete_task_request(
     request_id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -3804,7 +4403,7 @@ async def create_comment(
     project_id: int,
     task_id: int,
     payload: s.CommentCreate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
@@ -4018,8 +4617,11 @@ async def create_dsr(
                         filename = f"{uuid.uuid4()}_{safe_name}"
                         path = os.path.join(upload_dir, filename).replace("\\", "/")
 
-                        with open(path, "wb") as f:
-                            f.write(content)
+                        def _save_dsr():
+                            with open(path, "wb") as f:
+                                f.write(content)
+                                
+                        await run_in_threadpool(_save_dsr)
 
                         photo = m.DSRPhoto(dsr_id=obj.id, file_url=path)
                         db.add(photo)
@@ -8165,7 +8767,7 @@ async def validate_and_save_qc_file(file: UploadFile) -> str:
 
     file.file.seek(0)
 
-    return save_qc_file(file)
+    return await run_in_threadpool(save_qc_file, file)
 
 
 qc_router = APIRouter(prefix="/qc", tags=["QC"])
@@ -8651,8 +9253,11 @@ async def upload_photo(
     file_path = os.path.join(UPLOAD_DIR, filename)
 
     #  Save file
-    with open(file_path, "wb") as f:
-        f.write(content)
+    def _save_site_photo():
+        with open(file_path, "wb") as f:
+            f.write(content)
+            
+    await run_in_threadpool(_save_site_photo)
 
     #  Store URL (NOT raw path)
     file_url = f"/uploads/site_photos/{filename}"
@@ -8808,8 +9413,11 @@ async def upload_drawing(
 
         # ================= SAVE FILE =================
 
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
+        def _save_drawing():
+            with open(file_path, "wb") as f:
+                f.write(file.file.read())
+                
+        await run_in_threadpool(_save_drawing)
 
         # ================= GET NEXT REVISION =================
 
@@ -8947,6 +9555,82 @@ async def get_drawing_approval_history(
         }
         for approval in approvals
     ]
+
+
+#===================== List Drawings =====================
+@drawing_router.get("", response_model=PaginatedResponse[s.DrawingOut])
+async def list_drawings(
+    project_id: int = Query(..., gt=0),
+    parent_id: Optional[int] = Query(None),
+    search: Optional[str] = Query(None),
+    approval_status: Optional[DocumentStatus] = Query(None),
+    latest_only: bool = Query(True),
+    is_folder: Optional[bool] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    stmt = select(m.DrawingDocument).where(
+        m.DrawingDocument.project_id == project_id
+    )
+    count_stmt = (
+        select(func.count())
+        .select_from(m.DrawingDocument)
+        .where(m.DrawingDocument.project_id == project_id)
+    )
+    if parent_id is not None:
+        stmt = stmt.where(m.DrawingDocument.parent_id == parent_id)
+        count_stmt = count_stmt.where(
+            m.DrawingDocument.parent_id == parent_id
+        )
+    if search:
+        stmt = stmt.where(
+            m.DrawingDocument.drawing_name.ilike(f"%{search}%")
+        )
+        count_stmt = count_stmt.where(
+            m.DrawingDocument.drawing_name.ilike(f"%{search}%")
+        )
+    if approval_status:
+        stmt = stmt.where(
+            m.DrawingDocument.approval_status == approval_status
+        )
+        count_stmt = count_stmt.where(
+            m.DrawingDocument.approval_status == approval_status
+        )
+    if latest_only:
+        stmt = stmt.where(
+            m.DrawingDocument.is_latest_version.is_(True)
+        )
+        count_stmt = count_stmt.where(
+            m.DrawingDocument.is_latest_version.is_(True)
+        )
+    if is_folder is not None:
+        stmt = stmt.where(
+            m.DrawingDocument.is_folder == is_folder
+        )
+        count_stmt = count_stmt.where(
+            m.DrawingDocument.is_folder == is_folder
+        )
+    stmt = (
+        stmt.order_by(
+            m.DrawingDocument.is_folder.desc(),
+            m.DrawingDocument.created_at.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+    result = await db.execute(stmt)
+    items = result.scalars().all()
+    total = await db.scalar(count_stmt)
+    return PaginatedResponse[s.DrawingOut](
+        items=items,
+        meta=PaginationMeta(
+            total=total or 0,
+            limit=limit,
+            offset=offset,
+        ),
+    )
 
 
 # ===================== Version History =====================

@@ -1,10 +1,24 @@
-from sqlalchemy import Column, Date, Index, Integer, String, ForeignKey, Enum, DECIMAL, DateTime
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    Index,
+    Integer,
+    String,
+    ForeignKey,
+    Enum,
+    DECIMAL,
+    DateTime,
+    func,
+    JSON,
+)
 from sqlalchemy.orm import relationship
 from datetime import datetime
 import enum
 from sqlalchemy import Text
 from app.core.enums import AccountType
 from app.models.base import Base
+
 
 # ===================== CHART OF ACCOUNTS =====================
 class Account(Base):
@@ -17,12 +31,20 @@ class Account(Base):
 
     type = Column(Enum(AccountType), nullable=False)
 
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
     parent_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
     parent = relationship("Account", remote_side=[id])
 
-    __table_args__ = (
-        Index('ix_accounts_code', 'code'),
-    )
+    __table_args__ = (Index("ix_accounts_code", "code"),)
 
 
 # ===================== JOURNAL ENTRY =====================
@@ -32,14 +54,30 @@ class JournalEntry(Base):
     id = Column(Integer, primary_key=True)
 
     description = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    lines = relationship(
-        "JournalLine",
-        back_populates="entry",
-        cascade="all, delete-orphan"
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
     )
 
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False
+    )
+    journal_number = Column(String(100), index=True)
+    entry_date = Column(Date)
+    status = Column(String(50), server_default='Posted')
+    entry_type = Column(String(50), server_default='Auto')
+    created_by = Column(Integer, ForeignKey("users.id"))
+    lines = relationship(
+        "JournalLine", back_populates="entry", cascade="all, delete-orphan"
+    )
+
+    # created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # reference_type = Column(String(50), nullable=True)
+    # reference_id = Column(Integer, nullable=True)
 
 # ===================== JOURNAL LINES =====================
 class JournalLine(Base):
@@ -55,9 +93,7 @@ class JournalLine(Base):
 
     entry = relationship("JournalEntry", back_populates="lines")
 
-    __table_args__ = (
-        Index('ix_journal_lines_account', 'account_id'),
-    )
+    __table_args__ = (Index("ix_journal_lines_account", "account_id"),)
 
 
 class FixedAsset(Base):
@@ -74,8 +110,15 @@ class FixedAsset(Base):
 
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
 
 class RedevelopmentOffer(Base):
@@ -95,83 +138,226 @@ class RedevelopmentOffer(Base):
 
     note = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
 
 # ===================== BANK RECONCILIATION =====================
 class BankTransaction(Base):
     __tablename__ = "bank_transactions"
 
     id = Column(Integer, primary_key=True)
-    
-    bank_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False, index=True)
+
+    bank_account_id = Column(
+        Integer, ForeignKey("accounts.id"), nullable=False, index=True
+    )
     transaction_date = Column(Date, nullable=False, index=True)
-    
+
     amount = Column(DECIMAL(18, 2), nullable=False)
-    type = Column(String(10), nullable=False) # Credit, Debit
-    
+    type = Column(String(10), nullable=False)  # Credit, Debit
+
     description = Column(String(255), nullable=True)
     reference_number = Column(String(100), nullable=True, index=True)
-    
-    is_reconciled = Column(Integer, default=0) # 0 = False, 1 = True (SQLite boolean compat)
-    matched_journal_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
+
+    is_reconciled = Column(
+        Integer, default=0
+    )  # 0 = False, 1 = True (SQLite boolean compat)
+    matched_journal_id = Column(
+        Integer, ForeignKey("journal_entries.id"), nullable=True
+    )
+
+    # created_at = Column(DateTime, default=datetime.utcnow)
+
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
 
 # ===================== FUND TRANSFERS =====================
 class FundTransfer(Base):
     __tablename__ = "fund_transfers"
 
     id = Column(Integer, primary_key=True)
-    
+
     from_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
     to_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
-    
+
     amount = Column(DECIMAL(18, 2), nullable=False)
     transfer_date = Column(Date, nullable=False, index=True)
-    
+
     reference_number = Column(String(100), nullable=True)
     remarks = Column(String(255), nullable=True)
-    
+
     journal_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # created_at = Column(DateTime, default=datetime.utcnow)
+
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
 
 # ===================== GST RETURNS =====================
 class GSTReturn(Base):
     __tablename__ = "gst_returns"
-    
+
     id = Column(Integer, primary_key=True)
-    
-    filing_period = Column(String(20), nullable=False, index=True) # e.g. "2026-06"
-    return_type = Column(String(50), nullable=False) # e.g. "GSTR-1", "GSTR-3B"
-    
+
+    filing_period = Column(String(20), nullable=False, index=True)  # e.g. "2026-06"
+    return_type = Column(String(50), nullable=False)  # e.g. "GSTR-1", "GSTR-3B"
+
     taxable_value = Column(DECIMAL(18, 2), default=0)
     gst_liability = Column(DECIMAL(18, 2), default=0)
     itc_available = Column(DECIMAL(18, 2), default=0)
     net_gst_payable = Column(DECIMAL(18, 2), default=0)
-    
-    status = Column(String(50), default="Draft") # Draft, Filed
+
+    status = Column(String(50), default="Draft")  # Draft, Filed
     filing_date = Column(Date, nullable=True)
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # created_at = Column(DateTime, default=datetime.utcnow)
+
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
 
 # ===================== VENDOR BILLS =====================
 class VendorBill(Base):
     __tablename__ = "vendor_bills"
-    
+
     id = Column(Integer, primary_key=True)
-    
-    supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=False, index=True)
+
+    supplier_id = Column(
+        Integer, ForeignKey("suppliers.id"), nullable=False, index=True
+    )
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True, index=True)
-    purchase_order_id = Column(Integer, ForeignKey("purchase_orders.id"), nullable=True, index=True)
-    
+    purchase_order_id = Column(
+        Integer, ForeignKey("purchase_orders.id"), nullable=True, index=True
+    )
+
     bill_number = Column(String(50), unique=True, nullable=False, index=True)
     bill_date = Column(Date, nullable=False)
     due_date = Column(Date, nullable=False)
-    
+
     total_amount = Column(DECIMAL(18, 2), nullable=False)
     amount_paid = Column(DECIMAL(18, 2), default=0)
-    
-    status = Column(String(50), default="PENDING") # PENDING, PARTIAL, PAID
-    
-    created_at = Column(DateTime, default=datetime.utcnow)
+
+    status = Column(String(50), default="PENDING")  # PENDING, PARTIAL, PAID
+
+    # created_at = Column(DateTime, default=datetime.utcnow)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False
+    )
+
+
+# ===================== NEW CONSOLIDATED MODELS =====================
+class BankAccount(Base):
+    __tablename__ = "bank_accounts"
+    id = Column(Integer, primary_key=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), unique=True, nullable=False)
+    bank_name = Column(String(150), nullable=False)
+    account_number = Column(String(100), unique=True, nullable=False)
+    ifsc_code = Column(String(50), nullable=True)
+    is_active = Column(Boolean, default=True)
+    # created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class RecurringJournal(Base):
+    __tablename__ = "recurring_journals"
+    id = Column(Integer, primary_key=True)
+    template_name = Column(String(255), nullable=False)
+    frequency = Column(String(50), nullable=False)
+    next_run_date = Column(Date, nullable=False)
+    status = Column(String(50), default="ACTIVE")
+    template_data = Column(JSON, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"))
+    # created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class TDSDeduction(Base):
+    __tablename__ = "tds_deductions"
+    id = Column(Integer, primary_key=True)
+    party_name = Column(String(255), nullable=False)
+    pan_number = Column(String(20))
+    invoice_number = Column(String(100))
+    payment_amount = Column(DECIMAL(18, 2), nullable=False)
+    tds_section = Column(String(50), nullable=False)
+    tds_rate = Column(DECIMAL(5, 2), nullable=False)
+    tds_amount = Column(DECIMAL(18, 2), nullable=False)
+    deposit_date = Column(Date)
+    status = Column(String(50), default="PENDING")
+    vendor_bill_id = Column(Integer, ForeignKey("vendor_bills.id"))
+    ra_bill_id = Column(Integer, ForeignKey("ra_bills.id"))
+    created_by = Column(Integer, ForeignKey("users.id"))
+    # created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

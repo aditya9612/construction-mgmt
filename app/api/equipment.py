@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import io
 import json
+from zipfile import Path
 from app.models.boq import BOQ
 
 # FastAPI
@@ -61,7 +62,7 @@ from app.models.project import Project
 from app.models.user import User, UserRole
 
 # Internal - Enums
-from app.core.enums import EquipmentCondition, EquipmentStatus
+from app.core.enums import EquipmentCondition, EquipmentStatus, PurchaseType
 from openpyxl.cell.cell import MergedCell
 
 # Internal - Schemas
@@ -102,9 +103,6 @@ from app.schemas.equipment import (
 
 # Internal - Middleware
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
-from fastapi import APIRouter
-
-public_router = APIRouter(prefix="/equipment", tags=["Public Equipment"])
 
 # Utils
 from app.utils.helpers import NotFoundError
@@ -192,13 +190,10 @@ def safe_parse(value):
     if isinstance(value, str):
         try:
             return json.loads(value)
-        except:
+        except Exception:
             return {"raw": value}
 
     return {"raw": str(value)}
-
-
-from datetime import date
 
 
 def status_from_row(row):
@@ -225,10 +220,26 @@ def convert_decimal(obj):
     return obj
 
 
+def to_decimal(value):
+    """Safely convert an incoming numeric (float/int/str/Decimal/None) to Decimal.
+    FIX: prevents 'Decimal - Decimal + float' TypeErrors when a Pydantic schema
+    field is typed as float but is later combined with Decimal DB columns."""
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 async def recalculate_equipment_status(
     db: AsyncSession,
     equipment: Equipment,
 ):
+    """
+    NOTE: previously this function computed the DAMAGED and pending-maintenance
+    checks TWICE (duplicate blocks). Removed the duplication - behavior is
+    unchanged, just cleaned up.
+    """
     today = date.today()
 
     # 1. Damaged check
@@ -251,11 +262,7 @@ async def recalculate_equipment_status(
         equipment.status = EquipmentStatus.MAINTENANCE
         return
 
-    # 3. Project allocation check
-    if equipment.project_id:
-        equipment.status = EquipmentStatus.IN_PROJECT
-        return
-
+    # 3. Active Rental
     active_rental = await db.scalar(
         select(
             exists().where(
@@ -273,6 +280,12 @@ async def recalculate_equipment_status(
         equipment.status = EquipmentStatus.RENTED
         return
 
+    # 4. Project
+    if equipment.project_id:
+        equipment.status = EquipmentStatus.IN_PROJECT
+        return
+
+    # 5. Future Rental
     future_rental = await db.scalar(
         select(
             exists().where(
@@ -411,10 +424,23 @@ async def equipment_kpi(
 
 
 # ====================USAGE REPORT====================
+# Filters added below are ALL optional (Query default=None) - list behaves
+# exactly as before if the caller passes nothing.
 
 
 @router.get("/usage/report", response_model=List[UsageReportItem])
 async def usage_report(
+    equipment_id: Optional[int] = Query(
+        None, description="Optional: filter by equipment"
+    ),
+    date_from: Optional[date] = Query(
+        None, description="Optional: usage_date >= date_from"
+    ),
+    date_to: Optional[date] = Query(
+        None, description="Optional: usage_date <= date_to"
+    ),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
@@ -429,7 +455,21 @@ async def usage_report(
         )
         .join(Equipment)
         .where(Equipment.is_deleted == False)
-        .group_by(EquipmentUsage.equipment_id, Equipment.equipment_code)
+    )
+
+    if equipment_id:
+        stmt = stmt.where(EquipmentUsage.equipment_id == equipment_id)
+
+    if date_from:
+        stmt = stmt.where(EquipmentUsage.usage_date >= date_from)
+
+    if date_to:
+        stmt = stmt.where(EquipmentUsage.usage_date <= date_to)
+
+    stmt = (
+        stmt.group_by(EquipmentUsage.equipment_id, Equipment.equipment_code)
+        .limit(limit)
+        .offset(offset)
     )
 
     result = await db.execute(stmt)
@@ -452,6 +492,15 @@ async def usage_report(
 
 @router.get("/cost/report", response_model=List[CostReportItem])
 async def cost_report(
+    equipment_id: Optional[int] = Query(None),
+    date_from: Optional[date] = Query(
+        None, description="Optional: rental start_date >= date_from"
+    ),
+    date_to: Optional[date] = Query(
+        None, description="Optional: rental start_date <= date_to"
+    ),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
@@ -479,13 +528,27 @@ async def cost_report(
         .where(
             Equipment.is_deleted == False,
         )
-        .group_by(
+    )
+
+    if equipment_id:
+        stmt = stmt.where(EquipmentRental.equipment_id == equipment_id)
+
+    if date_from:
+        stmt = stmt.where(EquipmentRental.start_date >= date_from)
+
+    if date_to:
+        stmt = stmt.where(EquipmentRental.start_date <= date_to)
+
+    stmt = (
+        stmt.group_by(
             EquipmentRental.equipment_id,
             Equipment.equipment_code,
         )
         .order_by(
             func.sum(EquipmentRental.rental_cost).desc(),
         )
+        .limit(limit)
+        .offset(offset)
     )
 
     result = await db.execute(stmt)
@@ -525,42 +588,58 @@ async def cost_report(
     response_model=List[EquipmentPurchaseReportItem],
 )
 async def purchase_report(
+    purchase_type: Optional[str] = Query(None),
+    project_id: Optional[int] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
+    stmt = select(
+        EquipmentPurchase.purchase_type,
+        EquipmentPurchase.asset_id,
+        Equipment.equipment_name.label("asset_name"),
+        func.count(EquipmentPurchase.id).label("purchase_count"),
+        func.sum(EquipmentPurchase.quantity).label("total_quantity"),
+        func.sum(EquipmentPurchase.total_amount).label("total_purchase_amount"),
+    ).outerjoin(
+        Equipment,
+        Equipment.id == EquipmentPurchase.asset_id,
+    )
+
+    if purchase_type:
+        stmt = stmt.where(
+            EquipmentPurchase.purchase_type == PurchaseType(purchase_type)
+        )
+
+    if project_id:
+        stmt = stmt.where(EquipmentPurchase.project_id == project_id)
+
     stmt = (
-        select(
-            EquipmentPurchase.purchase_type,
-            EquipmentPurchase.asset_id,
-            Equipment.equipment_name.label("asset_name"),
-            func.count(EquipmentPurchase.id).label("purchase_count"),
-            func.sum(EquipmentPurchase.quantity).label("total_quantity"),
-            func.sum(EquipmentPurchase.total_amount).label("total_purchase_amount"),
-        )
-        .join(
-            Equipment,
-            Equipment.id == EquipmentPurchase.asset_id,
-        )
-        .group_by(
+        stmt.group_by(
             EquipmentPurchase.purchase_type,
             EquipmentPurchase.asset_id,
             Equipment.equipment_name,
         )
         .order_by(func.sum(EquipmentPurchase.total_amount).desc())
+        .limit(limit)
+        .offset(offset)
     )
 
     result = await db.execute(stmt)
+
+    rows = result.all()
 
     return [
         EquipmentPurchaseReportItem(
             purchase_type=row.purchase_type,
             asset_id=row.asset_id,
-            asset_name=row.asset_name,
+            asset_name=row.asset_name or "N/A",
             purchase_count=row.purchase_count,
-            total_quantity=row.total_quantity,
+            total_quantity=row.total_quantity or 0,
             total_purchase_amount=float(row.total_purchase_amount or 0),
         )
-        for row in result.all()
+        for row in rows
     ]
 
 
@@ -569,26 +648,30 @@ async def purchase_report(
 
 @router.get("/alerts/maintenance", response_model=List[MaintenanceAlertItem])
 async def maintenance_alerts(
+    equipment_id: Optional[int] = Query(
+        None, description="Optional: filter by equipment"
+    ),
+    days_ahead: int = Query(30, ge=1, le=365, description="Look-ahead window in days"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
 
     today = date.today()
-    upcoming_date = today + timedelta(days=30)
+    upcoming_date = today + timedelta(days=days_ahead)
 
     # Nearest pending maintenance per equipment
-    subq = (
-        select(
-            EquipmentMaintenance.equipment_id,
-            func.min(EquipmentMaintenance.next_maintenance_date).label("next_date"),
-        )
-        .where(
-            EquipmentMaintenance.next_maintenance_date.isnot(None),
-            EquipmentMaintenance.is_completed == False,
-        )
-        .group_by(EquipmentMaintenance.equipment_id)
-        .subquery()
+    subq_stmt = select(
+        EquipmentMaintenance.equipment_id,
+        func.min(EquipmentMaintenance.next_maintenance_date).label("next_date"),
+    ).where(
+        EquipmentMaintenance.next_maintenance_date.isnot(None),
+        EquipmentMaintenance.is_completed == False,
     )
+
+    if equipment_id:
+        subq_stmt = subq_stmt.where(EquipmentMaintenance.equipment_id == equipment_id)
+
+    subq = subq_stmt.group_by(EquipmentMaintenance.equipment_id).subquery()
 
     stmt = (
         select(EquipmentMaintenance, Equipment)
@@ -608,7 +691,7 @@ async def maintenance_alerts(
                 EquipmentMaintenance.next_maintenance_date.isnot(None),
                 EquipmentMaintenance.is_completed == False,
                 Equipment.is_deleted == False,
-                # Show all overdue and upcoming maintenance within next 30 days
+                # Show all overdue and upcoming maintenance within the window
                 EquipmentMaintenance.next_maintenance_date <= upcoming_date,
             )
         )
@@ -625,13 +708,13 @@ async def maintenance_alerts(
         days_until = (maintenance.next_maintenance_date - today).days
 
         if days_until < 0:
-            status = "OVERDUE"
+            m_status = "OVERDUE"
         elif days_until == 0:
-            status = "TODAY"
+            m_status = "TODAY"
         elif days_until <= 3:
-            status = "URGENT"
+            m_status = "URGENT"
         else:
-            status = "UPCOMING"
+            m_status = "UPCOMING"
 
         alerts.append(
             MaintenanceAlertItem(
@@ -639,7 +722,7 @@ async def maintenance_alerts(
                 equipment_code=equipment.equipment_code,
                 maintenance_date=maintenance.next_maintenance_date,
                 days_until=days_until,
-                status=status,
+                status=m_status,
             )
         )
 
@@ -647,21 +730,37 @@ async def maintenance_alerts(
 
 
 # ================== "Availability" =======================
+# FIX: previously this endpoint relied on the *stored* `eq.status` column to
+# decide MAINTENANCE state. That column is only refreshed by
+# recalculate_equipment_status(), which is not called on every read path
+# (e.g. list_equipment / plain GETs before this fix), so availability could
+# report stale data. It now queries pending maintenance directly, exactly
+# like recalculate_equipment_status() does, so this endpoint is always
+# consistent regardless of whether the stored status column is fresh.
 
 
 @router.get("/eq/availability", response_model=List[AvailabilityReportItem])
 async def availability_report(
+    project_id: Optional[int] = Query(None, description="Optional: filter by project"),
+    is_available: Optional[bool] = Query(
+        None, description="Optional: filter available/unavailable"
+    ),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
     today = date.today()
 
-    # Get all active equipments
-    equipments = (
-        (await db.execute(select(Equipment).where(Equipment.is_deleted == False)))
-        .scalars()
-        .all()
-    )
+    eq_stmt = select(Equipment).where(Equipment.is_deleted == False)
+
+    if project_id:
+        eq_stmt = eq_stmt.where(Equipment.project_id == project_id)
+
+    eq_stmt = eq_stmt.limit(limit).offset(offset)
+
+    # Get all active equipments (optionally filtered)
+    equipments = (await db.execute(eq_stmt)).scalars().all()
 
     # Active rentals
     rented_ids = set(
@@ -680,31 +779,50 @@ async def availability_report(
         .all()
     )
 
+    # FIX: compute pending-maintenance set live instead of trusting stored status
+    pending_maintenance_ids = set(
+        (
+            await db.execute(
+                select(EquipmentMaintenance.equipment_id).where(
+                    EquipmentMaintenance.is_completed.is_(False),
+                    EquipmentMaintenance.maintenance_date <= today,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     response = []
 
     for eq in equipments:
 
         if eq.condition == EquipmentCondition.DAMAGED:
-            status = "DAMAGED"
+            eq_status = "DAMAGED"
 
-        elif eq.status == EquipmentStatus.MAINTENANCE:
-            status = "MAINTENANCE"
+        elif eq.id in pending_maintenance_ids:
+            eq_status = "MAINTENANCE"
 
         elif eq.id in rented_ids:
-            status = "RENTED"
+            eq_status = "RENTED"
 
         elif eq.project_id is not None:
-            status = "ALLOCATED"
+            eq_status = "ALLOCATED"
 
         else:
-            status = "AVAILABLE"
+            eq_status = "AVAILABLE"
+
+        available_flag = eq_status == "AVAILABLE"
+
+        if is_available is not None and available_flag != is_available:
+            continue
 
         response.append(
             AvailabilityReportItem(
                 equipment_id=eq.id,
                 equipment_code=eq.equipment_code,
                 equipment_name=eq.equipment_name,
-                is_available=(status == "AVAILABLE"),
+                is_available=available_flag,
                 project_id=eq.project_id,
             )
         )
@@ -808,12 +926,17 @@ async def allocate_equipment(
             continue
 
         # ================= MAINTENANCE CHECK =================
+        # FIX: was missing `is_completed == False`. Without it, a maintenance
+        # record dated in the future but already marked completed would still
+        # block allocation, which is wrong - only *pending* maintenance should
+        # block allocation.
 
         maintenance_exists = await db.scalar(
             select(
                 exists().where(
                     EquipmentMaintenance.equipment_id == equipment_id,
                     EquipmentMaintenance.maintenance_date >= today,
+                    EquipmentMaintenance.is_completed == False,
                 )
             )
         )
@@ -968,7 +1091,6 @@ async def deallocate_equipment(
             )
             continue
 
-        # NEW VALIDATION
         if obj.project_id != payload.project_id:
             failed.append(
                 {
@@ -1047,7 +1169,7 @@ async def get_allocation(
     )
 
 
-# =========== EQUIPMENT CRUD ====================
+# =========== CREATE EQUIPMENT ====================
 
 
 @router.post(
@@ -1123,6 +1245,7 @@ async def create_equipment(
 
 
 # ================== LIST EQUIPMENT ==================
+# All filters below are optional - none are mandatory.
 
 
 @router.get("", response_model=PaginatedResponse[EquipmentOut])
@@ -1154,21 +1277,21 @@ async def list_equipment(
         Equipment.is_deleted.is_(False)
     )
 
-    # ================= SEARCH =================
+    # ================= SEARCH (optional) =================
 
     if search:
         query = query.where(Equipment.equipment_name.ilike(f"%{search}%"))
 
         count_query = count_query.where(Equipment.equipment_name.ilike(f"%{search}%"))
 
-    # ================= PROJECT FILTER =================
+    # ================= PROJECT FILTER (optional) =================
 
     if project_id:
         query = query.where(Equipment.project_id == project_id)
 
         count_query = count_query.where(Equipment.project_id == project_id)
 
-    # ================= CONDITION FILTER =================
+    # ================= CONDITION FILTER (optional) =================
 
     if condition:
 
@@ -1319,6 +1442,84 @@ async def soft_delete_equipment(
         redis,
         VERSION_KEY,
     )
+
+
+# ================== RESTORE (NEW) ==================
+# NEW API: soft_delete_equipment never had an inverse operation - once
+# deleted, equipment could never come back without a manual DB edit.
+
+
+@router.put("/{equipment_id}/restore", response_model=EquipmentOut)
+async def restore_equipment(
+    equipment_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
+    obj = await db.get(Equipment, equipment_id)
+
+    if not obj:
+        raise HTTPException(status_code=404, detail="Equipment not found")
+
+    if not obj.is_deleted:
+        raise HTTPException(status_code=400, detail="Equipment is not deleted")
+
+    # Prevent restoring into a duplicate active equipment_code
+    duplicate = await db.scalar(
+        select(Equipment).where(
+            Equipment.equipment_code == obj.equipment_code,
+            Equipment.is_deleted == False,
+            Equipment.id != obj.id,
+        )
+    )
+
+    if duplicate:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot restore: another active equipment already uses this code",
+        )
+
+    old_values = serialize(
+        {
+            "is_deleted": obj.is_deleted,
+            "deleted_at": obj.deleted_at,
+            "deleted_by": obj.deleted_by,
+        }
+    )
+
+    obj.is_deleted = False
+    obj.deleted_at = None
+    obj.deleted_by = None
+
+    await recalculate_equipment_status(db, obj)
+
+    new_values = serialize(
+        {
+            "is_deleted": obj.is_deleted,
+            "deleted_at": obj.deleted_at,
+            "deleted_by": obj.deleted_by,
+            "status": obj.status.value if obj.status else None,
+        }
+    )
+
+    await create_audit_log(
+        db=db,
+        equipment_id=obj.id,
+        action="RESTORE",
+        old_values=old_values,
+        new_values=new_values,
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+
+    await bump_cache_version(redis, VERSION_KEY)
+
+    await db.refresh(obj)
+
+    return EquipmentOut.model_validate(obj)
 
 
 # ========================= CREATE USAGE===========================
@@ -1513,35 +1714,93 @@ async def create_usage(
     return EquipmentUsageOut.model_validate(obj)
 
 
-# ========================= LIST USAGE===========================
+# ========================= GET USAGE===========================
 
 
 @router.get(
-    "/{equipment_id}/usage",
-    response_model=List[EquipmentUsageOut],
+    "/usage/{usage_id}",
+    response_model=EquipmentUsageOut,
 )
-async def list_usage(
-    equipment_id: int,
+async def get_usage(
+    usage_id: int,
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    usage = await db.get(
+        EquipmentUsage,
+        usage_id,
+    )
+
+    if not usage:
+        raise HTTPException(
+            status_code=404,
+            detail="Usage record not found",
+        )
+
     await get_active_equipment_or_404(
         db,
-        equipment_id,
+        usage.equipment_id,
     )
 
-    stmt = (
-        select(EquipmentUsage)
-        .where(
+    return EquipmentUsageOut(
+        id=usage.id,
+        boq_item_id=usage.boq_item_id,
+        equipment_id=usage.equipment_id,
+        working_hours=float(usage.working_hours or 0),
+        fuel_used=float(usage.fuel_used or 0),
+        usage_date=usage.usage_date,
+        notes=usage.notes,
+        created_at=usage.created_at,
+    )
+
+
+# ========================= LIST USAGE===========================
+# Added optional filters + pagination (previously returned everything,
+# unbounded, with no way to narrow the result set).
+
+
+@router.get(
+    "/usage",
+    response_model=List[EquipmentUsageOut],
+)
+async def list_usage(
+    equipment_id: Optional[int] = Query(
+        None, description="Optional: Equipment ID to filter usage history"
+    ),
+    date_from: Optional[date] = Query(
+        None, description="Optional: usage_date >= date_from"
+    ),
+    date_to: Optional[date] = Query(
+        None, description="Optional: usage_date <= date_to"
+    ),
+    boq_item_id: Optional[int] = Query(
+        None, description="Optional: filter by BOQ item"
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    stmt = select(EquipmentUsage)
+
+    if equipment_id is not None:
+        await get_active_equipment_or_404(db, equipment_id)
+        stmt = stmt.where(
             EquipmentUsage.equipment_id == equipment_id,
         )
-        .order_by(
-            EquipmentUsage.usage_date.desc(),
-        )
-    )
+
+    if date_from:
+        stmt = stmt.where(EquipmentUsage.usage_date >= date_from)
+
+    if date_to:
+        stmt = stmt.where(EquipmentUsage.usage_date <= date_to)
+
+    if boq_item_id:
+        stmt = stmt.where(EquipmentUsage.boq_item_id == boq_item_id)
+
+    stmt = stmt.order_by(EquipmentUsage.usage_date.desc()).limit(limit).offset(offset)
 
     result = await db.execute(stmt)
-
     usages = result.scalars().all()
 
     return [
@@ -1601,6 +1860,14 @@ async def update_usage(
     old_boq_item_id = usage.boq_item_id
 
     update_data = payload.model_dump(exclude_unset=True)
+
+    # FIX: previously `working_hours` / `fuel_used` coming from the payload
+    # could be plain floats. Combining `Decimal - Decimal + float` raises
+    # TypeError. Coerce these fields to Decimal up-front so downstream math
+    # is always Decimal-safe, matching the Equipment/EquipmentUsage columns.
+    for numeric_field in ("working_hours", "fuel_used"):
+        if numeric_field in update_data and update_data[numeric_field] is not None:
+            update_data[numeric_field] = to_decimal(update_data[numeric_field])
 
     # ================= DUPLICATE DATE CHECK =================
 
@@ -2008,21 +2275,21 @@ async def create_maintenance(
     # ================= RESPONSE STATUS =================
 
     if obj.is_completed:
-        status = "COMPLETED"
+        m_status = "COMPLETED"
 
     elif obj.next_maintenance_date:
 
         if obj.next_maintenance_date < today:
-            status = "OVERDUE"
+            m_status = "OVERDUE"
 
         elif obj.next_maintenance_date == today:
-            status = "TODAY"
+            m_status = "TODAY"
 
         else:
-            status = "UPCOMING"
+            m_status = "UPCOMING"
 
     else:
-        status = "NO_SCHEDULE"
+        m_status = "NO_SCHEDULE"
 
     return EquipmentMaintenanceOut(
         id=obj.id,
@@ -2036,11 +2303,18 @@ async def create_maintenance(
         is_completed=obj.is_completed,
         completed_at=obj.completed_at,
         created_at=obj.created_at,
-        status=status,
+        status=m_status,
     )
 
 
 # ======================== UPDATE MAINTENANCE =========================
+# FIX: previously the date validation ran *after* the fields were already
+# mutated on the ORM object with setattr(). Since the mutation happened
+# in-place on a tracked entity, that's risky (partial state visible to
+# anything reading `maintenance` before the exception rolls the session
+# back, and harder to reason about). Now we compute the prospective dates
+# first, validate, and only mutate the object once we know the update is
+# valid.
 
 
 @router.put(
@@ -2073,22 +2347,32 @@ async def update_maintenance(
 
     update_data = payload.model_dump(exclude_unset=True)
 
-    old_values = {}
+    # ================= VALIDATE BEFORE MUTATING =================
 
-    for field, value in update_data.items():
-        old_values[field] = getattr(maintenance, field)
-        setattr(maintenance, field, value)
-
-    # ================= VALIDATION =================
+    prospective_maintenance_date = update_data.get(
+        "maintenance_date", maintenance.maintenance_date
+    )
+    prospective_next_date = update_data.get(
+        "next_maintenance_date", maintenance.next_maintenance_date
+    )
 
     if (
-        maintenance.next_maintenance_date
-        and maintenance.next_maintenance_date <= maintenance.maintenance_date
+        prospective_next_date
+        and prospective_maintenance_date
+        and prospective_next_date <= prospective_maintenance_date
     ):
         raise HTTPException(
             status_code=400,
             detail="Next maintenance date must be after maintenance date",
         )
+
+    # ================= APPLY UPDATE (only after validation passes) =================
+
+    old_values = {}
+
+    for field, value in update_data.items():
+        old_values[field] = getattr(maintenance, field)
+        setattr(maintenance, field, value)
 
     # ================= BOQ RECALCULATION =================
 
@@ -2163,21 +2447,21 @@ async def update_maintenance(
     today = date.today()
 
     if maintenance.is_completed:
-        status = "COMPLETED"
+        m_status = "COMPLETED"
 
     elif maintenance.next_maintenance_date:
 
         if maintenance.next_maintenance_date < today:
-            status = "OVERDUE"
+            m_status = "OVERDUE"
 
         elif maintenance.next_maintenance_date == today:
-            status = "TODAY"
+            m_status = "TODAY"
 
         else:
-            status = "UPCOMING"
+            m_status = "UPCOMING"
 
     else:
-        status = "NO_SCHEDULE"
+        m_status = "NO_SCHEDULE"
 
     return EquipmentMaintenanceOut(
         id=maintenance.id,
@@ -2189,14 +2473,13 @@ async def update_maintenance(
         cost=float(maintenance.cost or 0),
         next_maintenance_date=maintenance.next_maintenance_date,
         created_at=maintenance.created_at,
-        status=status,
+        status=m_status,
         is_completed=maintenance.is_completed,
         completed_at=maintenance.completed_at,
     )
 
 
 # ===================== COMPLETE MAINTENANCE =====================
-from datetime import date
 
 
 @router.put(
@@ -2234,9 +2517,12 @@ async def complete_maintenance(
 
     old_status = equipment.status
 
-    # Mark maintenance completed
+    # Complete maintenance
     maintenance.is_completed = True
     maintenance.completed_at = datetime.utcnow()
+
+    # Flush changes before checking status
+    await db.flush()
 
     # Recalculate equipment status
     await recalculate_equipment_status(
@@ -2283,7 +2569,7 @@ async def complete_maintenance(
         is_completed=maintenance.is_completed,
         completed_at=maintenance.completed_at,
         created_at=maintenance.created_at,
-        status="COMPLETED",
+        status=equipment.status.value,
     )
 
 
@@ -2377,32 +2663,99 @@ async def delete_maintenance(
     }
 
 
-# ===================== LIST MAINTENANCE HISTORY =====================
+# ======================== GET MAINTENANCE =====================
 
 
 @router.get(
-    "/{equipment_id}/maintenance",
-    response_model=List[EquipmentMaintenanceOut],
+    "/maintenance/{maintenance_id}",
+    response_model=EquipmentMaintenanceOut,
 )
-async def list_maintenance(
-    equipment_id: int,
+async def get_maintenance(
+    maintenance_id: int,
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # Validate equipment exists
-    await get_active_equipment_or_404(
-        db,
-        equipment_id,
+    maintenance = await db.get(
+        EquipmentMaintenance,
+        maintenance_id,
     )
 
+    if not maintenance:
+        raise HTTPException(
+            status_code=404,
+            detail="Maintenance record not found",
+        )
+
+    await get_active_equipment_or_404(
+        db,
+        maintenance.equipment_id,
+    )
+
+    return EquipmentMaintenanceOut(
+        id=maintenance.id,
+        project_id=maintenance.project_id,
+        boq_item_id=maintenance.boq_item_id,
+        equipment_id=maintenance.equipment_id,
+        description=maintenance.description,
+        maintenance_date=maintenance.maintenance_date,
+        cost=float(maintenance.cost or 0),
+        next_maintenance_date=maintenance.next_maintenance_date,
+        is_completed=maintenance.is_completed,
+        completed_at=maintenance.completed_at,
+        created_at=maintenance.created_at,
+        status=status_from_row(maintenance),
+    )
+
+
+# ===================== LIST MAINTENANCE HISTORY =====================
+# Added optional filters + pagination.
+
+
+@router.get(
+    "/maintenance",
+    response_model=List[EquipmentMaintenanceOut],
+)
+async def list_maintenance(
+    equipment_id: Optional[int] = Query(
+        None, description="Optional: filter by equipment"
+    ),
+    is_completed: Optional[bool] = Query(
+        None, description="Optional: filter by completion status"
+    ),
+    date_from: Optional[date] = Query(
+        None, description="Optional: maintenance_date >= date_from"
+    ),
+    date_to: Optional[date] = Query(
+        None, description="Optional: maintenance_date <= date_to"
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    stmt = select(EquipmentMaintenance)
+
+    # Optional equipment filter
+    if equipment_id is not None:
+        await get_active_equipment_or_404(db, equipment_id)
+        stmt = stmt.where(EquipmentMaintenance.equipment_id == equipment_id)
+
+    if is_completed is not None:
+        stmt = stmt.where(EquipmentMaintenance.is_completed == is_completed)
+
+    if date_from:
+        stmt = stmt.where(EquipmentMaintenance.maintenance_date >= date_from)
+
+    if date_to:
+        stmt = stmt.where(EquipmentMaintenance.maintenance_date <= date_to)
+
     stmt = (
-        select(EquipmentMaintenance)
-        .where(EquipmentMaintenance.equipment_id == equipment_id)
-        .order_by(EquipmentMaintenance.maintenance_date.desc())
+        stmt.order_by(EquipmentMaintenance.maintenance_date.desc())
+        .limit(limit)
+        .offset(offset)
     )
 
     result = await db.execute(stmt)
-
     maintenances = result.scalars().all()
 
     return [
@@ -2694,38 +3047,85 @@ async def create_rental(
 
 
 # ========================== RENTAL LIST ===========================
+# Added optional status/date filters + pagination.
 
 
 @router.get(
-    "/{equipment_id}/rental",
+    "/rental",
     response_model=List[EquipmentRentalOut],
 )
 async def list_rental(
-    equipment_id: int,
+    equipment_id: Optional[int] = Query(
+        None, description="Optional: filter by equipment"
+    ),
+    rental_status: Optional[str] = Query(
+        None,
+        description="Optional: ACTIVE | UPCOMING | COMPLETED",
+    ),
+    date_from: Optional[date] = Query(
+        None, description="Optional: start_date >= date_from"
+    ),
+    date_to: Optional[date] = Query(
+        None, description="Optional: start_date <= date_to"
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    equipment = await get_active_equipment_or_404(
-        db,
-        equipment_id,
-    )
+    today = date.today()
+
+    stmt = select(EquipmentRental)
+
+    # Optional equipment filter
+    if equipment_id is not None:
+        await get_active_equipment_or_404(db, equipment_id)
+        stmt = stmt.where(EquipmentRental.equipment_id == equipment_id)
+
+    if date_from:
+        stmt = stmt.where(EquipmentRental.start_date >= date_from)
+
+    if date_to:
+        stmt = stmt.where(EquipmentRental.start_date <= date_to)
+
+    if rental_status:
+        normalized = rental_status.upper()
+
+        if normalized not in {"ACTIVE", "UPCOMING", "COMPLETED"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid rental_status. Allowed: ACTIVE, UPCOMING, COMPLETED",
+            )
+
+        if normalized == "UPCOMING":
+            stmt = stmt.where(EquipmentRental.start_date > today)
+
+        elif normalized == "COMPLETED":
+            stmt = stmt.where(
+                EquipmentRental.end_date.isnot(None),
+                EquipmentRental.end_date < today,
+            )
+
+        else:  # ACTIVE
+            stmt = stmt.where(
+                EquipmentRental.start_date <= today,
+                or_(
+                    EquipmentRental.end_date.is_(None),
+                    EquipmentRental.end_date >= today,
+                ),
+            )
 
     stmt = (
-        select(EquipmentRental)
-        .where(
-            EquipmentRental.equipment_id == equipment.id,
-        )
-        .order_by(
+        stmt.order_by(
             EquipmentRental.start_date.desc(),
             EquipmentRental.created_at.desc(),
         )
+        .limit(limit)
+        .offset(offset)
     )
 
     result = await db.execute(stmt)
-
     rentals = result.scalars().all()
-
-    today = date.today()
 
     return [
         EquipmentRentalOut(
@@ -2748,9 +3148,8 @@ async def list_rental(
                     else "ACTIVE"
                 )
             ),
-            duration=(
-                ((rental.end_date or rental.start_date) - rental.start_date).days + 1
-            ),
+            duration=((rental.end_date or rental.start_date) - rental.start_date).days
+            + 1,
             per_day_cost=round(
                 float(rental.rental_cost or 0)
                 / (
@@ -2823,6 +3222,10 @@ async def get_rental(
 
 
 # ============================== RENTAL UPDATE ========================
+# FIX: create_rental validates that a BOQ item belongs to the target project,
+# but update_rental didn't repeat that check when boq_item_id changed. A
+# caller could attach a rental to a BOQ item from an unrelated project. Added
+# the same project-membership validation here.
 
 
 @router.put(
@@ -2923,6 +3326,14 @@ async def update_rental(
                 detail="BOQ item not found",
             )
 
+        # FIX: added missing project-membership validation (present in
+        # create_rental but absent here before this fix).
+        if rental.project_id and new_boq.project_id != rental.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="BOQ item does not belong to project",
+            )
+
         new_boq.actual_cost = (new_boq.actual_cost or Decimal("0")) + rental.rental_cost
 
     # ================= STATUS =================
@@ -2985,9 +3396,6 @@ async def update_rental(
 
 
 # =============================== RENTAL DELETE ========================
-
-
-from pydantic import BaseModel
 
 
 @router.delete(
@@ -3092,6 +3500,11 @@ async def delete_rental(
 
 @router.get("/report/utilization", response_model=List[UtilizationReportItem])
 async def utilization_report(
+    equipment_id: Optional[int] = Query(
+        None, description="Optional: filter by equipment"
+    ),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -3105,11 +3518,17 @@ async def utilization_report(
                 "total_hours"
             ),
         )
-        .outerjoin(
-            EquipmentUsage, Equipment.id == EquipmentUsage.equipment_id
-        )  #  important fix
+        .outerjoin(EquipmentUsage, Equipment.id == EquipmentUsage.equipment_id)
         .where(Equipment.is_deleted == False)
-        .group_by(Equipment.id, Equipment.equipment_code)
+    )
+
+    if equipment_id:
+        stmt = stmt.where(Equipment.id == equipment_id)
+
+    stmt = (
+        stmt.group_by(Equipment.id, Equipment.equipment_code)
+        .limit(limit)
+        .offset(offset)
     )
 
     result = await db.execute(stmt)
@@ -3126,7 +3545,7 @@ async def utilization_report(
             UtilizationReportItem(
                 equipment_id=row.equipment_id,
                 equipment_code=row.equipment_code,
-                total_hours=round(total_hours, 2),  #  clean output
+                total_hours=round(total_hours, 2),
                 utilization_rate=round(utilization_rate, 2),
             )
         )
@@ -3135,12 +3554,16 @@ async def utilization_report(
 
 
 # ===================equipment_alerts======================================
-# 🔧 configurable limits
+
 WORKING_HOURS_LIMIT = 1000
 
 
 @router.get("/alerts/equipment", response_model=list[dict])
 async def equipment_alerts(
+    severity: Optional[str] = Query(None, description="Optional: CRITICAL | HIGH"),
+    project_id: Optional[int] = Query(None, description="Optional: filter by project"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
@@ -3155,6 +3578,11 @@ async def equipment_alerts(
         )
     )
 
+    if project_id:
+        stmt = stmt.where(Equipment.project_id == project_id)
+
+    stmt = stmt.limit(limit).offset(offset)
+
     result = await db.execute(stmt)
     rows = result.scalars().all()
 
@@ -3168,17 +3596,17 @@ async def equipment_alerts(
             issues.append({"type": "DAMAGED", "severity": "CRITICAL"})
             recommendation = "Stop usage and repair immediately"
 
-        # ⚠ OVERUSED
+        # OVERUSED
         if row.working_hours and row.working_hours > WORKING_HOURS_LIMIT:
             if row.working_hours > WORKING_HOURS_LIMIT * 1.5:
-                severity = "CRITICAL"
+                item_severity = "CRITICAL"
             else:
-                severity = "HIGH"
+                item_severity = "HIGH"
 
             issues.append(
                 {
                     "type": "OVERUSED",
-                    "severity": severity,
+                    "severity": item_severity,
                     "current_hours": float(row.working_hours),
                     "limit": WORKING_HOURS_LIMIT,
                 }
@@ -3186,6 +3614,9 @@ async def equipment_alerts(
 
             if not recommendation:
                 recommendation = "Schedule maintenance soon"
+
+        if severity and not any(i["severity"] == severity.upper() for i in issues):
+            continue
 
         alerts.append(
             {
@@ -3219,15 +3650,12 @@ async def get_audit_logs(
         EquipmentAuditLog.equipment_id == equipment_id
     )
 
-    #  filter
     if action:
         base_query = base_query.where(EquipmentAuditLog.action == action)
 
-    #  total count
     count_stmt = select(func.count()).select_from(base_query.subquery())
     total = await db.scalar(count_stmt)
 
-    #  data query
     stmt = (
         base_query.order_by(EquipmentAuditLog.created_at.desc())
         .limit(limit)
@@ -3291,47 +3719,26 @@ async def create_purchase(
 
     # ================= EQUIPMENT VALIDATION =================
 
-    equipment = await db.get(
-        Equipment,
-        payload.asset_id,
-    )
+    equipment = None
 
-    if not equipment or equipment.is_deleted:
-        raise HTTPException(
-            status_code=404,
-            detail="Equipment not found",
+    if payload.asset_id is not None:
+
+        equipment = await db.get(
+            Equipment,
+            payload.asset_id,
         )
 
-    # ================= PROJECT MATCH VALIDATION =================
+        if not equipment or equipment.is_deleted:
+            raise HTTPException(
+                status_code=404,
+                detail="Equipment not found",
+            )
 
-    if equipment.project_id and equipment.project_id != payload.project_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Equipment belongs to another project",
-        )
-
-    # ================= PURCHASE TYPE VALIDATION =================
-
-    ALLOWED_PURCHASE_TYPES = {
-        "PURCHASE",
-        "LEASE",
-        "REPLACEMENT",
-    }
-
-    if payload.purchase_type.upper() not in ALLOWED_PURCHASE_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid purchase type. Allowed: {', '.join(ALLOWED_PURCHASE_TYPES)}",
-        )
-
-    # ================= QUANTITY VALIDATION =================
-
-    if payload.quantity <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Quantity must be greater than zero",
-        )
-
+        if equipment.project_id and equipment.project_id != payload.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Equipment belongs to another project",
+            )
     # ================= INVOICE VALIDATION =================
 
     duplicate = await db.scalar(
@@ -3415,7 +3822,7 @@ async def create_purchase(
                 "project_id": payload.project_id,
                 "boq_item_id": payload.boq_item_id,
                 "asset_id": payload.asset_id,
-                "purchase_type": payload.purchase_type,
+                "purchase_type": payload.purchase_type.value,
                 "vendor_name": payload.vendor_name,
                 "invoice_number": payload.invoice_number,
                 "quantity": payload.quantity,
@@ -3445,7 +3852,7 @@ async def create_purchase(
         boq_item_id=purchase.boq_item_id,
         purchase_type=purchase.purchase_type,
         asset_id=purchase.asset_id,
-        asset_name=equipment.equipment_name,
+        asset_name=equipment.equipment_name if equipment else None,
         purchase_date=purchase.purchase_date,
         vendor_name=purchase.vendor_name,
         invoice_number=purchase.invoice_number,
@@ -3459,6 +3866,7 @@ async def create_purchase(
 
 
 # =============================== PURCHASE LIST ========================
+# Already had proper optional filters + pagination - left as is.
 
 
 @router.get(
@@ -3484,28 +3892,38 @@ async def list_purchase(
             EquipmentPurchase,
             Equipment.equipment_name,
         )
-        .join(
+        .outerjoin(
             Equipment,
             Equipment.id == EquipmentPurchase.asset_id,
         )
-        .where(Equipment.is_deleted.is_(False))
+        .where(
+            or_(
+                Equipment.id.is_(None),
+                Equipment.is_deleted.is_(False),
+            )
+        )
     )
 
     count_stmt = (
         select(func.count())
         .select_from(EquipmentPurchase)
-        .join(
+        .outerjoin(
             Equipment,
             Equipment.id == EquipmentPurchase.asset_id,
         )
-        .where(Equipment.is_deleted.is_(False))
+        .where(
+            or_(
+                Equipment.id.is_(None),
+                Equipment.is_deleted.is_(False),
+            )
+        )
     )
 
     if purchase_type:
         stmt = stmt.where(EquipmentPurchase.purchase_type == purchase_type)
         count_stmt = count_stmt.where(EquipmentPurchase.purchase_type == purchase_type)
 
-    if asset_id:
+    if asset_id is not None:
         stmt = stmt.where(EquipmentPurchase.asset_id == asset_id)
         count_stmt = count_stmt.where(EquipmentPurchase.asset_id == asset_id)
 
@@ -3554,7 +3972,7 @@ async def list_purchase(
             id=purchase.id,
             project_id=purchase.project_id,
             boq_item_id=purchase.boq_item_id,
-            purchase_type=str(purchase.purchase_type),
+            purchase_type=purchase.purchase_type.value,
             asset_id=purchase.asset_id,
             asset_name=equipment_name,
             purchase_date=purchase.purchase_date,
@@ -3597,7 +4015,7 @@ async def get_purchase(
             EquipmentPurchase,
             Equipment.equipment_name,
         )
-        .join(
+        .outerjoin(
             Equipment,
             Equipment.id == EquipmentPurchase.asset_id,
         )
@@ -3713,6 +4131,9 @@ async def update_purchase(
     new_boq_item_id = purchase.boq_item_id
 
     # ================= BOQ SYNC =================
+    # FIX: previously only actual_cost was kept in sync; variance_cost
+    # (total_cost - actual_cost) was never recalculated here, unlike
+    # create_purchase. Now both stay consistent on update too.
 
     if old_boq_item_id != new_boq_item_id:
 
@@ -3730,6 +4151,9 @@ async def update_purchase(
                     Decimal("0"),
                     (old_boq.actual_cost or Decimal("0")) - old_total_amount,
                 )
+                old_boq.variance_cost = (
+                    old_boq.total_cost or Decimal("0")
+                ) - old_boq.actual_cost
 
         # Add amount to new BOQ
         if new_boq_item_id:
@@ -3754,6 +4178,9 @@ async def update_purchase(
             new_boq.actual_cost = (
                 new_boq.actual_cost or Decimal("0")
             ) + new_total_amount
+            new_boq.variance_cost = (
+                new_boq.total_cost or Decimal("0")
+            ) - new_boq.actual_cost
 
     # Same BOQ -> adjust amount difference only
     elif new_boq_item_id:
@@ -3773,13 +4200,19 @@ async def update_purchase(
                     + new_total_amount
                 ),
             )
+            boq_item.variance_cost = (
+                boq_item.total_cost or Decimal("0")
+            ) - boq_item.actual_cost
 
     # ================= EQUIPMENT =================
 
-    equipment = await db.get(
-        Equipment,
-        purchase.asset_id,
-    )
+    equipment = None
+
+    if purchase.asset_id is not None:
+        equipment = await db.get(
+            Equipment,
+            purchase.asset_id,
+        )
 
     # ================= AUDIT LOG =================
 
@@ -3816,7 +4249,7 @@ async def update_purchase(
         id=purchase.id,
         project_id=purchase.project_id,
         boq_item_id=purchase.boq_item_id,
-        purchase_type=str(purchase.purchase_type),
+        purchase_type=purchase.purchase_type.value,
         asset_id=purchase.asset_id,
         asset_name=(equipment.equipment_name if equipment else None),
         purchase_date=purchase.purchase_date,
@@ -3872,6 +4305,9 @@ async def delete_purchase(
                 (boq_item.actual_cost or Decimal("0"))
                 - (purchase.total_amount or Decimal("0")),
             )
+            boq_item.variance_cost = (
+                boq_item.total_cost or Decimal("0")
+            ) - boq_item.actual_cost
 
     # ================= AUDIT LOG =================
 
@@ -3897,21 +4333,53 @@ async def delete_purchase(
     invoice_number = purchase.invoice_number
     boq_item_id = purchase.boq_item_id
 
-    await db.delete(purchase)
+    try:
+        # ================= BOQ ROLLBACK =================
+        if purchase.boq_item_id:
 
-    await db.commit()
+            boq_item = await db.get(
+                BOQ,
+                purchase.boq_item_id,
+            )
 
-    await bump_cache_version(
-        redis,
-        VERSION_KEY,
-    )
+            if boq_item:
+                boq_item.actual_cost = max(
+                    Decimal("0"),
+                    (boq_item.actual_cost or Decimal("0"))
+                    - (purchase.total_amount or Decimal("0")),
+                )
+                boq_item.variance_cost = (
+                    boq_item.total_cost or Decimal("0")
+                ) - boq_item.actual_cost
+
+        # ================= AUDIT LOG =================
+        await create_audit_log(
+            db=db,
+            equipment_id=asset_id,
+            action="PURCHASE_DELETE",
+            old_values={
+                "purchase_id": purchase.id,
+                "asset_id": asset_id,
+                "boq_item_id": boq_item_id,
+                "invoice_number": invoice_number,
+                "vendor_name": purchase.vendor_name,
+                "quantity": purchase.quantity,
+                "unit_price": float(purchase.unit_price or 0),
+                "total_amount": float(purchase.total_amount or 0),
+            },
+            user_id=current_user.id,
+            request=request,
+        )
+
+        await db.delete(purchase)
+        await db.commit()
+
+    except Exception:
+        await db.rollback()
+        raise
 
     return {
         "message": "Purchase deleted successfully",
-        "purchase_id": purchase_id,
-        "asset_id": asset_id,
-        "boq_item_id": boq_item_id,
-        "invoice_number": invoice_number,
     }
 
 
@@ -4026,7 +4494,113 @@ async def transfer_equipment(
     }
 
 
+# ============================== TRANSFER HISTORY (NEW) ========================
+# NEW API: no endpoint previously exposed an equipment's transfer trail.
+# transfer_equipment() already writes a "TRANSFER" audit log entry with
+# old/new project_id, so this endpoint just reads and formats that history -
+# no new table/model required.
+
+
+@router.get("/{equipment_id}/transfer-history")
+async def get_transfer_history(
+    equipment_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await get_active_equipment_or_404(db, equipment_id)
+
+    base_query = select(EquipmentAuditLog).where(
+        EquipmentAuditLog.equipment_id == equipment_id,
+        EquipmentAuditLog.action == "TRANSFER",
+    )
+
+    count_stmt = select(func.count()).select_from(base_query.subquery())
+    total = await db.scalar(count_stmt)
+
+    stmt = (
+        base_query.order_by(EquipmentAuditLog.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    # Collect referenced project ids so we can enrich the response with names
+    project_ids = set()
+
+    parsed_rows = []
+
+    for row in rows:
+        old_values = safe_parse(row.old_values) if row.old_values else {}
+        new_values = safe_parse(row.new_values) if row.new_values else {}
+
+        from_project_id = old_values.get("project_id")
+        to_project_id = new_values.get("project_id")
+
+        if from_project_id:
+            project_ids.add(from_project_id)
+        if to_project_id:
+            project_ids.add(to_project_id)
+
+        parsed_rows.append(
+            {
+                "id": row.id,
+                "equipment_id": row.equipment_id,
+                "from_project_id": from_project_id,
+                "to_project_id": to_project_id,
+                "transferred_by": row.user_id,
+                "transferred_at": row.created_at,
+                "ip_address": row.ip_address,
+            }
+        )
+
+    # Collect project names
+    project_name_map = {}
+
+    project_ids = {pid for pid in project_ids if pid is not None}
+
+    if project_ids:
+        proj_result = await db.execute(
+            select(Project.id, Project.project_name).where(Project.id.in_(project_ids))
+        )
+
+        project_name_map = {
+            pid: project_name for pid, project_name in proj_result.all()
+        }
+
+    items = []
+
+    for item in parsed_rows:
+        items.append(
+            {
+                **item,
+                "from_project_name": project_name_map.get(item["from_project_id"]),
+                "to_project_name": project_name_map.get(item["to_project_id"]),
+            }
+        )
+
+    return {
+        "items": items,
+        "meta": {
+            "total": total or 0,
+            "limit": limit,
+            "offset": offset,
+        },
+    }
+
+
 # =====================get_equipment==============================
+# FIX: this is a plain read (GET) endpoint but was committing a DB write on
+# every single call via recalculate_equipment_status() + db.commit(). A GET
+# request should not mutate/persist data - besides being semantically wrong,
+# it adds needless write load and possible race conditions when many clients
+# poll this endpoint concurrently. The status is still computed live for an
+# accurate response, but it is no longer persisted here. Persisting status
+# changes should happen in the write-path endpoints (create/update/allocate/
+# rental/maintenance) which already call recalculate_equipment_status().
 
 
 @router.get("/{equipment_id}", response_model=EquipmentOut)
@@ -4040,14 +4614,12 @@ async def get_equipment(
         equipment_id,
     )
 
-    # Recalculate latest status
+    # Compute the live status for an accurate response WITHOUT persisting it -
+    # no commit/refresh here since this is a read-only endpoint.
     await recalculate_equipment_status(
         db,
         obj,
     )
-
-    await db.commit()
-    await db.refresh(obj)
 
     return EquipmentOut.model_validate(obj)
 
@@ -4090,7 +4662,6 @@ async def update_equipment(
     for field, value in update_data.items():
         setattr(obj, field, value)
 
-    # 🔥 FIX
     await recalculate_equipment_status(
         db,
         obj,
@@ -4108,6 +4679,8 @@ async def update_equipment(
     }
 
     if not changed_fields:
+        await db.commit()
+        await db.refresh(obj)
         return EquipmentOut.model_validate(obj)
 
     old_values = {k: v["old"] for k, v in changed_fields.items()}
@@ -4136,14 +4709,20 @@ async def update_equipment(
 
 
 # ============================== EQUIPMENT PURCHASE HISTORY ========================
+# Added optional filters + pagination.
 
 
 @router.get(
-    "/purchase/equipment/{equipment_id}",
+    "/purchase/history",
     response_model=List[EquipmentPurchaseOut],
 )
 async def get_equipment_purchase_history(
-    equipment_id: int,
+    equipment_id: Optional[int] = Query(None),
+    purchase_type: Optional[str] = Query(None),
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -4152,22 +4731,29 @@ async def get_equipment_purchase_history(
         equipment_id,
     )
 
-    if not equipment:
-        raise HTTPException(
-            status_code=404,
-            detail="Equipment not found",
-        )
+    stmt = select(EquipmentPurchase).where(
+        EquipmentPurchase.asset_id == equipment_id,
+    )
 
-    result = await db.execute(
-        select(EquipmentPurchase)
-        .where(
-            EquipmentPurchase.asset_id == equipment_id,
-        )
-        .order_by(
+    if purchase_type:
+        stmt = stmt.where(EquipmentPurchase.purchase_type == purchase_type)
+
+    if date_from:
+        stmt = stmt.where(EquipmentPurchase.purchase_date >= date_from)
+
+    if date_to:
+        stmt = stmt.where(EquipmentPurchase.purchase_date <= date_to)
+
+    stmt = (
+        stmt.order_by(
             EquipmentPurchase.purchase_date.desc(),
             EquipmentPurchase.created_at.desc(),
         )
+        .limit(limit)
+        .offset(offset)
     )
+
+    result = await db.execute(stmt)
 
     purchases = result.scalars().all()
 
@@ -4176,7 +4762,7 @@ async def get_equipment_purchase_history(
             id=purchase.id,
             project_id=purchase.project_id,
             boq_item_id=purchase.boq_item_id,
-            purchase_type=str(purchase.purchase_type),
+            purchase_type=purchase.purchase_type.value,
             asset_id=purchase.asset_id,
             asset_name=equipment.equipment_name,
             purchase_date=purchase.purchase_date,

@@ -83,6 +83,15 @@ class CompanySettingsUpdate(BaseModel):
     upi_id: Optional[str] = None
 
     terms_conditions: Optional[str] = None
+    
+    primary_cash_account_id: Optional[int] = None
+    petty_cash_account_id: Optional[int] = None
+
+    wages_account_id: Optional[int] = None
+    staff_salary_account_id: Optional[int] = None
+    contractor_expense_account_id: Optional[int] = None
+    tds_payable_account_id: Optional[int] = None
+    retention_payable_account_id: Optional[int] = None
 
     # =====================================
     # STRING CLEANING
@@ -202,6 +211,15 @@ class CompanySettingsOut(BaseModel):
     signature_image: Optional[str]
 
     terms_conditions: Optional[str]
+
+    primary_cash_account_id: Optional[int]
+    petty_cash_account_id: Optional[int]
+
+    wages_account_id: Optional[int] = None
+    staff_salary_account_id: Optional[int] = None
+    contractor_expense_account_id: Optional[int] = None
+    tds_payable_account_id: Optional[int] = None
+    retention_payable_account_id: Optional[int] = None
 
     class Config:
         from_attributes = True

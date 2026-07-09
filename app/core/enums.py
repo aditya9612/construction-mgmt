@@ -1,9 +1,11 @@
 from enum import Enum
 
+
 class InvoiceStatus(str, Enum):
     PENDING = "pending"
     PARTIAL = "partial"
     PAID = "paid"
+
 
 class AccountType(str, Enum):
     ASSET = "asset"
@@ -31,6 +33,7 @@ class LabourStatus(str, Enum):
     ACTIVE = "Active"
     INACTIVE = "Inactive"
 
+
 class OTPolicyType(str, Enum):
     MULTIPLIER = "Multiplier"
     FIXED_RATE = "FixedRate"
@@ -40,7 +43,6 @@ class SkillType(str, Enum):
     SKILLED = "Skilled"
     SEMI_SKILLED = "SemiSkilled"
     UNSKILLED = "Unskilled"
-
 
 
 class TransactionType(str, Enum):
@@ -81,10 +83,12 @@ class PurchaseStatus(str, Enum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
 
+
 class AttendanceStatus(str, Enum):
     PRESENT = "present"
     ABSENT = "absent"
     HALF_DAY = "half_day"
+
 
 class ProjectStatus(str, Enum):
     PLANNED = "PLANNED"
@@ -121,14 +125,14 @@ PRIORITY_MAP = {
     1: TaskPriority.LOW,
     2: TaskPriority.MEDIUM,
     3: TaskPriority.HIGH,
-    4: TaskPriority.CRITICAL
+    4: TaskPriority.CRITICAL,
 }
 
 REVERSE_PRIORITY_MAP = {
     TaskPriority.LOW: 1,
     TaskPriority.MEDIUM: 2,
     TaskPriority.HIGH: 3,
-    TaskPriority.CRITICAL: 4
+    TaskPriority.CRITICAL: 4,
 }
 
 
@@ -137,6 +141,7 @@ class MilestoneStatus(str, Enum):
     IN_PROGRESS = "In Progress"
     COMPLETED = "Completed"
     DELAYED = "Delayed"
+
 
 class WeatherType(str, Enum):
     SUNNY = "Sunny"
@@ -161,16 +166,19 @@ class SiteRequestType(str, Enum):
     MATERIAL = "Material"
     LABOUR = "Labour"
     EQUIPMENT = "Equipment"
-    WORK = "Work"   # optional: keep only if you have generic work requests
+    WORK = "Work"  # optional: keep only if you have generic work requests
+
 
 class QCStatus(str, Enum):
     PASS = "Pass"
     FAIL = "Fail"
 
+
 class SafetyChecklistStatus(str, Enum):
     PENDING = "pending"
     COMPLETED = "completed"
     FAILED = "failed"
+
 
 class EquipmentCondition(str, Enum):
     GOOD = "GOOD"
@@ -186,9 +194,10 @@ class EquipmentStatus(str, Enum):
     RENTED = "RENTED"
     MAINTENANCE = "MAINTENANCE"
     DAMAGED = "DAMAGED"
-    
+
+
 class AlertType(str, Enum):
-    LOW_STOCK = "LOW_STOCK" 
+    LOW_STOCK = "LOW_STOCK"
 
 
 class WorkActivityStatus(str, Enum):
@@ -204,14 +213,17 @@ class DocumentStatus(str, Enum):
     REJECTED = "REJECTED"
     UNDER_REVIEW = "UNDER_REVIEW"
 
+
 class ChecklistStatus(str, Enum):
     DONE = "DONE"
     PENDING = "PENDING"
+
 
 class InvoiceSourceType(str, Enum):
     QUOTATION = "quotation"
     MEASUREMENT = "measurement"
     MANUAL = "manual"
+
 
 class InvoiceType(str, Enum):
     OWNER = "owner"
@@ -263,3 +275,27 @@ class OwnerReferenceType(str, Enum):
     ADVANCE = "advance"
     CONTRACTOR = "contractor"
     RA_BILL = "ra_bill"
+
+
+class PaymentMethod(str, Enum):
+    CASH = "CASH"
+    CHEQUE = "CHEQUE"
+    NEFT = "NEFT"
+    RTGS = "RTGS"
+    UPI = "UPI"
+    ONLINE = "ONLINE"
+
+
+class PaymentStatus(str, Enum):
+    VERIFICATION_PENDING = "VERIFICATION_PENDING"
+    PENDING = "PENDING"
+    SUCCESS = "SUCCESS"
+    REJECTED = "REJECTED"
+    FAILED = "FAILED"
+
+
+class PurchaseType(str, Enum):
+    NEW = "NEW"
+    USED = "USED"
+    RENT = "RENT"
+    SPARE_PART = "SPARE_PART"

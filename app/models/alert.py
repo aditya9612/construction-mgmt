@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime
-from datetime import datetime
+from sqlalchemy.sql import func
 from app.models.base import Base
 
 
@@ -18,4 +18,4 @@ class Alert(Base):
 
     status = Column(String(20), default="active")
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, server_default=func.now())

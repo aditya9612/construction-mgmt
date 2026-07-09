@@ -1,5 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, Depends
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.session import get_db_session
@@ -172,8 +173,11 @@ async def csv_to_dxf(file_path: str, db: AsyncSession):
 async def convert(file: UploadFile = File(...), db: AsyncSession = Depends(get_db_session)):
     temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.csv")
 
-    with open(temp_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    def _save_cad():
+        with open(temp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+            
+    await run_in_threadpool(_save_cad)
 
     try:
         dxf_path = await csv_to_dxf(temp_path, db)
