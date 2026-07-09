@@ -18,13 +18,14 @@ from app.models.expense import Expense
 from app.models.final_measurement import FinalMeasurement
 from app.models.labour import Labour
 from app.models.user import UserAttendance
-from app.models.project import Project, Task
+from app.models.project import Project, ProjectMember, Task
 from app.db.session import get_db_session
 from app.models.invoice import Invoice, Transaction
 from app.models.owner import OwnerTransaction
 from app.models.user import User, ActivityLog
 from app.schemas.invoice import (
     AnalyticsSummaryOut,
+    CreateInvoice,
     InvoiceCreate,
     InvoiceUpdate,
     InvoiceOut,
