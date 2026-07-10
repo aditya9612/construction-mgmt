@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.enums import InvoiceSourceType
 from app.db.session import get_db_session
 from app.models.final_measurement import FinalMeasurement
 from app.models.project import Project
@@ -104,19 +105,6 @@ async def create_measurement(
     return FinalMeasurementOut.model_validate(obj)
 
 
-@router.get("/{id}", response_model=FinalMeasurementOut)
-async def get_measurement(
-    id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.require_roles(MEASUREMENT_READ_ROLES)),
-):
-    obj = await db.get(FinalMeasurement, id)
-
-    if not obj:
-        raise NotFoundError("Measurement not found")
-
-    return FinalMeasurementOut.model_validate(obj)
-
 
 @router.get("/project/{project_id}")
 async def get_by_project(
@@ -130,6 +118,19 @@ async def get_by_project(
     rows = result.scalars().all()
 
     return [FinalMeasurementOut.model_validate(r) for r in rows]
+
+@router.get("/{id}", response_model=FinalMeasurementOut)
+async def get_measurement(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(d.require_roles(MEASUREMENT_READ_ROLES)),
+):
+    obj = await db.get(FinalMeasurement, id)
+
+    if not obj:
+        raise NotFoundError("Measurement not found")
+
+    return FinalMeasurementOut.model_validate(obj)
 
 
 @router.put("/{id}", response_model=FinalMeasurementOut)
@@ -150,12 +151,32 @@ async def update_measurement(
     if obj.status not in ["DRAFT", "REJECTED"]:
         raise ValidationError("Cannot modify a measurement once it has been submitted for approval.")
 
-    invoice_exists = await db.scalar(
-        select(Invoice).where(
-            Invoice.source_type == InvoiceSourceType.MEASUREMENT,
-            Invoice.reference_id == obj.id
+    try:
+        result = await db.execute(
+            select(Invoice.id).where(
+                Invoice.source_type == InvoiceSourceType.MEASUREMENT,
+                Invoice.reference_id == obj.id
+            )
         )
-    )
+
+        invoice_exists = result.scalar_one_or_none()
+
+    except Exception as e:
+        logger.exception(
+            f"Invoice check failed measurement={id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    # invoice_exists = await db.scalar(
+    #     select(Invoice).where(
+    #         Invoice.source_type == InvoiceSourceType.MEASUREMENT,
+    #         Invoice.reference_id == obj.id
+    #     )
+    # )
     if invoice_exists:
         logger.warning(f"Measurement locked (invoice exists) id={id}")
         raise ValidationError("Measurement is locked. Invoice already generated.")
@@ -167,9 +188,12 @@ async def update_measurement(
             setattr(obj, k, v)
 
     final_area = Decimal(str(obj.final_area or 0))
-    extra_area = Decimal(obj.extra_area or 0)
-    approved_rate = Decimal(obj.approved_rate or 0)
-    extra_rate = Decimal(obj.extra_rate or 0)
+    # extra_area = Decimal(obj.extra_area or 0)
+    # approved_rate = Decimal(obj.approved_rate or 0)
+    # extra_rate = Decimal(obj.extra_rate or 0)
+    extra_area = Decimal(str(obj.extra_area or 0))
+    approved_rate = Decimal(str(obj.approved_rate or 0))
+    extra_rate = Decimal(str(obj.extra_rate or 0))
 
     obj.total_area = final_area + extra_area
     obj.total_amount = (final_area * approved_rate) + (extra_area * extra_rate)
@@ -215,12 +239,32 @@ async def delete_measurement(
     if obj.status not in ["DRAFT", "REJECTED"]:
         raise ValidationError("Cannot modify a measurement once it has been submitted for approval.")
 
-    invoice_exists = await db.scalar(
-        select(Invoice).where(
-            Invoice.source_type == InvoiceSourceType.MEASUREMENT,
-            Invoice.reference_id == obj.id
+    try:
+        result = await db.execute(
+            select(Invoice.id).where(
+                Invoice.source_type == InvoiceSourceType.MEASUREMENT,
+                Invoice.reference_id == obj.id
+            )
         )
-    )
+
+        invoice_exists = result.scalar_one_or_none()
+
+    except Exception as e:
+        logger.exception(
+            f"Invoice check failed measurement={id}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    # invoice_exists = await db.scalar(
+    #     select(Invoice).where(
+    #         Invoice.source_type == InvoiceSourceType.MEASUREMENT,
+    #         Invoice.reference_id == obj.id
+    #     )
+    # )
 
     if invoice_exists:
         logger.warning(f"Delete blocked (invoice exists) id={id}")

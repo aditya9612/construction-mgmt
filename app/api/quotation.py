@@ -1239,6 +1239,10 @@ async def create_quotation(
     # FINAL TOTALS
     # =====================================================
     await db.flush()
+    await db.refresh(
+        quotation,
+        attribute_names=["items", "labour_items", "material_items", "extra_charge_items"]
+    )
 
     calculate_quotation_totals(quotation)
 

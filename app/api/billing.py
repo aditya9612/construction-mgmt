@@ -447,10 +447,10 @@ async def approve_bill(
 
     # 3. Create Journal Entry
     je = JournalEntry(
-        entry_type="Invoice", # RA Bill behaves as an invoice to AR
+        entry_type="Invoice",
         journal_number=f"J-RAB-{obj.id}",
         entry_date=date.today(),
-        description=f"RA Bill {obj.ra_bill_no} Approved",
+        description=f"RA Bill {obj.bill_number} Approved",
         status="Posted"
     )
     db.add(je)
@@ -459,8 +459,16 @@ async def approve_bill(
     ar_acc = await get_accounts_receivable(db)
     rev_acc = await get_revenue_account(db)
 
-    db.add(JournalLine(entry_id=je.id, account_id=ar_acc.id, debit=obj.net_payable, credit=Decimal(0)))
-    
+    # db.add(JournalLine(entry_id=je.id, account_id=ar_acc.id, debit=obj.net_payable, credit=Decimal(0)))
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=ar_acc.id,
+            debit=obj.total_amount,
+            credit=Decimal(0)
+        )
+    )
+
     # Revenue is gross amount minus GST, wait, the instruction says:
     # Credit: Project Revenue
     # Credit: GST Payable if applicable
@@ -469,11 +477,34 @@ async def approve_bill(
     
     db.add(JournalLine(entry_id=je.id, account_id=rev_acc.id, debit=Decimal(0), credit=obj.gross_amount))
     
-    if obj.gst_amount and obj.gst_amount > 0:
+    # if obj.gst_amount and obj.gst_amount > 0:
+    #     from app.utils.accounting import resolve_tax_accounts
+    #     gst_acc = await resolve_tax_accounts(db, "output_gst")
+    #     db.add(JournalLine(entry_id=je.id, account_id=gst_acc.id, debit=Decimal(0), credit=obj.gst_amount))
+
+    gst_amount = (
+        obj.net_amount * obj.gst_percent
+    ) / 100
+
+
+    if gst_amount > 0:
+
         from app.utils.accounting import resolve_tax_accounts
-        gst_acc = await resolve_tax_accounts(db, "output_gst")
-        db.add(JournalLine(entry_id=je.id, account_id=gst_acc.id, debit=Decimal(0), credit=obj.gst_amount))
-        
+
+        gst_acc = await resolve_tax_accounts(
+            db,
+            "output_gst"
+        )
+
+        db.add(
+            JournalLine(
+                entry_id=je.id,
+                account_id=gst_acc.id,
+                debit=Decimal(0),
+                credit=gst_amount
+            )
+        )
+
     await db.commit()
 
     return {"message": "Approved"}

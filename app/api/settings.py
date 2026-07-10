@@ -124,31 +124,34 @@ async def update_profile(
     # VALIDATE + UPDATE TEXT FIELDS
     # =========================================
 
-    if full_name is not None:
-        current_user.full_name = validate_full_name(
-            full_name
-        )
+    try:
+        if full_name is not None:
+            current_user.full_name = validate_full_name(
+                full_name
+            )
 
-    if address is not None:
-        current_user.address = address.strip()
+        if address is not None:
+            current_user.address = address.strip()
 
-    if pan_number is not None:
-        current_user.pan_number = validate_pan(
-            pan_number
-        )
+        if pan_number is not None:
+            current_user.pan_number = validate_pan(
+                pan_number
+            )
 
-    if aadhaar_number is not None:
-        current_user.aadhaar_number = validate_aadhaar(
-            aadhaar_number
-        )
+        if aadhaar_number is not None:
+            current_user.aadhaar_number = validate_aadhaar(
+                aadhaar_number
+            )
 
-    if designation is not None:
-        current_user.designation = designation.strip()
+        if designation is not None:
+            current_user.designation = designation.strip()
 
-    if joining_date is not None:
-        current_user.joining_date = validate_joining_date(
-            joining_date
-        )
+        if joining_date is not None:
+            current_user.joining_date = validate_joining_date(
+                joining_date
+            )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     # =========================================
     # VALIDATE IMAGE REQUEST

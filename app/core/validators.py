@@ -58,8 +58,8 @@ def validate_full_name(v):
 
     v = " ".join(v.strip().split())
 
-    if not re.match(r"^[A-Za-z. ]+$", v):
-        raise ValueError("Full name must contain only alphabets, dots and spaces")
+    if not re.match(r"^[A-Za-z0-9. ]+$", v):
+        raise ValueError("Full name must contain only alphabets, numbers, dots and spaces")
 
     return v
 

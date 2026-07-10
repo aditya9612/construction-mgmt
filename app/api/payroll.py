@@ -86,7 +86,7 @@ async def export_payslips(
     
     for p in payrolls:
         period = f"{p.month}/{p.year}"
-        name = p.labour.name if p.labour else "Unknown"
+        name = p.labour.labour_name if p.labour else "Unknown"
         net_pay = float(p.total_wage or 0) - float(p.advance_adjusted or 0)
         writer.writerow([
             name,
@@ -216,8 +216,8 @@ async def get_labour_wages(
     for labour in labours:
         att_stmt = select(LabourAttendance).where(
             LabourAttendance.labour_id == labour.id,
-            LabourAttendance.date >= start_date,
-            LabourAttendance.date <= end_date
+            LabourAttendance.attendance_date >= start_date,
+            LabourAttendance.attendance_date <= end_date
         )
         attendances = (await db.execute(att_stmt)).scalars().all()
         
@@ -228,7 +228,7 @@ async def get_labour_wages(
         
         results.append({
             "labour_id": labour.id,
-            "full_name": labour.full_name,
+            "full_name": labour.labour_name,
             "total_hours": total_hours,
             "calculated_wage": wage
         })
@@ -258,7 +258,11 @@ async def pay_labour_wages(
         except ValueError:
             raise HTTPException(status_code=400, detail="Primary cash account not configured")
     else:
+        if not payload.bank_account_id:
+            raise HTTPException(status_code=400, detail="Bank account required for bank payment")
         bank = await db.get(BankAccount, payload.bank_account_id)
+        if not bank:
+            raise HTTPException(status_code=404, detail="Bank account not found")
         pay_acc = await db.get(Account, bank.account_id)
 
     amount = 500.00 # Placeholder for calculated wage
@@ -274,7 +278,11 @@ async def pay_labour_wages(
     )
     db.add(txn)
     
-    je = JournalEntry(description=f"Labour Wages {payload.start_date}")
+    je = JournalEntry(
+        description=f"Labour Wages {payload.start_date}",
+        entry_date=payload.start_date,
+        created_by=current_user.id
+    )
     db.add(je)
     await db.flush()
     
@@ -416,7 +424,7 @@ async def export_payroll_register(
         elif t.linked_to.startswith("LABOUR-WAGE:") and len(parts) >= 3:
             p_type = "Labour Wage"
             l = labours.get(int(parts[1]))
-            name = l.full_name if l else "Unknown Labour"
+            name = l.labour_name if l else "Unknown Labour"
             period = parts[2]
             
         elif t.linked_to.startswith("CONTRACTOR-PAY:") and len(parts) >= 2:
@@ -445,7 +453,7 @@ async def pay_contractor_bill(
     if not rabill:
         raise HTTPException(status_code=404, detail="RA Bill not found")
         
-    invoice_stmt = select(Invoice).where(Invoice.source_id == rabill.id, Invoice.source_type == "contractor")
+    invoice_stmt = select(Invoice).where(Invoice.reference_id == rabill.id, Invoice.source_type == "contractor")
     invoice = await db.scalar(invoice_stmt)
     
     try:
@@ -473,7 +481,7 @@ async def pay_contractor_bill(
             invoice.status = "Paid"
 
     txn = Transaction(
-        project_id=payload.project_id,
+        project_id=rabill.project_id,
         invoice_id=invoice.id if invoice else None,
         type="payment",
         amount=payload.paid_amount,
@@ -484,7 +492,11 @@ async def pay_contractor_bill(
     )
     db.add(txn)
     
-    je = JournalEntry(description=f"Contractor Payment RA Bill {rabill.bill_number}")
+    je = JournalEntry(
+        description=f"Contractor Payment RA Bill {rabill.bill_number}",
+        entry_date=date.today(),
+        created_by=current_user.id
+    )
     db.add(je)
     await db.flush()
     

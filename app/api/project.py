@@ -122,6 +122,27 @@ def compute_milestone_status(milestone):
     return "Planned"
 
 
+def serialize_milestone(obj: m.Milestone) -> s.MilestoneOut:
+    return s.MilestoneOut(
+        id=obj.id,
+        project_id=obj.project_id,
+        title=obj.title,
+        status=compute_milestone_status(obj),
+        description=obj.description,
+        start_date=obj.start_date,
+        end_date=obj.end_date,
+        actual_start_date=obj.actual_start_date,
+        actual_end_date=obj.actual_end_date,
+        total_tasks=obj.total_tasks,
+        completed_tasks=obj.completed_tasks,
+        pending_tasks=obj.pending_tasks,
+        delayed_tasks=obj.delayed_tasks,
+        is_delayed=obj.is_delayed,
+        completion_percentage=obj.completion_percentage,
+        execution_completion_percentage=obj.execution_completion_percentage,
+    )
+
+
 def get_pagination(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
@@ -1059,24 +1080,7 @@ class MilestonesService:
             logger.exception(f"Milestone create failed")
             raise
 
-        return s.MilestoneOut(
-            id=obj.id,
-            project_id=obj.project_id,
-            title=obj.title,
-            description=obj.description,
-            start_date=obj.start_date,
-            end_date=obj.end_date,
-            actual_start_date=obj.actual_start_date,
-            actual_end_date=obj.actual_end_date,
-            status=compute_milestone_status(obj),  # IMPORTANT
-            total_tasks=0,
-            completed_tasks=0,
-            pending_tasks=0,
-            delayed_tasks=0,
-            is_delayed=False,
-            completion_percentage=0.0,
-            execution_completion_percentage=0.0,
-        )
+        return serialize_milestone(obj)
 
     async def list_milestones(
         self,
@@ -1097,20 +1101,7 @@ class MilestonesService:
             offset=pagination.offset,
         )
 
-        items = [
-            s.MilestoneOut(
-                id=m.id,
-                project_id=m.project_id,
-                title=m.title,
-                description=m.description,
-                start_date=m.start_date,
-                end_date=m.end_date,
-                actual_start_date=m.actual_start_date,
-                actual_end_date=m.actual_end_date,
-                status=compute_milestone_status(m),
-            )
-            for m in rows
-        ]
+        items = [serialize_milestone(m) for m in rows]
 
         return PaginatedResponse(
             items=items,
@@ -1129,24 +1120,7 @@ class MilestonesService:
         )
         if obj is None:
             raise NotFoundError("Milestone not found")
-        return s.MilestoneOut(
-            id=obj.id,
-            project_id=obj.project_id,
-            title=obj.title,
-            status=compute_milestone_status(obj),
-            description=obj.description,
-            start_date=obj.start_date,
-            end_date=obj.end_date,
-            actual_start_date=obj.actual_start_date,
-            actual_end_date=obj.actual_end_date,
-            total_tasks=obj.total_tasks,
-            completed_tasks=obj.completed_tasks,
-            pending_tasks=obj.pending_tasks,
-            delayed_tasks=obj.delayed_tasks,
-            is_delayed=obj.is_delayed,
-            completion_percentage=obj.completion_percentage,
-            execution_completion_percentage=obj.execution_completion_percentage,
-        )
+        return serialize_milestone(obj)
 
     async def update_milestone(
         self,
@@ -1188,24 +1162,7 @@ class MilestonesService:
             logger.exception(f"Milestone update failed id={milestone_id}")
             raise
 
-        return s.MilestoneOut(
-            id=obj.id,
-            project_id=obj.project_id,
-            title=obj.title,
-            status=compute_milestone_status(obj),
-            description=obj.description,
-            start_date=obj.start_date,
-            end_date=obj.end_date,
-            actual_start_date=obj.actual_start_date,
-            actual_end_date=obj.actual_end_date,
-            total_tasks=obj.total_tasks,
-            completed_tasks=obj.completed_tasks,
-            pending_tasks=obj.pending_tasks,
-            delayed_tasks=obj.delayed_tasks,
-            is_delayed=obj.is_delayed,
-            completion_percentage=obj.completion_percentage,
-            execution_completion_percentage=obj.execution_completion_percentage,
-        )
+        return serialize_milestone(obj)
 
     async def delete_milestone(
         self,
@@ -3434,56 +3391,6 @@ async def list_projects(
     return result
 
 
-@router.get("/{project_id}", response_model=s.ProjectOut)
-async def get_project(
-    project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(get_request_redis),
-    service: ProjectsService = Depends(get_projects_service),
-):
-    version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:projects:get:{version}:{current_user.id}:{current_user.role}:{project_id}"
-    cached_json = await cache_get_json(redis, cache_key)
-    if (
-        cached_json is not None
-        and isinstance(cached_json, dict)
-        and "completion_percentage" in cached_json
-    ):
-        return s.ProjectOut.model_validate(cached_json)
-
-    out = await service.get_project(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
-    await cache_set_json(redis, cache_key, out.model_dump())
-    return out
-
-
-@router.put("/{project_id}", response_model=s.ProjectOut)
-async def update_project(
-    project_id: int,
-    payload: s.ProjectUpdate,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(get_request_redis),
-    service: ProjectsService = Depends(get_projects_service),
-):
-    logger.info(f"Updating project id={project_id}")
-
-    try:
-        out = await service.update_project(
-            db, current_user, project_id=project_id, payload=payload
-        )
-        await bump_cache_version(redis, VERSION_KEY)
-    except Exception:
-        logger.exception(f"Project update failed id={project_id}")
-        raise
-
-    logger.info(f"Project updated id={project_id}")
-
-    return out
 
 
 @router.post("/{project_id}/schedule")
@@ -3555,27 +3462,6 @@ async def get_task_alerts(
 ):
     return await service.get_task_alerts(db, current_user, pagination)
 
-
-@router.delete("/{project_id}", status_code=200)
-async def delete_project(
-    project_id: int,
-    current_user: User = Depends(require_roles(PROJECT_DELETE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(get_request_redis),
-    service: ProjectsService = Depends(get_projects_service),
-):
-    logger.info(f"Deleting project id={project_id}")
-
-    try:
-        await service.delete_project(db, current_user, project_id=project_id)
-        await bump_cache_version(redis, VERSION_KEY)
-    except Exception:
-        logger.exception(f"Project delete failed id={project_id}")
-        raise
-
-    logger.info(f"Project deleted id={project_id}")
-
-    return {"success": True, "message": f"Project_id {project_id} deleted successfully"}
 
 
 @router.post(
@@ -9190,15 +9076,23 @@ async def execute_checklist(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
 ):
-    checklist = await db.get(m.Checklist, id)
+    checklist = await db.scalar(
+        select(m.Checklist)
+        .options(selectinload(m.Checklist.items))
+        .where(m.Checklist.id == id)
+    )
 
     if not checklist:
         raise HTTPException(status_code=404, detail="Checklist not found")
+        
+    if not checklist.items:
+        raise HTTPException(status_code=400, detail="Cannot execute empty checklist")
 
     log = m.ChecklistLog(
         checklist_id=id,
         project_id=data.project_id,
         remarks=data.remarks,
+        status=data.status,
         executed_by=current_user.id,
     )
 
@@ -9856,3 +9750,77 @@ async def reject_request(
 
 router.include_router(milestones_router)
 router.include_router(tasks_router)
+
+
+# Moved dynamic routes to bottom
+@router.get("/{project_id}", response_model=s.ProjectOut)
+async def get_project(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    service: ProjectsService = Depends(get_projects_service),
+):
+    version = await get_cache_version(redis, VERSION_KEY)
+    cache_key = f"cache:projects:get:{version}:{current_user.id}:{current_user.role}:{project_id}"
+    cached_json = await cache_get_json(redis, cache_key)
+    if (
+        cached_json is not None
+        and isinstance(cached_json, dict)
+        and "completion_percentage" in cached_json
+    ):
+        return s.ProjectOut.model_validate(cached_json)
+
+    out = await service.get_project(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
+    await cache_set_json(redis, cache_key, out.model_dump())
+    return out
+
+@router.put("/{project_id}", response_model=s.ProjectOut)
+async def update_project(
+    project_id: int,
+    payload: s.ProjectUpdate,
+    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    service: ProjectsService = Depends(get_projects_service),
+):
+    logger.info(f"Updating project id={project_id}")
+
+    try:
+        out = await service.update_project(
+            db, current_user, project_id=project_id, payload=payload
+        )
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Project update failed id={project_id}")
+        raise
+
+    logger.info(f"Project updated id={project_id}")
+
+    return out
+
+@router.delete("/{project_id}", status_code=200)
+async def delete_project(
+    project_id: int,
+    current_user: User = Depends(require_roles(PROJECT_DELETE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    service: ProjectsService = Depends(get_projects_service),
+):
+    logger.info(f"Deleting project id={project_id}")
+
+    try:
+        await service.delete_project(db, current_user, project_id=project_id)
+        await bump_cache_version(redis, VERSION_KEY)
+    except Exception:
+        logger.exception(f"Project delete failed id={project_id}")
+        raise
+
+    logger.info(f"Project deleted id={project_id}")
+
+    return {"success": True, "message": f"Project_id {project_id} deleted successfully"}
+

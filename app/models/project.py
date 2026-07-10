@@ -864,8 +864,12 @@ class ChecklistLog(Base):
 
     status = Column(SAEnum(ChecklistStatus), nullable=False)
     remarks = Column(Text)
+    
+    executed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     checklist = relationship("Checklist", back_populates="logs")
+    executor = relationship("User", foreign_keys=[executed_by], lazy="selectin")
+
 
 
 # ======================

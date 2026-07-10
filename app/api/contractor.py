@@ -438,7 +438,7 @@ async def contractor_bills(
     return [
         {
             "bill_id": inv.id,
-            "amount": float(inv.total_amount),
+            "amount": float(inv.total_amount or 0),
             "status": inv.status,
             "date": inv.created_at,
         }
@@ -505,7 +505,7 @@ async def contractor_ledger(
         ledger.append(
             {
                 "type": "DEBIT",
-                "amount": float(exp.amount),
+                "amount": float(exp.amount or 0),
                 "date": exp.expense_date,
                 "description": exp.description,
             }
@@ -515,7 +515,7 @@ async def contractor_ledger(
         ledger.append(
             {
                 "type": "CREDIT",
-                "amount": float(inv.total_amount),
+                "amount": float(inv.total_amount or 0),
                 "date": inv.created_at,
                 "description": "Contractor Bill",
             }

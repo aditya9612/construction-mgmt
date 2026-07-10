@@ -111,8 +111,14 @@ async def get_client_portfolio(
 
     owner_ids = [o.id for o in owners]
     if not owner_ids:
-        return {"portfolio": [], "total_outstanding": 0}
-
+        return ClientPortfolioResponse(
+            summary=ClientPortfolioSummary(
+                total_clients=0,
+                total_outstanding_billing=0,
+                average_satisfaction_score=0.0
+            ),
+            items=[]
+        )
     # Batched Project Stats
     proj_stats_res = await db.execute(
         select(
@@ -317,10 +323,26 @@ async def delete_owner(
             f"Owner cannot be deleted because {project_count} project(s) are assigned to this owner. Reassign or delete the projects first."
         )
 
+    # Prevent deletion if there are payments
+    from app.models.owner import OwnerPaymentSchedule, OwnerTransaction
+    from app.models.invoice import Invoice
+    payment_count = await db.scalar(select(func.count(OwnerPaymentSchedule.id)).where(OwnerPaymentSchedule.owner_id == owner_id))
+    transaction_count = await db.scalar(select(func.count(OwnerTransaction.id)).where(OwnerTransaction.owner_id == owner_id))
+    invoice_count = await db.scalar(select(func.count(Invoice.id)).where(Invoice.owner_id == owner_id))
+
+    if (payment_count or 0) > 0 or (transaction_count or 0) > 0 or (invoice_count or 0) > 0:
+        logger.warning(f"Owner delete blocked id={owner_id}, related financial records exist.")
+        raise ValidationError("Owner cannot be deleted because related financial records exist.")
+
+
     try:
         await db.delete(obj)
         await db.flush()
 
+    except IntegrityError:
+        await db.rollback()
+        logger.warning(f"Owner delete failed due to IntegrityError id={owner_id}")
+        raise ValidationError("Owner cannot be deleted because there are related records.")
     except Exception:
         await db.rollback()
         logger.exception(f"Owner delete failed id={owner_id}")
@@ -401,6 +423,9 @@ async def export_owner_ledger_pdf(
             .order_by(OwnerTransaction.created_at.desc())
         )
         transactions = result.scalars().all()
+
+        if not transactions:
+            raise ValidationError("No ledger data available to export for this owner.")
 
         total_credit = sum(
             (t.amount or Decimal("0"))
@@ -499,6 +524,9 @@ async def export_owner_ledger_excel(
             .order_by(OwnerTransaction.created_at.desc())
         )
         transactions = result.scalars().all()
+
+        if not transactions:
+            raise ValidationError("No ledger data available to export for this owner.")
 
         string_buffer = StringIO()
         writer = csv.writer(string_buffer)

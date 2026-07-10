@@ -1,7 +1,7 @@
 from typing import Optional
 from datetime import date
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select, func
+from sqlalchemy import or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import OwnerReferenceType, OwnerTransactionType
 from app.db.session import get_db_session
@@ -116,7 +116,7 @@ async def create_expense(
         # CR Bank/Cash/Vendor Payable
         # We will dynamically find Expense account or fallback
         from app.core.enums import AccountType
-        expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Expense%'), Account.type == AccountType.DIRECT_EXPENSE.value))
+        expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
         if not expense_acc:
             expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Direct Expense%')))
         
@@ -198,7 +198,7 @@ async def list_expenses(
     return [ExpenseOut.model_validate(r) for r in rows]
 
 
-@router.get("/{id}", response_model=ExpenseOut)
+@router.get("/{id:int}", response_model=ExpenseOut)
 async def get_expense(
     id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -212,7 +212,7 @@ async def get_expense(
     return ExpenseOut.model_validate(obj)
 
 
-@router.put("/{id}", response_model=ExpenseOut)
+@router.put("/{id:int}", response_model=ExpenseOut)
 async def update_expense(
     id: int,
     payload: ExpenseUpdate,
@@ -280,7 +280,7 @@ async def update_expense(
     return ExpenseOut.model_validate(obj)
 
 
-@router.delete("/{id}", status_code=204)
+@router.delete("/{id:int}", status_code=204)
 async def delete_expense(
     id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -405,14 +405,14 @@ async def get_dashboard(
     current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
 ):
     # Total Expense
-    total_expense = await db.scalar(select(func.sum(Expense.amount))) or 0.0
+    total_expense = float(await db.scalar(select(func.sum(Expense.amount))) or 0.0)
 
     # Monthly Expense
     today = date.today()
     start_of_month = today.replace(day=1)
-    monthly_expense = await db.scalar(
+    monthly_expense = float(await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.expense_date >= start_of_month)
-    ) or 0.0
+    ) or 0.0)
 
     # For simple estimation, consider all currently assigned project expenses
     project_expense = total_expense  # in a real app might exclude HQ expenses
@@ -456,9 +456,9 @@ async def get_project_allocations(
 ):
     # Group by project
     res = await db.execute(
-        select(Project.id, Project.name, func.sum(Expense.amount))
+        select(Project.id, Project.project_name, func.sum(Expense.amount))
         .join(Expense, Expense.project_id == Project.id)
-        .group_by(Project.id, Project.name)
+        .group_by(Project.id, Project.project_name)
     )
     projects = []
     for pid, pname, amt in res.all():
@@ -476,7 +476,7 @@ async def get_project_allocations(
     for e in expenses:
         proj = await db.get(Project, e.project_id)
         recent.append(ProjectAllocationRecent(
-            project_name=proj.name if proj else "Unknown",
+            project_name=proj.project_name if proj else "Unknown",
             expense_category=e.category,
             amount=float(e.amount),
             allocated_date=e.expense_date,
@@ -492,7 +492,7 @@ async def get_expense_ledger(
 ):
     from app.core.enums import AccountType
     expense_accs = (await db.execute(
-        select(Account.id).where(or_(Account.name.ilike('%Expense%'), Account.type == AccountType.DIRECT_EXPENSE.value))
+        select(Account.id).where(or_(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
     )).scalars().all()
 
     if not expense_accs:
@@ -512,7 +512,7 @@ async def get_expense_ledger(
         credit = float(jl.credit or 0)
         running_balance += (debit - credit)
         rows.append(ExpenseLedgerRow(
-            date=je.entry_date,
+            date=je.entry_date or date.today(),
             particular=je.description or "Expense",
             debit=debit,
             credit=credit,

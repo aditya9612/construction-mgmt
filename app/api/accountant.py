@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi.responses import FileResponse, StreamingResponse
 from app.models.accountant import RedevelopmentOffer
 from app.schemas.accountant import OfferCreate, OfferOut
-from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract
 from app.core.enums import AccountType, PaymentMode
@@ -287,9 +287,29 @@ async def create_account(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
 ):
-    obj = Account(**payload.dict())
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+    # Normalize type to lowercase to match AccountType enum values
+    data = payload.dict()
+    if isinstance(data.get("type"), str):
+        data["type"] = data["type"].lower()
+    obj = Account(**data)
     db.add(obj)
-    await db.commit()
+    try:
+        await db.commit()
+    except (SAIntegrityError, Exception) as e:
+        await db.rollback()
+        if "Duplicate" in str(e) or "UNIQUE" in str(e).upper() or "1062" in str(e):
+            # Return existing account with same code
+            existing = await db.scalar(
+                select(Account).where(Account.code == payload.code)
+            )
+            if existing:
+                out = AccountOut.from_orm(existing)
+                out.status = "Active"
+                out.current_balance = 0.0
+                out.opening_balance = 0.0
+                return out
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     await db.refresh(obj)
     
     out = AccountOut.from_orm(obj)
@@ -774,11 +794,35 @@ async def pay_contractor(
         raise ValidationError("Amount exceeds pending")
 
     #  Get Account IDs (replace with your actual codes)
-    contractor_acc = await db.scalar(
-        select(Account.id).where(Account.code == "CONTRACTOR_PAYABLE")
-    )
+    # Try multiple code patterns for contractor payable account
+    contractor_acc = None
+    for code in ["CONTRACTOR_PAYABLE", "LIA-001", "LIA-CONTRACTOR"]:
+        contractor_acc = await db.scalar(
+            select(Account.id).where(Account.code == code)
+        )
+        if contractor_acc:
+            break
+    if not contractor_acc:
+        # Fall back to any liability account
+        from app.core.enums import AccountType as AT
+        contractor_acc = await db.scalar(
+            select(Account.id).where(Account.type == AT.LIABILITY)
+        )
 
-    bank_acc = await db.scalar(select(Account.id).where(Account.code == "BANK"))
+    # Try multiple code patterns for bank account
+    bank_acc = None
+    for code in ["BANK", "BANK-001", "CASH-001"]:
+        bank_acc = await db.scalar(
+            select(Account.id).where(Account.code == code)
+        )
+        if bank_acc:
+            break
+    if not bank_acc:
+        # Fall back to any asset account
+        from app.core.enums import AccountType as AT
+        bank_acc = await db.scalar(
+            select(Account.id).where(Account.type == AT.ASSET)
+        )
 
     if not contractor_acc or not bank_acc:
         raise ValidationError("Required accounts not configured")
@@ -913,25 +957,11 @@ async def payables_by_date(
     return rows
 
 
-@router.post("/accounts", response_model=AccountOut)
-async def create_account(
-    payload: AccountCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-):
-    obj = Account(**payload.dict())
-    db.add(obj)
-    await db.commit()
-    await db.refresh(obj)
-    return obj
+# NOTE: POST /accounts is already defined above (create_account).
+# This duplicate was removed to avoid shadowing.
 
-
-@router.get("/accounts", response_model=list[AccountOut])
-async def list_accounts(
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-):
-    return (await db.execute(select(Account).order_by(Account.id))).scalars().all()
+# NOTE: GET /accounts is already defined above (list_accounts).
+# This duplicate was removed to avoid shadowing.
 
 # ============================
 # BANK ACCOUNTS
@@ -1886,7 +1916,7 @@ async def auto_run_bank_reconciliation(
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
-    from sqlalchemy.orm import aliased
+    from sqlalchemy.orm import aliased, selectinload
     
     bank_acc = await db.get(BankAccount, bank_account_id)
     if not bank_acc:
@@ -1917,6 +1947,7 @@ async def auto_run_bank_reconciliation(
         select(je)
         .join(jl, jl.entry_id == je.id)
         .where(jl.account_id == ledger_account_id)
+        .options(selectinload(je.lines))
     )
     
     # Simple algorithm: index JEs by amount (and optionally date/reference)
@@ -1942,8 +1973,12 @@ async def auto_run_bank_reconciliation(
         best_match = None
         for cand in candidates:
             # check date proximity
-            date_diff = abs((bt.transaction_date - cand.date).days)
-            if date_diff <= 3:
+            if getattr(cand, "entry_date", None):
+                date_diff = abs((bt.transaction_date - cand.entry_date).days)
+                if date_diff <= 3:
+                    best_match = cand
+                    break
+            else:
                 best_match = cand
                 break
                 

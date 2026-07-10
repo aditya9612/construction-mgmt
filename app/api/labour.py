@@ -614,43 +614,43 @@ async def delete_labour(
     return {"message": "Labour deactivated successfully"}
 
 
-@router.post("/assign-project", response_model=s.LabourProjectOut)
-async def assign_labour_to_project(
-    payload: s.LabourAssignProject,
-    current_user: User = Depends(d.require_roles(LABOUR_DELETE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    # check labour
-    labour = await db.get(Labour, payload.labour_id)
-    if not labour:
-        raise NotFoundError("Labour not found")
+# @router.post("/assign-project", response_model=s.LabourProjectOut)
+# async def assign_labour_to_project(
+#     payload: s.LabourAssignProject,
+#     current_user: User = Depends(d.require_roles(LABOUR_DELETE_ROLES)),
+#     db: AsyncSession = Depends(get_db_session),
+# ):
+#     # check labour
+#     labour = await db.get(Labour, payload.labour_id)
+#     if not labour:
+#         raise NotFoundError("Labour not found")
 
-    # check project access
-    await assert_project_access(
-        db, project_id=payload.project_id, current_user=current_user
-    )
+#     # check project access
+#     await assert_project_access(
+#         db, project_id=payload.project_id, current_user=current_user
+#     )
 
-    # prevent duplicate assignment
-    existing = await db.scalar(
-        select(LabourProject).where(
-            LabourProject.labour_id == payload.labour_id,
-            LabourProject.project_id == payload.project_id,
-        )
-    )
+#     # prevent duplicate assignment
+#     existing = await db.scalar(
+#         select(LabourProject).where(
+#             LabourProject.labour_id == payload.labour_id,
+#             LabourProject.project_id == payload.project_id,
+#         )
+#     )
 
-    if existing:
-        raise ValidationError("Labour already assigned to this project")
+#     if existing:
+#         raise ValidationError("Labour already assigned to this project")
 
-    obj = LabourProject(
-        labour_id=payload.labour_id,
-        project_id=payload.project_id,
-    )
+#     obj = LabourProject(
+#         labour_id=payload.labour_id,
+#         project_id=payload.project_id,
+#     )
 
-    db.add(obj)
-    await db.flush()
-    await db.refresh(obj)
+#     db.add(obj)
+#     await db.flush()
+#     await db.refresh(obj)
 
-    return s.LabourProjectOut.model_validate(obj)
+#     return s.LabourProjectOut.model_validate(obj)
 
 
 # @router.put(

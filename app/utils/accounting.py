@@ -127,7 +127,7 @@ async def resolve_tax_accounts(db: AsyncSession, account_type_name: str) -> Acco
         if settings and getattr(settings, 'tds_payable_account_id', None):
             return await db.get(Account, settings.tds_payable_account_id)
         # Fallback to search
-        acc = await db.scalar(select(Account).where(Account.name.ilike('%TDS%'), Account.type == AccountType.CURRENT_LIABILITY))
+        acc = await db.scalar(select(Account).where(Account.name.ilike('%TDS%'), Account.type == AccountType.LIABILITY.value))
         if acc: return acc
         raise ValueError("TDS Payable account not configured or found.")
         
@@ -147,7 +147,7 @@ async def resolve_tax_accounts(db: AsyncSession, account_type_name: str) -> Acco
 
 async def get_accounts_receivable(db: AsyncSession) -> Account:
     from app.core.enums import AccountType
-    acc = await db.scalar(select(Account).where(Account.name.ilike('%Receivable%'), Account.type == AccountType.CURRENT_ASSET.value))
+    acc = await db.scalar(select(Account).where(Account.name.ilike('%Receivable%'), Account.type == AccountType.ASSET.value))
     if not acc:
         raise ValueError("Accounts Receivable account not configured or found.")
     return acc
