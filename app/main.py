@@ -68,10 +68,12 @@ from app.core.db import AsyncSessionLocal
 from app.middlewares.rate_limiter import init_rate_limiter
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.utils.helpers import AppError
-from app.core.logger import setup_logger
+from app.core.logger import setup_logger, setup_audit_logger
 from fastapi.staticfiles import StaticFiles
 from app.core.request_context import set_request_id
 from app.core.logger import logger
+from app.middlewares.audit_logger import AuditLogMiddleware
+from app.middlewares.security_headers import SecurityHeadersMiddleware
 from fastapi import WebSocket, WebSocketDisconnect
 from app.core.websocket_manager import manager
 from app.core.redis_pubsub import RedisPubSub
@@ -83,6 +85,7 @@ SLOW_API_THRESHOLD = 500
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logger()
+    setup_audit_logger()
 
     app.state.redis = await create_redis_client(settings.REDIS_URL)
     try:
@@ -136,6 +139,12 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Register Audit Logging Middleware as outermost wrapper possible (after CORS)
+    application.add_middleware(AuditLogMiddleware)
+    
+    # Register Security Headers Middleware
+    application.add_middleware(SecurityHeadersMiddleware)
 
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("uploads/profile", exist_ok=True)

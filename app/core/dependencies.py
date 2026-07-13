@@ -62,14 +62,40 @@ async def get_current_user(
         user_id = payload.get("sub")
         if user_id is None:
             raise credentials_exception
+            
+        jti = payload.get("jti")
+        iat = payload.get("iat")
     except Exception:
         logger.warning("JWT decode failed")
         raise credentials_exception
 
+    redis = getattr(request.app.state, "redis", None)
+
+    # --------------------------------------------------
+    # Token Blocklist & Logout All Checks (Redis)
+    # --------------------------------------------------
+    if redis:
+        try:
+            if jti:
+                is_blocked = await redis.exists(f"blocklist:jti:{jti}")
+                if is_blocked:
+                    logger.warning(f"Blocked token used jti={jti}")
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been logged out")
+            
+            if iat:
+                logout_all_ts = await redis.get(f"logout_all:user:{user_id}")
+                if logout_all_ts:
+                    if float(iat) < float(logout_all_ts):
+                        logger.warning(f"Token issued before logout_all for user={user_id}")
+                        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="All sessions have been terminated")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Redis blocklist check failed: {e}")
+
     # --------------------------------------------------
     # Try Redis cache first
     # --------------------------------------------------
-    redis = getattr(request.app.state, "redis", None)
     cache_key = f"cache:user:{user_id}"
 
     if redis:
