@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from reportlab.lib import colors
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.dependencies import require_roles
+from app.api import owner
+from app.core.dependencies import get_current_active_user, require_roles
 from app.core.enums import (
     AttendanceStatus,
     InvoiceStatus,
@@ -13,14 +14,16 @@ from app.core.enums import (
     InvoiceType,
     InvoiceSourceType,
 )
+import app.schemas.invoice as s
 from app.models.expense import Expense
 from app.models.final_measurement import FinalMeasurement
 from app.models.labour import Labour
+from app.models.notification import Notification
 from app.models.user import UserAttendance
 from app.models.project import Project, ProjectMember, Task
 from app.db.session import get_db_session
 from app.models.invoice import Invoice, Transaction
-from app.models.owner import OwnerTransaction
+from app.models.owner import Owner, OwnerTransaction
 from app.models.user import User, ActivityLog
 from app.schemas.invoice import (
     AnalyticsSummaryOut,
@@ -34,11 +37,17 @@ from app.schemas.invoice import (
     ClientLedgerResponse,
     CollectionOut,
     ClientLedgerTransactionOut,
+    SendInvoiceRequest,
+    SendInvoiceResponse,
 )
 from fastapi import APIRouter, Depends, status
 from app.models.billing import RABill
 from app.models.accountant import JournalEntry, JournalLine, Account
-from app.utils.accounting import get_accounts_receivable, get_revenue_account, get_primary_cash_account
+from app.utils.accounting import (
+    get_accounts_receivable,
+    get_revenue_account,
+    get_primary_cash_account,
+)
 from app.utils.common import assert_project_access, create_system_alert
 from app.utils.helpers import NotFoundError, ValidationError
 from decimal import Decimal
@@ -66,6 +75,9 @@ from app.schemas.invoice import (
     InvoiceUpdate,
     InvoiceOut,
     LabourInvoiceCreate,
+    InvoiceOut,
+    SendInvoiceRequest,
+    SendInvoiceResponse,
 )
 from app.utils.common import assert_project_access, create_system_alert
 from app.utils.helpers import NotFoundError, ValidationError
@@ -75,7 +87,6 @@ from io import BytesIO
 from app.core.logger import logger
 from app.models.quotation import QuotationMaster, QuotationStatus
 from app.models.user import UserRole
-
 
 INVOICE_READ_ROLES = [
     r.value
@@ -100,6 +111,7 @@ INVOICE_WRITE_ROLES = [
 PAYMENT_ROLES = INVOICE_WRITE_ROLES + [UserRole.CLIENT.value]
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
+
 
 @router.post("", response_model=InvoiceOut, status_code=status.HTTP_201_CREATED)
 async def create_invoice(
@@ -313,15 +325,19 @@ async def create_invoice_from_quotation(
                 f"has been generated for project {project.project_name}."
             ),
         )
-        
-        db.add(ActivityLog(
-            action="INVOICE_GENERATED",
-            entity="project",
-            entity_id=quotation.project_id,
-            performed_by=current_user.id,
-            details={"message": f"Invoice of Rs. {invoice.total_amount:,.2f} generated from QTN-{quotation.id}"}
-        ))
-        
+
+        db.add(
+            ActivityLog(
+                action="INVOICE_GENERATED",
+                entity="project",
+                entity_id=quotation.project_id,
+                performed_by=current_user.id,
+                details={
+                    "message": f"Invoice of Rs. {invoice.total_amount:,.2f} generated from QTN-{quotation.id}"
+                },
+            )
+        )
+
         await db.commit()
 
     except Exception:
@@ -343,7 +359,11 @@ async def list_invoices(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
-    rows = (await db.execute(select(Invoice).where(Invoice.pending_amount > 0))).scalars().all()
+    rows = (
+        (await db.execute(select(Invoice).where(Invoice.pending_amount > 0)))
+        .scalars()
+        .all()
+    )
     return [InvoiceOut.model_validate(r) for r in rows]
 
 
@@ -363,7 +383,9 @@ async def get_by_date_range(
     rows = (
         (
             await db.execute(
-                select(Invoice).where(Invoice.created_at.between(start_dt, end_dt)).order_by(Invoice.created_at.desc())
+                select(Invoice)
+                .where(Invoice.created_at.between(start_dt, end_dt))
+                .order_by(Invoice.created_at.desc())
             )
         )
         .scalars()
@@ -463,7 +485,13 @@ async def get_by_project(
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
     rows = (
-        (await db.execute(select(Invoice).where(Invoice.project_id == project_id).order_by(Invoice.created_at.desc())))
+        (
+            await db.execute(
+                select(Invoice)
+                .where(Invoice.project_id == project_id)
+                .order_by(Invoice.created_at.desc())
+            )
+        )
         .scalars()
         .all()
     )
@@ -478,7 +506,15 @@ async def get_by_type(
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
     rows = (
-        (await db.execute(select(Invoice).where(Invoice.type == type).order_by(Invoice.created_at.desc()))).scalars().all()
+        (
+            await db.execute(
+                select(Invoice)
+                .where(Invoice.type == type)
+                .order_by(Invoice.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
     )
 
     return [InvoiceOut.model_validate(r) for r in rows]
@@ -540,7 +576,7 @@ async def mark_paid(
 
 from io import BytesIO
 from fastapi.responses import StreamingResponse
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Table , Spacer, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, Spacer, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -572,37 +608,22 @@ async def generate_invoice_pdf(
     elements = []
 
     # Title
-    elements.append(
-        Paragraph(f"Invoice #{obj.id}", styles["Title"])
-    )
+    elements.append(Paragraph(f"Invoice #{obj.id}", styles["Title"]))
 
     elements.append(Spacer(1, 12))
 
     # Details
-    elements.append(
-        Paragraph(f"Type: {obj.type.value}", styles["Normal"])
-    )
+    elements.append(Paragraph(f"Type: {obj.type.value}", styles["Normal"]))
 
     if obj.source_type:
-        elements.append(
-            Paragraph(
-                f"Source: {obj.source_type.value}",
-                styles["Normal"]
-            )
-        )
+        elements.append(Paragraph(f"Source: {obj.source_type.value}", styles["Normal"]))
 
-    elements.append(
-        Paragraph(f"Amount: ₹{float(obj.amount):,.2f}", styles["Normal"])
-    )
+    elements.append(Paragraph(f"Amount: ₹{float(obj.amount):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
-    elements.append(
-        Paragraph(f"GST: ₹{float(obj.gst_amount):,.2f}", styles["Normal"])
-    )
+    elements.append(Paragraph(f"GST: ₹{float(obj.gst_amount):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
 
-    elements.append(
-        Paragraph(f"Tax: ₹{float(obj.tax_amount):,.2f}", styles["Normal"])
-    )
+    elements.append(Paragraph(f"Tax: ₹{float(obj.tax_amount):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
     elements.append(
         Paragraph(f"Total: ₹{float(obj.total_amount):,.2f}", styles["Normal"])
@@ -610,10 +631,7 @@ async def generate_invoice_pdf(
     elements.append(Spacer(1, 4))
     # Status
     elements.append(
-        Paragraph(
-            f"Status: {obj.status.value.capitalize()}",
-            styles["Normal"]
-        )
+        Paragraph(f"Status: {obj.status.value.capitalize()}", styles["Normal"])
     )
 
     doc.build(elements)
@@ -625,13 +643,14 @@ async def generate_invoice_pdf(
         headers={"Content-Disposition": f"attachment; filename=invoice_{obj.id}.pdf"},
     )
 
+
 async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
     je = JournalEntry(
         entry_type="Invoice",
         journal_number=f"J-INV-{invoice.id}",
         entry_date=date.today(),
         description=invoice.description or f"Invoice {invoice.id} posted",
-        status="Posted"
+        status="Posted",
     )
     db.add(je)
     await db.flush()
@@ -644,18 +663,40 @@ async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
         return
 
     # DR AR
-    db.add(JournalLine(entry_id=je.id, account_id=ar_acc.id, debit=invoice.total_amount, credit=Decimal(0)))
-    
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=ar_acc.id,
+            debit=invoice.total_amount,
+            credit=Decimal(0),
+        )
+    )
+
     # CR Revenue
     revenue_amount = invoice.amount
-    db.add(JournalLine(entry_id=je.id, account_id=rev_acc.id, debit=Decimal(0), credit=revenue_amount))
-    
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=rev_acc.id,
+            debit=Decimal(0),
+            credit=revenue_amount,
+        )
+    )
+
     # CR GST Payable if any
     if invoice.gst_amount > 0:
         from app.utils.accounting import resolve_tax_accounts
+
         try:
             gst_acc = await resolve_tax_accounts(db, "output_gst")
-            db.add(JournalLine(entry_id=je.id, account_id=gst_acc.id, debit=Decimal(0), credit=invoice.gst_amount))
+            db.add(
+                JournalLine(
+                    entry_id=je.id,
+                    account_id=gst_acc.id,
+                    debit=Decimal(0),
+                    credit=invoice.gst_amount,
+                )
+            )
         except (ValueError, Exception):
             pass
 
@@ -697,13 +738,15 @@ async def create_labour_invoice(
         select(Expense).where(
             Expense.project_id == project_id,
             Expense.source_type == "attendance_auto",
-            Expense.expense_date.between(start_date, end_date)
+            Expense.expense_date.between(start_date, end_date),
         )
     )
     expenses = result.scalars().all()
 
     if not expenses:
-        raise NotFoundError("No locked labour attendance expenses found for this date range")
+        raise NotFoundError(
+            "No locked labour attendance expenses found for this date range"
+        )
 
     # 4. Calculate total securely
     total_amount = sum(Decimal(e.amount or 0) for e in expenses)
@@ -731,7 +774,7 @@ async def create_labour_invoice(
 
         db.add(obj)
         await db.flush()
-        
+
         await _post_invoice_journal(db, obj)
 
         # 7. Owner ledger entry
@@ -881,7 +924,7 @@ async def create_invoice_from_measurement(
 
         db.add(obj)
         await db.flush()
-        
+
         await _post_invoice_journal(db, obj)
 
         # 5. Owner ledger entry
@@ -960,7 +1003,12 @@ async def analytics_summary(
     total_expense = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id,
-            Invoice.type.in_([InvoiceType.LABOUR,InvoiceType.MATERIAL,]),
+            Invoice.type.in_(
+                [
+                    InvoiceType.LABOUR,
+                    InvoiceType.MATERIAL,
+                ]
+            ),
         )
     )
 
@@ -1037,7 +1085,7 @@ async def pay_invoice(
         journal_number=f"J-REC-{txn.id or 'INV'+str(invoice.id)}",
         entry_date=date.today(),
         description=f"Payment received for Invoice {invoice.id}",
-        status="Posted"
+        status="Posted",
     )
     db.add(je)
     await db.flush()
@@ -1045,8 +1093,16 @@ async def pay_invoice(
     try:
         ar_acc = await get_accounts_receivable(db)
         cash_acc = await get_primary_cash_account(db)
-        db.add(JournalLine(entry_id=je.id, account_id=cash_acc.id, debit=amount, credit=Decimal(0)))
-        db.add(JournalLine(entry_id=je.id, account_id=ar_acc.id, debit=Decimal(0), credit=amount))
+        db.add(
+            JournalLine(
+                entry_id=je.id, account_id=cash_acc.id, debit=amount, credit=Decimal(0)
+            )
+        )
+        db.add(
+            JournalLine(
+                entry_id=je.id, account_id=ar_acc.id, debit=Decimal(0), credit=amount
+            )
+        )
     except (ValueError, Exception):
         pass
 
@@ -1078,14 +1134,19 @@ async def receivable_summary(
     inv_total = await db.scalar(select(func.sum(Invoice.total_amount))) or 0
     inv_paid = await db.scalar(select(func.sum(Invoice.paid_amount))) or 0
     inv_pending = await db.scalar(select(func.sum(Invoice.pending_amount))) or 0
-    
+
     # Invoices overdue
     today = date.today()
-    # Simple overdue calculation if due date were there, but just use pending as we don't have strict due dates in schema, 
+    # Simple overdue calculation if due date were there, but just use pending as we don't have strict due dates in schema,
     # but wait, let's query overdue if due_date is in Invoice. I'll just use pending.
     inv_overdue = 0
 
-    rabill_total = await db.scalar(select(func.sum(RABill.total_amount)).where(RABill.status == "Approved")) or 0
+    rabill_total = (
+        await db.scalar(
+            select(func.sum(RABill.total_amount)).where(RABill.status == "Approved")
+        )
+        or 0
+    )
     rabill_paid = 0  # RABill does not track paid_amount separately
     rabill_pending = rabill_total  # treat all approved as pending
 
@@ -1101,9 +1162,8 @@ async def receivable_summary(
         total_billed=total_billed,
         total_received=total_received,
         pending_amount=pending_amount,
-        overdue_amount=0.0  # Implement actual logic if due_date is added, else 0
+        overdue_amount=0.0,  # Implement actual logic if due_date is added, else 0
     )
-
 
 
 @router.get("/receivables/aging")
@@ -1113,7 +1173,11 @@ async def receivable_aging(
 ):
     today = date.today()
 
-    rows = (await db.execute(select(Invoice).where(Invoice.pending_amount > 0))).scalars().all()
+    rows = (
+        (await db.execute(select(Invoice).where(Invoice.pending_amount > 0)))
+        .scalars()
+        .all()
+    )
 
     result = {"0-30": 0, "30-60": 0, "60+": 0}
 
@@ -1132,18 +1196,23 @@ async def receivable_aging(
 
     return result
 
+
 # ----------------- RECEIVABLES NEW ENDPOINTS -----------------
 
 import csv
 from fastapi import UploadFile, File
 
-@router.get("/receivables/client-ledger/{client_id}", response_model=ClientLedgerResponse)
+
+@router.get(
+    "/receivables/client-ledger/{client_id}", response_model=ClientLedgerResponse
+)
 async def get_client_ledger(
     client_id: int,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
     from app.models.owner import Owner
+
     owner = await db.get(Owner, client_id)
     if not owner:
         raise NotFoundError("Client not found")
@@ -1152,42 +1221,47 @@ async def get_client_ledger(
         ar_acc = await get_accounts_receivable(db)
         ar_acc_id = ar_acc.id
     except (ValueError, Exception):
-        return ClientLedgerResponse(total_billed=0.0, total_received=0.0, outstanding=0.0, transactions=[])
-    
+        return ClientLedgerResponse(
+            total_billed=0.0, total_received=0.0, outstanding=0.0, transactions=[]
+        )
+
     # Query Journal Lines where account = AR and status = Posted, somehow tied to client.
-    # Wait! JournalLine does not have a client_id field directly. 
+    # Wait! JournalLine does not have a client_id field directly.
     # Usually in this system, the OwnerTransaction serves as a subledger, but the instruction said "Do NOT use OwnerTransaction as source. Source: JournalEntry, JournalLine. Only status=Posted."
     # If JournalEntry doesn't have an owner_id, how do we filter? Let's check JournalEntry model.
     # I'll just write a generic query, maybe the system expects us to use OwnerTransaction for filtering but pull the amount from JournalEntry? No, the instruction says "Do NOT use OwnerTransaction as source. Source: JournalEntry, JournalLine. Only: JournalEntry.status == 'Posted'".
-    # I will assume JournalEntry has owner_id or we can just fetch all and filter by description or something. 
+    # I will assume JournalEntry has owner_id or we can just fetch all and filter by description or something.
     # Wait, JournalEntry doesn't have owner_id. I will just query JournalEntry and if it fails during compile I will add owner_id to JournalEntry? No, no schema migration.
-    # How are Journal Entries linked to clients? Invoices have owner_id, RA Bills have client_id. 
+    # How are Journal Entries linked to clients? Invoices have owner_id, RA Bills have client_id.
     # I'll join Invoice and RABill to JournalEntry via journal_number! J-INV-{id} and J-REC-{id} and J-RAB-{id}.
-    
+
     result = await db.execute(
         select(JournalEntry, JournalLine)
         .join(JournalLine)
-        .where(
-            JournalLine.account_id == ar_acc_id,
-            JournalEntry.status == "Posted"
-        )
+        .where(JournalLine.account_id == ar_acc_id, JournalEntry.status == "Posted")
         .order_by(JournalEntry.entry_date.asc())
     )
-    
+
     rows = result.all()
-    
-    # In a real scenario we need to filter by client_id. Since we formatted journal_number as J-INV-{id}, we could parse it and check invoice.owner_id. 
+
+    # In a real scenario we need to filter by client_id. Since we formatted journal_number as J-INV-{id}, we could parse it and check invoice.owner_id.
     # For now, to fulfill the test safely without complex regex in SQL, we fetch invoices for this owner:
-    invoices = (await db.execute(select(Invoice.id).where(Invoice.owner_id == client_id))).scalars().all()
+    invoices = (
+        (await db.execute(select(Invoice.id).where(Invoice.owner_id == client_id)))
+        .scalars()
+        .all()
+    )
     rabills: list[int] = []  # RABill has no client_id field; skip RA Bill filtering
-    
-    valid_jnums = set([f"J-INV-{i}" for i in invoices] + [f"J-RAB-{r}" for r in rabills])
-    
+
+    valid_jnums = set(
+        [f"J-INV-{i}" for i in invoices] + [f"J-RAB-{r}" for r in rabills]
+    )
+
     txns = []
     running_balance = 0.0
     total_billed = 0.0
     total_received = 0.0
-    
+
     for je, jl in rows:
         # Check if this journal belongs to this client's invoices/bills
         is_owner = False
@@ -1197,33 +1271,38 @@ async def get_client_ledger(
             inv_id_str = je.journal_number.replace("J-REC-INV", "")
             if inv_id_str.isdigit() and int(inv_id_str) in invoices:
                 is_owner = True
-        elif je.journal_number and je.journal_number.startswith("J-REC-"): # generic receipt might use txn id, we'd need to check transaction. But let's assume it matches.
-            pass 
-            
+        elif je.journal_number and je.journal_number.startswith(
+            "J-REC-"
+        ):  # generic receipt might use txn id, we'd need to check transaction. But let's assume it matches.
+            pass
+
         # Let's simplify and just include it if it's broadly matching or we can just include all for now if parsing fails.
         # Actually, let's just do a string match on description if owner_id isn't directly linked.
-        
+
         debit = float(jl.debit or 0)
         credit = float(jl.credit or 0)
-        
-        running_balance += (debit - credit)
+
+        running_balance += debit - credit
         total_billed += debit
         total_received += credit
-        
-        txns.append(ClientLedgerTransactionOut(
-            date=datetime.combine(je.entry_date, datetime.min.time()),
-            particulars=je.description or je.journal_number,
-            debit=debit,
-            credit=credit,
-            running_balance=running_balance
-        ))
-        
+
+        txns.append(
+            ClientLedgerTransactionOut(
+                date=datetime.combine(je.entry_date, datetime.min.time()),
+                particulars=je.description or je.journal_number,
+                debit=debit,
+                credit=credit,
+                running_balance=running_balance,
+            )
+        )
+
     return ClientLedgerResponse(
         total_billed=total_billed,
         total_received=total_received,
         outstanding=running_balance,
-        transactions=txns
+        transactions=txns,
     )
+
 
 @router.get("/receivables/collections", response_model=list[CollectionOut])
 async def get_collections(
@@ -1231,19 +1310,26 @@ async def get_collections(
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
     # Fetch transactions of type receipt
-    txns = (await db.execute(select(Transaction).where(Transaction.type == "receipt"))).scalars().all()
+    txns = (
+        (await db.execute(select(Transaction).where(Transaction.type == "receipt")))
+        .scalars()
+        .all()
+    )
     res = []
     for t in txns:
-        res.append(CollectionOut(
-            invoice_no=f"INV-{t.invoice_id}" if t.invoice_id else "N/A",
-            client="Client", # would join owner ideally
-            amount_received=float(t.amount or 0),
-            received_on=t.created_at,
-            mode=t.mode or "Cash",
-            reference=t.reference or "-",
-            status="Received"
-        ))
+        res.append(
+            CollectionOut(
+                invoice_no=f"INV-{t.invoice_id}" if t.invoice_id else "N/A",
+                client="Client",  # would join owner ideally
+                amount_received=float(t.amount or 0),
+                received_on=t.created_at,
+                mode=t.mode or "Cash",
+                reference=t.reference or "-",
+                status="Received",
+            )
+        )
     return res
+
 
 @router.post("/receivables/manual")
 async def create_manual_receivable(
@@ -1256,7 +1342,7 @@ async def create_manual_receivable(
         journal_number=f"J-MAN-REC-{payload.client_id}-{date.today().strftime('%Y%m%d')}",
         entry_date=payload.due_date,
         description=payload.description,
-        status="Posted"
+        status="Posted",
     )
     db.add(je)
     await db.flush()
@@ -1264,13 +1350,28 @@ async def create_manual_receivable(
     try:
         ar_acc = await get_accounts_receivable(db)
         rev_acc = await get_revenue_account(db)
-        db.add(JournalLine(entry_id=je.id, account_id=ar_acc.id, debit=Decimal(str(payload.amount)), credit=Decimal(0)))
-        db.add(JournalLine(entry_id=je.id, account_id=rev_acc.id, debit=Decimal(0), credit=Decimal(str(payload.amount))))
+        db.add(
+            JournalLine(
+                entry_id=je.id,
+                account_id=ar_acc.id,
+                debit=Decimal(str(payload.amount)),
+                credit=Decimal(0),
+            )
+        )
+        db.add(
+            JournalLine(
+                entry_id=je.id,
+                account_id=rev_acc.id,
+                debit=Decimal(0),
+                credit=Decimal(str(payload.amount)),
+            )
+        )
     except (ValueError, Exception):
         pass  # Journal lines skipped if AR/Revenue accounts not configured
 
     await db.commit()
     return {"message": "Manual receivable posted", "journal_id": je.id}
+
 
 @router.post("/receivables/import")
 async def import_receivables(
@@ -1281,13 +1382,19 @@ async def import_receivables(
     content = await file.read()
     decoded = content.decode("utf-8")
     reader = csv.DictReader(io.StringIO(decoded))
-    
+
     valid = 0
     errors = 0
     for row in reader:
-        if row: valid += 1
-        
-    return {"valid_records": valid, "errors": errors, "message": "Import preview successful"}
+        if row:
+            valid += 1
+
+    return {
+        "valid_records": valid,
+        "errors": errors,
+        "message": "Import preview successful",
+    }
+
 
 @router.get("/receivables/export")
 async def export_receivables(db: AsyncSession = Depends(get_db_session)):
@@ -1295,7 +1402,12 @@ async def export_receivables(db: AsyncSession = Depends(get_db_session)):
     writer = csv.writer(output)
     writer.writerow(["ID", "Amount"])
     output.seek(0)
-    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=receivables.csv"})
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=receivables.csv"},
+    )
+
 
 @router.get("/receivables/collections/export")
 async def export_collections(db: AsyncSession = Depends(get_db_session)):
@@ -1303,12 +1415,182 @@ async def export_collections(db: AsyncSession = Depends(get_db_session)):
     writer = csv.writer(output)
     writer.writerow(["Invoice", "Amount Received"])
     output.seek(0)
-    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=collections.csv"})
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=collections.csv"},
+    )
+
 
 @router.get("/receivables/client-ledger/{client_id}/export")
-async def export_client_ledger(client_id: int, db: AsyncSession = Depends(get_db_session)):
+async def export_client_ledger(
+    client_id: int, db: AsyncSession = Depends(get_db_session)
+):
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Date", "Particulars", "Debit", "Credit", "Balance"])
     output.seek(0)
-    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=ledger_{client_id}.csv"})
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=ledger_{client_id}.csv"},
+    )
+
+
+# ================================================
+
+
+@router.post("/{invoice_id}/send", response_model=s.SendInvoiceResponse)
+async def send_invoice(
+    invoice_id: int,
+    payload: s.SendInvoiceRequest,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
+):
+    # =====================================================
+    # ONLY ADMIN CAN SEND INVOICE
+    # =====================================================
+    if current_user.role.lower() != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only admin can send invoices.",
+        )
+
+    # =====================================================
+    # GET INVOICE
+    # =====================================================
+    invoice = await db.get(Invoice, invoice_id)
+
+    if not invoice:
+        raise HTTPException(
+            status_code=404,
+            detail="Invoice not found.",
+        )
+
+    # =====================================================
+    # VALIDATE CLIENT
+    # =====================================================
+    client = await db.get(User, payload.client_user_id)
+
+    if not client:
+        raise HTTPException(
+            status_code=404,
+            detail="Client not found.",
+        )
+
+    if client.role.lower() != "client":
+        raise HTTPException(
+            status_code=400,
+            detail="Selected user is not a client.",
+        )
+
+    # =====================================================
+    # VALIDATE PROJECT
+    # =====================================================
+    project = await db.get(Project, invoice.project_id)
+
+    if not project:
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found.",
+        )
+
+    # =====================================================
+    # VALIDATE FINANCIALS
+    # =====================================================
+    if invoice.total_amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Invoice amount must be greater than zero.",
+        )
+
+    if invoice.pending_amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Invoice has no pending amount.",
+        )
+
+    # =====================================================
+    # STATUS VALIDATION
+    # =====================================================
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise HTTPException(
+            status_code=400,
+            detail="Cancelled invoice cannot be sent.",
+        )
+
+    if invoice.status == InvoiceStatus.PAID:
+        raise HTTPException(
+            status_code=400,
+            detail="Paid invoice cannot be sent.",
+        )
+
+    # =====================================================
+    # PREVENT DUPLICATE SEND
+    # =====================================================
+    existing_notification = await db.scalar(
+        select(Notification).where(
+            Notification.user_id == client.id,
+            Notification.type == "Invoice",
+            Notification.link == f"/invoice/{invoice.id}",
+        )
+    )
+
+    if existing_notification:
+        raise HTTPException(
+            status_code=400,
+            detail="Invoice has already been sent to this client.",
+        )
+
+    # =====================================================
+    # CREATE NOTIFICATION
+    # =====================================================
+    notification = Notification(
+        user_id=client.id,
+        title="New Invoice Received",
+        message=(
+            f"Invoice #{invoice.id} has been shared with you. "
+            "Please review your invoice."
+        ),
+        type="Invoice",
+        link=f"/invoice/{invoice.id}",
+    )
+
+    db.add(notification)
+
+    # =====================================================
+    # ACTIVITY LOG
+    # =====================================================
+    db.add(
+        ActivityLog(
+            action="SEND_INVOICE",
+            entity="invoice",
+            entity_id=invoice.id,
+            performed_by=current_user.id,
+            details={
+                "invoice_id": invoice.id,
+                "client_id": client.id,
+                "project_id": invoice.project_id,
+                "owner_id": invoice.owner_id,
+                "amount": float(invoice.total_amount),
+            },
+        )
+    )
+
+    # =====================================================
+    # SAVE
+    # =====================================================
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    # =====================================================
+    # RESPONSE
+    # =====================================================
+    return s.SendInvoiceResponse(
+        message="Invoice sent successfully.",
+        invoice_id=invoice.id,
+        client_user_id=client.id,
+    )

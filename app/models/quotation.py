@@ -51,9 +51,11 @@ class QuotationMaster(Base):
     )
 
     client = relationship(
-        "User", foreign_keys=[client_user_id], back_populates="quotations", lazy="selectin"
+        "User",
+        foreign_keys=[client_user_id],
+        back_populates="quotations",
+        lazy="selectin",
     )
-
 
     client_name: Mapped[str] = mapped_column(String(150))
 
@@ -144,6 +146,10 @@ class QuotationMaster(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     rejected_reason: Mapped[str | None] = mapped_column(Text)
+
+    # ================= SEND =================
+
+    #sent_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     # ================= CONVERSION =================
 

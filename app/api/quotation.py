@@ -101,10 +101,7 @@ def calculate_item(unit, length, width, height, rate):
         formula = "cubic_feet"
 
     else:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported unit: {unit}"
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported unit: {unit}")
 
     amount = quantity * rate
 
@@ -405,7 +402,7 @@ def generate_quotation_pdf(
         leftMargin=20,
         rightMargin=20,
         topMargin=100,
-        bottomMargin=110,   # Reserve space for fixed footer
+        bottomMargin=110,  # Reserve space for fixed footer
     )
 
     styles = getSampleStyleSheet()
@@ -444,36 +441,19 @@ def generate_quotation_pdf(
             logo_path = company_settings.company_logo
 
     # Create title
-    title_para = Paragraph(
-        "<b>PROJECT QUOTATION</b>",
-        title_style
-    )
+    title_para = Paragraph("<b>PROJECT QUOTATION</b>", title_style)
 
     # Create header table
     if logo_path:
 
-        logo = Image(
-            logo_path,
-            width=80,
-            height=80
-        )
+        logo = Image(logo_path, width=80, height=80)
 
-        header_table = Table(
-            [
-                [logo, title_para, ""]
-            ],
-            colWidths=[100, 350, 100]
-        )
+        header_table = Table([[logo, title_para, ""]], colWidths=[100, 350, 100])
 
     else:
 
         # If no uploaded logo exists, show title only
-        header_table = Table(
-            [
-                ["", title_para, ""]
-            ],
-            colWidths=[100, 350, 100]
-        )
+        header_table = Table([["", title_para, ""]], colWidths=[100, 350, 100])
 
     # Style header table
     header_table.setStyle(
@@ -538,12 +518,14 @@ def generate_quotation_pdf(
     ]
 
     elements.append(
-        KeepTogether([
-            Paragraph("<b>Client Details</b>", styles["Heading2"]),
-            Spacer(1, 6),
-            create_styled_table(client_info, [150, 370]),
-            Spacer(1, 15),
-        ])
+        KeepTogether(
+            [
+                Paragraph("<b>Client Details</b>", styles["Heading2"]),
+                Spacer(1, 6),
+                create_styled_table(client_info, [150, 370]),
+                Spacer(1, 15),
+            ]
+        )
     )
 
     # =====================================================
@@ -564,12 +546,14 @@ def generate_quotation_pdf(
         )
 
     elements.append(
-        KeepTogether([
-            Paragraph("<b>Item Details</b>", styles["Heading2"]),
-            Spacer(1, 6),
-            create_styled_table(item_data, [180, 70, 70, 80, 90]),
-            Spacer(1, 15),
-        ])
+        KeepTogether(
+            [
+                Paragraph("<b>Item Details</b>", styles["Heading2"]),
+                Spacer(1, 6),
+                create_styled_table(item_data, [180, 70, 70, 80, 90]),
+                Spacer(1, 15),
+            ]
+        )
     )
 
     # =====================================================
@@ -591,12 +575,14 @@ def generate_quotation_pdf(
             )
 
     elements.append(
-        KeepTogether([
-            Paragraph("<b>Labour Details</b>", styles["Heading2"]),
-            Spacer(1, 6),
-            create_styled_table(labour_data, [150, 80, 80, 100, 100]),
-            Spacer(1, 15),
-        ])
+        KeepTogether(
+            [
+                Paragraph("<b>Labour Details</b>", styles["Heading2"]),
+                Spacer(1, 6),
+                create_styled_table(labour_data, [150, 80, 80, 100, 100]),
+                Spacer(1, 15),
+            ]
+        )
     )
 
     # =====================================================
@@ -618,12 +604,14 @@ def generate_quotation_pdf(
             )
 
         elements.append(
-            KeepTogether([
-                Paragraph("<b>Material Details</b>", styles["Heading2"]),
-                Spacer(1, 6),
-                create_styled_table(material_data, [180, 70, 70, 80, 90]),
-                Spacer(1, 15),
-            ])
+            KeepTogether(
+                [
+                    Paragraph("<b>Material Details</b>", styles["Heading2"]),
+                    Spacer(1, 6),
+                    create_styled_table(material_data, [180, 70, 70, 80, 90]),
+                    Spacer(1, 15),
+                ]
+            )
         )
 
     # =====================================================
@@ -644,12 +632,14 @@ def generate_quotation_pdf(
             )
 
         elements.append(
-            KeepTogether([
-                Paragraph("<b>Extra Charges</b>", styles["Heading2"]),
-                Spacer(1, 6),
-                create_styled_table(extra_data, [220, 90, 90, 90]),
-                Spacer(1, 15),
-            ])
+            KeepTogether(
+                [
+                    Paragraph("<b>Extra Charges</b>", styles["Heading2"]),
+                    Spacer(1, 6),
+                    create_styled_table(extra_data, [220, 90, 90, 90]),
+                    Spacer(1, 15),
+                ]
+            )
         )
 
     # =====================================================
@@ -669,12 +659,14 @@ def generate_quotation_pdf(
     ]
 
     elements.append(
-        KeepTogether([
-            Paragraph("<b>Financial Summary</b>", styles["Heading2"]),
-            Spacer(1, 6),
-            create_styled_table(summary_data, [250, 150], highlight_last_row=True),
-            Spacer(1, 20),
-        ])
+        KeepTogether(
+            [
+                Paragraph("<b>Financial Summary</b>", styles["Heading2"]),
+                Spacer(1, 6),
+                create_styled_table(summary_data, [250, 150], highlight_last_row=True),
+                Spacer(1, 20),
+            ]
+        )
     )
 
     # =====================================================
@@ -728,8 +720,7 @@ def generate_quotation_pdf(
     company_name = (
         company_settings.company_name
         if company_settings and company_settings.company_name
-        else quotation.company_name
-        or ""
+        else quotation.company_name or ""
     )
     # =====================================================
     # QR CODE + SIGNATURE (SIDE BY SIDE)
@@ -760,7 +751,7 @@ def generate_quotation_pdf(
     if qr_drawing:
         elements.append(Paragraph("<b><i>Scan To Pay</i></b>", styles["Heading3"]))
         elements.append(Spacer(1, 5))
-        qr_drawing.hAlign = 'LEFT'
+        qr_drawing.hAlign = "LEFT"
         elements.append(qr_drawing)
         elements.append(Spacer(1, 35))
 
@@ -786,14 +777,18 @@ def generate_quotation_pdf(
     elements.append(Spacer(1, 10))
 
     # Horizontal line
-    line_table = Table([[""]], colWidths=[555]) # Full width line
-    line_table.setStyle(TableStyle([
-        ("LINEABOVE", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-    ]))
+    line_table = Table([[""]], colWidths=[555])  # Full width line
+    line_table.setStyle(
+        TableStyle(
+            [
+                ("LINEABOVE", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
     elements.append(line_table)
     elements.append(Spacer(1, 15))
 
@@ -821,9 +816,7 @@ def generate_quotation_pdf(
     )
 
     email = (
-        company_settings.email
-        if company_settings and company_settings.email
-        else "-"
+        company_settings.email if company_settings and company_settings.email else "-"
     )
 
     instagram_handle = (
@@ -857,15 +850,13 @@ def generate_quotation_pdf(
     icon_dir = os.path.abspath(
         os.path.join(
             os.path.dirname(__file__),
-            "..",      # app
-            "..",      # project root
+            "..",  # app
+            "..",  # project root
             "static",
         )
     )
 
-
     from reportlab.lib.utils import ImageReader
-
 
     def get_icon(filename):
         """
@@ -880,11 +871,7 @@ def generate_quotation_pdf(
 
         try:
             # Create image with explicit dimensions
-            img = Image(
-                path,
-                width=18,
-                height=18
-            )
+            img = Image(path, width=18, height=18)
 
             # Ensure proper alignment inside table cells
             img.hAlign = "CENTER"
@@ -894,7 +881,6 @@ def generate_quotation_pdf(
         except Exception as e:
             print(f"Error loading icon {filename}: {e}")
             return Spacer(1, 18)
-
 
     def create_icon_text_table(icon_filename, text, col_width=150):
         """
@@ -924,7 +910,6 @@ def generate_quotation_pdf(
         )
 
         return table
-
 
     # =====================================================
     # FOOTER CONTENT (3 COLUMNS)
@@ -970,13 +955,10 @@ def generate_quotation_pdf(
             [
                 # Background color
                 ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#D9DDE3")),
-
                 # Green top border
                 ("LINEABOVE", (0, 0), (-1, 0), 4, colors.HexColor("#4CAF50")),
-
                 # Alignment
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-
                 # Padding
                 ("LEFTPADDING", (0, 0), (-1, -1), 15),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 15),
@@ -1241,25 +1223,15 @@ async def create_quotation(
     await db.flush()
     await db.refresh(
         quotation,
-        attribute_names=["items", "labour_items", "material_items", "extra_charge_items"]
+        attribute_names=[
+            "items",
+            "labour_items",
+            "material_items",
+            "extra_charge_items",
+        ],
     )
 
     calculate_quotation_totals(quotation)
-
-    # =====================================================
-    # CLIENT NOTIFICATION
-    # =====================================================
-    notification = Notification(
-        user_id=quotation.client_user_id,
-        title="New Quotation Received",
-        message=(
-            f"Quotation {quotation.quotation_no} has been shared with you. "
-            "Please review and approve/reject it."
-        ),
-        type="Quotation",
-        link=f"/quotation/{quotation.id}",
-    )
-    db.add(notification)
 
     await db.commit()
 
@@ -1276,18 +1248,16 @@ async def create_quotation(
 @router.get("/", response_model=list[s.QuotationOut])
 async def list_quotations(
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
 
     query = select(QuotationMaster).options(
-        selectinload(QuotationMaster.items).selectinload(
-            QuotationItem.measurements
-        ),
+        selectinload(QuotationMaster.items).selectinload(QuotationItem.measurements),
         selectinload(QuotationMaster.labour_items),
         selectinload(QuotationMaster.material_items),
         selectinload(QuotationMaster.extra_charge_items),
     )
-    
+
     if project_id:
         query = query.where(QuotationMaster.project_id == project_id)
 
@@ -1322,11 +1292,14 @@ async def update_quotation(
     quotation = await get_quotation_or_404(quotation_id, db)
 
     # =====================================================
-    # APPROVED CHECK
+    # ONLY DRAFT QUOTATION CAN BE UPDATED
     # =====================================================
 
-    if quotation.is_approved:
-        raise HTTPException(400, "Approved quotation cannot be edited")
+    if quotation.status != QuotationStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail="Only draft quotations can be edited."
+        )
 
     update_data = payload.model_dump(exclude_unset=True)
 
@@ -1336,6 +1309,7 @@ async def update_quotation(
     calculate_quotation_totals(quotation)
 
     await db.commit()
+    await db.refresh(quotation)
 
     return await get_quotation_or_404(quotation_id, db)
 
@@ -1602,30 +1576,45 @@ async def preview_quotation(
 
 @router.put("/{quotation_id}/approve")
 async def approve_quotation(
-    quotation_id: int, 
+    quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
 
+    # Already approved
+    if quotation.is_approved:
+        raise HTTPException(status_code=400, detail="Quotation is already approved")
+
+    # Quotation must be sent before approval
+    if quotation.status != QuotationStatus.SENT:
+        raise HTTPException(
+            status_code=400,
+            detail="Quotation must be sent to the client before approval",
+        )
+
     quotation.is_approved = True
-
     quotation.approved_at = datetime.utcnow()
-
     quotation.status = QuotationStatus.APPROVED
-    
-    db.add(ActivityLog(
-        action="APPROVE_QUOTATION",
-        entity="project",
-        entity_id=quotation.project_id,
-        performed_by=current_user.id,
-        details={"message": f"Quotation QTN-{quotation.id} approved"}
-    ))
+
+    db.add(
+        ActivityLog(
+            action="APPROVE_QUOTATION",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={"message": f"Quotation {quotation.quotation_no} approved"},
+        )
+    )
 
     await db.commit()
 
-    return {"message": "Quotation approved"}
+    return {
+        "message": "Quotation approved successfully",
+        "quotation_id": quotation.id,
+        "status": quotation.status,
+    }
 
 
 # =========================================================
@@ -1642,13 +1631,29 @@ async def reject_quotation(
 
     quotation = await get_quotation_or_404(quotation_id, db)
 
-    quotation.status = QuotationStatus.REJECTED
+    # Quotation must be sent first
+    if quotation.status == QuotationStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail="Please send the quotation to the client before rejecting it.",
+        )
 
+    # Already approved
+    if quotation.status == QuotationStatus.APPROVED:
+        raise HTTPException(
+            status_code=400, detail="Approved quotation cannot be rejected."
+        )
+
+    # Already rejected
+    if quotation.status == QuotationStatus.REJECTED:
+        raise HTTPException(status_code=400, detail="Quotation is already rejected.")
+
+    quotation.status = QuotationStatus.REJECTED
     quotation.rejected_reason = payload.reason
 
     await db.commit()
 
-    return {"message": "Quotation rejected"}
+    return {"message": "Quotation rejected successfully"}
 
 
 # =========================================================
@@ -1782,7 +1787,6 @@ from app.models.invoice import Invoice
 from app.models.owner import Owner, OwnerTransaction
 from app.models.project import Project
 from decimal import Decimal
-
 
 # @router.post("/{quotation_id}/convert-to-invoice")
 # async def convert_to_invoice(
@@ -2484,31 +2488,40 @@ async def generate_pdf(quotation_id: int, db: AsyncSession = Depends(get_db_sess
 
 from app.core.enums import ProjectStatus
 
-@router.post("/{quotation_id}/convert-to-project", response_model=s.QuotationToProjectConvertResponse)
+
+@router.post(
+    "/{quotation_id}/convert-to-project",
+    response_model=s.QuotationToProjectConvertResponse,
+)
 async def convert_quotation_to_project(
     quotation_id: int,
     payload: s.QuotationToProjectConvertRequest,
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     quotation = await get_quotation_or_404(quotation_id, db)
 
     if not quotation.is_approved:
-        raise HTTPException(status_code=400, detail="Quotation must be approved before converting to a project")
+        raise HTTPException(
+            status_code=400,
+            detail="Quotation must be approved before converting to a project",
+        )
 
     # Check if a project already exists for this quotation
-    result = await db.execute(select(Project).where(Project.quotation_id == quotation_id))
+    result = await db.execute(
+        select(Project).where(Project.quotation_id == quotation_id)
+    )
     existing_project = result.scalars().first()
 
     if existing_project:
-        raise HTTPException(status_code=400, detail="A project has already been created for this quotation")
+        raise HTTPException(
+            status_code=400,
+            detail="A project has already been created for this quotation",
+        )
 
     owner = await db.get(Owner, payload.owner_id)
 
     if not owner:
-        raise HTTPException(
-            status_code=404,
-            detail="Owner not found"
-        )
+        raise HTTPException(status_code=404, detail="Owner not found")
 
     business_id = await generate_business_id(db, Project, "business_id", "PRJ")
 
@@ -2538,12 +2551,12 @@ async def convert_quotation_to_project(
 
     db.add(project)
     await db.flush()
-    
+
     # TODO: Future BOQ Integration
     # Quotation -> Project -> BOQ -> Tasks
     quotation.project_id = project.id
     quotation.status = QuotationStatus.CONVERTED
-    
+
     await db.commit()
     await db.refresh(project)
 
@@ -2552,5 +2565,84 @@ async def convert_quotation_to_project(
         project_id=project.id,
         project_business_id=project.business_id,
         quotation_id=quotation.id,
-        budget_amount=float(project.budget_amount)
+        budget_amount=float(project.budget_amount),
     )
+
+
+# ============================================
+
+
+@router.post("/{quotation_id}/send")
+async def send_quotation(
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
+):
+    quotation = await get_quotation_or_404(quotation_id, db)
+
+    # Client validation
+    if not quotation.client_user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Client is not assigned to this quotation."
+        )
+
+    # Already sent
+    if quotation.status == QuotationStatus.SENT:
+        raise HTTPException(
+            status_code=400,
+            detail="Quotation has already been sent."
+        )
+
+    # Already approved
+    if quotation.status == QuotationStatus.APPROVED:
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be sent again."
+        )
+
+    # Already converted
+    if quotation.status == QuotationStatus.CONVERTED:
+        raise HTTPException(
+            status_code=400,
+            detail="Converted quotation cannot be sent."
+        )
+
+    # Re-send support (Rejected -> Sent)
+    quotation.status = QuotationStatus.SENT
+    quotation.sent_at = datetime.utcnow()
+    quotation.rejected_reason = None
+
+    notification = Notification(
+        user_id=quotation.client_user_id,
+        title="New Quotation Received",
+        message=(
+            f"Quotation {quotation.quotation_no} has been shared with you. "
+            "Please review and approve or reject it."
+        ),
+        type="Quotation",
+        link=f"/quotation/{quotation.id}",
+    )
+
+    db.add(notification)
+
+    db.add(
+        ActivityLog(
+            action="SEND_QUOTATION",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={
+                "quotation_no": quotation.quotation_no,
+                "client_name": quotation.client_name,
+                "status": "Sent",
+            },
+        )
+    )
+
+    await db.commit()
+    await db.refresh(quotation)
+
+    return {
+        "message": "Quotation sent successfully.",
+    }

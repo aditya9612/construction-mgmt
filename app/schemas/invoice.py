@@ -37,6 +37,7 @@ class InvoiceUpdate(BaseModel):
 
     description: Optional[str] = None
 
+
 class InvoiceOut(BaseModel):
     id: int
     project_id: int
@@ -64,6 +65,7 @@ class InvoiceOut(BaseModel):
     class Config:
         from_attributes = True
 
+
 class LabourInvoiceCreate(BaseModel):
     project_id: int
     start_date: date
@@ -76,12 +78,14 @@ class AnalyticsSummaryOut(BaseModel):
     total_expense: float
     total_revenue: float
 
+
 class ReceivablesSummaryOut(BaseModel):
     portfolio_value: float
     total_billed: float
     total_received: float
     pending_amount: float
     overdue_amount: float
+
 
 class ManualReceivableCreate(BaseModel):
     client_id: int
@@ -90,6 +94,7 @@ class ManualReceivableCreate(BaseModel):
     due_date: date
     reference: Optional[str] = None
 
+
 class ClientLedgerTransactionOut(BaseModel):
     date: datetime
     particulars: str
@@ -97,11 +102,13 @@ class ClientLedgerTransactionOut(BaseModel):
     credit: float
     running_balance: float
 
+
 class ClientLedgerResponse(BaseModel):
     total_billed: float
     total_received: float
     outstanding: float
     transactions: list[ClientLedgerTransactionOut]
+
 
 class CollectionOut(BaseModel):
     invoice_no: str
@@ -127,15 +134,6 @@ class CreateInvoice(BaseModel):
     description: Optional[str] = None
 
 
-class SendInvoiceResponse(BaseModel):
-
-    message: str
-
-    invoice_id: int
-
-    client_user_id: int
-
-
 class InvoiceList(BaseModel):
 
     total: int
@@ -150,3 +148,13 @@ class InvoiceFilter(BaseModel):
     owner_id: Optional[int] = None
 
     status: Optional[InvoiceStatus] = None
+
+
+class SendInvoiceRequest(BaseModel):
+    client_user_id: int
+
+
+class SendInvoiceResponse(BaseModel):
+    message: str
+    invoice_id: int
+    client_user_id: int

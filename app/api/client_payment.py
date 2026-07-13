@@ -49,6 +49,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.notification import Notification
 import app.schemas.client_payment as s
 from app.cache.redis import bump_cache_version
 from app.core.dependencies import get_request_redis, require_roles
@@ -72,7 +73,7 @@ VERSION_KEY = "cache_version:client_payments"
 # ---------------------------------------------------------------------------
 # Company details used on receipt PDFs & statements.
 # ---------------------------------------------------------------------------
-COMPANY_NAME = "Construction Management System"
+COMPANY_NAME = "Infra Pilot"
 COMPANY_ADDRESS_LINE = "123, Business Park, Andheri East, Mumbai - 400069"
 COMPANY_CONTACT_LINE = (
     "Tel: +91 22 1234 5678 | Email: accounts@cms.com | GSTIN: 27XXXXX1234X1ZX"
@@ -131,8 +132,8 @@ NON_BLOCKING_DUPLICATE_STATUSES = (
 )
 
 # Colors for PDFs
-PRIMARY_COLOR = HexColor("#1a365d")
-SECONDARY_COLOR = HexColor("#2c5282")
+PRIMARY_COLOR = HexColor("#f4fc96")
+SECONDARY_COLOR = HexColor("#89CEF1EB")
 ACCENT_COLOR = HexColor("#e53e3e")
 SUCCESS_COLOR = HexColor("#38a169")
 LIGHT_BG = HexColor("#f7fafc")
@@ -1158,6 +1159,14 @@ async def export_client_payments_excel(
 # GET /client-payments/export/pdf
 # =============================================================================
 
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    Spacer,
+)
+
 
 @router.get("/export/pdf", summary="Export Client Payments to PDF")
 async def export_client_payments_pdf(
@@ -1243,6 +1252,10 @@ async def export_client_payments_pdf(
             bottomMargin=30,
         )
         styles = getSampleStyleSheet()
+        body_style = styles["BodyText"]
+        body_style.fontName = "Helvetica"
+        body_style.fontSize = 8
+        body_style.leading = 10
         content = []
 
         # Header
@@ -1262,50 +1275,79 @@ async def export_client_payments_pdf(
         # Table
         table_data = [
             [
-                "Payment No",
-                "Client",
-                "Project",
-                "Amount",
-                "Method",
-                "Status",
-                "Date",
+                Paragraph("<b>Payment No</b>", body_style),
+                Paragraph("<b>Client</b>", body_style),
+                Paragraph("<b>Project</b>", body_style),
+                Paragraph("<b>Amount</b>", body_style),
+                Paragraph("<b>Method</b>", body_style),
+                Paragraph("<b>Status</b>", body_style),
+                Paragraph("<b>Date</b>", body_style),
             ]
         ]
+
         total_amount = 0
+
         for payment in payments:
             total_amount += float(payment.amount)
+
             table_data.append(
                 [
-                    payment.payment_no,
-                    payment.client_user.full_name if payment.client_user else "",
-                    payment.project.project_name if payment.project else "",
-                    format_indian_currency(float(payment.amount)),
-                    payment.payment_method.value,
-                    payment.payment_status.value,
-                    (
-                        payment.payment_date.strftime("%d-%m-%Y")
-                        if payment.payment_date
-                        else ""
+                    Paragraph(payment.payment_no or "", body_style),
+                    Paragraph(
+                        payment.client_user.full_name if payment.client_user else "",
+                        body_style,
+                    ),
+                    Paragraph(
+                        payment.project.project_name if payment.project else "",
+                        body_style,
+                    ),
+                    Paragraph(
+                        format_indian_currency(float(payment.amount)),
+                        body_style,
+                    ),
+                    Paragraph(payment.payment_method.value, body_style),
+                    Paragraph(payment.payment_status.value, body_style),
+                    Paragraph(
+                        (
+                            payment.payment_date.strftime("%d-%m-%Y")
+                            if payment.payment_date
+                            else ""
+                        ),
+                        body_style,
                     ),
                 ]
             )
 
         payment_table = Table(
             table_data,
-            colWidths=[70, 90, 90, 80, 60, 60, 70],
+            colWidths=[
+                65,  # Payment No
+                90,  # Client
+                180,  # Project (Increased)
+                75,  # Amount
+                55,  # Method
+                60,  # Status
+                70,  # Date
+            ],
         )
+
         payment_table.setStyle(
             TableStyle(
                 [
                     ("BACKGROUND", (0, 0), (-1, 0), PRIMARY_COLOR),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), white),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("FONTSIZE", (0, 0), (-1, 0), 9),
-                    ("FONTSIZE", (0, 1), (-1, -1), 8),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                    ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                    ("FONTSIZE", (0, 1), (-1, -1), 8),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("ALIGN", (3, 1), (3, -1), "RIGHT"),
+                    ("ALIGN", (4, 1), (6, -1), "CENTER"),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
                     ("TOPPADDING", (0, 0), (-1, -1), 6),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("WORDWRAP", (0, 0), (-1, -1), "CJK"),
                 ]
             )
         )
@@ -1446,7 +1488,30 @@ async def create_client_payment(
                 },
             )
         )
+        # =====================================================
+        # SEND NOTIFICATION TO ALL ADMINS
+        # =====================================================
 
+        admins = (
+            (await db.execute(select(User).where(User.role == UserRole.ADMIN)))
+            .scalars()
+            .all()
+        )
+
+        for admin in admins:
+            db.add(
+                Notification(
+                    user_id=admin.id,
+                    title="New Client Payment Received",
+                    message=(
+                        f"Client has submitted payment "
+                        f"{payment.payment_no} of ₹{payment.amount} "
+                        f"for Invoice #{invoice_obj.id}."
+                    ),
+                    type="Client Payment",
+                    link=f"/client-payments/{payment.id}",
+                )
+            )
         if receipt:
             payment.receipt_url = await save_receipt(receipt, payment.payment_no)
 
@@ -1967,9 +2032,9 @@ async def verify_client_payment(
                     debit_code="1001",  # Cash/Bank
                     credit_code="1200",  # Accounts Receivable
                     description=f"Client payment {payment.payment_no} verified",
-                    reference_type="client_payment",
-                    reference_id=payment.id,
-                    created_by=current_user.id,
+                    # reference_type="client_payment",
+                    # reference_id=payment.id,
+                    # created_by=current_user.id,
                 )
 
             # Notify client
