@@ -101,7 +101,10 @@ class Labour(Base, TimestampMixin):
     )
 
     contractor_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("contractors.id", ondelete="SET NULL")
+        Integer,
+        ForeignKey("contractors.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     status: Mapped[LabourStatus] = mapped_column(

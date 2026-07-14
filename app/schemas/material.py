@@ -154,12 +154,12 @@ class MaterialOut(BaseSchema):
     supplier_id: int
     supplier_name: Optional[str] = None
 
-    purchase_rate: float
+    purchase_rate: Decimal
     rate_type: RateType
 
-    quantity_purchased: float
-    quantity_used: float
-    remaining_stock: float
+    quantity_purchased: Decimal
+    quantity_used: Decimal
+    remaining_stock: Decimal
 
     total_amount: float
 
@@ -546,10 +546,19 @@ class InventoryOut(BaseSchema):
 
     material_id: int
 
-    total_purchased: float
-    total_used: float
+    material_name: str
 
     remaining_stock: float
+
+    unit_id: int
+
+    unit_name: str
+
+    avg_rate: float
+
+    total_value: float
+
+    project_id: int
 
 
 # ================= LOG =================
@@ -707,24 +716,27 @@ class UsageMaterialOut(BaseSchema):
     created_at: datetime
 
 
-class MaterialLedgerOut(BaseSchema):
-    id: int
-    material_id: int
-    transaction_type: TransactionType
-    quantity: float
-    balance_stock: float
-    created_at: datetime
-
-
 class MaterialTransactionOut(BaseSchema):
     id: int
+
     material_id: int
-    boq_item_id: Optional[int]
-    project_id: Optional[int]
+    boq_item_id: Optional[int] = None
+    project_id: Optional[int] = None
+    task_id: Optional[int] = None
+
     type: TransactionType
+
     quantity: float
     rate: float
+    avg_rate: float
+
     total_amount: float
+
+    amount_paid: float
+    payment_pending: float
+
+    issue_type: Optional[IssueType] = None
+
     created_at: datetime
 
 
@@ -768,7 +780,7 @@ class InventoryItemOut(BaseSchema):
 
     remaining_stock: float
 
-    unit: Optional[str]
+    unit_name: Optional[str]
 
     avg_rate: float
 

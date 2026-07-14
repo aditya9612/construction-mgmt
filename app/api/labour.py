@@ -1,7 +1,7 @@
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import io
-from fastapi import Form
+from fastapi import Form, HTTPException
 from pydantic import EmailStr
 from app.models.master_data import LabourType
 from sqlalchemy import case
@@ -125,11 +125,20 @@ async def create_labour(
 
     data["profile_image"] = image_path
 
-    if payload.contractor_id:
-        contractor = await db.get(Contractor, payload.contractor_id)
-        if not contractor:
-            raise ValidationError("Invalid contractor_id")
+    contractor = None
 
+    if payload.contractor_id:
+        contractor = await db.get(
+            Contractor,
+            payload.contractor_id,
+        )
+
+        if not contractor:
+            raise HTTPException(
+                status_code=404,
+                detail="Contractor not found",
+            )
+        
     # =========================================
     # ADD HERE
     # =========================================
@@ -425,6 +434,8 @@ async def get_contractor_liability(
         )
     return output
 
+#=============================================
+
 
 @router.put("/{labour_id}", response_model=s.LabourOut)
 async def update_labour(
@@ -497,17 +508,34 @@ async def update_labour(
 
     data = {k: v for k, v in data.items() if v is not None}
 
+    # Labour Type validation
     if labour_type_id is not None:
 
-        labour_type = await db.get(LabourType, labour_type_id)
+        labour_type = await db.get(
+            LabourType,
+            labour_type_id,
+        )
 
         if not labour_type:
             raise ValidationError("Invalid labour_type_id")
 
+    # Contractor validation (optional)
+    if contractor_id is not None:
+
+        contractor = await db.get(
+            Contractor,
+            contractor_id,
+        )
+
+        if not contractor:
+            raise ValidationError("Invalid contractor_id")
+
     # PROFILE IMAGE UPDATE
     if profile_image:
         image_path = await validate_and_save_image(
-            file=profile_image, upload_dir="uploads/labour", prefix="labour"
+            file=profile_image,
+            upload_dir="uploads/labour",
+            prefix="labour",
         )
 
         data["profile_image"] = image_path
@@ -559,6 +587,9 @@ async def update_labour(
     await r.bump_cache_version(redis, "dashboard_version")
 
     return s.LabourOut.model_validate(obj, from_attributes=True)
+
+
+#====================================================
 
 
 @router.delete("/{labour_id}", status_code=200)

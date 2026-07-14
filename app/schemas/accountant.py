@@ -24,7 +24,7 @@ class PayablePaymentRequest(BaseModel):
 class PayableOut(BaseModel):
     ra_id: int
     project_id: int
-    contractor_id: Optional[int]
+    contractor_id: Optional[int] = None
 
     total_amount: float
     paid_amount: float

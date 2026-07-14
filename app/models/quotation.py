@@ -147,10 +147,6 @@ class QuotationMaster(Base):
 
     rejected_reason: Mapped[str | None] = mapped_column(Text)
 
-    # ================= SEND =================
-
-    #sent_at: Mapped[datetime | None] = mapped_column(DateTime)
-
     # ================= CONVERSION =================
 
     converted_to_bill: Mapped[bool] = mapped_column(Boolean, default=False)

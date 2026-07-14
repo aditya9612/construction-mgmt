@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, ForeignKey, Date, DECIMAL
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
 
@@ -16,10 +16,9 @@ class RABill(Base, TimestampMixin):
         index=True,
     )
 
-    contractor_id = Column(
-        Integer,
-        ForeignKey("contractors.id", ondelete="CASCADE"),
-        nullable=False,
+    contractor_id = mapped_column(
+        ForeignKey("contractors.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 
@@ -52,12 +51,15 @@ class RABill(Base, TimestampMixin):
         nullable=True,
     )
 
-    quotation_id = Column( Integer, ForeignKey("quotation_master.id", ondelete="SET NULL"), nullable=True, unique=True, index=True, )
-
-    status = Column(
-        String(50),
-        default="Draft"  # Draft → Submitted → Approved → Paid
+    quotation_id = Column(
+        Integer,
+        ForeignKey("quotation_master.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+        index=True,
     )
+
+    status = Column(String(50), default="Draft")  # Draft → Submitted → Approved → Paid
 
     project = relationship("Project")
     contractor = relationship("Contractor")

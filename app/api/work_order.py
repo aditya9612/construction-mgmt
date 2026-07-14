@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +22,7 @@ from app.utils.common import (
 
 from app.models.user import User, UserRole
 from app.core.dependencies import require_roles
+
 router = APIRouter(prefix="/work-orders", tags=["Work Orders"])
 
 
@@ -38,20 +39,36 @@ WORK_ORDER_READ_ROLES = [
 ]
 
 
+# =================create_work_order=============================
+
+
 @router.post("", response_model=WorkOrderOut)
 async def create_work_order(
     payload: WorkOrderCreate,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(WORK_ORDER_CREATE_ROLES)),
 ):
-    project = await db.get(Project, payload.project_id)
-    contractor = await db.get(Contractor, payload.contractor_id)
+    project = await db.get(
+        Project,
+        payload.project_id,
+    )
 
     if not project:
         raise NotFoundError("Project not found")
 
-    if not contractor:
-        raise NotFoundError("Contractor not found")
+    # Contractor is optional
+    if payload.contractor_id:
+
+        contractor = await db.get(
+            Contractor,
+            payload.contractor_id,
+        )
+
+        if not contractor:
+            raise HTTPException(
+                status_code=404,
+                detail="Contractor not found",
+            )
 
     await assert_project_access(
         db,
@@ -60,7 +77,10 @@ async def create_work_order(
     )
 
     work_order_number = await generate_business_id(
-        db, WorkOrder, "work_order_number", "WO"
+        db,
+        WorkOrder,
+        "work_order_number",
+        "WO",
     )
 
     total_amount = payload.total_quantity * payload.rate
@@ -72,9 +92,13 @@ async def create_work_order(
     )
 
     db.add(obj)
+
     await db.flush()
 
     return WorkOrderOut.model_validate(obj)
+
+
+# ==============================
 
 
 @router.get("", response_model=list[WorkOrderOut])
@@ -85,8 +109,10 @@ async def list_work_orders(
     query = select(WorkOrder)
 
     if str(current_user.role) != UserRole.ADMIN.value:
-        query = query.join(Project).join(Project.members).where(
-            Project.members.any(user_id=current_user.id)
+        query = (
+            query.join(Project)
+            .join(Project.members)
+            .where(Project.members.any(user_id=current_user.id))
         )
 
     result = await db.execute(query.order_by(WorkOrder.id.desc()))
@@ -115,6 +141,9 @@ async def get_work_order(
     return WorkOrderOut.model_validate(obj)
 
 
+# =======================================
+
+
 @router.put("/{id}", response_model=WorkOrderOut)
 async def update_work_order(
     id: int,
@@ -135,23 +164,49 @@ async def update_work_order(
 
     data = payload.model_dump(exclude_unset=True)
 
+    # ==========================
+    # Contractor Validation
+    # ==========================
+    if "contractor_id" in data and data["contractor_id"] is not None:
+        contractor = await db.get(
+            Contractor,
+            data["contractor_id"],
+        )
+
+        if not contractor:
+            raise ValidationError("Invalid contractor_id")
+
+    # ==========================
+    # Update Fields
+    # ==========================
     for k, v in data.items():
         setattr(obj, k, v)
 
-    # validations
-    if obj.completed_quantity and obj.completed_quantity > obj.total_quantity:
-        raise ValidationError("Completed > total quantity")
+    # ==========================
+    # Validations
+    # ==========================
+    if (
+        obj.completed_quantity is not None
+        and obj.completed_quantity > obj.total_quantity
+    ):
+        raise ValidationError("Completed quantity cannot exceed total quantity")
 
-    # status auto update
+    # ==========================
+    # Auto Status Update
+    # ==========================
     if obj.completed_quantity == obj.total_quantity:
         obj.status = "Completed"
-    elif obj.completed_quantity and obj.completed_quantity > 0:
+
+    elif obj.completed_quantity is not None and obj.completed_quantity > 0:
         obj.status = "In Progress"
 
-    # recalc
+    # ==========================
+    # Recalculate Amount
+    # ==========================
     obj.total_amount = obj.total_quantity * obj.rate
 
     await db.flush()
+    await db.refresh(obj)
 
     return WorkOrderOut.model_validate(obj)
 

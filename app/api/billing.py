@@ -1,5 +1,5 @@
 from decimal import Decimal
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date
@@ -57,15 +57,26 @@ async def create_ra_bill(
     current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
 ):
     from app.models.work_order import WorkOrder
+    from app.models.final_measurement import FinalMeasurement
 
     project = await db.get(Project, payload.project_id)
-    contractor = await db.get(Contractor, payload.contractor_id)
 
     if not project:
         raise NotFoundError("Project not found")
 
-    if not contractor:
-        raise NotFoundError("Contractor not found")
+    contractor = None
+
+    if payload.contractor_id:
+        contractor = await db.get(
+            Contractor,
+            payload.contractor_id,
+        )
+
+        if not contractor:
+            raise HTTPException(
+                status_code=404,
+                detail="Contractor not found",
+            )
 
     await assert_project_access(
         db,
@@ -76,34 +87,54 @@ async def create_ra_bill(
     if payload.bill_date > date.today():
         raise ValidationError("Future bill date not allowed")
 
-    from app.models.final_measurement import FinalMeasurement
-    
+    # ================= Measurement Validation =================
+
     if payload.measurement_id:
-        measurement = await db.get(FinalMeasurement, payload.measurement_id)
+        measurement = await db.get(
+            FinalMeasurement,
+            payload.measurement_id,
+        )
+
         if not measurement:
             raise ValidationError("Measurement not found")
+
         if measurement.project_id != payload.project_id:
             raise ValidationError("Measurement project mismatch")
+
         if measurement.status not in ["VERIFIED", "APPROVED"]:
-            raise ValidationError("Only VERIFIED or APPROVED measurements can be billed")
-        
-        # Prevent billing beyond certified quantity if needed
-        # For now we just enforce the link status
+            raise ValidationError(
+                "Only VERIFIED or APPROVED measurements can be billed"
+            )
+
+    # ================= Duplicate Bill =================
 
     existing = await db.scalar(
-        select(RABill).where(RABill.bill_number == payload.bill_number)
+        select(RABill).where(
+            RABill.bill_number == payload.bill_number
+        )
     )
+
     if existing:
         raise ValidationError("Bill number already exists")
 
+    # ================= Work Order Validation =================
+
     work_order = None
+
     if payload.work_order_id:
-        work_order = await db.get(WorkOrder, payload.work_order_id)
+
+        work_order = await db.get(
+            WorkOrder,
+            payload.work_order_id,
+        )
 
         if not work_order:
             raise ValidationError("Invalid work order")
 
-        if work_order.contractor_id != payload.contractor_id:
+        if (
+            work_order.contractor_id is not None
+            and work_order.contractor_id != payload.contractor_id
+        ):
             raise ValidationError("Work order contractor mismatch")
 
         if work_order.project_id != payload.project_id:
@@ -118,11 +149,13 @@ async def create_ra_bill(
                     RABill.work_order_id == payload.work_order_id
                 )
             )
-            or 0
+            or Decimal("0")
         )
 
         if total_billed + payload.quantity > work_order.completed_quantity:
             raise ValidationError("Total billing exceeds completed quantity")
+
+    # ================= Amount Calculation =================
 
     gross = payload.quantity * payload.rate
 
@@ -132,6 +165,8 @@ async def create_ra_bill(
     net = gross - payload.deductions
     gst_amount = (net * payload.gst_percent) / 100
     total = net + gst_amount
+
+    # ================= Create RA Bill =================
 
     obj = RABill(
         **payload.model_dump(),
@@ -143,6 +178,8 @@ async def create_ra_bill(
 
     db.add(obj)
     await db.flush()
+
+    # ================= Owner Transaction =================
 
     db.add(
         OwnerTransaction(
@@ -156,6 +193,8 @@ async def create_ra_bill(
         )
     )
 
+    # ================= Approval =================
+
     db.add(
         Approval(
             entity_type="bill",
@@ -167,20 +206,28 @@ async def create_ra_bill(
 
     await db.flush()
 
+    # ================= Response Calculation =================
+
     progress = None
     total_billed_qty = None
     remaining_qty = None
     available_qty = None
 
     if work_order:
-        if work_order.total_quantity:
-            progress = float((obj.quantity / work_order.total_quantity) * 100)
 
-        total_billed_qty = await db.scalar(
-            select(func.sum(RABill.quantity)).where(
-                RABill.work_order_id == obj.work_order_id
+        if work_order.total_quantity:
+            progress = float(
+                (obj.quantity / work_order.total_quantity) * 100
             )
-        ) or Decimal("0")
+
+        total_billed_qty = (
+            await db.scalar(
+                select(func.sum(RABill.quantity)).where(
+                    RABill.work_order_id == obj.work_order_id
+                )
+            )
+            or Decimal("0")
+        )
 
         remaining_qty = work_order.total_quantity - total_billed_qty
         available_qty = work_order.completed_quantity - total_billed_qty
@@ -192,13 +239,16 @@ async def create_ra_bill(
     return RABillOut.model_validate(
         {
             **obj.__dict__,
-            "progress_percent": round(progress, 2) if progress else None,
+            "progress_percent": (
+                round(progress, 2)
+                if progress is not None
+                else None
+            ),
             "total_billed_quantity": total_billed_qty,
             "remaining_quantity": remaining_qty,
             "available_to_bill": available_qty,
         }
     )
-
 
 # ======================
 # LIST
@@ -330,7 +380,6 @@ async def get_ra_bill(
         }
     )
 
-
 # ======================
 # UPDATE
 # ======================
@@ -341,7 +390,10 @@ async def update_ra_bill(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
 ):
+    from app.models.work_order import WorkOrder
+
     obj = await db.get(RABill, id)
+
     if not obj:
         raise NotFoundError("RA Bill not found")
 
@@ -351,10 +403,62 @@ async def update_ra_bill(
         current_user=current_user,
     )
 
-    for k, v in payload.model_dump(exclude_unset=True).items():
+    data = payload.model_dump(exclude_unset=True)
+
+    # ================= Contractor Validation =================
+
+    if (
+        "contractor_id" in data
+        and data["contractor_id"] is not None
+    ):
+        contractor = await db.get(
+            Contractor,
+            data["contractor_id"],
+        )
+
+        if not contractor:
+            raise ValidationError("Invalid contractor_id")
+
+    # ================= Work Order Validation =================
+
+    work_order_id = data.get("work_order_id", obj.work_order_id)
+
+    if work_order_id:
+
+        work_order = await db.get(
+            WorkOrder,
+            work_order_id,
+        )
+
+        if not work_order:
+            raise ValidationError("Invalid work order")
+
+        contractor_id = data.get(
+            "contractor_id",
+            obj.contractor_id,
+        )
+
+        if (
+            work_order.contractor_id is not None
+            and work_order.contractor_id != contractor_id
+        ):
+            raise ValidationError("Work order contractor mismatch")
+
+        if work_order.project_id != obj.project_id:
+            raise ValidationError("Work order project mismatch")
+
+    # ================= Update Fields =================
+
+    for k, v in data.items():
         setattr(obj, k, v)
 
+    # ================= Recalculate Amount =================
+
     gross = obj.quantity * obj.rate
+
+    if (obj.deductions or 0) > gross:
+        raise ValidationError("Deductions cannot exceed gross")
+
     net = gross - (obj.deductions or 0)
     gst_amount = (net * (obj.gst_percent or 0)) / 100
     total = net + gst_amount

@@ -4420,10 +4420,19 @@ async def create_dsr(
         raise BadRequestError("DSR already exists for this date")
 
     # Contractor validation
+    contractor = None
+
     if payload.contractor_id:
-        contractor = await db.get(Contractor, payload.contractor_id)
+        contractor = await db.get(
+            Contractor,
+            payload.contractor_id,
+        )
+
         if not contractor:
-            raise ValidationError("Invalid contractor_id")
+            raise HTTPException(
+                status_code=404,
+                detail="Contractor not found",
+            )
 
     labour_result = await db.execute(
         select(

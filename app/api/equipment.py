@@ -310,6 +310,7 @@ MAX_MONTHLY_HOURS = 240
 # ============================== EQUIPMENT PURCHASE HISTORY ========================
 # Added optional filters + pagination.
 
+
 @router.get(
     "/purchase/history",
     response_model=List[EquipmentPurchaseOut],
@@ -376,11 +377,7 @@ async def get_equipment_purchase_history(
 
     for purchase in purchases:
 
-        asset_name = (
-            purchase.equipment.equipment_name
-            if purchase.equipment
-            else None
-        )
+        asset_name = purchase.equipment.equipment_name if purchase.equipment else None
 
         response.append(
             EquipmentPurchaseOut(
@@ -1764,7 +1761,10 @@ async def create_usage(
 
     equipment.fuel_used = old_fuel + payload.fuel_used
 
-    equipment.status = EquipmentStatus.IN_PROJECT
+    await recalculate_equipment_status(
+        db,
+        equipment,
+    )
 
     # ================= BOQ ACTUAL COST UPDATE =================
 
@@ -2406,13 +2406,6 @@ async def create_maintenance(
 
 
 # ======================== UPDATE MAINTENANCE =========================
-# FIX: previously the date validation ran *after* the fields were already
-# mutated on the ORM object with setattr(). Since the mutation happened
-# in-place on a tracked entity, that's risky (partial state visible to
-# anything reading `maintenance` before the exception rolls the session
-# back, and harder to reason about). Now we compute the prospective dates
-# first, validate, and only mutate the object once we know the update is
-# valid.
 
 
 @router.put(
@@ -2448,10 +2441,13 @@ async def update_maintenance(
     # ================= VALIDATE BEFORE MUTATING =================
 
     prospective_maintenance_date = update_data.get(
-        "maintenance_date", maintenance.maintenance_date
+        "maintenance_date",
+        maintenance.maintenance_date,
     )
+
     prospective_next_date = update_data.get(
-        "next_maintenance_date", maintenance.next_maintenance_date
+        "next_maintenance_date",
+        maintenance.next_maintenance_date,
     )
 
     if (
@@ -2464,7 +2460,7 @@ async def update_maintenance(
             detail="Next maintenance date must be after maintenance date",
         )
 
-    # ================= APPLY UPDATE (only after validation passes) =================
+    # ================= APPLY UPDATE =================
 
     old_values = {}
 
@@ -2477,7 +2473,6 @@ async def update_maintenance(
     new_cost = maintenance.cost or Decimal("0")
     new_boq_id = maintenance.boq_item_id
 
-    # BOQ changed
     if old_boq_id != new_boq_id:
 
         if old_boq_id:
@@ -2508,7 +2503,6 @@ async def update_maintenance(
 
             new_boq.actual_cost = (new_boq.actual_cost or Decimal("0")) + new_cost
 
-    # Same BOQ → adjust cost difference
     elif new_boq_id:
 
         boq_item = await db.get(
@@ -2520,6 +2514,18 @@ async def update_maintenance(
             boq_item.actual_cost = (
                 (boq_item.actual_cost or Decimal("0")) - old_cost + new_cost
             )
+
+    # ================= STATUS RECALCULATION =================
+
+    equipment = await get_active_equipment_or_404(
+        db,
+        maintenance.equipment_id,
+    )
+
+    await recalculate_equipment_status(
+        db,
+        equipment,
+    )
 
     # ================= AUDIT =================
 
@@ -2533,14 +2539,19 @@ async def update_maintenance(
         request=request,
     )
 
+    # ================= COMMIT =================
+
     await db.commit()
 
     await db.refresh(maintenance)
+    await db.refresh(equipment)
 
     await bump_cache_version(
         redis,
         VERSION_KEY,
     )
+
+    # ================= RESPONSE STATUS =================
 
     today = date.today()
 
@@ -3361,16 +3372,28 @@ async def update_rental(
 
     update_data = payload.model_dump(exclude_unset=True)
 
-    old_values = {}
+    # ================= VALIDATE BEFORE MUTATING =================
 
-    for field, value in update_data.items():
-        old_values[field] = getattr(rental, field)
-        setattr(rental, field, value)
+    if rental.end_date and rental.end_date < date.today():
+        raise HTTPException(
+            status_code=400,
+            detail="Completed rental cannot be updated",
+        )
 
-    start_date = rental.start_date
-    end_date = rental.end_date or rental.start_date
+    prospective_start = update_data.get(
+        "start_date",
+        rental.start_date,
+    )
 
-    if end_date < start_date:
+    prospective_end = (
+        update_data.get(
+            "end_date",
+            rental.end_date,
+        )
+        or prospective_start
+    )
+
+    if prospective_end < prospective_start:
         raise HTTPException(
             status_code=400,
             detail="End date cannot be before start date",
@@ -3381,10 +3404,10 @@ async def update_rental(
             exists().where(
                 EquipmentRental.equipment_id == rental.equipment_id,
                 EquipmentRental.id != rental.id,
-                EquipmentRental.start_date <= end_date,
+                EquipmentRental.start_date <= prospective_end,
                 or_(
                     EquipmentRental.end_date.is_(None),
-                    EquipmentRental.end_date >= start_date,
+                    EquipmentRental.end_date >= prospective_start,
                 ),
             )
         )
@@ -3395,6 +3418,17 @@ async def update_rental(
             status_code=400,
             detail="Rental overlap found",
         )
+
+    # ================= APPLY UPDATE =================
+
+    old_values = {}
+
+    for field, value in update_data.items():
+        old_values[field] = getattr(rental, field)
+        setattr(rental, field, value)
+
+    start_date = rental.start_date
+    end_date = rental.end_date or rental.start_date
 
     # ================= BOQ COST UPDATE =================
 
@@ -3590,6 +3624,130 @@ async def delete_rental(
         rental_id=rental_id,
         equipment_id=equipment.id,
         equipment_status=equipment.status.value,
+    )
+
+
+# =================complete_rental=============================
+
+
+@router.put(
+    "/rental/{rental_id}/complete",
+    response_model=EquipmentRentalOut,
+)
+async def complete_rental(
+    rental_id: int,
+    request: Request,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+    rental = await db.get(
+        EquipmentRental,
+        rental_id,
+    )
+
+    if not rental:
+        raise HTTPException(
+            status_code=404,
+            detail="Rental not found",
+        )
+
+    equipment = await get_active_equipment_or_404(
+        db,
+        rental.equipment_id,
+    )
+
+    today = date.today()
+
+    # ================= VALIDATIONS =================
+
+    if rental.start_date > today:
+        raise HTTPException(
+            status_code=400,
+            detail="Upcoming rental cannot be completed",
+        )
+
+    if rental.end_date and rental.end_date <= today:
+        raise HTTPException(
+            status_code=400,
+            detail="Rental already completed",
+        )
+
+    old_status = equipment.status
+    old_end_date = rental.end_date
+
+    # ================= COMPLETE RENTAL =================
+
+    rental.end_date = today
+
+    await db.flush()
+
+    # ================= STATUS RECALCULATION =================
+
+    await recalculate_equipment_status(
+        db,
+        equipment,
+    )
+
+    # ================= AUDIT =================
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="RENTAL_COMPLETE",
+        old_values={
+            "status": old_status.value if old_status else None,
+            "end_date": (str(old_end_date) if old_end_date else None),
+        },
+        new_values={
+            "status": equipment.status.value,
+            "end_date": str(rental.end_date),
+        },
+        user_id=current_user.id,
+        request=request,
+    )
+
+    # ================= COMMIT =================
+
+    await db.commit()
+
+    await db.refresh(rental)
+    await db.refresh(equipment)
+
+    await bump_cache_version(
+        redis,
+        VERSION_KEY,
+    )
+
+    # ================= RESPONSE =================
+
+    end_date = rental.end_date or rental.start_date
+
+    duration = (end_date - rental.start_date).days + 1
+
+    per_day_cost = (
+        round(
+            float(rental.rental_cost) / duration,
+            2,
+        )
+        if duration > 0
+        else 0
+    )
+
+    return EquipmentRentalOut(
+        id=rental.id,
+        project_id=rental.project_id,
+        boq_item_id=rental.boq_item_id,
+        equipment_id=rental.equipment_id,
+        start_date=rental.start_date,
+        end_date=rental.end_date,
+        rental_cost=float(rental.rental_cost),
+        client_name=rental.client_name,
+        notes=rental.notes,
+        created_at=rental.created_at,
+        status="COMPLETED",
+        duration=duration,
+        per_day_cost=per_day_cost,
     )
 
 
@@ -4365,10 +4523,7 @@ async def update_purchase(
 # =============================== PURCHASE DELETE ========================
 
 
-@router.delete(
-    "/purchase/{purchase_id}",
-    status_code=status.HTTP_200_OK,
-)
+@router.delete("/purchase/{purchase_id}", status_code=status.HTTP_200_OK)
 async def delete_purchase(
     purchase_id: int,
     current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
@@ -4376,70 +4531,19 @@ async def delete_purchase(
     redis=Depends(get_request_redis),
     request: Request = None,
 ):
-    purchase = await db.get(
-        EquipmentPurchase,
-        purchase_id,
-    )
+    purchase = await db.get(EquipmentPurchase, purchase_id)
 
     if not purchase:
-        raise HTTPException(
-            status_code=404,
-            detail="Purchase not found",
-        )
-
-    # ================= BOQ ROLLBACK =================
-
-    if purchase.boq_item_id:
-
-        boq_item = await db.get(
-            BOQ,
-            purchase.boq_item_id,
-        )
-
-        if boq_item:
-
-            boq_item.actual_cost = max(
-                Decimal("0"),
-                (boq_item.actual_cost or Decimal("0"))
-                - (purchase.total_amount or Decimal("0")),
-            )
-            boq_item.variance_cost = (
-                boq_item.total_cost or Decimal("0")
-            ) - boq_item.actual_cost
-
-    # ================= AUDIT LOG =================
-
-    await create_audit_log(
-        db=db,
-        equipment_id=purchase.asset_id,
-        action="PURCHASE_DELETE",
-        old_values={
-            "purchase_id": purchase.id,
-            "asset_id": purchase.asset_id,
-            "boq_item_id": purchase.boq_item_id,
-            "invoice_number": purchase.invoice_number,
-            "vendor_name": purchase.vendor_name,
-            "quantity": purchase.quantity,
-            "unit_price": float(purchase.unit_price or 0),
-            "total_amount": float(purchase.total_amount or 0),
-        },
-        user_id=current_user.id,
-        request=request,
-    )
+        raise HTTPException(status_code=404, detail="Purchase not found")
 
     asset_id = purchase.asset_id
     invoice_number = purchase.invoice_number
     boq_item_id = purchase.boq_item_id
 
     try:
-        # ================= BOQ ROLLBACK =================
+        # ================= BOQ ROLLBACK (single execution) =================
         if purchase.boq_item_id:
-
-            boq_item = await db.get(
-                BOQ,
-                purchase.boq_item_id,
-            )
-
+            boq_item = await db.get(BOQ, purchase.boq_item_id)
             if boq_item:
                 boq_item.actual_cost = max(
                     Decimal("0"),
@@ -4450,7 +4554,7 @@ async def delete_purchase(
                     boq_item.total_cost or Decimal("0")
                 ) - boq_item.actual_cost
 
-        # ================= AUDIT LOG =================
+        # ================= AUDIT LOG (single execution) =================
         await create_audit_log(
             db=db,
             equipment_id=asset_id,
@@ -4476,9 +4580,9 @@ async def delete_purchase(
         await db.rollback()
         raise
 
-    return {
-        "message": "Purchase deleted successfully",
-    }
+    await bump_cache_version(redis, VERSION_KEY)
+
+    return {"message": "Purchase deleted successfully"}
 
 
 # ============================== EQUIPMENT TRANSFER ========================

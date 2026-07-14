@@ -10,7 +10,7 @@ from app.core.validators import (
 
 class RABillBase(BaseModel):
     project_id: int
-    contractor_id: int
+    contractor_id: Optional[int] = None
     measurement_id: Optional[int] = None
     work_order_id: Optional[int] = None
     bill_number: str
@@ -38,6 +38,7 @@ class RABillCreate(RABillBase):
 
 
 class RABillUpdate(BaseModel):
+    contractor_id: Optional[int] = None
     work_order_id: Optional[int] = None
     work_description: Optional[str] = None
     quantity: Optional[Decimal] = None
@@ -71,7 +72,7 @@ class RABillUpdate(BaseModel):
 class RABillOut(BaseModel):
     id: int
     project_id: int
-    contractor_id: int
+    contractor_id: Optional[int] = None
     measurement_id: Optional[int]
     work_order_id: Optional[int]
 

@@ -1,30 +1,38 @@
-from typing import Optional, Dict
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any, Optional
 
 from pydantic import (
-    BaseModel,
     ConfigDict,
     Field,
-    validator,
+    field_validator,
 )
 
-from app.core.enums import EquipmentCondition, EquipmentStatus, PurchaseType
 from app.schemas.base import BaseSchema
+from app.core.enums import (
+    EquipmentCondition,
+    EquipmentStatus,
+    PurchaseType,
+)
 from app.core.validators import (
+    validate_client_name,
     validate_equipment_name,
     validate_equipment_code,
     validate_operator_name,
-    validate_client_name,
     validate_notes,
 )
 
-# === EQUIPMENT SCHEMAS ===
+# =====================================================
+# EQUIPMENT
+# =====================================================
 
 
 class EquipmentCreate(BaseSchema):
 
-    project_id: Optional[int] = Field(None, gt=0)
+    project_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
     equipment_name: str = Field(
         ...,
@@ -44,7 +52,7 @@ class EquipmentCreate(BaseSchema):
     condition: EquipmentCondition = EquipmentCondition.GOOD
 
     rental_cost: Decimal = Field(
-        default=0,
+        default=Decimal("0.00"),
         ge=0,
         max_digits=12,
         decimal_places=2,
@@ -52,28 +60,24 @@ class EquipmentCreate(BaseSchema):
 
     maintenance_date: Optional[date] = None
 
-    @validator("condition")
-    def normalize_condition(cls, v):
-
-        if v:
-            return EquipmentCondition(v.value.upper())
-
-        return v
-
-    @validator("equipment_name")
-    def validate_eq_name(cls, v):
+    @field_validator("equipment_name")
+    @classmethod
+    def validate_name(cls, v):
         return validate_equipment_name(v)
 
-    @validator("equipment_code")
-    def validate_eq_code(cls, v):
+    @field_validator("equipment_code")
+    @classmethod
+    def validate_code(cls, v):
         return validate_equipment_code(v)
 
-    @validator("operator_name")
+    @field_validator("operator_name")
+    @classmethod
     def validate_operator(cls, v):
         return validate_operator_name(v)
 
-    @validator("maintenance_date")
-    def validate_maintenance_date(cls, v):
+    @field_validator("maintenance_date")
+    @classmethod
+    def validate_date(cls, v):
 
         if v and v.year < 2000:
             raise ValueError("Invalid maintenance date")
@@ -83,7 +87,10 @@ class EquipmentCreate(BaseSchema):
 
 class EquipmentUpdate(BaseSchema):
 
-    project_id: Optional[int] = Field(None, gt=0)
+    project_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
     equipment_name: Optional[str] = Field(
         None,
@@ -111,26 +118,37 @@ class EquipmentUpdate(BaseSchema):
 
     maintenance_date: Optional[date] = None
 
-    @validator("equipment_name")
-    def validate_eq_name(cls, v):
+    @field_validator("equipment_name")
+    @classmethod
+    def validate_name(cls, v):
+
         if v is None:
             return v
+
         return validate_equipment_name(v)
 
-    @validator("equipment_code")
-    def validate_eq_code(cls, v):
+    @field_validator("equipment_code")
+    @classmethod
+    def validate_code(cls, v):
+
         if v is None:
             return v
+
         return validate_equipment_code(v)
 
-    @validator("operator_name")
+    @field_validator("operator_name")
+    @classmethod
     def validate_operator(cls, v):
+
         if v is None:
             return v
+
         return validate_operator_name(v)
 
-    @validator("maintenance_date")
-    def validate_maintenance_date(cls, v):
+    @field_validator("maintenance_date")
+    @classmethod
+    def validate_date(cls, v):
+
         if v is None:
             return v
 
@@ -139,23 +157,21 @@ class EquipmentUpdate(BaseSchema):
 
         return v
 
-    @validator("condition")
-    def normalize_condition(cls, v):
-        if v is None:
-            return v
-        return EquipmentCondition(v.value.upper())
-
 
 class EquipmentOut(BaseSchema):
 
     id: int
+
     project_id: Optional[int]
 
     equipment_name: str
+
     equipment_code: str
+
     operator_name: Optional[str]
 
     working_hours: Optional[float]
+
     fuel_used: Optional[float]
 
     condition: Optional[EquipmentCondition]
@@ -167,11 +183,15 @@ class EquipmentOut(BaseSchema):
     maintenance_date: Optional[date]
 
     is_deleted: bool
+
     created_at: datetime
+
     updated_at: datetime
 
 
-# === USAGE SCHEMAS ===
+# =====================================================
+# EQUIPMENT USAGE
+# =====================================================
 
 
 class EquipmentUsageCreate(BaseSchema):
@@ -197,47 +217,208 @@ class EquipmentUsageCreate(BaseSchema):
         max_length=500,
     )
 
-    boq_item_id: Optional[int] = None
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
-    @validator("usage_date")
+    @field_validator("usage_date")
+    @classmethod
     def validate_usage_date(cls, v):
 
         if v > date.today():
-            raise ValueError("Usage date cannot be future")
+            raise ValueError("Usage date cannot be in the future")
 
         if v.year < 2000:
             raise ValueError("Invalid usage date")
 
         return v
 
-    @validator("notes")
+    @field_validator("notes")
+    @classmethod
     def validate_usage_notes(cls, v):
+        return validate_notes(v)
+
+
+class EquipmentUsageUpdate(BaseSchema):
+
+    working_hours: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        max_digits=10,
+        decimal_places=2,
+    )
+
+    fuel_used: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        max_digits=10,
+        decimal_places=2,
+    )
+
+    usage_date: Optional[date] = None
+
+    notes: Optional[str] = Field(
+        None,
+        max_length=500,
+    )
+
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
+    @field_validator("usage_date")
+    @classmethod
+    def validate_usage_date(cls, v):
+
+        if v is None:
+            return v
+
+        if v > date.today():
+            raise ValueError("Usage date cannot be in the future")
+
+        if v.year < 2000:
+            raise ValueError("Invalid usage date")
+
+        return v
+
+    @field_validator("notes")
+    @classmethod
+    def validate_notes(cls, v):
+
+        if v is None:
+            return v
+
         return validate_notes(v)
 
 
 class EquipmentUsageOut(BaseSchema):
 
     id: int
+
     equipment_id: int
+
     working_hours: float
+
     fuel_used: float
+
     usage_date: date
+
     notes: Optional[str]
+
     created_at: datetime
+
     boq_item_id: Optional[int]
 
 
-# === MAINTENANCE SCHEMAS ===
+# =====================================================
+# REPORT
+# =====================================================
+
+
+class EquipmentUsageReportOut(BaseSchema):
+
+    equipment_id: int
+
+    equipment_code: str
+
+    total_hours: float
+
+    total_fuel: float
+
+    avg_hours: float
+
+    usage_count: int
+
+
+# =====================================================
+# EQUIPMENT MAINTENANCE
+# =====================================================
 
 
 class EquipmentMaintenanceCreate(BaseSchema):
 
     description: str = Field(
         ...,
+        min_length=3,
         max_length=1000,
     )
 
     maintenance_date: date
+
+    cost: Optional[Decimal] = Field(
+        default=None,
+        ge=0,
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    next_maintenance_date: Optional[date] = None
+
+    project_id: int = Field(
+        ...,
+        gt=0,
+    )
+
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v):
+
+        v = " ".join(v.strip().split())
+
+        if not v:
+            raise ValueError("Description is required.")
+
+        return v
+
+    @field_validator("maintenance_date")
+    @classmethod
+    def validate_maintenance_date(cls, v):
+
+        if v.year < 2000:
+            raise ValueError("Invalid maintenance date.")
+
+        return v
+
+    @field_validator("next_maintenance_date")
+    @classmethod
+    def validate_next_date(cls, v, info):
+
+        maintenance_date = info.data.get("maintenance_date")
+
+        if v:
+
+            if v.year < 2000:
+                raise ValueError("Invalid next maintenance date.")
+
+            if maintenance_date and v < maintenance_date:
+                raise ValueError(
+                    "Next maintenance date cannot be before maintenance date."
+                )
+
+        return v
+
+
+# =====================================================
+# UPDATE
+# =====================================================
+
+
+class EquipmentMaintenanceUpdate(BaseSchema):
+
+    description: Optional[str] = Field(
+        None,
+        min_length=3,
+        max_length=1000,
+    )
+
+    maintenance_date: Optional[date] = None
 
     cost: Optional[Decimal] = Field(
         None,
@@ -247,63 +428,99 @@ class EquipmentMaintenanceCreate(BaseSchema):
     )
 
     next_maintenance_date: Optional[date] = None
-    project_id: int
-    boq_item_id: Optional[int] = None
 
-    @validator("description")
-    def validate_maintenance_description(cls, v):
+    project_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
-        if not v or not v.strip():
-            raise ValueError("Description required")
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
-        return " ".join(v.strip().split())
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v):
 
-    @validator("maintenance_date")
+        if v is None:
+            return v
+
+        v = " ".join(v.strip().split())
+
+        if not v:
+            raise ValueError("Description is required.")
+
+        return v
+
+    @field_validator("maintenance_date")
+    @classmethod
     def validate_maintenance_date(cls, v):
 
+        if v is None:
+            return v
+
         if v.year < 2000:
-            raise ValueError("Invalid maintenance date")
+            raise ValueError("Invalid maintenance date.")
 
         return v
 
-    @validator("next_maintenance_date")
-    def validate_next_maintenance(cls, v, values):
+    @field_validator("next_maintenance_date")
+    @classmethod
+    def validate_next_date(cls, v, info):
 
-        maintenance_date = values.get("maintenance_date")
+        if v is None:
+            return v
 
-        if v and maintenance_date and v < maintenance_date:
-            raise ValueError("Next maintenance date cannot be before maintenance date")
+        maintenance_date = info.data.get("maintenance_date")
 
-        if v and v.year < 2000:
-            raise ValueError("Invalid next maintenance date")
+        if v.year < 2000:
+            raise ValueError("Invalid next maintenance date.")
+
+        if maintenance_date and v < maintenance_date:
+            raise ValueError("Next maintenance date cannot be before maintenance date.")
 
         return v
 
 
-class EquipmentMaintenanceOut(BaseModel):
+# =====================================================
+# RESPONSE
+# =====================================================
+
+
+class EquipmentMaintenanceOut(BaseSchema):
 
     id: int
+
     project_id: int
+
     boq_item_id: Optional[int]
+
     equipment_id: int
+
     description: str
+
     maintenance_date: date
-    cost: float
+
+    cost: Optional[float]
+
     next_maintenance_date: Optional[date]
 
     is_completed: bool = False
+
     completed_at: Optional[datetime] = None
 
     created_at: datetime
-    status: str
 
     model_config = ConfigDict(
         from_attributes=True,
-        json_encoders={Decimal: float},
+        json_encoders={Decimal: lambda v: round(float(v), 2)},
     )
 
 
-# === RENTAL SCHEMAS ===
+# =====================================================
+# EQUIPMENT RENTAL CREATE
+# =====================================================
 
 
 class EquipmentRentalCreate(BaseSchema):
@@ -314,13 +531,14 @@ class EquipmentRentalCreate(BaseSchema):
 
     rental_cost: Decimal = Field(
         ...,
-        ge=0,
+        gt=0,
         max_digits=12,
         decimal_places=2,
     )
 
     client_name: str = Field(
         ...,
+        min_length=2,
         max_length=255,
     )
 
@@ -328,203 +546,208 @@ class EquipmentRentalCreate(BaseSchema):
         None,
         max_length=1000,
     )
-    project_id: Optional[int] = None
-    boq_item_id: Optional[int] = None
 
-    @validator("client_name")
-    def validate_rental_client(cls, v):
+    project_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
+    @field_validator("client_name")
+    @classmethod
+    def validate_client(cls, v):
         return validate_client_name(v)
 
-    @validator("notes")
-    def validate_rental_notes(cls, v):
+    @field_validator("notes")
+    @classmethod
+    def validate_notes_field(cls, v):
         return validate_notes(v)
 
-    @validator("start_date")
-    def validate_start_date(cls, v):
+    @field_validator("start_date")
+    @classmethod
+    def validate_start(cls, v):
 
         if v.year < 2000:
-            raise ValueError("Invalid start date")
+            raise ValueError("Invalid start date.")
 
         return v
 
-    @validator("end_date")
-    def validate_end_date(cls, v, values):
+    @field_validator("end_date")
+    @classmethod
+    def validate_end(cls, v, info):
 
-        start_date = values.get("start_date")
+        if v is None:
+            return v
 
-        if v and start_date and v < start_date:
-            raise ValueError("End date cannot be before start date")
+        start_date = info.data.get("start_date")
 
-        if v and v.year < 2000:
-            raise ValueError("Invalid end date")
+        if v.year < 2000:
+            raise ValueError("Invalid end date.")
+
+        if start_date and v < start_date:
+            raise ValueError("End date cannot be before start date.")
 
         return v
+
+
+# =====================================================
+# EQUIPMENT RENTAL UPDATE
+# =====================================================
+
+
+class EquipmentRentalUpdate(BaseSchema):
+
+    start_date: Optional[date] = None
+
+    end_date: Optional[date] = None
+
+    rental_cost: Optional[Decimal] = Field(
+        None,
+        gt=0,
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    client_name: Optional[str] = Field(
+        None,
+        max_length=255,
+    )
+
+    notes: Optional[str] = Field(
+        None,
+        max_length=1000,
+    )
+
+    project_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
+    @field_validator("client_name")
+    @classmethod
+    def validate_client(cls, v):
+
+        if v is None:
+            return v
+
+        return validate_client_name(v)
+
+    @field_validator("notes")
+    @classmethod
+    def validate_notes_field(cls, v):
+
+        if v is None:
+            return v
+
+        return validate_notes(v)
+
+    @field_validator("start_date")
+    @classmethod
+    def validate_start(cls, v):
+
+        if v is None:
+            return v
+
+        if v.year < 2000:
+            raise ValueError("Invalid start date.")
+
+        return v
+
+    @field_validator("end_date")
+    @classmethod
+    def validate_end(cls, v, info):
+
+        if v is None:
+            return v
+
+        start_date = info.data.get("start_date")
+
+        if v.year < 2000:
+            raise ValueError("Invalid end date.")
+
+        if start_date and v < start_date:
+            raise ValueError("End date cannot be before start date.")
+
+        return v
+
+
+# =====================================================
+# EQUIPMENT RENTAL RESPONSE
+# =====================================================
 
 
 class EquipmentRentalOut(BaseSchema):
 
     id: int
+
     equipment_id: int
+
     start_date: date
+
     end_date: Optional[date]
+
     rental_cost: float
+
     client_name: str
+
     notes: Optional[str]
+
     created_at: datetime
-    status: Optional[str] = None
-    duration: Optional[int] = None
-    per_day_cost: Optional[float] = None
+
+    status: Optional[str]
+
+    duration: Optional[int]
+
+    per_day_cost: Optional[float]
+
     project_id: Optional[int]
+
     boq_item_id: Optional[int]
 
-
-class EquipmentUsageReportOut(BaseModel):
-
-    equipment_id: int
-    equipment_code: str
-    total_hours: float
-    total_fuel: float
-    avg_hours: float
-    usage_count: int
-
-
-class EquipmentAlertOut(BaseModel):
-
-    equipment_id: int
-    equipment_code: str
-    issue: str
-
-    model_config = {"from_attributes": True}
-
-
-class EquipmentAuditLogOut(BaseSchema):
-
-    id: int
-    equipment_id: int
-    action: str
-    old_values: Optional[Dict] = None
-    new_values: Optional[Dict] = None
-    user_id: Optional[int] = None
-    ip_address: Optional[str] = None
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-# ==== ALLOCATION SCHEMAS ====
-
-
-class AllocationOut(BaseSchema):
-
-    equipment_id: int
-    project_id: Optional[int]
-    allocated: bool
-
-
-# ====== REPORT SCHEMAS =====
-
-
-class UsageReportItem(BaseSchema):
-
-    equipment_id: int
-    equipment_code: str
-    total_hours: float
-    total_fuel: float
-    avg_hours: float
-    usage_count: int
-
-
-class CostReportItem(BaseSchema):
-
-    equipment_id: int
-    equipment_code: str
-    total_cost: float
-    rental_count: int
-    avg_cost: Optional[float] = None
-    total_days: Optional[int] = None
-    revenue_per_day: Optional[float] = None
-
-
-class AvailabilityReportItem(BaseSchema):
-
-    equipment_id: int
-    equipment_code: str
-    equipment_name: str
-    is_available: bool
-    project_id: Optional[int]
-
-
-class UtilizationReportItem(BaseSchema):
-
-    equipment_id: int
-    equipment_code: str
-    total_hours: float
-    utilization_rate: float
-
-
-class MaintenanceAlertItem(BaseSchema):
-
-    equipment_id: int
-    equipment_code: str
-    maintenance_date: date
-    days_until: int
-    status: str
-
-
-# ================= BULK ALLOCATION SCHEMAS =================
-
-from typing import List
-
-
-class EquipmentAllocateRequest(BaseSchema):
-    equipment_ids: List[int] = Field(
-        ...,
-        min_length=1,
-        description="Single or multiple equipment ids",
-    )
-
-    project_id: int = Field(
-        ...,
-        gt=0,
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_encoders={Decimal: lambda v: round(float(v), 2)},
     )
 
 
-class EquipmentDeallocateRequest(BaseSchema):
-    equipment_ids: List[int] = Field(
-        ...,
-        min_length=1,
-        description="Single or multiple equipment ids",
-    )
-
-    project_id: int = Field(
-        ...,
-        gt=0,
-    )
+# =====================================================
+# DELETE RENTAL RESPONSE
+# =====================================================
 
 
-class EquipmentAllocateResponse(BaseSchema):
-    equipment_ids: List[int]
-    project_id: int
-    success_count: int
-    failed_count: int
-    allocated_ids: List[int]
-    failed: List[dict] = []
+class DeleteRentalResponse(BaseSchema):
+
+    message: str
+
+    rental_id: int
+
+    equipment_id: int
+
+    equipment_status: EquipmentStatus
 
 
-class EquipmentDeallocateResponse(BaseSchema):
-    project_id: int
-    success_count: int
-    failed_count: int
-    deallocated_ids: List[int]
-    failed: List[dict] = []
+# =====================================================
+# PURCHASE
+# =====================================================
 
 
 class EquipmentPurchaseCreate(BaseSchema):
 
     purchase_type: PurchaseType
 
-    asset_id: Optional[int] = Field(None, gt=0, description="Equipment ID (optional)")
+    asset_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
     purchase_date: date
 
@@ -540,7 +763,10 @@ class EquipmentPurchaseCreate(BaseSchema):
         max_length=100,
     )
 
-    quantity: int = Field(..., gt=0)
+    quantity: int = Field(
+        ...,
+        gt=0,
+    )
 
     unit_price: Decimal = Field(
         ...,
@@ -556,69 +782,48 @@ class EquipmentPurchaseCreate(BaseSchema):
         max_length=1000,
     )
 
-    project_id: int
+    project_id: int = Field(
+        ...,
+        gt=0,
+    )
 
-    boq_item_id: Optional[int] = None
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
-    @validator("vendor_name")
+    @field_validator("vendor_name")
+    @classmethod
     def validate_vendor(cls, v):
         return " ".join(v.strip().split())
 
-    @validator("invoice_number")
+    @field_validator("invoice_number")
+    @classmethod
     def validate_invoice(cls, v):
         return v.strip()
 
-    @validator("notes")
+    @field_validator("notes")
+    @classmethod
     def validate_purchase_notes(cls, v):
         return validate_notes(v)
 
-    @validator("purchase_date")
+    @field_validator("purchase_date")
+    @classmethod
     def validate_purchase_date(cls, v):
 
         if v.year < 2000:
-            raise ValueError("Invalid purchase date")
+            raise ValueError("Invalid purchase date.")
 
         return v
 
-    @validator("warranty_end_date")
+    @field_validator("warranty_end_date")
+    @classmethod
     def validate_warranty(cls, v):
 
         if v and v.year < 2000:
-            raise ValueError("Invalid warranty date")
+            raise ValueError("Invalid warranty date.")
 
         return v
-
-
-class EquipmentPurchaseOut(BaseSchema):
-    """
-    FIX: asset_id was previously typed as Optional[str], but the DB column
-    (EquipmentPurchase.asset_id -> Equipment.id) is an integer. Kept as
-    Optional[int] so the response model matches the actual data instead of
-    silently coercing/breaking on serialization.
-    """
-
-    id: int
-    project_id: int
-    boq_item_id: Optional[int]
-    purchase_type: PurchaseType
-    asset_id: Optional[int] = Field(None, gt=0, description="Equipment ID (optional)")
-    asset_name: Optional[str] = None
-
-    purchase_date: date
-
-    vendor_name: str
-    invoice_number: str
-
-    quantity: int
-
-    unit_price: float
-    total_amount: float
-
-    warranty_end_date: Optional[date]
-
-    notes: Optional[str]
-
-    created_at: datetime
 
 
 class EquipmentPurchaseUpdate(BaseSchema):
@@ -649,60 +854,251 @@ class EquipmentPurchaseUpdate(BaseSchema):
 
     notes: Optional[str] = None
 
-    project_id: Optional[int] = None
+    project_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
-    boq_item_id: Optional[int] = None
+    boq_item_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
 
-    @validator("vendor_name")
+    @field_validator("vendor_name")
+    @classmethod
     def validate_vendor(cls, v):
 
         if v is None:
             return v
 
-        if len(v.strip()) < 2:
-            raise ValueError("Vendor name required")
-
         return " ".join(v.strip().split())
 
-    @validator("invoice_number")
+    @field_validator("invoice_number")
+    @classmethod
     def validate_invoice(cls, v):
 
         if v is None:
             return v
 
-        if len(v.strip()) < 2:
-            raise ValueError("Invoice number required")
-
         return v.strip()
 
-    @validator("notes")
-    def validate_purchase_notes(cls, v):
+    @field_validator("notes")
+    @classmethod
+    def validate_notes_field(cls, v):
 
         if v is None:
             return v
 
         return validate_notes(v)
 
-    @validator("warranty_end_date")
-    def validate_warranty(cls, v):
 
-        if v is None:
-            return v
+class EquipmentPurchaseOut(BaseSchema):
 
-        if v.year < 2000:
-            raise ValueError("Invalid warranty date")
+    id: int
 
-        return v
+    project_id: int
 
-
-class EquipmentPurchaseReportItem(BaseSchema):
-    """FIX: asset_id typed as Optional[int] to match the actual int column."""
+    boq_item_id: Optional[int]
 
     purchase_type: PurchaseType
 
-    asset_id: Optional[int] = Field(None, gt=0, description="Equipment ID (optional)")
+    asset_id: Optional[int]
 
-    asset_name: str
+    asset_name: Optional[str]
+
+    purchase_date: date
+
+    vendor_name: str
+
+    invoice_number: str
+
+    quantity: int
+
+    unit_price: float
+
+    total_amount: float
+
+    warranty_end_date: Optional[date]
+
+    notes: Optional[str]
+
+    created_at: datetime
+
+
+# =====================================================
+# TRANSFER
+# =====================================================
+
+
+class EquipmentTransferRequest(BaseSchema):
+
+    equipment_id: int = Field(
+        ...,
+        gt=0,
+    )
+
+    to_project_id: int = Field(
+        ...,
+        gt=0,
+    )
+
+
+# =====================================================
+# BULK ALLOCATION
+# =====================================================
+
+
+class EquipmentAllocateRequest(BaseSchema):
+
+    equipment_ids: list[int] = Field(
+        ...,
+        min_length=1,
+    )
+
+    project_id: int = Field(
+        ...,
+        gt=0,
+    )
+
+
+class EquipmentDeallocateRequest(BaseSchema):
+
+    equipment_ids: list[int] = Field(
+        ...,
+        min_length=1,
+    )
+
+    project_id: int = Field(
+        ...,
+        gt=0,
+    )
+
+
+class EquipmentAllocateResponse(BaseSchema):
+
+    equipment_ids: list[int]
+
+    project_id: int
+
+    success_count: int
+
+    failed_count: int
+
+    allocated_ids: list[int]
+
+    failed: list[dict] = Field(default_factory=list)
+
+
+class EquipmentDeallocateResponse(BaseSchema):
+
+    project_id: int
+
+    success_count: int
+
+    failed_count: int
+
+    deallocated_ids: list[int]
+
+    failed: list[dict] = Field(default_factory=list)
+
+
+class AllocationOut(BaseSchema):
+
+    equipment_id: int
+
+    project_id: Optional[int]
+
+    allocated: bool
+
+
+# =====================================================
+# USAGE REPORT
+# =====================================================
+
+
+class UsageReportItem(BaseSchema):
+
+    equipment_id: int
+
+    equipment_code: str
+
+    total_hours: float
+
+    total_fuel: float
+
+    avg_hours: float
+
+    usage_count: int
+
+
+# =====================================================
+# COST REPORT
+# =====================================================
+
+
+class CostReportItem(BaseSchema):
+
+    equipment_id: int
+
+    equipment_code: str
+
+    total_cost: float
+
+    rental_count: int
+
+    avg_cost: Optional[float] = None
+
+    total_days: Optional[int] = None
+
+    revenue_per_day: Optional[float] = None
+
+
+# =====================================================
+# AVAILABILITY REPORT
+# =====================================================
+
+
+class AvailabilityReportItem(BaseSchema):
+
+    equipment_id: int
+
+    equipment_code: str
+
+    equipment_name: str
+
+    is_available: bool
+
+    project_id: Optional[int]
+
+
+# =====================================================
+# UTILIZATION REPORT
+# =====================================================
+
+
+class UtilizationReportItem(BaseSchema):
+
+    equipment_id: int
+
+    equipment_code: str
+
+    total_hours: float
+
+    utilization_rate: float
+
+
+# =====================================================
+# PURCHASE REPORT
+# =====================================================
+
+
+class EquipmentPurchaseReportItem(BaseSchema):
+
+    purchase_type: PurchaseType
+
+    asset_id: Optional[int]
+
+    asset_name: Optional[str]
 
     purchase_count: int
 
@@ -711,203 +1107,124 @@ class EquipmentPurchaseReportItem(BaseSchema):
     total_purchase_amount: float
 
 
-class EquipmentTransferRequest(BaseSchema):
-    equipment_id: int = Field(..., gt=0)
-    to_project_id: int = Field(..., gt=0)
+# =====================================================
+# MAINTENANCE ALERT
+# =====================================================
 
 
-class DeleteRentalResponse(BaseModel):
-    message: str
-    rental_id: int
-    equipment_id: int
-    equipment_status: str
+class MaintenanceAlertItem(BaseSchema):
 
-
-class EquipmentUsageUpdate(BaseSchema):
-
-    working_hours: Optional[Decimal] = Field(
-        None,
-        ge=0,
-        max_digits=10,
-        decimal_places=2,
-    )
-
-    fuel_used: Optional[Decimal] = Field(
-        None,
-        ge=0,
-        max_digits=10,
-        decimal_places=2,
-    )
-
-    usage_date: Optional[date] = None
-
-    notes: Optional[str] = Field(
-        None,
-        max_length=500,
-    )
-
-    boq_item_id: Optional[int] = None
-
-    @validator("usage_date")
-    def validate_usage_date(cls, v):
-
-        if v is None:
-            return v
-
-        if v > date.today():
-            raise ValueError("Usage date cannot be future")
-
-        if v.year < 2000:
-            raise ValueError("Invalid usage date")
-
-        return v
-
-    @validator("notes")
-    def validate_usage_notes(cls, v):
-
-        if v is None:
-            return v
-
-        return validate_notes(v)
-
-
-class DeleteUsageResponse(BaseModel):
-    message: str
-    usage_id: int
     equipment_id: int
 
+    equipment_code: str
 
-class EquipmentMaintenanceUpdate(BaseSchema):
+    maintenance_date: date
 
-    description: Optional[str] = Field(
-        None,
-        max_length=1000,
+    days_until: int
+
+    status: str
+
+
+# =====================================================
+# EQUIPMENT ALERT
+# =====================================================
+
+
+class EquipmentAlertOut(BaseSchema):
+
+    equipment_id: int
+
+    equipment_code: str
+
+    issue: str
+
+
+# =====================================================
+# AUDIT LOG
+# =====================================================
+
+
+class EquipmentAuditLogOut(BaseSchema):
+
+    id: int
+
+    equipment_id: int
+
+    action: str
+
+    old_values: Optional[dict[str, Any]] = None
+
+    new_values: Optional[dict[str, Any]] = None
+
+    user_id: Optional[int] = None
+
+    ip_address: Optional[str] = None
+
+    created_at: datetime
+
+    model_config = ConfigDict(
+        from_attributes=True,
     )
 
-    maintenance_date: Optional[date] = None
 
-    cost: Optional[Decimal] = Field(
-        None,
-        ge=0,
-        max_digits=12,
-        decimal_places=2,
-    )
-
-    next_maintenance_date: Optional[date] = None
-    project_id: Optional[int] = None
-    boq_item_id: Optional[int] = None
-
-    @validator("description")
-    def validate_description(cls, v):
-
-        if v is None:
-            return v
-
-        if not v.strip():
-            raise ValueError("Description required")
-
-        return " ".join(v.strip().split())
-
-    @validator("maintenance_date")
-    def validate_maintenance_date(cls, v):
-
-        if v is None:
-            return v
-
-        if v.year < 2000:
-            raise ValueError("Invalid maintenance date")
-
-        return v
-
-    @validator("next_maintenance_date")
-    def validate_next_maintenance(cls, v, values):
-
-        if v is None:
-            return v
-
-        maintenance_date = values.get("maintenance_date")
-
-        if maintenance_date and v < maintenance_date:
-            raise ValueError("Next maintenance date cannot be before maintenance date")
-
-        if v.year < 2000:
-            raise ValueError("Invalid next maintenance date")
-
-        return v
-
-
-class EquipmentRentalUpdate(BaseSchema):
-
-    start_date: Optional[date] = None
-
-    end_date: Optional[date] = None
-
-    rental_cost: Optional[Decimal] = Field(
-        None,
-        gt=0,
-        max_digits=12,
-        decimal_places=2,
-    )
-
-    client_name: Optional[str] = None
-
-    notes: Optional[str] = None
-    project_id: Optional[int]
-    boq_item_id: Optional[int]
-
-    @validator("client_name")
-    def validate_client(cls, v):
-
-        if v is None:
-            return v
-
-        return validate_client_name(v)
-
-    @validator("notes")
-    def validate_notes_field(cls, v):
-
-        if v is None:
-            return v
-
-        return validate_notes(v)
-
-    @validator("start_date")
-    def validate_start_date(cls, v):
-
-        if v is None:
-            return v
-
-        if v.year < 2000:
-            raise ValueError("Invalid start date")
-
-        return v
-
-    @validator("end_date")
-    def validate_end_date(cls, v, values):
-
-        if v is None:
-            return v
-
-        start_date = values.get("start_date")
-
-        if start_date and v < start_date:
-            raise ValueError("End date cannot be before start date")
-
-        if v.year < 2000:
-            raise ValueError("Invalid end date")
-
-        return v
+# =====================================================
+# KPI
+# =====================================================
 
 
 class EquipmentKPIOut(BaseSchema):
+
     total_equipment: int
+
     available: int
+
     allocated: int
+
     rented: int
+
     maintenance: int
+
     damaged: int
 
     utilization_rate: float
 
     total_rental_revenue: float
+
     total_maintenance_cost: float
+
+
+class EquipmentTransferHistoryOut(BaseSchema):
+
+    id: int
+
+    equipment_id: int
+
+    from_project_id: Optional[int]
+
+    from_project_name: Optional[str]
+
+    to_project_id: Optional[int]
+
+    to_project_name: Optional[str]
+
+    transferred_at: datetime
+
+    transferred_by: Optional[int]
+
+
+class EquipmentAvailabilityOut(BaseSchema):
+
+    equipment_id: int
+
+    equipment_name: str
+
+    equipment_code: str
+
+    status: EquipmentStatus
+
+    project_name: Optional[str]
+
+class DeleteUsageResponse(BaseSchema):
+    message: str
+    usage_id: int
+    equipment_id: int

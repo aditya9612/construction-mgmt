@@ -5,7 +5,7 @@ from decimal import Decimal
 
 class WorkOrderBase(BaseModel):
     project_id: int
-    contractor_id: int
+    contractor_id: Optional[int] = None
     work_description: str
     total_quantity: Decimal
     rate: Decimal
@@ -22,6 +22,7 @@ class WorkOrderCreate(WorkOrderBase):
 
 
 class WorkOrderUpdate(BaseModel):
+    contractor_id: Optional[int] = None
     work_description: Optional[str] = None
     total_quantity: Optional[Decimal] = None
     completed_quantity: Optional[Decimal] = None
@@ -32,7 +33,7 @@ class WorkOrderUpdate(BaseModel):
 class WorkOrderOut(BaseModel):
     id: int
     project_id: int
-    contractor_id: int
+    contractor_id: Optional[int] = None
     work_order_number: str
     work_description: str
     total_quantity: Decimal

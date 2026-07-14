@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, ForeignKey, DECIMAL
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
 
@@ -16,10 +16,9 @@ class WorkOrder(Base, TimestampMixin):
         index=True,
     )
 
-    contractor_id = Column(
-        Integer,
-        ForeignKey("contractors.id", ondelete="CASCADE"),
-        nullable=False,
+    contractor_id = mapped_column(
+        ForeignKey("contractors.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 

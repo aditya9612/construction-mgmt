@@ -157,7 +157,7 @@ class LabourOut(BaseModel):
     custom_ot_rate_per_hour: Optional[Decimal] = None
     effective_daily_wage: Decimal
     effective_ot_rate: Decimal
-    contractor_id: Optional[int]
+    contractor_id: Optional[int] = None
     contractor_name: Optional[str] = None
     status: e.LabourStatus
     notes: Optional[str] = None
