@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 import asyncio
 import json
 from fastapi import WebSocket, WebSocketDisconnect
@@ -64,7 +65,7 @@ from app.api.notification import router as notification_router
 # from app.api.rbac import router as rbac_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
-from app.core.db import AsyncSessionLocal
+from app.core.db import AsyncSessionLocal, async_engine
 from app.middlewares.rate_limiter import init_rate_limiter
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.utils.helpers import AppError
@@ -116,6 +117,9 @@ async def lifespan(app: FastAPI):
         redis = getattr(app.state, "redis", None)
         if redis is not None:
             await redis.close()
+            
+        logger.info("Disposing SQLAlchemy async engine...")
+        await async_engine.dispose()
 
 
 def create_app() -> FastAPI:
@@ -145,6 +149,9 @@ def create_app() -> FastAPI:
     
     # Register Security Headers Middleware
     application.add_middleware(SecurityHeadersMiddleware)
+    
+    # Register GZip Middleware as the absolute outermost wrapper
+    application.add_middleware(GZipMiddleware, minimum_size=settings.GZIP_MINIMUM_SIZE)
 
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("uploads/profile", exist_ok=True)
@@ -266,6 +273,9 @@ def create_app() -> FastAPI:
     @application.get("/health", tags=["health"])
     async def health():
         return {"status": "ok"}
+
+    from app.api.health import router as advanced_health_router
+    application.include_router(advanced_health_router)
 
     api_router = APIRouter(dependencies=[default_rate_limiter_dependency()])
     from app.api.project import qc_router, safety_router, checklist_router

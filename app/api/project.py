@@ -9824,3 +9824,64 @@ async def delete_project(
 
     return {"success": True, "message": f"Project_id {project_id} deleted successfully"}
 
+
+from app.schemas import gantt as s_gantt
+
+@router.get("/{project_id}/gantt", response_model=s_gantt.GanttResponseSchema)
+async def get_project_gantt(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    service: ProjectsService = Depends(get_projects_service),
+):
+    obj = await service.projects_repo.get_project(db, project_id=project_id)
+    if obj is None:
+        raise NotFoundError("Project not found")
+
+    await assert_project_access(
+        db,
+        project_id=obj.id,
+        current_user=current_user,
+    )
+
+    gantt_items = []
+    for mstone in obj.milestones:
+        children = []
+        for t in mstone.tasks:
+            children.append(s_gantt.GanttTaskSchema(
+                id=f"t_{t.id}",
+                name=t.title,
+                start_date=t.start_date,
+                end_date=t.end_date,
+                progress=t.completion_percentage or 0.0,
+                status=t.status.value if hasattr(t.status, "value") else str(t.status)
+            ))
+        
+        gantt_items.append(s_gantt.GanttMilestoneSchema(
+            id=f"m_{mstone.id}",
+            name=mstone.title,
+            start_date=mstone.start_date,
+            end_date=mstone.end_date,
+            progress=mstone.completion_percentage or 0.0,
+            status=mstone.status.value if hasattr(mstone.status, "value") else str(mstone.status),
+            children=children
+        ))
+
+    unassigned_tasks = []
+    for t in obj.tasks:
+        if not t.milestone_id:
+            unassigned_tasks.append(s_gantt.GanttTaskSchema(
+                id=f"t_{t.id}",
+                name=t.title,
+                start_date=t.start_date,
+                end_date=t.end_date,
+                progress=t.completion_percentage or 0.0,
+                status=t.status.value if hasattr(t.status, "value") else str(t.status)
+            ))
+
+    return s_gantt.GanttResponseSchema(
+        project_id=obj.id,
+        project_name=obj.project_name,
+        gantt_items=gantt_items,
+        unassigned_tasks=unassigned_tasks,
+    )
