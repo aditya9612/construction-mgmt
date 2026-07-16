@@ -470,7 +470,15 @@ async def export_accounts(
     )
 
 @router.post("/accounts/import")
-async def import_accounts(file: UploadFile = File(...)):
+async def import_accounts(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    import csv
+    from app.core.enums import AccountType
+    from sqlalchemy import select
+
     content = await file.read()
     text = content.decode('utf-8')
     lines = text.splitlines()
@@ -478,17 +486,56 @@ async def import_accounts(file: UploadFile = File(...)):
     valid = 0
     errors = []
     
-    for i, line in enumerate(lines[1:], start=2):
-        if not line.strip(): continue
-        parts = line.split(',')
+    reader = csv.reader(lines)
+    try:
+        next(reader)
+    except StopIteration:
+        pass
+
+    for i, parts in enumerate(reader, start=2):
+        if not parts or not any(parts):
+            continue
         if len(parts) < 3:
             errors.append(f"Line {i}: Invalid format")
-        else:
-            valid += 1
+            continue
             
+        name = parts[0].strip()
+        code = parts[1].strip()
+        type_str = parts[2].strip()
+        parent_id_str = parts[3].strip() if len(parts) > 3 else None
+
+        try:
+            acc_type = AccountType(type_str.lower())
+        except ValueError:
+            errors.append(f"Line {i}: Invalid account type '{type_str}'")
+            continue
+            
+        existing = await db.scalar(select(Account).where(Account.code == code).limit(1))
+        if existing:
+            errors.append(f"Line {i}: Account with code '{code}' already exists")
+            continue
+            
+        parent_id = None
+        if parent_id_str:
+            try:
+                parent_id = int(parent_id_str)
+            except ValueError:
+                errors.append(f"Line {i}: Invalid parent ID '{parent_id_str}'")
+                continue
+
+        acc = Account(name=name, code=code, type=acc_type, parent_id=parent_id)
+        db.add(acc)
+        valid += 1
+            
+    if valid > 0 and len(errors) == 0:
+        await db.commit()
+    else:
+        await db.rollback()
+        
     return {
-        "valid_records": valid,
-        "errors": errors
+        "valid_records": valid if len(errors) == 0 else 0,
+        "errors": errors,
+        "message": "Import successful" if len(errors) == 0 else "Import failed due to errors"
     }
 
 @router.get("/accounts/{id}", response_model=AccountDetailOut)
@@ -1082,7 +1129,16 @@ async def export_bank_accounts(
     )
 
 @router.post("/bank-accounts/import")
-async def import_bank_accounts(file: UploadFile = File(...)):
+async def import_bank_accounts(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    import csv
+    from sqlalchemy import select
+    from app.core.validators import validate_ifsc
+    from app.core.enums import AccountType
+
     content = await file.read()
     text = content.decode('utf-8')
     lines = text.splitlines()
@@ -1090,17 +1146,64 @@ async def import_bank_accounts(file: UploadFile = File(...)):
     valid = 0
     errors = []
     
-    for i, line in enumerate(lines[1:], start=2):
-        if not line.strip(): continue
-        parts = line.split(',')
+    reader = csv.reader(lines)
+    try:
+        next(reader)
+    except StopIteration:
+        pass
+
+    for i, parts in enumerate(reader, start=2):
+        if not parts or not any(parts):
+            continue
         if len(parts) < 3:
             errors.append(f"Line {i}: Invalid format")
-        else:
-            valid += 1
+            continue
             
+        account_id_str = parts[0].strip()
+        bank_name = parts[1].strip()
+        account_number = parts[2].strip()
+        ifsc_code = parts[3].strip() if len(parts) > 3 else None
+
+        try:
+            account_id = int(account_id_str)
+        except ValueError:
+            errors.append(f"Line {i}: Invalid account ID '{account_id_str}'")
+            continue
+            
+        acc = await db.get(Account, account_id)
+        if not acc or acc.type != AccountType.ASSET:
+            errors.append(f"Line {i}: Account must be a valid ASSET account")
+            continue
+
+        if "bank" not in acc.name.lower() and (acc.parent and "bank" not in acc.parent.name.lower()):
+            errors.append(f"Line {i}: Account name or parent must contain 'Bank'")
+            continue
+
+        if ifsc_code:
+            try:
+                validate_ifsc(ifsc_code)
+            except ValueError as e:
+                errors.append(f"Line {i}: {str(e)}")
+                continue
+
+        bank_acc = BankAccount(
+            account_id=account_id,
+            bank_name=bank_name,
+            account_number=account_number,
+            ifsc_code=ifsc_code
+        )
+        db.add(bank_acc)
+        valid += 1
+            
+    if valid > 0 and len(errors) == 0:
+        await db.commit()
+    else:
+        await db.rollback()
+        
     return {
-        "valid_records": valid,
-        "errors": errors
+        "valid_records": valid if len(errors) == 0 else 0,
+        "errors": errors,
+        "message": "Import successful" if len(errors) == 0 else "Import failed due to errors"
     }
 
 @router.get("/bank-accounts/{id}", response_model=BankAccountOut)
