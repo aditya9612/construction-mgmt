@@ -92,7 +92,7 @@ import csv
 
 from app.utils.common import assert_project_access
 from app.utils.helpers import NotFoundError, safe_divide, validate_percentage
-from app.utils.timezone import get_naive_utc_now
+from app.utils.timezone import get_naive_utc_now, get_naive_local_now, localize_datetime
 from datetime import timezone
 from app.models.labour import Labour, LabourProject, LabourAttendance, LabourPayroll
 from app.core.enums import TaskStatus
@@ -209,7 +209,7 @@ async def cache_get_set(redis, key, version, func):
 # KPI COMPARISON (NEW)
 # =========================================
 async def get_kpi_comparison(db):
-    now = datetime.utcnow()
+    now = get_naive_local_now()
     last_month = now - timedelta(days=30)
 
     current = await db.scalar(
@@ -240,7 +240,7 @@ async def admin_dashboard(
         return {"error": "Access denied"}
 
     async def logic():
-        today = date.today()
+        today = get_naive_local_now().date()
 
         # 1. Project Overview
         project_stats = await db.execute(
@@ -448,7 +448,7 @@ async def engineer_dashboard(
 
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
-        today = date.today()
+        today = get_naive_local_now().date()
 
         labour = await db.scalar(
             select(func.count(func.distinct(UserAttendance.user_id)))
@@ -610,7 +610,7 @@ async def accountant_dashboard(
         # 2. Revenue vs Expense Trend
         rev_exp_trends = []
         for i in range(5, -1, -1):
-            target_date = datetime.utcnow() - relativedelta(months=i)
+            target_date = get_naive_local_now() - relativedelta(months=i)
             month_str = target_date.strftime("%b")
 
             month_start = target_date.replace(
@@ -619,7 +619,7 @@ async def accountant_dashboard(
             month_end = (
                 (month_start + relativedelta(months=1)) - timedelta(seconds=1)
                 if i != 0
-                else datetime.utcnow()
+                else get_naive_local_now()
             )
 
             month_expense = (
@@ -653,7 +653,7 @@ async def accountant_dashboard(
                 # 3. Cash Flow (Monthly Trend)
         cash_flow = []
         for i in range(5, -1, -1):
-            target_date = datetime.utcnow() - relativedelta(months=i)
+            target_date = get_naive_local_now() - relativedelta(months=i)
             month_str = target_date.strftime("%b")
 
             month_start = target_date.replace(
@@ -662,7 +662,7 @@ async def accountant_dashboard(
             month_end = (
                 (month_start + relativedelta(months=1)) - timedelta(seconds=1)
                 if i != 0
-                else datetime.utcnow()
+                else get_naive_local_now()
             )
 
             c_inflow = await db.scalar(
@@ -723,7 +723,7 @@ async def accountant_dashboard(
             )
 
         # 5. Receivable Aging
-        today_date = datetime.utcnow().date()
+        today_date = get_naive_local_now().date()
         inv_query = await db.execute(select(Invoice).where(Invoice.status == InvoiceStatus.PENDING.value))
         
         r_buckets = {"0-30 Days": 0.0, "31-60 Days": 0.0, "61-90 Days": 0.0, "> 90 Days": 0.0}
@@ -859,7 +859,7 @@ async def pm_command_center(
 ):
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
-        today = date.today()
+        today = get_naive_local_now().date()
         now = datetime.utcnow()
 
         # 1. KPIs
@@ -1249,7 +1249,7 @@ async def pm_summary(
         budget_utilized_percent = float(total_expense / total_budget) * 100.0
 
     # Today's Activities
-    today_dt = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_dt = get_naive_local_now().replace(hour=0, minute=0, second=0, microsecond=0)
     todays_activities = (
         await db.scalar(
             select(func.count(ActivityLog.id)).where(
@@ -1543,7 +1543,7 @@ async def client_dashboard(
         days_remaining = 0
 
         if end_date:
-            days_remaining = (end_date - date.today()).days
+            days_remaining = (end_date - get_naive_local_now().date()).days
 
         # ========================
         # RESPONSE
@@ -2132,7 +2132,7 @@ async def site_engineer_dashboard(
         
         # Planned progress for single project
         planned_progress = 0
-        today = date.today()
+        today = get_naive_local_now().date()
         if project.start_date and project.end_date:
             total_days = (project.end_date - project.start_date).days
             elapsed_days = (today - project.start_date).days
@@ -2176,7 +2176,7 @@ async def site_engineer_dashboard(
         # Calculate avg planned progress across all assigned projects
         projects_query = await db.execute(select(m.Project).where(m.Project.id.in_(project_ids)))
         projects = projects_query.scalars().all()
-        today = date.today()
+        today = get_naive_local_now().date()
         total_planned = 0
         valid_projs = 0
         for p in projects:
@@ -2466,7 +2466,7 @@ async def client_command_center(
 
     if project.end_date:
 
-        days_remaining = (project.end_date - date.today()).days
+        days_remaining = (project.end_date - get_naive_local_now().date()).days
 
         if days_remaining < 0:
             days_remaining = 0
@@ -2717,7 +2717,7 @@ async def get_labour_dashboard(
         project_name = proj_res.scalar_one_or_none()
 
     # 3. Get Attendance Status for today
-    today = date.today()
+    today = get_naive_local_now().date()
     att_res = await db.execute(
         select(UserAttendance).where(
             UserAttendance.user_id == current_user.id,
@@ -2808,7 +2808,7 @@ async def get_labour_dashboard(
             "title": "Task Assigned",
             "description": f"Assigned to {t.title}",
             "time": t.start_date.strftime("%d %b %Y") if t.start_date else "Recent",
-            "timestamp": getattr(t, "created_at", datetime.utcnow()) or datetime.utcnow()
+            "timestamp": getattr(t, "created_at", get_naive_local_now()) or get_naive_local_now()
         })
         
     # Attendance events
@@ -2822,7 +2822,7 @@ async def get_labour_dashboard(
             "title": "Attendance Logged",
             "description": f"Present on {a.attendance_date.strftime('%d %b')}",
             "time": a.in_time.strftime("%I:%M %p") if a.in_time else "Logged",
-            "timestamp": a.in_time if a.in_time else datetime.combine(a.attendance_date, datetime.min.time())
+            "timestamp": localize_datetime(a.in_time.replace(tzinfo=timezone.utc)).replace(tzinfo=None) if a.in_time else datetime.combine(a.attendance_date, datetime.min.time())
         })
         
     # Payroll Updates
@@ -2831,7 +2831,7 @@ async def get_labour_dashboard(
             "title": "Payroll Generated",
             "description": f"Wage ₹{p.total_wage} for {p.month}/{p.year}",
             "time": p.created_at.strftime("%d %b") if getattr(p, "created_at", None) else "Recent",
-            "timestamp": getattr(p, "created_at", datetime.utcnow()) or datetime.utcnow()
+            "timestamp": getattr(p, "created_at", get_naive_local_now()) or get_naive_local_now()
         })
         
     # Sort and take top 5
@@ -2866,7 +2866,7 @@ async def get_labour_dashboard(
 
 def apply_payroll_time_filter(stmt, time_filter: Optional[str], month: Optional[int], year: Optional[int]):
     if time_filter:
-        today = get_naive_utc_now().replace(tzinfo=timezone.utc).date()
+        today = get_naive_local_now().date()
         start_date = None
         if time_filter == "daily":
             start_date = today

@@ -2260,7 +2260,7 @@ async def gst_invoice_register(
     for inv in invoices:
         items.append(GSTRegisterItem(
             date=inv.created_at.date(), # assuming created_at as date for now
-            invoice_no=inv.invoice_number,
+            invoice_no=str(inv.id),
             type='SALES',
             party_name='Customer', # Would join customer/project
             taxable_amount=float(inv.amount),
@@ -2444,7 +2444,7 @@ async def gst_invoice_register(
     for inv in invoices:
         items.append(GSTRegisterItem(
             date=inv.created_at.date(), # assuming created_at as date for now
-            invoice_no=inv.invoice_number,
+            invoice_no=str(inv.id),
             type='SALES',
             party_name='Customer', # Would join customer/project
             taxable_amount=float(inv.amount),
@@ -2575,7 +2575,7 @@ async def export_gst(
     
     for inv in invoices:
         writer.writerow([
-            inv.invoice_number,
+            str(inv.id),
             inv.created_at.date().isoformat(),
             'SALES',
             'Customer', # Simplified
