@@ -1,8 +1,24 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, EmailStr
 
 from typing import Optional, Literal
 
 from datetime import date, datetime, time
+
+from app.models.quotation import QuotationStatus
+
+# =========================================================
+# GENERIC / SHARED
+# =========================================================
+
+
+class MessageResponse(BaseModel):
+    """Generic response for mutation endpoints that only return a status message.
+    Fixes ISSUE #17: mutation endpoints previously returned bare dicts with
+    no response_model, so FastAPI could not validate/document their shape.
+    """
+
+    message: str
+
 
 # =========================================================
 # MATERIAL
@@ -13,11 +29,11 @@ class QuotationMaterialCreate(BaseModel):
 
     material_id: Optional[int] = None
 
-    material_name: str
+    material_name: str = Field(..., min_length=1)  # FIX #12: reject blank names
 
     category: Optional[str] = None
 
-    unit: str
+    unit: str = Field(..., min_length=1)
 
     estimated_quantity: float = Field(..., ge=0)
 
@@ -30,11 +46,11 @@ class QuotationMaterialUpdate(BaseModel):
 
     material_id: Optional[int] = None
 
-    material_name: Optional[str] = None
+    material_name: Optional[str] = Field(None, min_length=1)
 
     category: Optional[str] = None
 
-    unit: Optional[str] = None
+    unit: Optional[str] = Field(None, min_length=1)
 
     estimated_quantity: Optional[float] = Field(None, ge=0)
 
@@ -76,7 +92,7 @@ class QuotationLabourCreate(BaseModel):
 
     labour_id: Optional[int] = None
 
-    skill_type: str
+    skill_type: str = Field(..., min_length=1)  # FIX #12
 
     labour_count: int = Field(..., ge=1)
 
@@ -95,7 +111,7 @@ class QuotationLabourUpdate(BaseModel):
 
     labour_id: Optional[int] = None
 
-    skill_type: Optional[str] = None
+    skill_type: Optional[str] = Field(None, min_length=1)
 
     labour_count: Optional[int] = Field(None, ge=1)
 
@@ -164,9 +180,19 @@ class MeasurementCreate(BaseModel):
         return v
 
 
-class MeasurementOut(MeasurementCreate):
+# FIX #9: MeasurementOut previously inherited MeasurementCreate, which carries
+# the "at least one dimension > 0" validator. That is an INPUT rule; applying
+# it to OUTPUT serialization meant a GET could 500 on any pre-existing row
+# with all-zero dimensions. MeasurementOut is now a standalone read model
+# with no create-time validators.
+class MeasurementOut(BaseModel):
 
     id: int
+
+    length: Optional[float]
+    width: Optional[float]
+    height: Optional[float]
+    unit: Optional[str]
 
     cubic_feet: float
     cubic_meter: float
@@ -181,11 +207,13 @@ class MeasurementOut(MeasurementCreate):
 
 class QuotationExtraChargeCreate(BaseModel):
     equipment_id: Optional[int] = None
-    expense_type: str
+    expense_type: str = Field(..., min_length=1)  # FIX #12
     description: Optional[str] = None
     quantity: float = Field(1, ge=0)
     rate: float = Field(0, ge=0)
-    amount: float = 0
+    # NOTE: `amount` is always recomputed server-side as quantity * rate
+    # (see router). Kept here only for backward response compatibility via
+    # QuotationExtraChargeOut; any client-supplied value is ignored on create.
     notes: Optional[str] = None
 
 
@@ -193,7 +221,7 @@ class QuotationExtraChargeUpdate(BaseModel):
 
     equipment_id: Optional[int] = None
 
-    expense_type: Optional[str] = None
+    expense_type: Optional[str] = Field(None, min_length=1)
 
     description: Optional[str] = None
 
@@ -201,14 +229,19 @@ class QuotationExtraChargeUpdate(BaseModel):
 
     rate: Optional[float] = Field(None, ge=0)
 
-    amount: Optional[float] = Field(None, ge=0)
-
     notes: Optional[str] = None
 
 
-class QuotationExtraChargeOut(QuotationExtraChargeCreate):
+class QuotationExtraChargeOut(BaseModel):
     id: int
     quotation_id: int
+    equipment_id: Optional[int]
+    expense_type: str
+    description: Optional[str]
+    quantity: float
+    rate: float
+    amount: float
+    notes: Optional[str]
 
     model_config = {"from_attributes": True}
 
@@ -224,7 +257,7 @@ class QuotationItemCreate(BaseModel):
         "soling", "plum_concrete", "stone_work", "excavation", "rcc", "road_work"
     ]
 
-    title: str
+    title: str = Field(..., min_length=1)  # FIX #12
 
     description: Optional[str] = None
 
@@ -233,6 +266,15 @@ class QuotationItemCreate(BaseModel):
     rate: float = Field(..., ge=0)
 
     measurements: list[MeasurementCreate] = []
+
+    @field_validator("measurements")
+    @classmethod
+    def validate_measurements(cls, v):
+        # FIX #13: previously an item could be created with zero measurements,
+        # silently producing quantity=0 / amount=0 with no error.
+        if not v:
+            raise ValueError("At least one measurement is required per item")
+        return v
 
 
 class QuotationItemUpdate(BaseModel):
@@ -243,7 +285,7 @@ class QuotationItemUpdate(BaseModel):
         ]
     ] = None
 
-    title: Optional[str] = None
+    title: Optional[str] = Field(None, min_length=1)
 
     description: Optional[str] = None
 
@@ -252,6 +294,15 @@ class QuotationItemUpdate(BaseModel):
     rate: Optional[float] = Field(None, ge=0)
 
     measurements: Optional[list[MeasurementCreate]] = None
+
+    @field_validator("measurements")
+    @classmethod
+    def validate_measurements(cls, v):
+        # Only enforce non-empty when the caller actually supplied the list
+        # (None means "leave measurements untouched").
+        if v is not None and len(v) == 0:
+            raise ValueError("At least one measurement is required per item")
+        return v
 
 
 class QuotationItemOut(BaseModel):
@@ -285,13 +336,13 @@ class CreateQuotation(BaseModel):
 
     client_user_id: int
 
-    client_name: str
+    client_name: str = Field(..., min_length=1)  # FIX #12
 
     company_name: Optional[str] = None
 
     mobile_number: str
 
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None  # FIX #11: was plain str, now format-validated
 
     billing_address: Optional[str] = None
 
@@ -299,11 +350,9 @@ class CreateQuotation(BaseModel):
 
     gst_number: Optional[str] = None
 
-    project_id: Optional[int] = None
+    project_name: str = Field(..., min_length=1)  # FIX #12
 
-    project_name: str
-
-    project_type: str
+    project_type: str = Field(..., min_length=1)  # FIX #12
 
     project_start_date: Optional[date] = None
 
@@ -378,24 +427,20 @@ class CreateQuotation(BaseModel):
         cleaned = v.strip()
 
         if not cleaned.isdigit():
-            raise ValueError(
-                "Mobile number must contain digits only"
-            )
+            raise ValueError("Mobile number must contain digits only")
 
         if len(cleaned) < 10 or len(cleaned) > 15:
-            raise ValueError(
-                "Mobile number must be between 10 and 15 digits"
-            )
+            raise ValueError("Mobile number must be between 10 and 15 digits")
 
         return cleaned
 
 
 class UpdateQuotation(BaseModel):
 
-    client_name: Optional[str] = None
+    client_name: Optional[str] = Field(None, min_length=1)
     company_name: Optional[str] = None
     mobile_number: Optional[str] = None
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None  # FIX #11
     billing_address: Optional[str] = None
     site_address: Optional[str] = None
     cgst_percent: Optional[float] = Field(None, ge=0, le=100)
@@ -405,9 +450,9 @@ class UpdateQuotation(BaseModel):
     tds_percent: Optional[float] = Field(None, ge=0, le=100)
 
     gst_percent: Optional[float] = Field(None, ge=0, le=100)
-    project_id: Optional[int] = None
-    project_name: Optional[str] = None
-    project_type: Optional[str] = None
+
+    project_name: Optional[str] = Field(None, min_length=1)
+    project_type: Optional[str] = Field(None, min_length=1)
 
     project_start_date: Optional[date] = None
     project_end_date: Optional[date] = None
@@ -440,23 +485,26 @@ class UpdateQuotation(BaseModel):
     @field_validator("mobile_number")
     @classmethod
     def validate_mobile_number(cls, v):
+        # FIX #10: v can legitimately be None (Optional field, or explicit
+        # `"mobile_number": null` in the payload). Previously this called
+        # v.strip() unconditionally, raising an uncaught AttributeError
+        # (-> raw 500) instead of a clean validation result.
+        if v is None:
+            return v
 
         cleaned = v.strip()
 
         if not cleaned.isdigit():
-            raise ValueError(
-                "Mobile number must contain digits only"
-            )
+            raise ValueError("Mobile number must contain digits only")
 
         if len(cleaned) < 10 or len(cleaned) > 15:
-            raise ValueError(
-                "Mobile number must be between 10 and 15 digits"
-            )
+            raise ValueError("Mobile number must be between 10 and 15 digits")
 
         return cleaned
 
+
 class RejectQuotation(BaseModel):
-    reason: str
+    reason: str = Field(..., min_length=3)  # FIX #12: no more blank rejection reasons
 
 
 class QuotationOut(BaseModel):
@@ -464,6 +512,8 @@ class QuotationOut(BaseModel):
     id: int
 
     quotation_no: str
+
+    client_user_id: int
 
     client_name: str
 
@@ -476,8 +526,6 @@ class QuotationOut(BaseModel):
     billing_address: Optional[str]
 
     site_address: Optional[str]
-
-    project_id: Optional[int]
 
     project_name: str
 
@@ -525,7 +573,7 @@ class QuotationOut(BaseModel):
 
     is_approved: bool
 
-    status: str
+    status: QuotationStatus  # FIX #15: was plain str, now the real enum
 
     created_at: datetime
 
@@ -545,6 +593,7 @@ class QuotationOut(BaseModel):
 # QUOTATION CONVERT TO PROJECT
 # =========================================================
 
+
 class QuotationToProjectConvertRequest(BaseModel):
     owner_id: int
     location_type: Optional[str] = None
@@ -554,9 +603,14 @@ class QuotationToProjectConvertRequest(BaseModel):
     pincode: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    shift_start_time: Optional[time] = Field(default=time(9, 0), description="Default shift start time (09:00 IST)")
-    shift_end_time: Optional[time] = Field(default=time(18, 0), description="Default shift end time (18:00 IST)")
+    shift_start_time: Optional[time] = Field(
+        default=time(9, 0), description="Default shift start time (09:00 IST)"
+    )
+    shift_end_time: Optional[time] = Field(
+        default=time(18, 0), description="Default shift end time (18:00 IST)"
+    )
     grace_period_minutes: int = 15
+
 
 class QuotationToProjectConvertResponse(BaseModel):
     message: str
@@ -564,3 +618,41 @@ class QuotationToProjectConvertResponse(BaseModel):
     project_business_id: str
     quotation_id: int
     budget_amount: float
+
+
+# =========================================================
+# QUOTATION CONVERT TO BILL / WORK ORDER
+# FIX #6: these were previously bare query params (project_id, contractor_id)
+# on convert_to_bill / convert_to_work_order, inconsistent with the request
+# body pattern used everywhere else (including convert-to-project below).
+# =========================================================
+
+
+class ConvertToBillRequest(BaseModel):
+    project_id: int
+    contractor_id: int
+
+
+class ConvertToBillResponse(BaseModel):
+    message: str
+    bill_id: int
+    bill_number: str
+    project_id: int
+    project_name: str
+    contractor_id: int
+    contractor_name: str
+
+
+class ConvertToWorkOrderRequest(BaseModel):
+    project_id: int
+    contractor_id: int
+
+
+class ConvertToWorkOrderResponse(BaseModel):
+    message: str
+    work_order_id: int
+    work_order_number: str
+    project_id: int
+    project_name: str
+    contractor_id: int
+    contractor_name: str

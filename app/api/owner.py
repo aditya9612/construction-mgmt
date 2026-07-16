@@ -3,11 +3,11 @@ from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import and_, case, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.enums import OwnerTransactionType
+from app.core.enums import OwnerTransactionType, ProjectStatus
 from app.db.session import get_db_session
 from app.models.owner import Owner, OwnerTransaction, OwnerPaymentSchedule
 from app.models.project import Project

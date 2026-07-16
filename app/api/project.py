@@ -169,7 +169,13 @@ TASK_WRITE_ROLES = [
 TASK_DELETE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
 
 TASK_REQUEST_ROLES = [
-    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER, UserRole.LABOUR ]
+    r.value
+    for r in [
+        UserRole.ADMIN,
+        UserRole.PROJECT_MANAGER,
+        UserRole.SITE_ENGINEER,
+        UserRole.LABOUR,
+    ]
 ]
 
 DSR_WRITE_ROLES = [
@@ -632,14 +638,16 @@ class ProjectsService:
                 )
 
                 obj = await self.projects_repo.create_project(db, data)
-                
-                db.add(ActivityLog(
-                    action="CREATE_PROJECT",
-                    entity="project",
-                    entity_id=obj.id,
-                    performed_by=current_user.id,
-                    details={"message": f"Project '{obj.project_name}' created"}
-                ))
+
+                db.add(
+                    ActivityLog(
+                        action="CREATE_PROJECT",
+                        entity="project",
+                        entity_id=obj.id,
+                        performed_by=current_user.id,
+                        details={"message": f"Project '{obj.project_name}' created"},
+                    )
+                )
                 await db.flush()
 
                 break
@@ -943,7 +951,10 @@ class ProjectMembersService:
     ) -> s.ProjectMemberOut:
 
         from app.utils.common import assert_project_access
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
         self._assert_member_mutation_role(current_user)
 
         project = await self.projects_repo.get_project(db, project_id=project_id)
@@ -1016,7 +1027,10 @@ class ProjectMembersService:
         user_id: int,
     ) -> None:
         from app.utils.common import assert_project_access
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
         self._assert_member_mutation_role(current_user)
 
         project = await self.projects_repo.get_project(db, project_id=project_id)
@@ -1143,10 +1157,19 @@ class MilestonesService:
             raise ValidationError("title cannot be null")
 
         from datetime import date
+
         if "status" in data:
-            if data["status"] == MilestoneStatus.IN_PROGRESS and data.get("actual_start_date") is None and obj.actual_start_date is None:
+            if (
+                data["status"] == MilestoneStatus.IN_PROGRESS
+                and data.get("actual_start_date") is None
+                and obj.actual_start_date is None
+            ):
                 data["actual_start_date"] = date.today()
-            if data["status"] == MilestoneStatus.COMPLETED and data.get("actual_end_date") is None and obj.actual_end_date is None:
+            if (
+                data["status"] == MilestoneStatus.COMPLETED
+                and data.get("actual_end_date") is None
+                and obj.actual_end_date is None
+            ):
                 data["actual_end_date"] = date.today()
 
         try:
@@ -1784,14 +1807,20 @@ class TasksService:
             data={"status": status},
         )
 
-        if (hasattr(status, "value") and status.value.upper() == "COMPLETED") or str(status).upper() == "COMPLETED" or str(status).upper() == "TASKSTATUS.COMPLETED":
-            db.add(ActivityLog(
-                action="TASK_COMPLETED",
-                entity="project",
-                entity_id=project_id,
-                performed_by=current_user.id,
-                details={"message": f"Task '{obj.title}' completed"}
-            ))
+        if (
+            (hasattr(status, "value") and status.value.upper() == "COMPLETED")
+            or str(status).upper() == "COMPLETED"
+            or str(status).upper() == "TASKSTATUS.COMPLETED"
+        ):
+            db.add(
+                ActivityLog(
+                    action="TASK_COMPLETED",
+                    entity="project",
+                    entity_id=project_id,
+                    performed_by=current_user.id,
+                    details={"message": f"Task '{obj.title}' completed"},
+                )
+            )
             await db.flush()
 
         await db.refresh(obj)
@@ -2244,29 +2273,24 @@ class ReportsService:
         owner = None
 
         if project.owner_id:
-            owner = await db.scalar(
-                select(Owner).where(
-                    Owner.id == project.owner_id
-                )
-            )
+            owner = await db.scalar(select(Owner).where(Owner.id == project.owner_id))
 
         # =====================================
         # Financial Data
         # =====================================
 
         total_boq = await db.scalar(
-            select(func.sum(BOQ.total_cost))
-            .where(BOQ.project_id == project_id)
+            select(func.sum(BOQ.total_cost)).where(BOQ.project_id == project_id)
         )
 
         total_invoice = await db.scalar(
-            select(func.sum(Invoice.total_amount))
-            .where(Invoice.project_id == project_id)
+            select(func.sum(Invoice.total_amount)).where(
+                Invoice.project_id == project_id
+            )
         )
 
         total_expense = await db.scalar(
-            select(func.sum(Expense.amount))
-            .where(Expense.project_id == project_id)
+            select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
         )
 
         boq_value = float(total_boq or 0)
@@ -2285,8 +2309,9 @@ class ReportsService:
                 await db.execute(
                     select(m.Task)
                     .options(
-                        selectinload(m.Task.assignments)
-                        .joinedload(m.TaskAssignment.user)
+                        selectinload(m.Task.assignments).joinedload(
+                            m.TaskAssignment.user
+                        )
                     )
                     .where(m.Task.project_id == project_id)
                 )
@@ -2301,10 +2326,7 @@ class ReportsService:
         completed_tasks = sum(
             1
             for t in tasks
-            if (
-                hasattr(t.status, "value")
-                and t.status.value == "Completed"
-            )
+            if (hasattr(t.status, "value") and t.status.value == "Completed")
             or str(t.status) == "Completed"
         )
 
@@ -2313,12 +2335,14 @@ class ReportsService:
             for t in tasks
             if (
                 hasattr(t.status, "value")
-                and t.status.value in [
+                and t.status.value
+                in [
                     "Pending",
                     "In Progress",
                 ]
             )
-            or str(t.status) in [
+            or str(t.status)
+            in [
                 "Pending",
                 "In Progress",
             ]
@@ -2327,10 +2351,7 @@ class ReportsService:
         delayed_tasks = sum(
             1
             for t in tasks
-            if (
-                hasattr(t.status, "value")
-                and t.status.value == "Delayed"
-            )
+            if (hasattr(t.status, "value") and t.status.value == "Delayed")
             or str(t.status) == "Delayed"
         )
 
@@ -2355,10 +2376,7 @@ class ReportsService:
         milestones = (
             (
                 await db.execute(
-                    select(m.Milestone)
-                    .where(
-                        m.Milestone.project_id == project_id
-                    )
+                    select(m.Milestone).where(m.Milestone.project_id == project_id)
                 )
             )
             .scalars()
@@ -2370,10 +2388,7 @@ class ReportsService:
         completed_milestones = sum(
             1
             for ms in milestones
-            if (
-                hasattr(ms.status, "value")
-                and ms.status.value == "Completed"
-            )
+            if (hasattr(ms.status, "value") and ms.status.value == "Completed")
             or str(ms.status) == "Completed"
         )
 
@@ -2387,14 +2402,10 @@ class ReportsService:
                 m.ProjectMember,
                 m.ProjectMember.user_id == UserModel.id,
             )
-            .where(
-                m.ProjectMember.project_id == project_id
-            )
+            .where(m.ProjectMember.project_id == project_id)
         )
 
-        members_result = await db.execute(
-            members_query
-        )
+        members_result = await db.execute(members_query)
 
         members = []
 
@@ -2403,11 +2414,7 @@ class ReportsService:
 
         for user in members_result.scalars().all():
 
-            role = (
-                user.role.value
-                if hasattr(user.role, "value")
-                else str(user.role)
-            )
+            role = user.role.value if hasattr(user.role, "value") else str(user.role)
 
             members.append(
                 {
@@ -2689,9 +2696,11 @@ class ReportsService:
                     assignee,
                     str(task.start_date or ""),
                     str(task.end_date or ""),
-                    task.status.value
-                    if hasattr(task.status, "value")
-                    else str(task.status),
+                    (
+                        task.status.value
+                        if hasattr(task.status, "value")
+                        else str(task.status)
+                    ),
                     getattr(task, "completion_percentage", 0),
                 ]
             )
@@ -2734,9 +2743,7 @@ class ReportsService:
                 [
                     ms.title,
                     str(ms.end_date or ""),
-                    ms.status.value
-                    if hasattr(ms.status, "value")
-                    else str(ms.status),
+                    ms.status.value if hasattr(ms.status, "value") else str(ms.status),
                     getattr(ms, "completion_percentage", 0),
                 ]
             )
@@ -2800,10 +2807,7 @@ class ReportsService:
 
                 if cell.value is not None:
 
-                    max_length = max(
-                        max_length,
-                        len(str(cell.value))
-                    )
+                    max_length = max(max_length, len(str(cell.value)))
 
             ws.column_dimensions[column_letter].width = min(
                 max_length + 4,
@@ -2836,7 +2840,6 @@ class ReportsService:
                 )
             },
         )
-
 
     async def export_pdf(
         self,
@@ -3114,10 +3117,14 @@ async def projects_module_summary(
     # 1. Summary
     total = await db.scalar(select(func.count(m.Project.id)))
     ongoing = await db.scalar(
-        select(func.count(m.Project.id)).where(m.Project.status == ProjectStatus.ONGOING.value)
+        select(func.count(m.Project.id)).where(
+            m.Project.status == ProjectStatus.ONGOING.value
+        )
     )
     completed = await db.scalar(
-        select(func.count(m.Project.id)).where(m.Project.status == ProjectStatus.COMPLETED.value)
+        select(func.count(m.Project.id)).where(
+            m.Project.status == ProjectStatus.COMPLETED.value
+        )
     )
     delayed = await db.scalar(
         select(func.count(m.Project.id)).where(
@@ -3236,9 +3243,11 @@ async def create_project(
 
     return out
 
+
 # =========================================
 # PM DASHBOARD ENDPOINTS
 # =========================================
+
 
 @router.get("/calendar", response_model=s.PMCalendarOut)
 async def get_pm_calendar(
@@ -3248,11 +3257,13 @@ async def get_pm_calendar(
     # Get all project IDs this user has access to
     from app.models.project import ProjectMember, Task, Milestone
     from app.models.approval import Approval
-    
+
     project_ids = []
     if current_user.role != UserRole.ADMIN:
         memberships = await db.scalars(
-            select(ProjectMember.project_id).where(ProjectMember.user_id == current_user.id)
+            select(ProjectMember.project_id).where(
+                ProjectMember.user_id == current_user.id
+            )
         )
         project_ids = list(memberships.all())
     else:
@@ -3260,61 +3271,65 @@ async def get_pm_calendar(
         project_ids = list(projs.all())
 
     events = []
-    
+
     if project_ids:
         # Tasks (Due Dates)
         tasks = await db.scalars(
-            select(Task).where(Task.project_id.in_(project_ids), Task.end_date.isnot(None))
+            select(Task).where(
+                Task.project_id.in_(project_ids), Task.end_date.isnot(None)
+            )
         )
         for t in tasks:
-            events.append(s.CalendarEvent(
-                title=t.title,
-                date=t.end_date,
-                type="Task"
-            ))
-            
+            events.append(s.CalendarEvent(title=t.title, date=t.end_date, type="Task"))
+
         # Milestones (Due Dates)
         milestones = await db.scalars(
-            select(Milestone).where(Milestone.project_id.in_(project_ids), Milestone.end_date.isnot(None))
+            select(Milestone).where(
+                Milestone.project_id.in_(project_ids), Milestone.end_date.isnot(None)
+            )
         )
         for ml in milestones:
-            events.append(s.CalendarEvent(
-                title=ml.title,
-                date=ml.end_date,
-                type="Milestone"
-            ))
+            events.append(
+                s.CalendarEvent(title=ml.title, date=ml.end_date, type="Milestone")
+            )
 
     return s.PMCalendarOut(events=events)
 
 
-@router.get("/{project_id}/resource-summary", response_model=s.ProjectResourceSummaryOut)
+@router.get(
+    "/{project_id}/resource-summary", response_model=s.ProjectResourceSummaryOut
+)
 async def get_project_resource_summary(
     project_id: int,
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     await assert_project_access(db, project_id=project_id, current_user=current_user)
-    
+
     from app.models.labour import LabourProject
     from app.models.equipment import Equipment
     from app.models.expense import Expense
 
     labour_count = await db.scalar(
-        select(func.count(LabourProject.labour_id)).where(LabourProject.project_id == project_id)
+        select(func.count(LabourProject.labour_id)).where(
+            LabourProject.project_id == project_id
+        )
     )
-    
+
     equipment_count = await db.scalar(
         select(func.count(Equipment.id)).where(Equipment.project_id == project_id)
     )
-    
+
     material_expense = await db.scalar(
-        select(func.sum(Expense.amount)).where(Expense.project_id == project_id, Expense.category == "Material")
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id, Expense.category == "Material"
+        )
     )
 
     return s.ProjectResourceSummaryOut(
         labour=labour_count or 0,
         equipment=equipment_count or 0,
-        materials_cost=float(material_expense or 0.0)
+        materials_cost=float(material_expense or 0.0),
     )
 
 
@@ -3325,31 +3340,35 @@ async def get_project_health_score(
     db: AsyncSession = Depends(get_db_session),
 ):
     await assert_project_access(db, project_id=project_id, current_user=current_user)
-    
+
     from app.models.project import Issue
-    
+
     project = await db.get(m.Project, project_id)
     if not project:
         raise NotFoundError("Project not found")
 
     score = 100
-    if project.status == ProjectStatus.ONGOING.value and project.end_date and project.end_date < date.today():
+    if (
+        project.status == ProjectStatus.ONGOING.value
+        and project.end_date
+        and project.end_date < date.today()
+    ):
         score -= 20
     elif project.status == ProjectStatus.ON_HOLD.value:
         score -= 15
-        
+
     open_critical_issues = await db.scalar(
         select(func.count(Issue.id)).where(
             Issue.project_id == project_id,
             Issue.status == "Open",
-            Issue.priority == "High"
+            Issue.priority == "High",
         )
     )
     if open_critical_issues:
-        score -= (open_critical_issues * 5)
-        
+        score -= open_critical_issues * 5
+
     score = max(0, min(100, score))
-    
+
     status_str = "Good"
     if score < 50:
         status_str = "Poor"
@@ -3357,7 +3376,6 @@ async def get_project_health_score(
         status_str = "At Risk"
 
     return s.ProjectHealthScoreOut(health=score, status=status_str)
-
 
 
 @router.get("", response_model=PaginatedResponse[s.ProjectOut])
@@ -3389,8 +3407,6 @@ async def list_projects(
     )
     await cache_set_json(redis, cache_key, result.model_dump())
     return result
-
-
 
 
 @router.post("/{project_id}/schedule")
@@ -3461,7 +3477,6 @@ async def get_task_alerts(
     service: AlertsService = Depends(get_alerts_service),
 ):
     return await service.get_task_alerts(db, current_user, pagination)
-
 
 
 @router.post(
@@ -3567,14 +3582,16 @@ async def get_project_logs(
         .limit(limit)
     )
     for act, title in act_res.all():
-        logs.append(s.ProjectLogItem(
-            timestamp=act.created_at,
-            module="Activity",
-            action=act.action,
-            message=f"Activity '{title}' updated",
-            user_id=act.changed_by,
-            details={"remarks": act.remarks}
-        ))
+        logs.append(
+            s.ProjectLogItem(
+                timestamp=act.created_at,
+                module="Activity",
+                action=act.action,
+                message=f"Activity '{title}' updated",
+                user_id=act.changed_by,
+                details={"remarks": act.remarks},
+            )
+        )
 
     # 2. BOQAudit
     boq_res = await db.execute(
@@ -3585,14 +3602,16 @@ async def get_project_logs(
         .limit(limit)
     )
     for ba in boq_res.scalars().all():
-        logs.append(s.ProjectLogItem(
-            timestamp=ba.created_at,
-            module="BOQ",
-            action=ba.action,
-            message=ba.message,
-            user_id=ba.user_id,
-            details=ba.changes
-        ))
+        logs.append(
+            s.ProjectLogItem(
+                timestamp=ba.created_at,
+                module="BOQ",
+                action=ba.action,
+                message=ba.message,
+                user_id=ba.user_id,
+                details=ba.changes,
+            )
+        )
 
     # 3. EquipmentAuditLog
     eq_res = await db.execute(
@@ -3603,19 +3622,22 @@ async def get_project_logs(
         .limit(limit)
     )
     for ea, eq_name in eq_res.all():
-        logs.append(s.ProjectLogItem(
-            timestamp=ea.created_at,
-            module="Equipment",
-            action=ea.action,
-            message=f"Equipment '{eq_name}' updated",
-            user_id=ea.user_id,
-            details={"old": ea.old_values, "new": ea.new_values}
-        ))
+        logs.append(
+            s.ProjectLogItem(
+                timestamp=ea.created_at,
+                module="Equipment",
+                action=ea.action,
+                message=f"Equipment '{eq_name}' updated",
+                user_id=ea.user_id,
+                details={"old": ea.old_values, "new": ea.new_values},
+            )
+        )
 
     # Sort all by timestamp descending and slice
     logs.sort(key=lambda x: x.timestamp, reverse=True)
-    
-    return logs[offset:offset+limit]
+
+    return logs[offset : offset + limit]
+
 
 @router.get("/{project_id}/photos")
 async def get_project_photos(
@@ -3884,7 +3906,7 @@ async def create_task(
         def _save_audio():
             with open(filepath, "wb") as buffer:
                 shutil.copyfileobj(audio_file.file, buffer)
-                
+
         await run_in_threadpool(_save_audio)
 
         audio_instruction_url = filepath.replace("\\", "/")
@@ -3916,7 +3938,7 @@ async def create_task(
         def _save_image():
             with open(filepath, "wb") as buffer:
                 shutil.copyfileobj(instruction_image.file, buffer)
-                
+
         await run_in_threadpool(_save_image)
 
         instruction_image_url = filepath.replace("\\", "/")
@@ -4031,7 +4053,7 @@ async def update_task(
         def _save_update_audio():
             with open(filepath, "wb") as buffer:
                 shutil.copyfileobj(audio_file.file, buffer)
-                
+
         await run_in_threadpool(_save_update_audio)
 
         audio_instruction_url = filepath.replace("\\", "/")
@@ -4062,7 +4084,7 @@ async def update_task(
         def _save_update_image():
             with open(filepath, "wb") as buffer:
                 shutil.copyfileobj(instruction_image.file, buffer)
-                
+
         await run_in_threadpool(_save_update_image)
 
         instruction_image_url = filepath.replace("\\", "/")
@@ -4211,13 +4233,14 @@ async def list_task_progress_history(
 async def create_task_request(
     request: s.TaskRequestCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
     db_obj = m.TaskRequest(**request.model_dump())
     db.add(db_obj)
     await db.commit()
     await db.refresh(db_obj)
     return db_obj
+
 
 @tasks_router.get("/task-requests", response_model=List[s.TaskRequestResponse])
 async def get_task_requests(
@@ -4227,7 +4250,7 @@ async def get_task_requests(
     skip: int = Query(0, ge=0, description="Pagination skip"),
     limit: int = Query(100, ge=1, le=1000, description="Pagination limit"),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
     query = select(m.TaskRequest).where(m.TaskRequest.is_deleted == False)
     if project_id:
@@ -4236,51 +4259,62 @@ async def get_task_requests(
         query = query.where(m.TaskRequest.status == status)
     if priority:
         query = query.where(m.TaskRequest.priority == priority)
-        
+
     query = query.offset(skip).limit(limit)
-        
+
     result = await db.execute(query)
     task_requests = result.scalars().all()
     return list(task_requests)
+
 
 @tasks_router.put("/task-requests/{request_id}", response_model=s.TaskRequestResponse)
 async def update_task_request(
     request_id: int,
     request: s.TaskRequestUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
-    result = await db.execute(select(m.TaskRequest).where(m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False))
+    result = await db.execute(
+        select(m.TaskRequest).where(
+            m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False
+        )
+    )
     db_obj = result.scalar_one_or_none()
-    
+
     if not db_obj:
         raise HTTPException(status_code=404, detail="Task request not found")
-    
+
     update_data = request.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(db_obj, key, value)
-        
+
     await db.commit()
     await db.refresh(db_obj)
     return db_obj
+
 
 @tasks_router.delete("/task-requests/{request_id}", status_code=204)
 async def delete_task_request(
     request_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES))
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
-    result = await db.execute(select(m.TaskRequest).where(m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False))
+    result = await db.execute(
+        select(m.TaskRequest).where(
+            m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False
+        )
+    )
     db_obj = result.scalar_one_or_none()
-    
+
     if not db_obj:
         raise HTTPException(status_code=404, detail="Task request not found")
-        
+
     # Soft delete
     db_obj.is_deleted = True
     await db.commit()
-    
+
     return None
+
 
 @tasks_router.post(
     "/{project_id}/tasks/{task_id}/comments", response_model=s.CommentOut
@@ -4515,7 +4549,7 @@ async def create_dsr(
                         def _save_dsr():
                             with open(path, "wb") as f:
                                 f.write(content)
-                                
+
                         await run_in_threadpool(_save_dsr)
 
                         photo = m.DSRPhoto(dsr_id=obj.id, file_url=path)
@@ -5082,14 +5116,16 @@ async def submit_dsr(
         raise ValidationError("Only draft DSR can be submitted")
 
     obj.status = "Submitted"
-    
-    db.add(ActivityLog(
-        action="SUBMIT_DSR",
-        entity="project",
-        entity_id=obj.project_id,
-        performed_by=current_user.id,
-        details={"message": f"Daily Site Report submitted for {obj.report_date}"}
-    ))
+
+    db.add(
+        ActivityLog(
+            action="SUBMIT_DSR",
+            entity="project",
+            entity_id=obj.project_id,
+            performed_by=current_user.id,
+            details={"message": f"Daily Site Report submitted for {obj.report_date}"},
+        )
+    )
 
     await db.flush()
 
@@ -5118,13 +5154,15 @@ async def approve_dsr(
 
     obj.status = "Approved"
 
-    db.add(ActivityLog(
-        action="APPROVE_DSR",
-        entity="project",
-        entity_id=obj.project_id,
-        performed_by=current_user.id,
-        details={"message": f"Daily Site Report approved for {obj.report_date}"}
-    ))
+    db.add(
+        ActivityLog(
+            action="APPROVE_DSR",
+            entity="project",
+            entity_id=obj.project_id,
+            performed_by=current_user.id,
+            details={"message": f"Daily Site Report approved for {obj.report_date}"},
+        )
+    )
 
     await db.commit()
     await db.refresh(obj)
@@ -5154,13 +5192,15 @@ async def reject_dsr(
 
     obj.status = "Draft"
 
-    db.add(ActivityLog(
-        action="REJECT_DSR",
-        entity="project",
-        entity_id=obj.project_id,
-        performed_by=current_user.id,
-        details={"message": f"Daily Site Report rejected for {obj.report_date}"}
-    ))
+    db.add(
+        ActivityLog(
+            action="REJECT_DSR",
+            entity="project",
+            entity_id=obj.project_id,
+            performed_by=current_user.id,
+            details={"message": f"Daily Site Report rejected for {obj.report_date}"},
+        )
+    )
 
     await db.commit()
     await db.refresh(obj)
@@ -5220,14 +5260,16 @@ async def create_issue(
 
                 db.add(obj)
                 await db.flush()
-                
-                db.add(ActivityLog(
-                    action="RAISE_ISSUE",
-                    entity="project",
-                    entity_id=payload.project_id,
-                    performed_by=current_user.id,
-                    details={"message": f"Issue '{obj.title}' raised"}
-                ))
+
+                db.add(
+                    ActivityLog(
+                        action="RAISE_ISSUE",
+                        entity="project",
+                        entity_id=payload.project_id,
+                        performed_by=current_user.id,
+                        details={"message": f"Issue '{obj.title}' raised"},
+                    )
+                )
                 await db.flush()
 
                 if getattr(obj.priority, "value", str(obj.priority)) == "HIGH":
@@ -8868,7 +8910,8 @@ async def list_logs(
         items=items, meta=PaginationMeta(total=count, limit=limit, offset=offset)
     )
 
-#=====================================================
+
+# =====================================================
 
 
 @checklist_router.post("")
@@ -8884,7 +8927,8 @@ async def create_checklist(
     return obj
 
 
-#=============================================
+# =============================================
+
 
 @checklist_router.get("/{id}")
 async def get_checklist(
@@ -8899,7 +8943,9 @@ async def get_checklist(
 
     return checklist
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.put("/{id}")
 async def update_checklist(
@@ -8921,7 +8967,9 @@ async def update_checklist(
 
     return checklist
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.delete("/{id}")
 async def delete_checklist(
@@ -8940,7 +8988,9 @@ async def delete_checklist(
 
     return {"message": "Checklist deleted successfully"}
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.post("/items")
 async def add_item(
@@ -8951,28 +9001,19 @@ async def add_item(
     checklist = await db.get(m.Checklist, data.checklist_id)
 
     if not checklist:
-        raise HTTPException(
-            status_code=404,
-            detail="Checklist not found"
-        )
+        raise HTTPException(status_code=404, detail="Checklist not found")
 
     existing = await db.scalar(
         select(m.ChecklistItem).where(
             m.ChecklistItem.checklist_id == data.checklist_id,
-            m.ChecklistItem.item == data.item
+            m.ChecklistItem.item == data.item,
         )
     )
 
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="Checklist item already exists"
-        )
+        raise HTTPException(status_code=400, detail="Checklist item already exists")
 
-    obj = m.ChecklistItem(
-        checklist_id=data.checklist_id,
-        item=data.item
-    )
+    obj = m.ChecklistItem(checklist_id=data.checklist_id, item=data.item)
 
     db.add(obj)
 
@@ -8981,7 +9022,8 @@ async def add_item(
 
     return obj
 
-#=============================================
+
+# =============================================
 
 
 @checklist_router.get("/{id}/items")
@@ -9003,7 +9045,8 @@ async def get_items(
 
     return result.scalars().all()
 
-#=============================================
+
+# =============================================
 
 
 @checklist_router.put("/items/{item_id}")
@@ -9026,7 +9069,9 @@ async def update_item(
 
     return item
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.get("/items/{checklist_id}")
 async def list_items(
@@ -9047,7 +9092,9 @@ async def list_items(
 
     return result.scalars().all()
 
-#==========================================
+
+# ==========================================
+
 
 @checklist_router.delete("/items/{item_id}")
 async def delete_item(
@@ -9066,7 +9113,8 @@ async def delete_item(
 
     return {"message": "Checklist item deleted"}
 
-#=============================================
+
+# =============================================
 
 
 @checklist_router.get("")
@@ -9076,7 +9124,9 @@ async def list_checklists(
 ):
     return (await db.execute(select(m.Checklist))).scalars().all()
 
-#=============================================
+
+# =============================================
+
 
 @checklist_router.post("/{id}/execute")
 async def execute_checklist(
@@ -9093,7 +9143,7 @@ async def execute_checklist(
 
     if not checklist:
         raise HTTPException(status_code=404, detail="Checklist not found")
-        
+
     if not checklist.items:
         raise HTTPException(status_code=400, detail="Cannot execute empty checklist")
 
@@ -9159,7 +9209,7 @@ async def upload_photo(
     def _save_site_photo():
         with open(file_path, "wb") as f:
             f.write(content)
-            
+
     await run_in_threadpool(_save_site_photo)
 
     #  Store URL (NOT raw path)
@@ -9247,7 +9297,7 @@ drawing_router = APIRouter(prefix="/drawings", tags=["Drawings"])
 
 
 # ===================== DRAWING FOLDERS =====================
-@drawing_router.post("/folders", response_model=s.DrawingOut)
+@drawing_router.post("/folders", response_model=s.DrawingFolderOut)
 async def create_folder(
     data: s.DrawingFolderCreate,
     project_id: int,
@@ -9256,7 +9306,7 @@ async def create_folder(
 ):
     obj = m.DrawingDocument(
         project_id=project_id,
-        drawing_name=data.drawing_name,
+        drawing_name=data.folder_name,
         is_folder=True,
         parent_id=data.parent_id,
         approval_status=DocumentStatus.APPROVED,
@@ -9267,7 +9317,14 @@ async def create_folder(
     await db.commit()
     await db.refresh(obj)
 
-    return obj
+    return s.DrawingFolderOut(
+        id=obj.id,
+        project_id=obj.project_id,
+        folder_name=obj.drawing_name,
+        parent_id=obj.parent_id,
+        is_folder=obj.is_folder,
+    )
+
 
 @drawing_router.post("/upload", response_model=s.DrawingOut)
 async def upload_drawing(
@@ -9319,7 +9376,7 @@ async def upload_drawing(
         def _save_drawing():
             with open(file_path, "wb") as f:
                 f.write(file.file.read())
-                
+
         await run_in_threadpool(_save_drawing)
 
         # ================= GET NEXT REVISION =================
@@ -9460,7 +9517,7 @@ async def get_drawing_approval_history(
     ]
 
 
-#===================== List Drawings =====================
+# ===================== List Drawings =====================
 @drawing_router.get("", response_model=PaginatedResponse[s.DrawingOut])
 async def list_drawings(
     project_id: int = Query(..., gt=0),
@@ -9474,9 +9531,7 @@ async def list_drawings(
     current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    stmt = select(m.DrawingDocument).where(
-        m.DrawingDocument.project_id == project_id
-    )
+    stmt = select(m.DrawingDocument).where(m.DrawingDocument.project_id == project_id)
     count_stmt = (
         select(func.count())
         .select_from(m.DrawingDocument)
@@ -9484,37 +9539,23 @@ async def list_drawings(
     )
     if parent_id is not None:
         stmt = stmt.where(m.DrawingDocument.parent_id == parent_id)
-        count_stmt = count_stmt.where(
-            m.DrawingDocument.parent_id == parent_id
-        )
+        count_stmt = count_stmt.where(m.DrawingDocument.parent_id == parent_id)
     if search:
-        stmt = stmt.where(
-            m.DrawingDocument.drawing_name.ilike(f"%{search}%")
-        )
+        stmt = stmt.where(m.DrawingDocument.drawing_name.ilike(f"%{search}%"))
         count_stmt = count_stmt.where(
             m.DrawingDocument.drawing_name.ilike(f"%{search}%")
         )
     if approval_status:
-        stmt = stmt.where(
-            m.DrawingDocument.approval_status == approval_status
-        )
+        stmt = stmt.where(m.DrawingDocument.approval_status == approval_status)
         count_stmt = count_stmt.where(
             m.DrawingDocument.approval_status == approval_status
         )
     if latest_only:
-        stmt = stmt.where(
-            m.DrawingDocument.is_latest_version.is_(True)
-        )
-        count_stmt = count_stmt.where(
-            m.DrawingDocument.is_latest_version.is_(True)
-        )
+        stmt = stmt.where(m.DrawingDocument.is_latest_version.is_(True))
+        count_stmt = count_stmt.where(m.DrawingDocument.is_latest_version.is_(True))
     if is_folder is not None:
-        stmt = stmt.where(
-            m.DrawingDocument.is_folder == is_folder
-        )
-        count_stmt = count_stmt.where(
-            m.DrawingDocument.is_folder == is_folder
-        )
+        stmt = stmt.where(m.DrawingDocument.is_folder == is_folder)
+        count_stmt = count_stmt.where(m.DrawingDocument.is_folder == is_folder)
     stmt = (
         stmt.order_by(
             m.DrawingDocument.is_folder.desc(),
@@ -9539,7 +9580,7 @@ async def list_drawings(
 # ===================== Version History =====================
 
 
-@drawing_router.get("/versions", response_model=list[s.DrawingOut])
+#@drawing_router.get("/versions", response_model=list[s.DrawingOut])
 @drawing_router.get("/{project_id}/versions", response_model=list[s.DrawingOut])
 async def get_versions(
     db: AsyncSession = Depends(get_db_session),
@@ -9552,7 +9593,7 @@ async def get_versions(
     query = select(m.DrawingDocument)
     if project_id is not None:
         query = query.where(m.DrawingDocument.project_id == project_id)
-        
+
     if parent_id is not None:
         query = query.where(m.DrawingDocument.parent_id == parent_id)
     else:
@@ -9576,7 +9617,7 @@ async def get_versions(
 # ===================== Latest =====================
 
 
-@drawing_router.get("/latest", response_model=list[s.DrawingOut])
+#@drawing_router.get("/latest", response_model=list[s.DrawingOut])
 @drawing_router.get("/{project_id}/latest", response_model=list[s.DrawingOut])
 async def get_latest(
     db: AsyncSession = Depends(get_db_session),
@@ -9589,7 +9630,7 @@ async def get_latest(
     )
     if project_id is not None:
         query = query.where(m.DrawingDocument.project_id == project_id)
-        
+
     if parent_id is not None:
         query = query.where(m.DrawingDocument.parent_id == parent_id)
     else:
@@ -9723,7 +9764,9 @@ async def list_requests(
     db: AsyncSession = Depends(get_db_session),
 ):
     result = await db.execute(
-        select(m.SiteRequest).where(m.SiteRequest.project_id == project_id).order_by(m.SiteRequest.created_at.desc())
+        select(m.SiteRequest)
+        .where(m.SiteRequest.project_id == project_id)
+        .order_by(m.SiteRequest.created_at.desc())
     )
     return result.scalars().all()
 
@@ -9754,7 +9797,6 @@ async def reject_request(
 
     await db.commit()
     return {"message": "Rejected"}
-
 
 
 router.include_router(milestones_router)
@@ -9788,6 +9830,7 @@ async def get_project(
     await cache_set_json(redis, cache_key, out.model_dump())
     return out
 
+
 @router.put("/{project_id}", response_model=s.ProjectOut)
 async def update_project(
     project_id: int,
@@ -9812,6 +9855,7 @@ async def update_project(
 
     return out
 
+
 @router.delete("/{project_id}", status_code=200)
 async def delete_project(
     project_id: int,
@@ -9832,4 +9876,3 @@ async def delete_project(
     logger.info(f"Project deleted id={project_id}")
 
     return {"success": True, "message": f"Project_id {project_id} deleted successfully"}
-

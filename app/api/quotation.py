@@ -3,7 +3,9 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
+from starlette import status
 from app.models.billing import RABill
 from app.models.contractor import Contractor
 from app.models.equipment import Equipment
@@ -25,7 +27,9 @@ from app.models.quotation import (
     QuotationStatus,
     QuotationLabour,
 )
-from app.models.user import User, ActivityLog
+
+from app.models.user import User, ActivityLog, UserRole
+from app.models.owner import Owner
 from app.core.dependencies import get_current_active_user
 
 import app.schemas.quotation as s
@@ -41,6 +45,10 @@ from reportlab.platypus import (
     Image,
     KeepTogether,
 )
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/quotations", tags=["Quotations"])
 
@@ -1004,240 +1012,657 @@ def generate_quotation_pdf(
 
     return buffer
 
-
-# =========================================================
+# =====================================================
 # CREATE QUOTATION
-# =========================================================
+# =====================================================
 
 
-@router.post("/", response_model=s.QuotationOut)
+@router.post("/", response_model=s.QuotationOut,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_quotation(
-    payload: s.CreateQuotation, db: AsyncSession = Depends(get_db_session)
+    payload: s.CreateQuotation,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation_no = await generate_quotation_no(db)
+    try:
 
-    quotation = QuotationMaster(
-        quotation_no=quotation_no,
-        # CLIENT DETAILS
-        client_user_id=payload.client_user_id,
-        client_name=payload.client_name,
-        company_name=payload.company_name,
-        mobile_number=payload.mobile_number,
-        email=payload.email,
-        billing_address=payload.billing_address,
-        site_address=payload.site_address,
-        gst_number=payload.gst_number,
-        # PROJECT DETAILS
-        project_name=payload.project_name,
-        project_type=payload.project_type,
-        project_start_date=payload.project_start_date,
-        project_end_date=payload.project_end_date,
-        engineer_name=payload.engineer_name,
-        work_order_no=payload.work_order_no,
-        # TAX DETAILS
-        gst_percent=payload.gst_percent,
-        discount_amount=payload.discount_amount,
-        advance_paid=payload.advance_paid,
-        cgst_percent=payload.cgst_percent,
-        sgst_percent=payload.sgst_percent,
-        tds_percent=payload.tds_percent,
-        # PAYMENT DETAILS
-        payment_mode=payload.payment_mode,
-        upi_id=payload.upi_id,
-        bank_name=payload.bank_name,
-        account_holder_name=payload.account_holder_name,
-        account_number=payload.account_number,
-        ifsc_code=payload.ifsc_code,
-        due_date=payload.due_date,
-        # EXTRA
-        notes=payload.notes,
-        terms_conditions=payload.terms_conditions,
-    )
+        # =====================================================
+        # VALIDATE CLIENT
+        # =====================================================
 
-    db.add(quotation)
+        client = await db.get(User, payload.client_user_id)
 
-    # =====================================================
-    # QUOTATION ITEMS
-    # =====================================================
+        if not client:
+            raise HTTPException(
+                status_code=404,
+                detail="Client not found."
+            )
 
-    for item_data in payload.items:
+        if client.role != UserRole.CLIENT:
+            raise HTTPException(
+                status_code=400,
+                detail="Selected user is not a Client."
+            )
 
-        item = QuotationItem(
-            quotation=quotation,
-            item_type=item_data.item_type,
-            title=item_data.title,
-            description=item_data.description,
-            unit=item_data.unit,
-            rate=item_data.rate,
+        if not client.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail="Selected client is inactive."
+            )
+
+        # =====================================================
+        # ALLOW ONLY ONE ACTIVE QUOTATION PER CLIENT
+        # =====================================================
+
+        existing_quotation = await db.scalar(
+            select(QuotationMaster).where(
+                QuotationMaster.client_user_id == payload.client_user_id,
+                QuotationMaster.status.in_(
+                    [
+                        QuotationStatus.DRAFT,
+                        QuotationStatus.SENT,
+                        QuotationStatus.APPROVED,
+                    ]
+                ),
+            )
         )
 
-        db.add(item)
+        if existing_quotation:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Client already has an active quotation "
+                    f"({existing_quotation.quotation_no}). "
+                    "Reject or delete it before creating another quotation."
+                ),
+            )
 
-        total_quantity = 0
-        total_amount = 0
+        # =====================================================
+        # VALIDATE ITEMS
+        # =====================================================
 
-        # =================================================
-        # MEASUREMENTS
-        # =================================================
+        if not payload.items:
+            raise HTTPException(
+                status_code=400,
+                detail="Quotation must contain at least one item."
+            )
 
-        for m in item_data.measurements:
+        # =====================================================
+        # VALIDATE PAYMENT MODE
+        # =====================================================
 
-            result = calculate_item(
+        payment_mode = None
+
+        if payload.payment_mode:
+
+            payment_mode = payload.payment_mode.strip().upper()
+
+            if payment_mode not in ["BANK", "UPI", "CASH"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid payment mode."
+                )
+
+            if payment_mode == "BANK":
+
+                required_fields = [
+                    payload.bank_name,
+                    payload.account_holder_name,
+                    payload.account_number,
+                    payload.ifsc_code,
+                ]
+
+                if any(not value for value in required_fields):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Bank details are required for BANK payment mode."
+                    )
+
+            elif payment_mode == "UPI":
+
+                if not payload.upi_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="UPI ID is required for UPI payment mode."
+                    )
+
+        # =====================================================
+        # VALIDATE GST PERCENTAGES
+        # =====================================================
+
+        if not 0 <= payload.gst_percent <= 100:
+            raise HTTPException(
+                status_code=400,
+                detail="GST percent must be between 0 and 100."
+            )
+
+        if not 0 <= payload.cgst_percent <= 100:
+            raise HTTPException(
+                status_code=400,
+                detail="CGST percent must be between 0 and 100."
+            )
+
+        if not 0 <= payload.sgst_percent <= 100:
+            raise HTTPException(
+                status_code=400,
+                detail="SGST percent must be between 0 and 100."
+            )
+
+        if not 0 <= payload.tds_percent <= 100:
+            raise HTTPException(
+                status_code=400,
+                detail="TDS percent must be between 0 and 100."
+            )
+
+        if (
+            payload.gst_percent
+            != payload.cgst_percent + payload.sgst_percent
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="GST must be equal to CGST + SGST."
+            )
+
+        # =====================================================
+        # VALIDATE PROJECT DATES
+        # =====================================================
+
+        if (
+            payload.project_start_date
+            and payload.project_end_date
+            and payload.project_end_date < payload.project_start_date
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Project end date cannot be before project start date."
+            )
+
+        # =====================================================
+        # VALIDATE DUE DATE
+        # =====================================================
+
+        if (
+            payload.project_start_date
+            and payload.due_date
+            and payload.due_date < payload.project_start_date
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Due date cannot be before project start date."
+            )
+
+        # =====================================================
+        # VALIDATE LABOUR IDs
+        # =====================================================
+
+        for labour_data in payload.labour_items:
+
+            if labour_data.labour_count <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Labour count must be greater than zero."
+                )
+
+            if labour_data.daily_wage <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Daily wage must be greater than zero."
+                )
+
+            if labour_data.labour_days <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Labour days must be greater than zero."
+                )
+
+            if labour_data.labour_id:
+
+                labour = await db.get(
+                    Labour,
+                    labour_data.labour_id,
+                )
+
+                if not labour:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Labour ID {labour_data.labour_id} not found."
+                    )
+
+        # =====================================================
+        # VALIDATE MATERIAL IDs
+        # =====================================================
+
+        for material_data in payload.material_items:
+
+            if material_data.estimated_quantity <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Material quantity must be greater than zero."
+                )
+
+            if material_data.estimated_rate <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Material rate must be greater than zero."
+                )
+
+            if material_data.material_id:
+
+                material = await db.get(
+                    Material,
+                    material_data.material_id,
+                )
+
+                if not material:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Material ID {material_data.material_id} not found."
+                    )
+
+        # =====================================================
+        # VALIDATE EQUIPMENT IDs
+        # =====================================================
+
+        for extra_data in payload.extra_charge_items:
+
+            if extra_data.quantity <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Extra charge quantity must be greater than zero."
+                )
+
+            if extra_data.rate <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Extra charge rate must be greater than zero."
+                )
+
+            if extra_data.equipment_id:
+
+                equipment = await db.get(
+                    Equipment,
+                    extra_data.equipment_id,
+                )
+
+                if not equipment:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Equipment ID {extra_data.equipment_id} not found."
+                    )
+
+        # =====================================================
+        # GENERATE QUOTATION NUMBER
+        # =====================================================
+
+        quotation_no = await generate_quotation_no(db)
+
+                # =====================================================
+        # CREATE QUOTATION MASTER
+        # =====================================================
+
+        quotation = QuotationMaster(
+
+            quotation_no=quotation_no,
+
+            # CLIENT
+            client_user_id=payload.client_user_id,
+            client_name=payload.client_name,
+            company_name=payload.company_name,
+            mobile_number=payload.mobile_number,
+            email=payload.email,
+            billing_address=payload.billing_address,
+            site_address=payload.site_address,
+            gst_number=payload.gst_number,
+
+            # PROJECT
+            project_name=payload.project_name,
+            project_type=payload.project_type,
+            project_start_date=payload.project_start_date,
+            project_end_date=payload.project_end_date,
+            engineer_name=payload.engineer_name,
+            work_order_no=payload.work_order_no,
+
+            # TAX
+            gst_percent=payload.gst_percent,
+            cgst_percent=payload.cgst_percent,
+            sgst_percent=payload.sgst_percent,
+            tds_percent=payload.tds_percent,
+            discount_amount=payload.discount_amount,
+            advance_paid=payload.advance_paid,
+
+            # PAYMENT
+            payment_mode=payment_mode,
+            upi_id=payload.upi_id,
+            bank_name=payload.bank_name,
+            account_holder_name=payload.account_holder_name,
+            account_number=payload.account_number,
+            ifsc_code=payload.ifsc_code,
+            due_date=payload.due_date,
+
+            # EXTRA
+            notes=payload.notes,
+            terms_conditions=payload.terms_conditions,
+        )
+
+        db.add(quotation)
+
+        # =====================================================
+        # CREATE QUOTATION ITEMS
+        # =====================================================
+
+        for item_data in payload.items:
+
+            if item_data.rate <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Rate must be greater than zero for '{item_data.title}'."
+                )
+
+            if not item_data.measurements:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Measurements are required for '{item_data.title}'."
+                )
+
+            item = QuotationItem(
+                quotation=quotation,
+                item_type=item_data.item_type,
+                title=item_data.title,
+                description=item_data.description,
                 unit=item_data.unit,
-                length=m.length or 0,
-                width=m.width or 0,
-                height=m.height or 0,
                 rate=item_data.rate,
             )
 
-            measurement = MeasurementDetail(
-                quotation_item=item,
-                length=m.length,
-                width=m.width,
-                height=m.height,
-                unit=m.unit,
-                cubic_feet=result["cubic_feet"],
-                cubic_meter=result["cubic_meter"],
-                brass=result["brass"],
-                quantity=result["quantity"],
-                formula_used=result["formula"],
+            db.add(item)
+
+            total_quantity = 0.0
+            total_amount = 0.0
+
+            # =================================================
+            # CREATE MEASUREMENTS
+            # =================================================
+
+            for measurement_data in item_data.measurements:
+
+                if (
+                    (measurement_data.length or 0) <= 0
+                    or (measurement_data.width or 0) <= 0
+                    or (measurement_data.height or 0) <= 0
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Invalid measurement values for "
+                            f"'{item_data.title}'."
+                        ),
+                    )
+
+                result = calculate_item(
+                    unit=item_data.unit,
+                    length=measurement_data.length,
+                    width=measurement_data.width,
+                    height=measurement_data.height,
+                    rate=item_data.rate,
+                )
+
+                measurement = MeasurementDetail(
+                    quotation_item=item,
+                    length=measurement_data.length,
+                    width=measurement_data.width,
+                    height=measurement_data.height,
+                    unit=measurement_data.unit,
+                    cubic_feet=result["cubic_feet"],
+                    cubic_meter=result["cubic_meter"],
+                    brass=result["brass"],
+                    quantity=result["quantity"],
+                    formula_used=result["formula"],
+                )
+
+                db.add(measurement)
+
+                total_quantity += result["quantity"]
+                total_amount += result["amount"]
+
+            item.quantity = round(total_quantity, 2)
+            item.amount = round(total_amount, 2)
+
+        # =====================================================
+        # FLUSH MASTER + ITEMS
+        # =====================================================
+
+        await db.flush()
+
+                # =====================================================
+        # CREATE LABOUR ITEMS
+        # =====================================================
+
+        for labour_data in payload.labour_items:
+
+            amount = calculate_labour_amount(
+                labour_count=labour_data.labour_count,
+                daily_wage=labour_data.daily_wage,
+                labour_days=labour_data.labour_days,
+                overtime_hours=labour_data.overtime_hours,
+                overtime_rate=labour_data.overtime_rate,
             )
 
-            db.add(measurement)
+            labour_item = QuotationLabour(
+                quotation=quotation,
+                labour_id=labour_data.labour_id,
+                skill_type=labour_data.skill_type,
+                labour_count=labour_data.labour_count,
+                daily_wage=labour_data.daily_wage,
+                labour_days=labour_data.labour_days,
+                overtime_hours=labour_data.overtime_hours,
+                overtime_rate=labour_data.overtime_rate,
+                amount=amount,
+                notes=labour_data.notes,
+            )
 
-            total_quantity += result["quantity"]
+            db.add(labour_item)
 
-            total_amount += result["amount"]
+        # =====================================================
+        # CREATE MATERIAL ITEMS
+        # =====================================================
 
-        item.quantity = round(total_quantity, 2)
+        for material_data in payload.material_items:
 
-        item.amount = round(total_amount, 2)
+            estimated_amount = round(
+                material_data.estimated_quantity
+                * material_data.estimated_rate,
+                2,
+            )
 
-    # =====================================================
-    # LABOUR ITEMS
-    # =====================================================
+            material_item = QuotationMaterial(
+                quotation=quotation,
+                material_id=material_data.material_id,
+                material_name=material_data.material_name,
+                category=material_data.category,
+                unit=material_data.unit,
+                estimated_quantity=material_data.estimated_quantity,
+                estimated_rate=material_data.estimated_rate,
+                estimated_amount=estimated_amount,
+                notes=material_data.notes,
+            )
 
-    for labour_data in payload.labour_items:
+            db.add(material_item)
 
-        # ================================================
-        # OPTIONAL LABOUR VALIDATION
-        # ================================================
+        # =====================================================
+        # CREATE EXTRA CHARGES
+        # =====================================================
 
-        if labour_data.labour_id:
+        for extra_data in payload.extra_charge_items:
 
-            labour = await db.get(Labour, labour_data.labour_id)
+            amount = round(
+                extra_data.quantity * extra_data.rate,
+                2,
+            )
 
-            if not labour:
-                raise HTTPException(404, "Labour not found")
+            extra_charge = QuotationExtraCharge(
+                quotation=quotation,
+                equipment_id=extra_data.equipment_id,
+                expense_type=extra_data.expense_type,
+                description=extra_data.description,
+                quantity=extra_data.quantity,
+                rate=extra_data.rate,
+                amount=amount,
+                notes=extra_data.notes,
+            )
 
-        # ================================================
-        # CALCULATE LABOUR AMOUNT
-        # ================================================
+            db.add(extra_charge)
 
-        amount = calculate_labour_amount(
-            labour_count=labour_data.labour_count,
-            daily_wage=labour_data.daily_wage,
-            labour_days=labour_data.labour_days,
-            overtime_hours=labour_data.overtime_hours,
-            overtime_rate=labour_data.overtime_rate,
+        # =====================================================
+        # SAVE ALL CHILD RECORDS
+        # =====================================================
+
+        await db.flush()
+
+        # =====================================================
+        # LOAD RELATIONSHIPS
+        # =====================================================
+
+        await db.refresh(
+            quotation,
+            attribute_names=[
+                "items",
+                "labour_items",
+                "material_items",
+                "extra_charge_items",
+            ],
         )
 
-        labour_item = QuotationLabour(
-            quotation=quotation,
-            labour_id=labour_data.labour_id,
-            skill_type=labour_data.skill_type,
-            labour_count=labour_data.labour_count,
-            daily_wage=labour_data.daily_wage,
-            labour_days=labour_data.labour_days,
-            overtime_hours=labour_data.overtime_hours,
-            overtime_rate=labour_data.overtime_rate,
-            amount=amount,
-            notes=labour_data.notes,
+        # =====================================================
+        # CALCULATE TOTALS
+        # =====================================================
+
+        calculate_quotation_totals(quotation)
+
+        # =====================================================
+        # VALIDATE TOTALS
+        # =====================================================
+
+        if quotation.discount_amount < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Discount amount cannot be negative."
+            )
+
+        if quotation.discount_amount > quotation.subtotal:
+            raise HTTPException(
+                status_code=400,
+                detail="Discount amount cannot exceed subtotal."
+            )
+
+        if quotation.advance_paid < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Advance amount cannot be negative."
+            )
+
+        if quotation.advance_paid > quotation.grand_total:
+            raise HTTPException(
+                status_code=400,
+                detail="Advance paid cannot exceed grand total."
+            )
+
+        quotation.balance_due = round(
+            quotation.grand_total - quotation.advance_paid,
+            2,
         )
 
-        db.add(labour_item)
+        # =====================================================
+        # SAVE UPDATED TOTALS
+        # =====================================================
 
-    # =====================================================
-    # MATERIAL ITEMS
-    # =====================================================
+        await db.flush()
+                # =====================================================
+        # ACTIVITY LOG
+        # =====================================================
 
-    for material_data in payload.material_items:
-
-        if material_data.material_id:
-
-            material = await db.get(Material, material_data.material_id)
-
-            if not material:
-                raise HTTPException(404, "Material not found")
-
-        estimated_amount = (
-            material_data.estimated_quantity * material_data.estimated_rate
+        db.add(
+            ActivityLog(
+                action="CREATE_QUOTATION",
+                entity="quotation",
+                entity_id=quotation.id,
+                performed_by=current_user.id,
+                details={
+                    "quotation_no": quotation.quotation_no,
+                    "client_id": quotation.client_user_id,
+                    "client_name": quotation.client_name,
+                    "status": quotation.status.value,
+                    "subtotal": quotation.subtotal,
+                    "grand_total": quotation.grand_total,
+                },
+            )
         )
 
-        material_item = QuotationMaterial(
-            quotation=quotation,
-            material_id=material_data.material_id,
-            material_name=material_data.material_name,
-            category=material_data.category,
-            unit=material_data.unit,
-            estimated_quantity=material_data.estimated_quantity,
-            estimated_rate=material_data.estimated_rate,
-            estimated_amount=estimated_amount,
-            notes=material_data.notes,
+        # =====================================================
+        # SAVE ACTIVITY LOG
+        # =====================================================
+
+        await db.flush()
+
+        # =====================================================
+        # COMMIT TRANSACTION
+        # =====================================================
+
+        await db.commit()
+
+        # =====================================================
+        # REFRESH QUOTATION
+        # =====================================================
+
+        await db.refresh(quotation)
+
+        # =====================================================
+        # RETURN COMPLETE OBJECT
+        # =====================================================
+
+        return await get_quotation_or_404(
+            quotation.id,
+            db,
         )
 
-        db.add(material_item)
-
     # =====================================================
-    # EXTRA CHARGE ITEMS
+    # HTTP EXCEPTION
     # =====================================================
 
-    for extra_data in payload.extra_charge_items:
+    except HTTPException:
+        await db.rollback()
+        raise
 
-        if extra_data.equipment_id:
+    # =====================================================
+    # DATABASE ERROR
+    # =====================================================
 
-            equipment = await db.get(Equipment, extra_data.equipment_id)
+    except IntegrityError as e:
+        await db.rollback()
 
-            if not equipment:
-                raise HTTPException(404, "Equipment not found")
+        logger.exception("Integrity error while creating quotation")
 
-        amount = extra_data.quantity * extra_data.rate
-
-        extra_charge = QuotationExtraCharge(
-            quotation=quotation,
-            equipment_id=extra_data.equipment_id,
-            expense_type=extra_data.expense_type,
-            description=extra_data.description,
-            quantity=extra_data.quantity,
-            rate=extra_data.rate,
-            amount=amount,
-            notes=extra_data.notes,
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Database integrity error. Duplicate or invalid reference detected.",
         )
 
-        db.add(extra_charge)
-
     # =====================================================
-    # FINAL TOTALS
+    # UNEXPECTED ERROR
     # =====================================================
-    await db.flush()
-    await db.refresh(
-        quotation,
-        attribute_names=[
-            "items",
-            "labour_items",
-            "material_items",
-            "extra_charge_items",
-        ],
-    )
 
-    calculate_quotation_totals(quotation)
+    except Exception as e:
+        await db.rollback()
 
-    await db.commit()
+        logger.exception(
+            "Unexpected error while creating quotation",
+            exc_info=True,
+        )
 
-    await db.refresh(quotation)
-
-    return await get_quotation_or_404(quotation.id, db)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create quotation. Please try again later.",
+        )
 
 
 # =========================================================
@@ -1247,8 +1672,11 @@ async def create_quotation(
 
 @router.get("/", response_model=list[s.QuotationOut])
 async def list_quotations(
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(50, ge=1, le=200, description="Max records to return"),
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     query = select(QuotationMaster).options(
@@ -1261,6 +1689,8 @@ async def list_quotations(
     if project_id:
         query = query.where(QuotationMaster.project_id == project_id)
 
+    query = query.order_by(QuotationMaster.id.desc()).offset(skip).limit(limit)
+
     result = await db.execute(query)
 
     return result.scalars().unique().all()
@@ -1272,7 +1702,11 @@ async def list_quotations(
 
 
 @router.get("/{quotation_id}", response_model=s.QuotationOut)
-async def get_quotation(quotation_id: int, db: AsyncSession = Depends(get_db_session)):
+async def get_quotation(
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
+):
 
     return await get_quotation_or_404(quotation_id, db)
 
@@ -1287,6 +1721,7 @@ async def update_quotation(
     quotation_id: int,
     payload: s.UpdateQuotation,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
@@ -1303,10 +1738,36 @@ async def update_quotation(
 
     update_data = payload.model_dump(exclude_unset=True)
 
+    # =====================================================
+    # CROSS-FIELD DATE VALIDATION AGAINST STORED VALUES
+    # (Pydantic can only validate the payload in isolation,
+    #  a partial update needs to be checked against the
+    #  values that will actually end up persisted)
+    # =====================================================
+
+    new_start = update_data.get("project_start_date", quotation.project_start_date)
+    new_end = update_data.get("project_end_date", quotation.project_end_date)
+
+    if new_start and new_end and new_end < new_start:
+        raise HTTPException(
+            status_code=400,
+            detail="Project end date cannot be before start date.",
+        )
+
     for key, value in update_data.items():
         setattr(quotation, key, value)
 
     calculate_quotation_totals(quotation)
+
+    db.add(
+        ActivityLog(
+            action="UPDATE_QUOTATION",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={"updated_fields": list(update_data.keys())},
+        )
+    )
 
     await db.commit()
     await db.refresh(quotation)
@@ -1321,7 +1782,9 @@ async def update_quotation(
 
 @router.delete("/{quotation_id}")
 async def delete_quotation(
-    quotation_id: int, db: AsyncSession = Depends(get_db_session)
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
@@ -1332,6 +1795,16 @@ async def delete_quotation(
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be deleted")
+
+    db.add(
+        ActivityLog(
+            action="DELETE_QUOTATION",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={"quotation_no": quotation.quotation_no},
+        )
+    )
 
     await db.delete(quotation)
 
@@ -1350,12 +1823,27 @@ async def add_quotation_item(
     quotation_id: int,
     payload: s.QuotationItemCreate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
 
+    # =====================================================
+    # APPROVED CHECK
+    # =====================================================
+
+    if quotation.is_approved:
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be modified"
+        )
+
+    # =====================================================
+    # CREATE ITEM
+    # =====================================================
+
     item = QuotationItem(
-        quotation_id=quotation.id,
+        quotation=quotation,
         item_type=payload.item_type,
         title=payload.title,
         description=payload.description,
@@ -1367,6 +1855,10 @@ async def add_quotation_item(
 
     total_quantity = 0
     total_amount = 0
+
+    # =====================================================
+    # MEASUREMENTS
+    # =====================================================
 
     for m in payload.measurements:
 
@@ -1396,16 +1888,39 @@ async def add_quotation_item(
         total_quantity += result["quantity"]
         total_amount += result["amount"]
 
-    item.quantity = round(total_quantity, 2)
+    # =====================================================
+    # ITEM TOTALS
+    # =====================================================
 
+    item.quantity = round(total_quantity, 2)
     item.amount = round(total_amount, 2)
 
+    # =====================================================
+    # SAVE ITEM
+    # =====================================================
+
     await db.flush()
+
     calculate_quotation_totals(quotation)
+
+    db.add(
+        ActivityLog(
+            action="ADD_QUOTATION_ITEM",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={
+                "item_title": item.title,
+                "quotation_no": quotation.quotation_no,
+            },
+        )
+    )
 
     await db.commit()
 
-    return await get_quotation_or_404(quotation_id, db)
+    await db.refresh(quotation)
+
+    return await get_quotation_or_404(quotation.id, db)
 
 
 # =========================================================
@@ -1413,11 +1928,12 @@ async def add_quotation_item(
 # =========================================================
 
 
-@router.put("/quotation-items/{item_id}")
+@router.put("/quotation-items/{item_id}", response_model=s.QuotationOut)
 async def update_quotation_item(
     item_id: int,
     payload: s.QuotationItemUpdate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     result = await db.execute(
@@ -1429,30 +1945,42 @@ async def update_quotation_item(
     item = result.scalars().first()
 
     if not item:
-        raise HTTPException(404, "Quotation item not found")
+        raise HTTPException(status_code=404, detail="Quotation item not found")
 
     quotation = await get_quotation_or_404(item.quotation_id, db)
 
     # =====================================================
-    # APPROVED CHECK
+    # ONLY DRAFT QUOTATION CAN BE MODIFIED
     # =====================================================
 
     if quotation.is_approved:
-        raise HTTPException(400, "Approved quotation cannot be modified")
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be modified",
+        )
 
     update_data = payload.model_dump(exclude_unset=True)
 
-    for key, value in update_data.items():
+    unit_changed = (
+        "unit" in update_data
+        and update_data["unit"] != item.unit
+    )
 
+    # =====================================================
+    # UPDATE NORMAL FIELDS
+    # =====================================================
+
+    for key, value in update_data.items():
         if key != "measurements":
             setattr(item, key, value)
 
     # =====================================================
-    # RECALCULATE MEASUREMENTS
+    # UPDATE MEASUREMENTS
     # =====================================================
 
     if payload.measurements is not None:
 
+        # delete old measurements
         for old in item.measurements:
             await db.delete(old)
 
@@ -1464,11 +1992,11 @@ async def update_quotation_item(
         for m in payload.measurements:
 
             result = calculate_item(
-                unit=payload.unit or item.unit,
+                unit=item.unit,
                 length=m.length or 0,
                 width=m.width or 0,
                 height=m.height or 0,
-                rate=payload.rate or item.rate,
+                rate=item.rate,
             )
 
             measurement = MeasurementDetail(
@@ -1487,18 +2015,53 @@ async def update_quotation_item(
             db.add(measurement)
 
             total_quantity += result["quantity"]
-
             total_amount += result["amount"]
 
         item.quantity = round(total_quantity, 2)
-
         item.amount = round(total_amount, 2)
 
-    else:
+    # =====================================================
+    # UNIT CHANGED
+    # =====================================================
 
-        # =================================================
-        # RATE UPDATE ONLY
-        # =================================================
+    elif unit_changed:
+
+        if not item.measurements:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot change unit without measurements.",
+            )
+
+        total_quantity = 0
+        total_amount = 0
+
+        for existing in item.measurements:
+
+            result = calculate_item(
+                unit=item.unit,
+                length=existing.length or 0,
+                width=existing.width or 0,
+                height=existing.height or 0,
+                rate=item.rate,
+            )
+
+            existing.cubic_feet = result["cubic_feet"]
+            existing.cubic_meter = result["cubic_meter"]
+            existing.brass = result["brass"]
+            existing.quantity = result["quantity"]
+            existing.formula_used = result["formula"]
+
+            total_quantity += result["quantity"]
+            total_amount += result["amount"]
+
+        item.quantity = round(total_quantity, 2)
+        item.amount = round(total_amount, 2)
+
+    # =====================================================
+    # ONLY RATE UPDATED
+    # =====================================================
+
+    elif "rate" in update_data:
 
         item.amount = round(item.quantity * item.rate, 2)
 
@@ -1510,10 +2073,24 @@ async def update_quotation_item(
 
     calculate_quotation_totals(quotation)
 
+    db.add(
+        ActivityLog(
+            action="UPDATE_QUOTATION_ITEM",
+            entity="quotation_item",
+            entity_id=item.id,
+            performed_by=current_user.id,
+            details={
+                "quotation_id": quotation.id,
+                "item_title": item.title,
+            },
+        )
+    )
+
     await db.commit()
 
-    return {"message": "Quotation item updated successfully"}
+    await db.refresh(quotation)
 
+    return await get_quotation_or_404(quotation.id, db)
 
 # =========================================================
 # DELETE ITEM
@@ -1522,7 +2099,9 @@ async def update_quotation_item(
 
 @router.delete("/quotation-items/{item_id}")
 async def delete_quotation_item(
-    item_id: int, db: AsyncSession = Depends(get_db_session)
+    item_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     result = await db.execute(select(QuotationItem).where(QuotationItem.id == item_id))
@@ -1540,6 +2119,11 @@ async def delete_quotation_item(
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
+
+    # Unlink from the already-loaded collection first so the total
+    # recalculated below doesn't still include this item's amount.
+    if item in quotation.items:
+        quotation.items.remove(item)
 
     await db.delete(item)
 
@@ -1563,7 +2147,9 @@ async def delete_quotation_item(
 
 @router.get("/{quotation_id}/preview", response_model=s.QuotationOut)
 async def preview_quotation(
-    quotation_id: int, db: AsyncSession = Depends(get_db_session)
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     return await get_quotation_or_404(quotation_id, db)
@@ -1627,6 +2213,7 @@ async def reject_quotation(
     quotation_id: int,
     payload: s.RejectQuotation,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
@@ -1648,8 +2235,24 @@ async def reject_quotation(
     if quotation.status == QuotationStatus.REJECTED:
         raise HTTPException(status_code=400, detail="Quotation is already rejected.")
 
+    # Already converted - this is a terminal state and must not be reopened
+    if quotation.status == QuotationStatus.CONVERTED:
+        raise HTTPException(
+            status_code=400, detail="Converted quotation cannot be rejected."
+        )
+
     quotation.status = QuotationStatus.REJECTED
     quotation.rejected_reason = payload.reason
+
+    db.add(
+        ActivityLog(
+            action="REJECT_QUOTATION",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={"reason": payload.reason},
+        )
+    )
 
     await db.commit()
 
@@ -1667,9 +2270,23 @@ async def convert_to_bill(
     project_id: int,  # Required query parameter
     contractor_id: int,  # Required query parameter
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
-    # GET QUOTATION
+    # GET QUOTATION AND LOCK THE ROW so a concurrent conversion
+    # request can't pass the converted_to_bill check before this
+    # transaction commits (reduces, though without a DB-level
+    # unique constraint on RABill.quotation_id cannot fully close,
+    # the double-conversion race).
+
+    lock_result = await db.execute(
+        select(QuotationMaster)
+        .where(QuotationMaster.id == quotation_id)
+        .with_for_update()
+    )
+    locked = lock_result.scalars().first()
+    if not locked:
+        raise HTTPException(404, "Quotation not found")
 
     quotation = await get_quotation_or_404(quotation_id, db)
 
@@ -1744,6 +2361,16 @@ async def convert_to_bill(
     quotation.converted_to_bill = True
     quotation.status = QuotationStatus.CONVERTED
 
+    db.add(
+        ActivityLog(
+            action="CONVERT_QUOTATION_TO_BILL",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={"bill_id": bill.id, "bill_number": bill.bill_number},
+        )
+    )
+
     await db.commit()
 
     return {
@@ -1758,181 +2385,6 @@ async def convert_to_bill(
 
 
 # =========================================================
-# CONVERT TO INVOICE
-# =========================================================
-# IMPORTANT:
-# Do NOT use generate_business_id() here because your Invoice model
-# does not have either `invoice_number` or `invoice_no`.
-#
-# Your actual Invoice model (used in app/api/invoice.py) relies on:
-# - id (primary key)
-# - project_id
-# - owner_id
-# - quotation_id
-# - type
-# - amount
-# - gst_percent
-# - gst_amount
-# - tax_percent
-# - tax_amount
-# - total_amount
-# - paid_amount
-# - pending_amount
-# - status
-# - description
-#
-# So create the invoice exactly like /api/v1/invoices/from-quotation does.
-
-from app.models.invoice import Invoice
-from app.models.owner import Owner, OwnerTransaction
-from app.models.project import Project
-from decimal import Decimal
-
-# @router.post("/{quotation_id}/convert-to-invoice")
-# async def convert_to_invoice(
-#     quotation_id: int,
-#     db: AsyncSession = Depends(get_db_session)
-# ):
-#     # =====================================================
-#     # 1. GET QUOTATION
-#     # =====================================================
-#     quotation = await get_quotation_or_404(quotation_id, db)
-
-#     # =====================================================
-#     # 2. APPROVAL CHECK
-#     # =====================================================
-#     if not quotation.is_approved:
-#         raise HTTPException(400, "Quotation must be approved first")
-
-#     # =====================================================
-#     # 3. DUPLICATE CHECK
-#     # =====================================================
-#     if quotation.converted_to_invoice:
-#         raise HTTPException(400, "Already converted to invoice")
-
-#     # =====================================================
-#     # 4. PROJECT CHECK
-#     # =====================================================
-#     if not quotation.project_id:
-#         raise HTTPException(
-#             400,
-#             "Quotation is not linked to any project"
-#         )
-
-#     # =====================================================
-#     # 5. LOAD PROJECT
-#     # =====================================================
-#     project = await db.get(Project, quotation.project_id)
-
-#     if not project:
-#         raise HTTPException(404, "Project not found")
-
-#     # =====================================================
-#     # 6. PREVENT DUPLICATE INVOICE
-#     # =====================================================
-#     existing_invoice = await db.scalar(
-#         select(Invoice).where(
-#             Invoice.quotation_id == quotation.id
-#         )
-#     )
-
-#     if existing_invoice:
-#         raise HTTPException(
-#             400,
-#             "Invoice already exists for this quotation"
-#         )
-
-#     # =====================================================
-#     # 7. CALCULATE GST %
-#     # =====================================================
-#     gst_percent = Decimal(
-#         (quotation.cgst_percent or 0)
-#         + (quotation.sgst_percent or 0)
-#     )
-
-#     grand_total = Decimal(str(quotation.grand_total or 0))
-
-#     # =====================================================
-#     # 8. CREATE INVOICE
-#     # =====================================================
-#     invoice = Invoice(
-#         project_id=quotation.project_id,
-#         owner_id=project.owner_id,
-
-#         quotation_id=quotation.id,
-
-#         type="owner",
-#         reference_id=quotation.id,
-
-#         amount=Decimal(str(quotation.subtotal or 0)),
-
-#         gst_percent=gst_percent,
-#         gst_amount=Decimal(str(quotation.gst_amount or 0)),
-
-#         tax_percent=Decimal(str(quotation.tds_percent or 0)),
-#         tax_amount=Decimal(str(quotation.tds_amount or 0)),
-
-#         total_amount=grand_total,
-
-#         paid_amount=Decimal("0"),
-#         pending_amount=grand_total,
-
-#         status="pending",
-
-#         description=(
-#             f"Invoice generated from quotation "
-#             f"{quotation.quotation_no}"
-#         ),
-#     )
-
-#     db.add(invoice)
-
-#     # Generate invoice.id
-#     await db.flush()
-
-#     # =====================================================
-#     # 9. OWNER LEDGER ENTRY
-#     # =====================================================
-#     owner_txn = OwnerTransaction(
-#         owner_id=project.owner_id,
-#         project_id=quotation.project_id,
-#         type="credit",
-#         amount=grand_total,
-#         reference_type="invoice",
-#         reference_id=invoice.id,
-#         description=(
-#             f"Invoice generated from quotation "
-#             f"{quotation.quotation_no}"
-#         ),
-#     )
-
-#     db.add(owner_txn)
-
-#     # =====================================================
-#     # 10. UPDATE QUOTATION
-#     # =====================================================
-#     quotation.converted_to_invoice = True
-#     quotation.status = QuotationStatus.CONVERTED
-
-#     # =====================================================
-#     # 11. SAVE
-#     # =====================================================
-#     await db.commit()
-
-#     # Refresh invoice
-#     await db.refresh(invoice)
-
-#     # =====================================================
-#     # 12. RESPONSE
-#     # =====================================================
-#     return {
-#         "message": "Converted to invoice successfully",
-#         "invoice_id": invoice.id,
-#         "invoice_total": float(invoice.total_amount),
-#         "invoice_status": invoice.status,
-#     }
-
-# =========================================================
 # CONVERT TO WORK ORDER
 # =========================================================
 
@@ -1943,6 +2395,7 @@ async def convert_to_work_order(
     project_id: int,  # Required query parameter
     contractor_id: int,  # Required query parameter
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
     from decimal import Decimal
 
@@ -1952,8 +2405,17 @@ async def convert_to_work_order(
     from app.utils.common import generate_business_id
 
     # =====================================================
-    # GET QUOTATION
+    # LOCK THE QUOTATION ROW (see note in convert_to_bill)
     # =====================================================
+
+    lock_result = await db.execute(
+        select(QuotationMaster)
+        .where(QuotationMaster.id == quotation_id)
+        .with_for_update()
+    )
+    locked = lock_result.scalars().first()
+    if not locked:
+        raise HTTPException(404, "Quotation not found")
 
     quotation = await get_quotation_or_404(quotation_id, db)
 
@@ -2033,6 +2495,19 @@ async def convert_to_work_order(
     quotation.converted_to_work_order = True
     quotation.status = QuotationStatus.CONVERTED
 
+    db.add(
+        ActivityLog(
+            action="CONVERT_QUOTATION_TO_WORK_ORDER",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={
+                "work_order_id": work_order.id,
+                "work_order_number": work_order.work_order_number,
+            },
+        )
+    )
+
     await db.commit()
 
     return {
@@ -2051,24 +2526,30 @@ async def convert_to_work_order(
 # =========================================================
 
 
-@router.post("/{quotation_id}/labour")
+@router.post("/{quotation_id}/labour", response_model=s.QuotationOut)
 async def add_labour_item(
     quotation_id: int,
     payload: s.QuotationLabourCreate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
 
     if quotation.is_approved:
-        raise HTTPException(400, "Approved quotation cannot be modified")
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be modified"
+        )
 
     if payload.labour_id:
-
         labour = await db.get(Labour, payload.labour_id)
 
         if not labour:
-            raise HTTPException(404, "Labour not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Labour not found"
+            )
 
     amount = calculate_labour_amount(
         labour_count=payload.labour_count,
@@ -2094,43 +2575,100 @@ async def add_labour_item(
     db.add(labour_item)
 
     await db.flush()
+
+    await db.refresh(quotation, attribute_names=["labour_items"])
+
     calculate_quotation_totals(quotation)
+
+    db.add(
+        ActivityLog(
+            action="ADD_QUOTATION_LABOUR",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={
+                "labour_item_id": labour_item.id,
+                "skill_type": labour_item.skill_type,
+            },
+        )
+    )
 
     await db.commit()
 
-    return {"message": "Labour item added successfully"}
+    await db.refresh(quotation)
 
+    return await get_quotation_or_404(quotation.id, db)
 
 # =========================================================
 # UPDATE LABOUR ITEM
 # =========================================================
 
 
-@router.put("/labour/{labour_item_id}")
+@router.put("/labour/{labour_item_id}", response_model=s.QuotationOut)
 async def update_labour_item(
     labour_item_id: int,
     payload: s.QuotationLabourUpdate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     result = await db.execute(
-        select(QuotationLabour).where(QuotationLabour.id == labour_item_id)
+        select(QuotationLabour).where(
+            QuotationLabour.id == labour_item_id
+        )
     )
 
     labour_item = result.scalars().first()
 
     if not labour_item:
-        raise HTTPException(404, "Labour item not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Labour item not found"
+        )
 
-    quotation = await get_quotation_or_404(labour_item.quotation_id, db)
+    quotation = await get_quotation_or_404(
+        labour_item.quotation_id,
+        db,
+    )
+
+    # =====================================================
+    # APPROVED QUOTATION CANNOT BE MODIFIED
+    # =====================================================
 
     if quotation.is_approved:
-        raise HTTPException(400, "Approved quotation cannot be modified")
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be modified"
+        )
+
+    # =====================================================
+    # VALIDATE LABOUR ID IF UPDATED
+    # =====================================================
+
+    if (
+        payload.labour_id is not None
+        and payload.labour_id != labour_item.labour_id
+    ):
+        labour = await db.get(Labour, payload.labour_id)
+
+        if not labour:
+            raise HTTPException(
+                status_code=404,
+                detail="Labour not found"
+            )
+
+    # =====================================================
+    # UPDATE FIELDS
+    # =====================================================
 
     update_data = payload.model_dump(exclude_unset=True)
 
     for key, value in update_data.items():
         setattr(labour_item, key, value)
+
+    # =====================================================
+    # RECALCULATE LABOUR AMOUNT
+    # =====================================================
 
     labour_item.amount = calculate_labour_amount(
         labour_count=labour_item.labour_count,
@@ -2141,12 +2679,35 @@ async def update_labour_item(
     )
 
     await db.flush()
+
+    await db.refresh(
+        quotation,
+        attribute_names=["labour_items"],
+    )
+
     calculate_quotation_totals(quotation)
+
+    db.add(
+        ActivityLog(
+            action="UPDATE_QUOTATION_LABOUR",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={
+                "labour_item_id": labour_item.id,
+                "skill_type": labour_item.skill_type,
+            },
+        )
+    )
 
     await db.commit()
 
-    return {"message": "Labour item updated successfully"}
+    await db.refresh(quotation)
 
+    return await get_quotation_or_404(
+        quotation.id,
+        db,
+    )
 
 # =========================================================
 # DELETE LABOUR ITEM
@@ -2155,7 +2716,9 @@ async def update_labour_item(
 
 @router.delete("/labour/{labour_item_id}")
 async def delete_labour_item(
-    labour_item_id: int, db: AsyncSession = Depends(get_db_session)
+    labour_item_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     result = await db.execute(
@@ -2171,6 +2734,9 @@ async def delete_labour_item(
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
+
+    if labour_item in quotation.labour_items:
+        quotation.labour_items.remove(labour_item)
 
     await db.delete(labour_item)
 
@@ -2187,29 +2753,50 @@ async def delete_labour_item(
 # =========================================================
 
 
-@router.post("/{quotation_id}/materials")
+@router.post("/{quotation_id}/materials", response_model=s.QuotationOut)
 async def add_material_item(
     quotation_id: int,
     payload: s.QuotationMaterialCreate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
 
+    # =====================================================
+    # APPROVED CHECK
+    # =====================================================
+
     if quotation.is_approved:
-        raise HTTPException(400, "Approved quotation cannot be modified")
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be modified"
+        )
+
+    # =====================================================
+    # VALIDATE MATERIAL
+    # =====================================================
 
     if payload.material_id:
 
         material = await db.get(Material, payload.material_id)
 
         if not material:
-            raise HTTPException(404, "Material not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Material not found"
+            )
 
-    estimated_amount = payload.estimated_quantity * payload.estimated_rate
+    # =====================================================
+    # CALCULATE AMOUNT
+    # =====================================================
+
+    estimated_amount = (
+        payload.estimated_quantity * payload.estimated_rate
+    )
 
     material_item = QuotationMaterial(
-        quotation_id=quotation.id,
+        quotation=quotation,
         material_id=payload.material_id,
         material_name=payload.material_name,
         category=payload.category,
@@ -2220,58 +2807,151 @@ async def add_material_item(
         notes=payload.notes,
     )
 
+    # =====================================================
+    # ADD TO SESSION (IMPORTANT)
+    # =====================================================
+
     db.add(material_item)
 
+    # =====================================================
+    # SAVE
+    # =====================================================
+
     await db.flush()
+
     calculate_quotation_totals(quotation)
+
+    db.add(
+        ActivityLog(
+            action="ADD_QUOTATION_MATERIAL",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={
+                "material_name": material_item.material_name
+            },
+        )
+    )
 
     await db.commit()
 
-    return {"message": "Material item added successfully"}
+    await db.refresh(
+        quotation,
+        attribute_names=[
+            "items",
+            "labour_items",
+            "material_items",
+            "extra_charge_items",
+        ],
+    )
 
+    return await get_quotation_or_404(quotation.id, db)
 
 # =========================================================
 # UPDATE MATERIAL ITEM
 # =========================================================
 
 
-@router.put("/quotation-materials/{material_item_id}")
+@router.put("/quotation-materials/{material_item_id}", response_model=s.QuotationOut)
 async def update_material_item(
     material_item_id: int,
     payload: s.QuotationMaterialUpdate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     result = await db.execute(
-        select(QuotationMaterial).where(QuotationMaterial.id == material_item_id)
+        select(QuotationMaterial).where(
+            QuotationMaterial.id == material_item_id
+        )
     )
 
     material_item = result.scalars().first()
 
     if not material_item:
-        raise HTTPException(404, "Material item not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Material item not found"
+        )
 
     quotation = await get_quotation_or_404(material_item.quotation_id, db)
 
+    # =====================================================
+    # APPROVED CHECK
+    # =====================================================
+
     if quotation.is_approved:
-        raise HTTPException(400, "Approved quotation cannot be modified")
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be modified"
+        )
+
+    # =====================================================
+    # VALIDATE MATERIAL ID (IF UPDATED)
+    # =====================================================
+
+    if payload.material_id:
+
+        material = await db.get(Material, payload.material_id)
+
+        if not material:
+            raise HTTPException(
+                status_code=404,
+                detail="Material not found"
+            )
+
+    # =====================================================
+    # UPDATE FIELDS
+    # =====================================================
 
     update_data = payload.model_dump(exclude_unset=True)
 
     for key, value in update_data.items():
         setattr(material_item, key, value)
 
-    material_item.estimated_amount = (
-        material_item.estimated_quantity * material_item.estimated_rate
+    # =====================================================
+    # RECALCULATE AMOUNT
+    # =====================================================
+
+    material_item.estimated_amount = round(
+        material_item.estimated_quantity * material_item.estimated_rate,
+        2,
     )
 
+    # =====================================================
+    # RECALCULATE QUOTATION TOTALS
+    # =====================================================
+
     await db.flush()
+
     calculate_quotation_totals(quotation)
+
+    db.add(
+        ActivityLog(
+            action="UPDATE_QUOTATION_MATERIAL",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={
+                "material_item_id": material_item.id,
+                "material_name": material_item.material_name,
+            },
+        )
+    )
 
     await db.commit()
 
-    return {"message": "Material item updated successfully"}
+    await db.refresh(
+        quotation,
+        attribute_names=[
+            "items",
+            "labour_items",
+            "material_items",
+            "extra_charge_items",
+        ],
+    )
 
+    return await get_quotation_or_404(quotation.id, db)
 
 # =========================================================
 # DELETE MATERIAL ITEM
@@ -2280,7 +2960,9 @@ async def update_material_item(
 
 @router.delete("/quotation-materials/{material_item_id}")
 async def delete_material_item(
-    material_item_id: int, db: AsyncSession = Depends(get_db_session)
+    material_item_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     result = await db.execute(
@@ -2296,6 +2978,9 @@ async def delete_material_item(
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
+
+    if material_item in quotation.material_items:
+        quotation.material_items.remove(material_item)
 
     await db.delete(material_item)
 
@@ -2314,7 +2999,9 @@ async def delete_material_item(
 
 @router.get("/{quotation_id}/materials")
 async def list_material_items(
-    quotation_id: int, db: AsyncSession = Depends(get_db_session)
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
@@ -2327,29 +3014,40 @@ async def list_material_items(
 # =========================================================
 
 
-@router.post("/{quotation_id}/extra-charges")
+@router.post("/{quotation_id}/extra-charges", response_model=s.QuotationOut)
 async def add_extra_charge(
     quotation_id: int,
     payload: s.QuotationExtraChargeCreate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
 
     if quotation.is_approved:
-        raise HTTPException(400, "Approved quotation cannot be modified")
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be modified",
+        )
+
+    # ================================================
+    # Equipment Validation
+    # ================================================
 
     if payload.equipment_id:
 
         equipment = await db.get(Equipment, payload.equipment_id)
 
         if not equipment:
-            raise HTTPException(404, "Equipment not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Equipment not found",
+            )
 
     amount = payload.quantity * payload.rate
 
     extra_charge = QuotationExtraCharge(
-        quotation_id=quotation.id,
+        quotation=quotation,
         equipment_id=payload.equipment_id,
         expense_type=payload.expense_type,
         description=payload.description,
@@ -2359,55 +3057,102 @@ async def add_extra_charge(
         notes=payload.notes,
     )
 
+    # IMPORTANT
     db.add(extra_charge)
 
     await db.flush()
+
     calculate_quotation_totals(quotation)
 
     await db.commit()
 
-    return {"message": "Extra charge added successfully"}
+    await db.refresh(extra_charge)
 
+    return await get_quotation_or_404(quotation_id, db)
 
 # =========================================================
 # UPDATE EXTRA CHARGE
 # =========================================================
 
 
-@router.put("/quotation-extra-charges/{extra_charge_id}")
+@router.put(
+    "/quotation-extra-charges/{extra_charge_id}",
+    response_model=s.QuotationOut,
+)
 async def update_extra_charge(
     extra_charge_id: int,
     payload: s.QuotationExtraChargeUpdate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     result = await db.execute(
-        select(QuotationExtraCharge).where(QuotationExtraCharge.id == extra_charge_id)
+        select(QuotationExtraCharge).where(
+            QuotationExtraCharge.id == extra_charge_id
+        )
     )
 
     extra_charge = result.scalars().first()
 
     if not extra_charge:
-        raise HTTPException(404, "Extra charge not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Extra charge not found",
+        )
 
     quotation = await get_quotation_or_404(extra_charge.quotation_id, db)
 
+    # =====================================================
+    # APPROVED CHECK
+    # =====================================================
+
     if quotation.is_approved:
-        raise HTTPException(400, "Approved quotation cannot be modified")
+        raise HTTPException(
+            status_code=400,
+            detail="Approved quotation cannot be modified",
+        )
+
+    # =====================================================
+    # EQUIPMENT VALIDATION
+    # =====================================================
+
+    if payload.equipment_id is not None:
+
+        equipment = await db.get(Equipment, payload.equipment_id)
+
+        if not equipment:
+            raise HTTPException(
+                status_code=404,
+                detail="Equipment not found",
+            )
+
+    # =====================================================
+    # UPDATE FIELDS
+    # =====================================================
 
     update_data = payload.model_dump(exclude_unset=True)
 
     for key, value in update_data.items():
         setattr(extra_charge, key, value)
 
-    extra_charge.amount = extra_charge.quantity * extra_charge.rate
+    # =====================================================
+    # RECALCULATE AMOUNT
+    # =====================================================
+
+    extra_charge.amount = (
+        (extra_charge.quantity or 0)
+        * (extra_charge.rate or 0)
+    )
 
     await db.flush()
+
     calculate_quotation_totals(quotation)
 
     await db.commit()
 
-    return {"message": "Extra charge updated successfully"}
+    await db.refresh(extra_charge)
+
+    return await get_quotation_or_404(quotation.id, db)
 
 
 # =========================================================
@@ -2417,7 +3162,9 @@ async def update_extra_charge(
 
 @router.delete("/quotation-extra-charges/{extra_charge_id}")
 async def delete_extra_charge(
-    extra_charge_id: int, db: AsyncSession = Depends(get_db_session)
+    extra_charge_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     result = await db.execute(
@@ -2433,6 +3180,9 @@ async def delete_extra_charge(
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
+
+    if extra_charge in quotation.extra_charge_items:
+        quotation.extra_charge_items.remove(extra_charge)
 
     await db.delete(extra_charge)
 
@@ -2451,7 +3201,9 @@ async def delete_extra_charge(
 
 @router.get("/{quotation_id}/extra-charges")
 async def list_extra_charges(
-    quotation_id: int, db: AsyncSession = Depends(get_db_session)
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db)
@@ -2465,7 +3217,11 @@ async def list_extra_charges(
 
 
 @router.get("/{quotation_id}/pdf")
-async def generate_pdf(quotation_id: int, db: AsyncSession = Depends(get_db_session)):
+async def generate_pdf(
+    quotation_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
+):
     quotation = await get_quotation_or_404(quotation_id, db)
 
     result = await db.execute(select(CompanySettings))
@@ -2497,7 +3253,18 @@ async def convert_quotation_to_project(
     quotation_id: int,
     payload: s.QuotationToProjectConvertRequest,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
+    # LOCK THE QUOTATION ROW (see note in convert_to_bill)
+    lock_result = await db.execute(
+        select(QuotationMaster)
+        .where(QuotationMaster.id == quotation_id)
+        .with_for_update()
+    )
+    locked = lock_result.scalars().first()
+    if not locked:
+        raise HTTPException(404, "Quotation not found")
+
     quotation = await get_quotation_or_404(quotation_id, db)
 
     if not quotation.is_approved:
@@ -2556,6 +3323,16 @@ async def convert_quotation_to_project(
     # Quotation -> Project -> BOQ -> Tasks
     quotation.project_id = project.id
     quotation.status = QuotationStatus.CONVERTED
+
+    db.add(
+        ActivityLog(
+            action="CONVERT_QUOTATION_TO_PROJECT",
+            entity="quotation",
+            entity_id=quotation.id,
+            performed_by=current_user.id,
+            details={"project_id": project.id, "project_business_id": project.business_id},
+        )
+    )
 
     await db.commit()
     await db.refresh(project)

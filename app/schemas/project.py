@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import List, Optional, Union
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 from typing_extensions import Annotated
 from app.core.enums import (
     ChecklistStatus,
@@ -988,14 +988,23 @@ class DrawingOut(DrawingCreate):
         from_attributes = True
 
 class DrawingFolderCreate(BaseSchema):
-    drawing_name: str
+    folder_name: str
     parent_id: Optional[int] = None
 
-    @field_validator("drawing_name")
+    @field_validator("folder_name")
     def validate_fields(cls, v):
         return validate_non_empty_string(v)
 
 
+class DrawingFolderOut(BaseSchema):
+    id: int
+    project_id: int
+    folder_name: str
+    parent_id: Optional[int] = None
+    is_folder: bool
+
+    class Config:
+        from_attributes = True
 # ===================== CREATE =====================
 
 
