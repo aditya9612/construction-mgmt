@@ -34,6 +34,7 @@ from app.models.user import User
 from app.core.dependencies import require_roles
 
 from app.utils.helpers import NotFoundError, ValidationError
+from app.utils.qr import generate_qr
 
 from app.models.user import UserRole
 
@@ -1684,6 +1685,30 @@ async def create_asset(
 
     return obj
 
+
+@router.get("/assets/{id}/qr", response_class=StreamingResponse)
+async def generate_asset_qr(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+):
+    asset = await db.get(FixedAsset, id)
+
+    if not asset:
+        raise NotFoundError("Asset not found")
+
+    qr_buf = generate_qr(entity_type="AST", entity_id=asset.id)
+
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="asset_{asset.id}.png"'
+    }
+
+    return StreamingResponse(
+        qr_buf,
+        media_type="image/png",
+        headers=headers,
+    )
 
 @router.post("/assets/{id}/depreciate")
 async def depreciate_asset(

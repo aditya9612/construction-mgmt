@@ -25,8 +25,9 @@ from app.schemas.material import MaterialReport
 from app.schemas.material import PriceHistoryOut
 from app.core.enums import IssueType, TransactionType, TransferStatus
 from app.utils.common import generate_business_id
+from app.utils.qr import generate_qr
 from sqlalchemy.orm import selectinload
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from app.services.notification_service import create_notification
 from app.models import project as proj_model
@@ -453,6 +454,32 @@ async def list_suppliers(
 
 # ================Get_supplier===============
 
+@router.get("/suppliers/{supplier_id}/qr", response_class=StreamingResponse)
+async def generate_supplier_qr(
+    supplier_id: int,
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    supplier = await db.get(Supplier, supplier_id)
+
+    if not supplier or supplier.is_deleted:
+        raise HTTPException(
+            status_code=404,
+            detail="Supplier not found",
+        )
+
+    qr_buf = generate_qr(entity_type="VEN", entity_id=supplier.id)
+
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="supplier_{supplier.id}.png"'
+    }
+
+    return StreamingResponse(
+        qr_buf,
+        media_type="image/png",
+        headers=headers
+    )
 
 @router.get("/suppliers/{supplier_id}", response_model=SupplierOut)
 async def get_supplier(
@@ -4042,6 +4069,39 @@ async def list_materials(
 
 
 # ==============get_material=================
+
+async def _get_active_material_or_404(db: AsyncSession, material_id: int):
+    obj = await db.scalar(
+        select(Material).where(
+            Material.id == material_id,
+            Material.is_deleted == False
+        )
+    )
+    if not obj:
+        raise HTTPException(status_code=404, detail="Material not found")
+    return obj
+
+
+@router.get("/{material_id}/qr", response_class=StreamingResponse)
+async def generate_material_qr(
+    material_id: int,
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    material = await _get_active_material_or_404(db, material_id)
+    
+    qr_buf = generate_qr(entity_type="MAT", entity_id=material.id)
+    
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="material_{material.id}.png"'
+    }
+    
+    return StreamingResponse(
+        qr_buf, 
+        media_type="image/png",
+        headers=headers
+    )
 
 
 @router.get("/{material_id}", response_model=MaterialOut)

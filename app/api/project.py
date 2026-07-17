@@ -83,6 +83,7 @@ from app.utils.common import (
     generate_business_id,
     assert_task_project,
 )
+from app.utils.qr import generate_qr
 
 
 def compute_project_status(project):
@@ -9753,6 +9754,32 @@ router.include_router(tasks_router)
 
 
 # Moved dynamic routes to bottom
+@router.get("/{project_id}/qr", response_class=StreamingResponse)
+async def generate_project_qr(
+    project_id: int,
+    current_user: User = Depends(require_roles(READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    service: ProjectsService = Depends(get_projects_service),
+):
+    out = await service.get_project(
+        db,
+        project_id=project_id,
+        current_user=current_user,
+    )
+    
+    qr_buf = generate_qr(entity_type="PRJ", entity_id=out.id)
+    
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="project_{out.id}.png"'
+    }
+    
+    return StreamingResponse(
+        qr_buf, 
+        media_type="image/png",
+        headers=headers
+    )
+
 @router.get("/{project_id}", response_model=s.ProjectOut)
 async def get_project(
     project_id: int,
