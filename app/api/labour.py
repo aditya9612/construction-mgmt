@@ -889,61 +889,73 @@ async def weekly_report(
 ):
     from app.utils.common import assert_project_access
 
-    labour = await db.get(Labour, labour_id)
+    labour = (
+        await db.execute(
+            select(Labour)
+            .options(selectinload(Labour.labour_type))
+            .where(Labour.id == labour_id)
+        )
+    ).scalar_one_or_none()
+
     if not labour:
         raise NotFoundError("Labour not found")
 
-    mapping = await db.scalars(
-        select(LabourProject.project_id).where(LabourProject.labour_id == labour_id)
-    )
+    project_ids = (
+        await db.scalars(
+            select(LabourProject.project_id).where(
+                LabourProject.labour_id == labour_id
+            )
+        )
+    ).all()
 
-    project_ids = mapping.all()
-
-    # Validate access only if labour assigned to projects
     if project_ids:
-
-        allowed = False
+        has_access = False
 
         for pid in project_ids:
             try:
                 await assert_project_access(
-                    db, project_id=pid, current_user=current_user
+                    db=db,
+                    project_id=pid,
+                    current_user=current_user,
                 )
-
-                allowed = True
+                has_access = True
                 break
-
             except PermissionDeniedError:
-                continue
+                pass
 
-        if not allowed:
+        if not has_access:
             raise PermissionDeniedError("No access to this labour")
 
-    result = await db.execute(
+    attendance = await db.execute(
         select(
             extract("week", UserAttendance.attendance_date).label("week"),
-            # total days
             func.count(UserAttendance.id).label("total_days"),
-            # absent days
             func.sum(
-                case((UserAttendance.status == AttendanceStatus.ABSENT, 1), else_=0)
+                case(
+                    (UserAttendance.status == AttendanceStatus.ABSENT, 1),
+                    else_=0,
+                )
             ).label("absent_days"),
             func.sum(
-                case((UserAttendance.status == AttendanceStatus.HALF_DAY, 1), else_=0)
+                case(
+                    (UserAttendance.status == AttendanceStatus.HALF_DAY, 1),
+                    else_=0,
+                )
             ).label("half_days"),
-            # existing
             func.sum(UserAttendance.working_hours).label("hours"),
             func.sum(UserAttendance.overtime_hours).label("ot"),
             func.sum(
-                UserAttendance.overtime_hours * UserAttendance.overtime_rate
+                UserAttendance.overtime_hours
+                * UserAttendance.overtime_rate
             ).label("ot_wage"),
         )
         .join(Labour, Labour.user_id == UserAttendance.user_id)
         .where(Labour.id == labour_id)
-        .group_by("week")
+        .group_by(extract("week", UserAttendance.attendance_date))
     )
 
-    rows = result.all()
+    rows = attendance.all()
+
     hourly_rate = labour.effective_daily_wage / Decimal("8")
 
     return [
@@ -953,16 +965,25 @@ async def weekly_report(
             "absent_days": int(r.absent_days or 0),
             "half_days": int(r.half_days or 0),
             "present_days": int(
-                (r.total_days or 0) - (r.absent_days or 0) - (r.half_days or 0)
+                (r.total_days or 0)
+                - (r.absent_days or 0)
+                - (r.half_days or 0)
             ),
             "total_hours": float(r.hours or 0),
             "overtime_hours": float(r.ot or 0),
             "total_wage": float(
-                hourly_rate * Decimal(r.hours or 0) + Decimal(r.ot_wage or 0)
+                (hourly_rate * Decimal(r.hours or 0))
+                + Decimal(r.ot_wage or 0)
             ),
         }
         for r in rows
     ]
+
+#==================================================
+
+from sqlalchemy import select, func, case, extract
+from sqlalchemy.orm import selectinload
+from decimal import Decimal
 
 
 @router.get("/{labour_id}/monthly-report")
@@ -973,30 +994,38 @@ async def monthly_report(
 ):
     from app.utils.common import assert_project_access
 
-    labour = await db.get(Labour, labour_id)
+    # Load labour with labour_type to avoid MissingGreenlet
+    labour = (
+        await db.execute(
+            select(Labour)
+            .options(selectinload(Labour.labour_type))
+            .where(Labour.id == labour_id)
+        )
+    ).scalar_one_or_none()
+
     if not labour:
         raise NotFoundError("Labour not found")
 
-    mapping = await db.scalars(
-        select(LabourProject.project_id).where(LabourProject.labour_id == labour_id)
-    )
+    project_ids = (
+        await db.scalars(
+            select(LabourProject.project_id).where(
+                LabourProject.labour_id == labour_id
+            )
+        )
+    ).all()
 
-    project_ids = mapping.all()
-
-    # Validate access only if labour assigned to projects
     if project_ids:
-
         allowed = False
 
         for pid in project_ids:
             try:
                 await assert_project_access(
-                    db, project_id=pid, current_user=current_user
+                    db=db,
+                    project_id=pid,
+                    current_user=current_user,
                 )
-
                 allowed = True
                 break
-
             except PermissionDeniedError:
                 continue
 
@@ -1006,28 +1035,33 @@ async def monthly_report(
     result = await db.execute(
         select(
             extract("month", UserAttendance.attendance_date).label("month"),
-            # total days
             func.count(UserAttendance.id).label("total_days"),
-            # absent days
             func.sum(
-                case((UserAttendance.status == AttendanceStatus.ABSENT, 1), else_=0)
+                case(
+                    (UserAttendance.status == AttendanceStatus.ABSENT, 1),
+                    else_=0,
+                )
             ).label("absent_days"),
             func.sum(
-                case((UserAttendance.status == AttendanceStatus.HALF_DAY, 1), else_=0)
+                case(
+                    (UserAttendance.status == AttendanceStatus.HALF_DAY, 1),
+                    else_=0,
+                )
             ).label("half_days"),
-            # existing
             func.sum(UserAttendance.working_hours).label("hours"),
             func.sum(UserAttendance.overtime_hours).label("ot"),
             func.sum(
-                UserAttendance.overtime_hours * UserAttendance.overtime_rate
+                UserAttendance.overtime_hours
+                * UserAttendance.overtime_rate
             ).label("ot_wage"),
         )
         .join(Labour, Labour.user_id == UserAttendance.user_id)
         .where(Labour.id == labour_id)
-        .group_by("month")
+        .group_by(extract("month", UserAttendance.attendance_date))
     )
 
     rows = result.all()
+
     hourly_rate = labour.effective_daily_wage / Decimal("8")
 
     return [
@@ -1037,12 +1071,15 @@ async def monthly_report(
             "absent_days": int(r.absent_days or 0),
             "half_days": int(r.half_days or 0),
             "present_days": int(
-                (r.total_days or 0) - (r.absent_days or 0) - (r.half_days or 0)
+                (r.total_days or 0)
+                - (r.absent_days or 0)
+                - (r.half_days or 0)
             ),
             "total_hours": float(r.hours or 0),
             "overtime_hours": float(r.ot or 0),
             "total_wage": float(
-                hourly_rate * Decimal(r.hours or 0) + Decimal(r.ot_wage or 0)
+                (hourly_rate * Decimal(r.hours or 0))
+                + Decimal(r.ot_wage or 0)
             ),
         }
         for r in rows
@@ -1082,6 +1119,9 @@ async def generate_payroll(
         result = await db.execute(
             select(UserAttendance, Labour)
             .join(Labour, Labour.user_id == UserAttendance.user_id)
+            .options(
+                selectinload(Labour.labour_type)
+            )
             .where(
                 extract("month", UserAttendance.attendance_date) == payload.month,
                 extract("year", UserAttendance.attendance_date) == payload.year,
@@ -1466,6 +1506,11 @@ async def get_labour_by_contractor(
 
     result = await db.execute(
         select(Labour)
+        .options(
+            selectinload(Labour.labour_type),
+            selectinload(Labour.user),
+            selectinload(Labour.contractor),
+        )
         .join(LabourProject, LabourProject.labour_id == Labour.id)
         .where(
             Labour.contractor_id == contractor_id,
@@ -1473,9 +1518,15 @@ async def get_labour_by_contractor(
         )
     )
 
-    rows = result.scalars().all()
+    rows = result.scalars().unique().all()
 
-    return [s.LabourOut.model_validate(r, from_attributes=True) for r in rows]
+    return [
+        s.LabourOut.model_validate(
+            labour,
+            from_attributes=True,
+        )
+        for labour in rows
+    ]
 
 
 @router.get("/summary/skill")
@@ -1522,6 +1573,7 @@ async def export_excel(
     project_ids = await get_user_project_ids(db, current_user)
     result = await db.execute(
         select(Labour)
+        .options(selectinload(Labour.labour_type))
         .join(LabourProject)
         .where(
             LabourProject.project_id == project_id, Labour.status == LabourStatus.ACTIVE

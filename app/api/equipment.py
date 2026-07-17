@@ -231,6 +231,70 @@ def to_decimal(value):
     return Decimal(str(value))
 
 
+from datetime import date
+from sqlalchemy import exists, or_, select
+
+
+async def calculate_equipment_status(
+    db: AsyncSession,
+    equipment: Equipment,
+) -> EquipmentStatus:
+    """
+    Calculate live equipment status without modifying ORM object.
+    Safe to use in GET APIs.
+    """
+    today = date.today()
+
+    if equipment.condition == EquipmentCondition.DAMAGED:
+        return EquipmentStatus.DAMAGED
+
+    pending_maintenance = await db.scalar(
+        select(
+            exists().where(
+                EquipmentMaintenance.equipment_id == equipment.id,
+                EquipmentMaintenance.is_completed.is_(False),
+                EquipmentMaintenance.maintenance_date <= today,
+            )
+        )
+    )
+
+    if pending_maintenance:
+        return EquipmentStatus.MAINTENANCE
+
+    active_rental = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.start_date <= today,
+                or_(
+                    EquipmentRental.end_date.is_(None),
+                    EquipmentRental.end_date >= today,
+                ),
+            )
+        )
+    )
+
+    if active_rental:
+        return EquipmentStatus.RENTED
+
+    if equipment.project_id:
+        return EquipmentStatus.IN_PROJECT
+
+    future_rental = await db.scalar(
+        select(
+            exists().where(
+                EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.start_date > today,
+            )
+        )
+    )
+
+    if future_rental:
+        return EquipmentStatus.IDLE
+
+    return EquipmentStatus.AVAILABLE
+
+
 async def recalculate_equipment_status(
     db: AsyncSession,
     equipment: Equipment,
@@ -299,7 +363,10 @@ async def recalculate_equipment_status(
         equipment.status = EquipmentStatus.IDLE
         return
 
-    equipment.status = EquipmentStatus.AVAILABLE
+    equipment.status = await calculate_equipment_status(
+        db,
+        equipment,
+    )
 
 
 # ============================== EQUIPMENT KPI ========================
@@ -825,13 +892,6 @@ async def maintenance_alerts(
 
 
 # ================== "Availability" =======================
-# FIX: previously this endpoint relied on the *stored* `eq.status` column to
-# decide MAINTENANCE state. That column is only refreshed by
-# recalculate_equipment_status(), which is not called on every read path
-# (e.g. list_equipment / plain GETs before this fix), so availability could
-# report stale data. It now queries pending maintenance directly, exactly
-# like recalculate_equipment_status() does, so this endpoint is always
-# consistent regardless of whether the stored status column is fresh.
 
 
 @router.get("/eq/availability", response_model=List[AvailabilityReportItem])
@@ -4665,7 +4725,14 @@ async def transfer_equipment(
 
     old_project = equipment.project_id
 
+    # Transfer equipment
     equipment.project_id = payload.to_project_id
+
+    # Recalculate equipment status
+    await recalculate_equipment_status(
+        db=db,
+        equipment=equipment,
+    )
 
     await create_audit_log(
         db=db,
@@ -4676,12 +4743,15 @@ async def transfer_equipment(
         },
         new_values={
             "project_id": payload.to_project_id,
+            "status": equipment.status.value,
         },
         user_id=current_user.id,
         request=request,
     )
 
     await db.commit()
+
+    await db.refresh(equipment)
 
     await bump_cache_version(
         redis,
@@ -4693,15 +4763,11 @@ async def transfer_equipment(
         "equipment_id": equipment.id,
         "from_project": old_project,
         "to_project": payload.to_project_id,
+        "status": equipment.status,
     }
 
 
 # ============================== TRANSFER HISTORY (NEW) ========================
-# NEW API: no endpoint previously exposed an equipment's transfer trail.
-# transfer_equipment() already writes a "TRANSFER" audit log entry with
-# old/new project_id, so this endpoint just reads and formats that history -
-# no new table/model required.
-
 
 @router.get("/{equipment_id}/transfer-history")
 async def get_transfer_history(
@@ -4718,69 +4784,180 @@ async def get_transfer_history(
         EquipmentAuditLog.action == "TRANSFER",
     )
 
-    count_stmt = select(func.count()).select_from(base_query.subquery())
-    total = await db.scalar(count_stmt)
+    total = await db.scalar(
+        select(func.count()).select_from(base_query.subquery())
+    ) or 0
 
-    stmt = (
+    result = await db.execute(
         base_query.order_by(EquipmentAuditLog.created_at.desc())
-        .limit(limit)
         .offset(offset)
+        .limit(limit)
     )
 
-    result = await db.execute(stmt)
-    rows = result.scalars().all()
+    logs = result.scalars().all()
 
-    # Collect referenced project ids so we can enrich the response with names
     project_ids = set()
 
-    parsed_rows = []
+    for log in logs:
+        old_values = safe_parse(log.old_values) if log.old_values else {}
+        new_values = safe_parse(log.new_values) if log.new_values else {}
 
-    for row in rows:
-        old_values = safe_parse(row.old_values) if row.old_values else {}
-        new_values = safe_parse(row.new_values) if row.new_values else {}
+        if old_values.get("project_id"):
+            project_ids.add(old_values["project_id"])
+
+        if new_values.get("project_id"):
+            project_ids.add(new_values["project_id"])
+
+    project_name_map = {}
+
+    if project_ids:
+        projects = await db.execute(
+            select(Project.id, Project.project_name).where(
+                Project.id.in_(project_ids)
+            )
+        )
+
+        project_name_map = dict(projects.all())
+
+    items = []
+
+    for log in logs:
+        old_values = safe_parse(log.old_values) if log.old_values else {}
+        new_values = safe_parse(log.new_values) if log.new_values else {}
 
         from_project_id = old_values.get("project_id")
         to_project_id = new_values.get("project_id")
 
-        if from_project_id:
-            project_ids.add(from_project_id)
-        if to_project_id:
-            project_ids.add(to_project_id)
-
-        parsed_rows.append(
+        items.append(
             {
-                "id": row.id,
-                "equipment_id": row.equipment_id,
+                "id": log.id,
+                "equipment_id": log.equipment_id,
                 "from_project_id": from_project_id,
+                "from_project_name": project_name_map.get(from_project_id),
                 "to_project_id": to_project_id,
-                "transferred_by": row.user_id,
-                "transferred_at": row.created_at,
-                "ip_address": row.ip_address,
+                "to_project_name": project_name_map.get(to_project_id),
+                "transferred_by": log.user_id,
+                "transferred_at": log.created_at,
+                "ip_address": log.ip_address,
             }
         )
 
-    # Collect project names
-    project_name_map = {}
+    return {
+        "items": items,
+        "meta": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        },
+    }
 
-    project_ids = {pid for pid in project_ids if pid is not None}
+#======================= list_transfer_history =================================
 
-    if project_ids:
-        proj_result = await db.execute(
-            select(Project.id, Project.project_name).where(Project.id.in_(project_ids))
+@router.get("/transfer-history")
+async def list_transfer_history(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    equipment_id: int | None = Query(None),
+    project_id: int | None = Query(None),
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(EquipmentAuditLog).where(EquipmentAuditLog.action == "TRANSFER")
+
+    if equipment_id:
+        query = query.where(EquipmentAuditLog.equipment_id == equipment_id)
+
+    count_stmt = select(func.count()).select_from(query.subquery())
+    total = await db.scalar(count_stmt)
+
+    stmt = (
+        query.order_by(EquipmentAuditLog.created_at.desc()).limit(limit).offset(offset)
+    )
+
+    result = await db.execute(stmt)
+    logs = result.scalars().all()
+
+    equipment_ids = set()
+    project_ids = set()
+    user_ids = set()
+
+    parsed_logs = []
+
+    for log in logs:
+        old_values = safe_parse(log.old_values) if log.old_values else {}
+        new_values = safe_parse(log.new_values) if log.new_values else {}
+
+        from_project = old_values.get("project_id")
+        to_project = new_values.get("project_id")
+
+        if project_id:
+            if from_project != project_id and to_project != project_id:
+                continue
+
+        equipment_ids.add(log.equipment_id)
+
+        if from_project:
+            project_ids.add(from_project)
+
+        if to_project:
+            project_ids.add(to_project)
+
+        if log.user_id:
+            user_ids.add(log.user_id)
+
+        parsed_logs.append(
+            {
+                "id": log.id,
+                "equipment_id": log.equipment_id,
+                "from_project_id": from_project,
+                "to_project_id": to_project,
+                "transferred_by": log.user_id,
+                "transferred_at": log.created_at,
+                "ip_address": log.ip_address,
+            }
         )
 
-        project_name_map = {
-            pid: project_name for pid, project_name in proj_result.all()
-        }
+    equipment_map = {}
+    if equipment_ids:
+        result = await db.execute(
+            select(
+                Equipment.id,
+                Equipment.equipment_name,
+            ).where(Equipment.id.in_(equipment_ids))
+        )
+
+        equipment_map = {row.id: row.equipment_name for row in result}
+
+    project_map = {}
+    if project_ids:
+        result = await db.execute(
+            select(
+                Project.id,
+                Project.project_name,
+            ).where(Project.id.in_(project_ids))
+        )
+        project_map = {row.id: row.project_name for row in result}
+
+    user_map = {}
+    if user_ids:
+        result = await db.execute(
+            select(
+                User.id,
+                User.full_name,
+            ).where(User.id.in_(user_ids))
+        )
+        user_map = {row.id: row.full_name for row in result}
 
     items = []
 
-    for item in parsed_rows:
+    for row in parsed_logs:
         items.append(
             {
-                **item,
-                "from_project_name": project_name_map.get(item["from_project_id"]),
-                "to_project_name": project_name_map.get(item["to_project_id"]),
+                **row,
+                "equipment_name": equipment_map.get(row["equipment_id"]),
+                "from_project_name": project_map.get(row["from_project_id"]),
+                "to_project_name": project_map.get(row["to_project_id"]),
+                "transferred_by_name": user_map.get(row["transferred_by"]),
             }
         )
 
@@ -4795,14 +4972,6 @@ async def get_transfer_history(
 
 
 # =====================get_equipment==============================
-# FIX: this is a plain read (GET) endpoint but was committing a DB write on
-# every single call via recalculate_equipment_status() + db.commit(). A GET
-# request should not mutate/persist data - besides being semantically wrong,
-# it adds needless write load and possible race conditions when many clients
-# poll this endpoint concurrently. The status is still computed live for an
-# accurate response, but it is no longer persisted here. Persisting status
-# changes should happen in the write-path endpoints (create/update/allocate/
-# rental/maintenance) which already call recalculate_equipment_status().
 
 
 @router.get("/{equipment_id}", response_model=EquipmentOut)
@@ -4816,14 +4985,13 @@ async def get_equipment(
         equipment_id,
     )
 
-    # Compute the live status for an accurate response WITHOUT persisting it -
-    # no commit/refresh here since this is a read-only endpoint.
-    await recalculate_equipment_status(
+    response = EquipmentOut.model_validate(obj)
+    response.status = await calculate_equipment_status(
         db,
         obj,
     )
 
-    return EquipmentOut.model_validate(obj)
+    return response
 
 
 # =============================update_equipment=======================

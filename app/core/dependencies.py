@@ -4,6 +4,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from app.cache.redis import cache_get_json, cache_set_json
 from app.core.logger import logger
 from app.core.security import decode_access_token
@@ -76,17 +77,22 @@ async def get_current_user(
         try:
             cached = await cache_get_json(redis, cache_key)
             if cached:
-                return User(**cached)
+                user = await db.scalar(select(User).where(User.id == int(user_id)))
+
+                if user:
+                    return user
         except Exception as e:
             logger.warning(f"Redis cache read failed: {e}")
 
-    # --------------------------------------------------
-    # Fallback to database
-    # --------------------------------------------------
-    user = await db.scalar(select(User).where(User.id == int(user_id)))
-    if user is None:
-        logger.warning(f"User not found id={user_id}")
-        raise credentials_exception
+        # --------------------------------------------------
+        # Fallback to database
+        # --------------------------------------------------
+
+        user = await db.scalar(
+            select(User)
+            .options(selectinload(User.project_memberships))
+            .where(User.id == int(user_id))
+        )
 
     # --------------------------------------------------
     # Store in Redis for future requests
@@ -144,6 +150,7 @@ async def get_current_active_user(
 
 from fastapi import Depends
 
+
 def require_roles(allowed_roles: Iterable[str]):
     allowed = list(allowed_roles)
 
@@ -181,13 +188,8 @@ def require_permissions(required_permissions: list[str]):
 
         result = await db.execute(
             select(Permission.code)
-            .join(
-                RolePermission,
-                RolePermission.permission_id == Permission.id
-            )
-            .where(
-                RolePermission.role == current_user.role
-            )
+            .join(RolePermission, RolePermission.permission_id == Permission.id)
+            .where(RolePermission.role == current_user.role)
         )
 
         user_permissions = set(result.scalars().all())

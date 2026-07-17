@@ -102,11 +102,11 @@ class User(Base, TimestampMixin):
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     deleted_at: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
-	
     quotations = relationship(
-    "QuotationMaster",
-    foreign_keys="QuotationMaster.client_user_id",
-    back_populates="client")
+        "QuotationMaster",
+        foreign_keys="QuotationMaster.client_user_id",
+        back_populates="client",
+    )
 
     @property
     def user_id(self) -> int:
@@ -115,6 +115,14 @@ class User(Base, TimestampMixin):
     @property
     def mobile_number(self) -> Optional[str]:
         return self.mobile
+
+    project_memberships = relationship(
+        "ProjectMember", lazy="selectin", overlaps="user"
+    )
+
+    @property
+    def allowed_projects(self) -> list[int]:
+        return [pm.project_id for pm in self.project_memberships]
 
 
 class UserAuditLog(Base):

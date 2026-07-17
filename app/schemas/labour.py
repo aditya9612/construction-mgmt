@@ -232,6 +232,7 @@ class LabourAttendanceOut(BaseModel):
 # PAYROLL
 # ======================
 class PayrollGenerate(BaseModel):
+    project_id: int
     month: int
     year: int
 
