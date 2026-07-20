@@ -21,6 +21,7 @@ from app.core.enums import (
     TaskPriority,
     WorkActivityStatus,
 )
+from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.core.validators import validate_drawing_file
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
@@ -29,6 +30,7 @@ from app.models.approval import Approval
 from app.models.labour import Labour
 from app.models.user import UserAttendance, ActivityLog
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
+from fastapi import APIRouter, Depends, Query, Request, Form, status
 from app.cache.redis import (
     bump_cache_version,
     cache_get_json,
@@ -4229,16 +4231,34 @@ async def list_task_progress_history(
     )
 
 
-@tasks_router.post("/task-requests", response_model=s.TaskRequestResponse)
+@tasks_router.post(
+    "/task-requests",
+    response_model=s.TaskRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_task_request(
-    request: s.TaskRequestCreate,
+    form: s.TaskRequestCreateForm = Depends(),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
-    db_obj = m.TaskRequest(**request.model_dump())
+    request = form.to_schema()
+
+    attachment_url = None
+
+    # Temporary file handling
+    if form.attachment:
+        attachment_url = form.attachment.filename
+        # Later replace with actual upload helper
+
+    data = request.model_dump(exclude={"attachment_url"})
+    data["attachment_url"] = attachment_url
+
+    db_obj = m.TaskRequest(**data)
+
     db.add(db_obj)
     await db.commit()
     await db.refresh(db_obj)
+
     return db_obj
 
 
@@ -4265,6 +4285,60 @@ async def get_task_requests(
     result = await db.execute(query)
     task_requests = result.scalars().all()
     return list(task_requests)
+
+
+@tasks_router.get(
+    "/task-requests",
+    response_model=PaginatedResponse[s.TaskRequestResponse],
+)
+async def list_task_requests(
+    project_id: int | None = Query(None),
+    status: str | None = Query(None),
+    priority: str | None = Query(None),
+    search: str | None = Query(None, description="Search by title"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
+):
+    query = select(m.TaskRequest).where(m.TaskRequest.is_deleted == False)
+
+    # Filters
+    if project_id:
+        query = query.where(m.TaskRequest.project_id == project_id)
+
+    if status:
+        query = query.where(m.TaskRequest.status == status)
+
+    if priority:
+        query = query.where(m.TaskRequest.priority == priority)
+
+    if search:
+        query = query.where(m.TaskRequest.title.ilike(f"%{search}%"))
+
+    # Total Count
+    count_query = select(func.count()).select_from(query.subquery())
+    total = await db.scalar(count_query)
+
+    # Pagination
+    offset = (page - 1) * page_size
+
+    query = (
+        query.order_by(m.TaskRequest.created_at.desc()).offset(offset).limit(page_size)
+    )
+
+    result = await db.execute(query)
+    records = result.scalars().all()
+
+    return s.PaginatedResponse(
+        items=records,
+        meta=s.PaginationMeta(
+            page=page,
+            page_size=page_size,
+            total=total or 0,
+            total_pages=((total or 0) + page_size - 1) // page_size,
+        ),
+    )
 
 
 @tasks_router.put("/task-requests/{request_id}", response_model=s.TaskRequestResponse)
@@ -9580,7 +9654,7 @@ async def list_drawings(
 # ===================== Version History =====================
 
 
-#@drawing_router.get("/versions", response_model=list[s.DrawingOut])
+# @drawing_router.get("/versions", response_model=list[s.DrawingOut])
 @drawing_router.get("/{project_id}/versions", response_model=list[s.DrawingOut])
 async def get_versions(
     db: AsyncSession = Depends(get_db_session),
@@ -9617,7 +9691,7 @@ async def get_versions(
 # ===================== Latest =====================
 
 
-#@drawing_router.get("/latest", response_model=list[s.DrawingOut])
+# @drawing_router.get("/latest", response_model=list[s.DrawingOut])
 @drawing_router.get("/{project_id}/latest", response_model=list[s.DrawingOut])
 async def get_latest(
     db: AsyncSession = Depends(get_db_session),

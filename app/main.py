@@ -25,6 +25,7 @@ from app.api.document import router as document_router
 from app.api.equipment import router as equipment_router
 from app.api.labour import router as labour_router
 from app.api.material import router as material_router
+from app.api.work_update import router as work_update_router
 from app.api.project import (
     router as project_router,
     dsr_router,
@@ -297,6 +298,7 @@ def create_app() -> FastAPI:
     api_router.include_router(notification_router)
     api_router.include_router(payroll_router)
     api_router.include_router(journal_router)
+    api_router.include_router(work_update_router)
 
     application.include_router(api_router, prefix="/api/v1")
 

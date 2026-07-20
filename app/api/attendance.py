@@ -9,7 +9,11 @@ from app.core.enums import AttendanceStatus
 from app.db.session import get_db_session
 from app.models.user import User, UserAttendance, ActivityLog
 from app.models.project import Project
-from app.schemas.user import UserAttendanceOut, ProxyBulkCheckInForm, ProxyBulkCheckOutForm
+from app.schemas.user import (
+    UserAttendanceOut,
+    ProxyBulkCheckInForm,
+    ProxyBulkCheckOutForm,
+)
 from datetime import datetime, date, timedelta, timezone
 from app.utils.helpers import calculate_distance
 from app.utils.timezone import get_naive_utc_now, localize_datetime, make_naive_utc
@@ -17,6 +21,7 @@ from app.core.validators import (
     validate_and_save_image,
     validate_and_save_document,
 )
+from sqlalchemy.orm import selectinload
 from app.models.labour import Labour
 from app.models.project import ProjectOTPolicy
 from app.models.expense import Expense
@@ -51,7 +56,7 @@ async def check_in(
 ):
     # Auto-generate UTC in_time
     actual_in_time = get_naive_utc_now()
-    
+
     # Auto-generate local attendance_date from the server timestamp
     actual_in_time_aware = actual_in_time.replace(tzinfo=timezone.utc)
     actual_in_time_local = localize_datetime(actual_in_time_aware).replace(tzinfo=None)
@@ -105,20 +110,25 @@ async def check_in(
                 shift_start_dt_local = datetime.combine(
                     attendance_date, project.shift_start_time
                 )
-                
+
                 actual_in_time_aware = actual_in_time.replace(tzinfo=timezone.utc)
-                actual_in_time_local = localize_datetime(actual_in_time_aware).replace(tzinfo=None)
+                actual_in_time_local = localize_datetime(actual_in_time_aware).replace(
+                    tzinfo=None
+                )
 
                 grace_mins = project.grace_period_minutes or 15
 
-                shift_start_with_grace = shift_start_dt_local + timedelta(minutes=grace_mins)
+                shift_start_with_grace = shift_start_dt_local + timedelta(
+                    minutes=grace_mins
+                )
 
                 if actual_in_time_local > shift_start_with_grace:
 
                     is_late = True
 
                     late_minutes = int(
-                        (actual_in_time_local - shift_start_dt_local).total_seconds() / 60
+                        (actual_in_time_local - shift_start_dt_local).total_seconds()
+                        / 60
                     )
 
     # Save check-in image if uploaded
@@ -176,7 +186,11 @@ async def check_out(
     )
     attendance = result.scalars().first()
 
-    labour = await db.scalar(select(Labour).where(Labour.user_id == current_user.id))
+    labour = await db.scalar(
+        select(Labour)
+        .options(selectinload(Labour.labour_type))
+        .where(Labour.user_id == current_user.id)
+    )
 
     if not attendance:
         raise HTTPException(status_code=404, detail="Attendance record not found")
@@ -199,9 +213,11 @@ async def check_out(
             shift_end_dt_local = datetime.combine(
                 attendance.attendance_date, project.shift_end_time
             )
-            
+
             actual_out_time_aware = actual_out_time.replace(tzinfo=timezone.utc)
-            actual_out_time_local = localize_datetime(actual_out_time_aware).replace(tzinfo=None)
+            actual_out_time_local = localize_datetime(actual_out_time_aware).replace(
+                tzinfo=None
+            )
 
             if actual_out_time_local < shift_end_dt_local:
                 is_early_departure = True
@@ -276,7 +292,9 @@ async def check_out(
                     overtime_rate = policy.fixed_ot_rate or Decimal("0")
                 else:
                     if base_ot_rate <= 0:
-                        logger.warning(f"Labour {labour.id} has missing or zero base OT rate. OT calculated as 0.")
+                        logger.warning(
+                            f"Labour {labour.id} has missing or zero base OT rate. OT calculated as 0."
+                        )
                         overtime_rate = Decimal("0")
                     elif policy:
                         multiplier = policy.normal_day_multiplier or Decimal("1")
@@ -312,12 +330,12 @@ async def check_out(
             if existing_expense:
 
                 existing_expense.amount = total_wage
-                
+
                 existing_transaction = await db.scalar(
                     select(OwnerTransaction).where(
                         OwnerTransaction.reference_id == existing_expense.id,
                         OwnerTransaction.reference_type == "labour",
-                        OwnerTransaction.project_id == attendance.project_id
+                        OwnerTransaction.project_id == attendance.project_id,
                     )
                 )
                 if existing_transaction:
@@ -383,9 +401,7 @@ async def today_status(
     """Get current user's attendance status for today."""
     # today = date.today()
 
-    today = localize_datetime(
-        get_naive_utc_now().replace(tzinfo=timezone.utc)
-    ).date()
+    today = localize_datetime(get_naive_utc_now().replace(tzinfo=timezone.utc)).date()
 
     result = await db.execute(
         select(UserAttendance).where(
@@ -526,6 +542,7 @@ async def list_attendance(
         ),
     }
 
+
 # ===================== PROXY BULK CHECK-IN =====================
 @router.post("/proxy-check-in", dependencies=[Depends(require_roles(APPROVE_ROLES))])
 async def proxy_check_in(
@@ -571,9 +588,12 @@ async def proxy_check_in(
             performed_by=current_user.id,
         )
         db.add(log)
-    
+
     await db.flush()
-    return {"success": True, "message": f"Checked in {checked_in_count} users successfully."}
+    return {
+        "success": True,
+        "message": f"Checked in {checked_in_count} users successfully.",
+    }
 
 
 # ===================== PROXY BULK CHECK-OUT =====================
@@ -595,8 +615,12 @@ async def proxy_check_out(
         if att and not att.out_time:
             att.out_time = actual_out_time
             if payload.remarks:
-                att.remarks = (att.remarks + " | " + payload.remarks) if att.remarks else payload.remarks
-            
+                att.remarks = (
+                    (att.remarks + " | " + payload.remarks)
+                    if att.remarks
+                    else payload.remarks
+                )
+
             # Recalculate hours
             if att.in_time:
                 delta = actual_out_time - att.in_time
@@ -605,7 +629,7 @@ async def proxy_check_out(
 
                 if hrs > 8.0:
                     att.overtime_hours = round(hrs - 8.0, 2)
-            
+
             checked_out_count += 1
 
     # Activity Log
@@ -618,19 +642,31 @@ async def proxy_check_out(
         db.add(log)
 
     await db.flush()
-    return {"success": True, "message": f"Checked out {checked_out_count} users successfully."}
+    return {
+        "success": True,
+        "message": f"Checked out {checked_out_count} users successfully.",
+    }
+
 
 import io
 import csv
 import pandas as pd
 from fastapi.responses import StreamingResponse
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Image as RLImage, Spacer
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Table,
+    TableStyle,
+    Image as RLImage,
+    Spacer,
+)
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 
 # ===================== EXPORT APIS =====================
+
 
 @router.get("/export/csv")
 async def export_attendance_csv(
@@ -646,11 +682,15 @@ async def export_attendance_csv(
     if current_user.role not in APPROVE_ROLES:
         user_id = current_user.id
 
-    query = select(UserAttendance, User, Project).join(User, UserAttendance.user_id == User.id).outerjoin(Project, UserAttendance.project_id == Project.id)
-    
+    query = (
+        select(UserAttendance, User, Project)
+        .join(User, UserAttendance.user_id == User.id)
+        .outerjoin(Project, UserAttendance.project_id == Project.id)
+    )
+
     query = query.where(UserAttendance.attendance_date >= start_date)
     query = query.where(UserAttendance.attendance_date <= end_date)
-    
+
     if project_id:
         query = query.where(UserAttendance.project_id == project_id)
     if user_id:
@@ -659,43 +699,59 @@ async def export_attendance_csv(
         query = query.where(User.role == role)
     if is_approved is not None:
         query = query.where(UserAttendance.is_approved == is_approved)
-        
+
     result = await db.execute(query.order_by(UserAttendance.attendance_date.desc()))
     records = result.all()
-    
+
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow([
-        "Date", "Employee ID", "Name", "Role", "Project Name", 
-        "Status", "In-Time", "Out-Time", "Total Hours", "Overtime Hours", "Overtime Payout", "Remarks"
-    ])
-    
+    writer.writerow(
+        [
+            "Date",
+            "Employee ID",
+            "Name",
+            "Role",
+            "Project Name",
+            "Status",
+            "In-Time",
+            "Out-Time",
+            "Total Hours",
+            "Overtime Hours",
+            "Overtime Payout",
+            "Remarks",
+        ]
+    )
+
     for att, user, proj in records:
         proj_name = proj.project_name if proj else "N/A"
         payout = (att.overtime_hours or 0) * (att.overtime_rate or 0)
         in_t = att.in_time.strftime("%H:%M:%S") if att.in_time else ""
         out_t = att.out_time.strftime("%H:%M:%S") if att.out_time else ""
-        
-        writer.writerow([
-            att.attendance_date,
-            user.id,
-            user.full_name,
-            user.role,
-            proj_name,
-            att.status,
-            in_t,
-            out_t,
-            round(att.working_hours or 0, 2),
-            round(att.overtime_hours or 0, 2),
-            round(payout, 2),
-            att.remarks or ""
-        ])
-    
+
+        writer.writerow(
+            [
+                att.attendance_date,
+                user.id,
+                user.full_name,
+                user.role,
+                proj_name,
+                att.status,
+                in_t,
+                out_t,
+                round(att.working_hours or 0, 2),
+                round(att.overtime_hours or 0, 2),
+                round(payout, 2),
+                att.remarks or "",
+            ]
+        )
+
     output.seek(0)
     return StreamingResponse(
-        iter([output.getvalue()]), 
-        media_type="text/csv", 
-        headers={"Content-Disposition": f"attachment; filename=attendance_{start_date}_to_{end_date}.csv"}
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=attendance_{start_date}_to_{end_date}.csv"
+        },
     )
 
 
@@ -711,64 +767,88 @@ async def export_attendance_pdf_audit(
     if current_user.role not in APPROVE_ROLES:
         user_id = current_user.id
 
-    query = select(UserAttendance, User, Project).join(User, UserAttendance.user_id == User.id).outerjoin(Project, UserAttendance.project_id == Project.id)
+    query = (
+        select(UserAttendance, User, Project)
+        .join(User, UserAttendance.user_id == User.id)
+        .outerjoin(Project, UserAttendance.project_id == Project.id)
+    )
     query = query.where(
         UserAttendance.attendance_date >= start_date,
         UserAttendance.attendance_date <= end_date,
-        UserAttendance.project_id == project_id
+        UserAttendance.project_id == project_id,
     )
     if user_id:
         query = query.where(UserAttendance.user_id == user_id)
-        
+
     result = await db.execute(query.order_by(UserAttendance.attendance_date.desc()))
     records = result.all()
-    
+
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=18)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=30,
+        leftMargin=30,
+        topMargin=30,
+        bottomMargin=18,
+    )
     elements = []
     styles = getSampleStyleSheet()
-    
-    title = Paragraph(f"Audit Report: Project {project_id} ({start_date} to {end_date})", styles['Heading1'])
+
+    title = Paragraph(
+        f"Audit Report: Project {project_id} ({start_date} to {end_date})",
+        styles["Heading1"],
+    )
     elements.append(title)
     elements.append(Spacer(1, 0.2 * inch))
-    
-    data = [["Date", "Name", "Check-In Time", "Check-In Location", "Check-Out Time", "Check-Out Location"]]
-    
+
+    data = [
+        [
+            "Date",
+            "Name",
+            "Check-In Time",
+            "Check-In Location",
+            "Check-Out Time",
+            "Check-Out Location",
+        ]
+    ]
+
     for att, user, proj in records:
         in_t = att.in_time.strftime("%H:%M:%S") if att.in_time else "N/A"
         out_t = att.out_time.strftime("%H:%M:%S") if att.out_time else "N/A"
-        
+
         in_loc = att.check_in_address or "N/A"
         out_loc = att.check_out_address or "N/A"
-        
-        data.append([
-            str(att.attendance_date),
-            user.full_name,
-            in_t,
-            in_loc,
-            out_t,
-            out_loc
-        ])
-    
+
+        data.append(
+            [str(att.attendance_date), user.full_name, in_t, in_loc, out_t, out_loc]
+        )
+
     t = Table(data)
-    t.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.grey),
-        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('BOTTOMPADDING', (0,0), (-1,0), 12),
-        ('BACKGROUND', (0,1), (-1,-1), colors.beige),
-        ('GRID', (0,0), (-1,-1), 1, colors.black)
-    ]))
+    t.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.beige),
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+            ]
+        )
+    )
     elements.append(t)
-    
+
     doc.build(elements)
     buffer.seek(0)
-    
+
     return StreamingResponse(
-        buffer, 
-        media_type="application/pdf", 
-        headers={"Content-Disposition": f"attachment; filename=audit_{project_id}_{start_date}.pdf"}
+        buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=audit_{project_id}_{start_date}.pdf"
+        },
     )
 
 
@@ -789,44 +869,59 @@ async def export_attendance_payroll(
         User.id,
         User.full_name,
         User.role,
-        func.sum(UserAttendance.working_hours).label('total_hours'),
-        func.sum(UserAttendance.overtime_hours).label('total_overtime'),
-        func.sum(UserAttendance.overtime_hours * UserAttendance.overtime_rate).label('total_payout')
+        func.sum(UserAttendance.working_hours).label("total_hours"),
+        func.sum(UserAttendance.overtime_hours).label("total_overtime"),
+        func.sum(UserAttendance.overtime_hours * UserAttendance.overtime_rate).label(
+            "total_payout"
+        ),
     ).join(UserAttendance, UserAttendance.user_id == User.id)
-    
+
     query = query.where(
         UserAttendance.attendance_date >= start_date,
-        UserAttendance.attendance_date <= end_date
+        UserAttendance.attendance_date <= end_date,
     )
-    
+
     if project_id:
         query = query.where(UserAttendance.project_id == project_id)
     if user_id:
         query = query.where(User.id == user_id)
     if role:
         query = query.where(User.role == role)
-        
+
     query = query.group_by(User.id, User.full_name, User.role)
     result = await db.execute(query)
     records = result.all()
-    
+
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Employee ID", "Name", "Role", "Total Hours", "Total Overtime Hours", "Overtime Payout"])
-    
+    writer.writerow(
+        [
+            "Employee ID",
+            "Name",
+            "Role",
+            "Total Hours",
+            "Total Overtime Hours",
+            "Overtime Payout",
+        ]
+    )
+
     for row in records:
-        writer.writerow([
-            row.id,
-            row.full_name,
-            row.role,
-            round(row.total_hours or 0, 2),
-            round(row.total_overtime or 0, 2),
-            round(row.total_payout or 0, 2)
-        ])
-        
+        writer.writerow(
+            [
+                row.id,
+                row.full_name,
+                row.role,
+                round(row.total_hours or 0, 2),
+                round(row.total_overtime or 0, 2),
+                round(row.total_payout or 0, 2),
+            ]
+        )
+
     output.seek(0)
     return StreamingResponse(
-        iter([output.getvalue()]), 
-        media_type="text/csv", 
-        headers={"Content-Disposition": f"attachment; filename=payroll_{start_date}_to_{end_date}.csv"}
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=payroll_{start_date}_to_{end_date}.csv"
+        },
     )

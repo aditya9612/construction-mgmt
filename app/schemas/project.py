@@ -3,7 +3,16 @@ from decimal import Decimal
 from typing import List, Optional, Union
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
+from fastapi import File, Form, UploadFile
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    json,
+    model_validator,
+)
 from typing_extensions import Annotated
 from app.core.enums import (
     ChecklistStatus,
@@ -60,8 +69,12 @@ class ProjectCreate(BaseSchema):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
-    shift_start_time: Optional[time] = Field(default=time(9, 0), description="Default shift start time (09:00 IST)")
-    shift_end_time: Optional[time] = Field(default=time(18, 0), description="Default shift end time (18:00 IST)")
+    shift_start_time: Optional[time] = Field(
+        default=time(9, 0), description="Default shift start time (09:00 IST)"
+    )
+    shift_end_time: Optional[time] = Field(
+        default=time(18, 0), description="Default shift end time (18:00 IST)"
+    )
     grace_period_minutes: int = 15
 
     budget_amount: Optional[Decimal] = None
@@ -208,12 +221,6 @@ class MilestoneOut(BaseSchema):
 # ===================== TASK =====================
 
 
-# ===================== TASK =====================
-
-from fastapi import Form
-import json
-
-
 class TaskCreate(BaseSchema):
     title: str
     description: Optional[str] = None
@@ -246,30 +253,21 @@ class TaskCreate(BaseSchema):
 # TASK CREATE FORM (multipart/form-data support)
 # =========================================================
 
+
 class TaskCreateForm:
 
     def __init__(
-
         self,
-
         title: str = Form(...),
-
         description: Optional[str] = Form(None),
         priority: Union[int, TaskPriority] = Form(...),
         status: TaskStatus = Form(TaskStatus.PLANNED),
-
         start_date: Optional[date] = Form(None),
-
         end_date: Optional[date] = Form(None),
-
         assigned_user_ids: Optional[str] = Form(None),
-
         activity_type_id: Optional[int] = Form(None),
-
         milestone_id: Optional[int] = Form(None),
-
         boq_id: Optional[int] = Form(None),
-
     ):
 
         self.title = title
@@ -290,8 +288,12 @@ class TaskCreateForm:
                 parsed = json.loads(assigned_user_ids)
                 parsed_ids = parsed if isinstance(parsed, list) else [parsed]
             except json.JSONDecodeError:
-                parsed_ids = [int(x.strip()) for x in assigned_user_ids.split(",") if x.strip().isdigit()]
-        
+                parsed_ids = [
+                    int(x.strip())
+                    for x in assigned_user_ids.split(",")
+                    if x.strip().isdigit()
+                ]
+
         self.assigned_user_ids = parsed_ids
 
         self.activity_type_id = activity_type_id
@@ -307,25 +309,15 @@ class TaskCreateForm:
     def to_schema(self) -> TaskCreate:
 
         return TaskCreate(
-
             title=self.title,
-
             description=self.description,
-
             priority=self.priority,
-
             status=self.status,
-
             start_date=self.start_date,
-
             end_date=self.end_date,
-
             assigned_user_ids=self.assigned_user_ids,
-
             activity_type_id=self.activity_type_id,
-
             milestone_id=self.milestone_id,
-
             boq_id=self.boq_id,
         )
 
@@ -362,36 +354,23 @@ class TaskUpdate(BaseSchema):
 # TASK UPDATE FORM (multipart/form-data support)
 # =========================================================
 
+
 class TaskUpdateForm:
 
     def __init__(
-
         self,
-
         title: str = Form(...),
-
         description: Optional[str] = Form(None),
-
         priority: Union[int, TaskPriority] = Form(...),
-
         start_date: Optional[date] = Form(None),
-
         end_date: Optional[date] = Form(None),
-
         status: Optional[TaskStatus] = Form(None),
-
         assigned_user_ids: Optional[str] = Form(None),
-
         activity_type_id: Optional[int] = Form(None),
-
         milestone_id: Optional[int] = Form(None),
-
         boq_id: Optional[int] = Form(None),
-
         remove_audio: bool = Form(False),
-
         remove_image: bool = Form(False),
-
     ):
 
         self.title = title
@@ -403,7 +382,7 @@ class TaskUpdateForm:
         self.start_date = start_date
 
         self.end_date = end_date
-        
+
         self.status = status
 
         parsed_ids = None
@@ -412,8 +391,12 @@ class TaskUpdateForm:
                 parsed = json.loads(assigned_user_ids)
                 parsed_ids = parsed if isinstance(parsed, list) else [parsed]
             except json.JSONDecodeError:
-                parsed_ids = [int(x.strip()) for x in assigned_user_ids.split(",") if x.strip().isdigit()]
-        
+                parsed_ids = [
+                    int(x.strip())
+                    for x in assigned_user_ids.split(",")
+                    if x.strip().isdigit()
+                ]
+
         self.assigned_user_ids = parsed_ids
 
         self.activity_type_id = activity_type_id
@@ -429,25 +412,15 @@ class TaskUpdateForm:
     def to_schema(self) -> TaskUpdate:
 
         return TaskUpdate(
-
             title=self.title,
-
             description=self.description,
-
             priority=self.priority,
-
             start_date=self.start_date,
-
             end_date=self.end_date,
-
             status=self.status,
-
             assigned_user_ids=self.assigned_user_ids,
-
             activity_type_id=self.activity_type_id,
-
             milestone_id=self.milestone_id,
-
             boq_id=self.boq_id,
         )
 
@@ -456,6 +429,7 @@ class AssignedUserOut(BaseSchema):
     id: int
     name: str
     role: Optional[str] = None
+
 
 class TaskOut(BaseSchema):
 
@@ -540,17 +514,70 @@ class TaskStatusUpdate(BaseSchema):
     status: TaskStatus
 
 
+# =========================================================
+# TASK REQUEST
+# =========================================================
+
+
 class TaskRequestBase(BaseModel):
-    title: str
-    category: str
+    title: Optional[str] = None
+    category: Optional[str] = None
     project_id: int
-    priority: str
+    priority: Optional[str] = None
     description: Optional[str] = None
     attachment_url: Optional[str] = None
     assigned_to: Optional[int] = None
 
+
+# =========================================================
+# JSON REQUEST
+# =========================================================
+
+
 class TaskRequestCreate(TaskRequestBase):
     pass
+
+
+# =========================================================
+# FORM DATA REQUEST
+# =========================================================
+
+
+class TaskRequestCreateForm:
+
+    def __init__(
+        self,
+        project_id: int = Form(...),
+        title: Optional[str] = Form(None),
+        category: Optional[str] = Form(None),
+        priority: Optional[str] = Form(None),
+        description: Optional[str] = Form(None),
+        assigned_to: Optional[int] = Form(None),
+        attachment: UploadFile | None = File(None),
+    ):
+        self.project_id = project_id
+        self.title = title
+        self.category = category
+        self.priority = priority
+        self.description = description
+        self.assigned_to = assigned_to
+        self.attachment = attachment
+
+    def to_schema(self) -> TaskRequestCreate:
+        return TaskRequestCreate(
+            project_id=self.project_id,
+            title=self.title,
+            category=self.category,
+            priority=self.priority,
+            description=self.description,
+            assigned_to=self.assigned_to,
+        )
+
+
+# =========================================================
+# UPDATE
+# =========================================================
+
 
 class TaskRequestUpdate(BaseModel):
     title: Optional[str] = None
@@ -562,14 +589,21 @@ class TaskRequestUpdate(BaseModel):
     assigned_to: Optional[int] = None
     is_deleted: Optional[bool] = None
 
+
+# =========================================================
+# RESPONSE
+# =========================================================
+
+
 class TaskRequestResponse(TaskRequestBase):
     id: int
     status: str
     is_deleted: bool
     created_at: datetime
     updated_at: datetime
-    
+
     model_config = ConfigDict(from_attributes=True)
+
 
 # ===================== COMMENTS =====================
 
@@ -916,6 +950,7 @@ class ChecklistLogOut(BaseModel):
 
     model_config = {"from_attributes": True}  #  VERY IMPORTANT
 
+
 class ChecklistUpdate(BaseSchema):
     name: Optional[str] = None
     description: Optional[str] = None
@@ -929,7 +964,9 @@ class ChecklistItemUpdate(BaseSchema):
     is_required: Optional[bool] = None
     is_completed: Optional[bool] = None
 
+
 # ===================== SitePhoto =====================
+
 
 class SitePhotoCreate(BaseSchema):
     project_id: int
@@ -987,6 +1024,7 @@ class DrawingOut(DrawingCreate):
     class Config:
         from_attributes = True
 
+
 class DrawingFolderCreate(BaseSchema):
     folder_name: str
     parent_id: Optional[int] = None
@@ -1005,6 +1043,8 @@ class DrawingFolderOut(BaseSchema):
 
     class Config:
         from_attributes = True
+
+
 # ===================== CREATE =====================
 
 
@@ -1407,7 +1447,10 @@ class ProjectOTPolicyCreate(BaseModel):
             if self.fixed_ot_rate is None or self.fixed_ot_rate <= 0:
                 raise ValueError("fixed_ot_rate must be > 0 for FixedRate policy")
         else:
-            if self.normal_day_multiplier is not None and self.normal_day_multiplier <= 0:
+            if (
+                self.normal_day_multiplier is not None
+                and self.normal_day_multiplier <= 0
+            ):
                 raise ValueError("normal_day_multiplier must be > 0")
             if self.sunday_multiplier is not None and self.sunday_multiplier <= 0:
                 raise ValueError("sunday_multiplier must be > 0")
@@ -1428,26 +1471,32 @@ class ProjectOTPolicyOut(ProjectOTPolicyCreate):
 
         json_encoders = {Decimal: float}
 
+
 # =========================================
 # PROJECT MANAGER DASHBOARD ADDITIONS
 # =========================================
+
 
 class ProjectResourceSummaryOut(BaseModel):
     labour: int
     equipment: int
     materials_cost: float
 
+
 class ProjectHealthScoreOut(BaseModel):
     health: int
     status: str
 
+
 class CalendarEvent(BaseModel):
     title: str
     date: date
-    type: str # Task, Milestone, Site Visit, Approval, Delivery
+    type: str  # Task, Milestone, Site Visit, Approval, Delivery
+
 
 class PMCalendarOut(BaseModel):
     events: List[CalendarEvent]
+
 
 class ProjectLogItem(BaseModel):
     timestamp: datetime
@@ -1456,4 +1505,3 @@ class ProjectLogItem(BaseModel):
     message: str
     user_id: int | None = None
     details: dict | None = None
-

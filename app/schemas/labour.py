@@ -406,3 +406,42 @@ class LabourPaymentResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
+
+class WeeklyReportOut(BaseModel):
+    week: int
+    total_days: int
+    present_days: int
+    absent_days: int
+    half_days: int
+    total_hours: Decimal
+    overtime_hours: Decimal
+    total_wage: Decimal
+
+    class Config:
+        from_attributes = True
+        json_encoders = {Decimal: float}
+
+class MonthlyReportOut(BaseModel):
+    month: int
+    total_days: int
+    present_days: int
+    absent_days: int
+    half_days: int
+    total_hours: Decimal
+    overtime_hours: Decimal
+    total_wage: Decimal
+
+    class Config:
+        json_encoders = {Decimal: float} 
+
+class DashboardStatsOut(BaseModel):
+    total_labour_today: int
+    total_cost_today: Decimal
+
+    class Config:
+        json_encoders = {Decimal: float}
+
+class AttendanceDashboardOut(BaseModel):
+    total_labour: int
+    present: int
+

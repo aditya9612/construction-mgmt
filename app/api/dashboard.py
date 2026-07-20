@@ -23,7 +23,13 @@ from app.models.material import Supplier
 from app.models import project as m
 from app.models.expense import Expense
 from app.models.invoice import Invoice, Transaction
-from app.models.accountant import Account, GSTReturn, VendorBill, JournalLine, JournalEntry
+from app.models.accountant import (
+    Account,
+    GSTReturn,
+    VendorBill,
+    JournalLine,
+    JournalEntry,
+)
 from app.models.user import UserAttendance
 from app.models.boq import BOQ
 from app.models.quotation import QuotationMaster
@@ -540,6 +546,7 @@ async def accountant_dashboard(
 
         # 1. KPIs
         from app.utils.accounting import get_primary_cash_account
+
         try:
             cash_acc = await get_primary_cash_account(db)
             cash_balance_query = await db.scalar(
@@ -650,7 +657,7 @@ async def accountant_dashboard(
                 )
             )
 
-                # 3. Cash Flow (Monthly Trend)
+            # 3. Cash Flow (Monthly Trend)
         cash_flow = []
         for i in range(5, -1, -1):
             target_date = datetime.utcnow() - relativedelta(months=i)
@@ -665,27 +672,31 @@ async def accountant_dashboard(
                 else datetime.utcnow()
             )
 
-            c_inflow = await db.scalar(
-                select(func.sum(Transaction.amount)).where(
-                    Transaction.type == "receipt",
-                    Transaction.created_at >= month_start,
-                    Transaction.created_at <= month_end,
+            c_inflow = (
+                await db.scalar(
+                    select(func.sum(Transaction.amount)).where(
+                        Transaction.type == "receipt",
+                        Transaction.created_at >= month_start,
+                        Transaction.created_at <= month_end,
+                    )
                 )
-            ) or 0.0
+                or 0.0
+            )
 
-            c_outflow = await db.scalar(
-                select(func.sum(Transaction.amount)).where(
-                    Transaction.type == "payment",
-                    Transaction.created_at >= month_start,
-                    Transaction.created_at <= month_end,
+            c_outflow = (
+                await db.scalar(
+                    select(func.sum(Transaction.amount)).where(
+                        Transaction.type == "payment",
+                        Transaction.created_at >= month_start,
+                        Transaction.created_at <= month_end,
+                    )
                 )
-            ) or 0.0
+                or 0.0
+            )
 
             cash_flow.append(
                 CashFlowTrend(
-                    month=month_str,
-                    inflow=float(c_inflow),
-                    outflow=float(c_outflow)
+                    month=month_str, inflow=float(c_inflow), outflow=float(c_outflow)
                 )
             )
 
@@ -724,46 +735,70 @@ async def accountant_dashboard(
 
         # 5. Receivable Aging
         today_date = datetime.utcnow().date()
-        inv_query = await db.execute(select(Invoice).where(Invoice.status == InvoiceStatus.PENDING.value))
-        
-        r_buckets = {"0-30 Days": 0.0, "31-60 Days": 0.0, "61-90 Days": 0.0, "> 90 Days": 0.0}
+        inv_query = await db.execute(
+            select(Invoice).where(Invoice.status == InvoiceStatus.PENDING.value)
+        )
+
+        r_buckets = {
+            "0-30 Days": 0.0,
+            "31-60 Days": 0.0,
+            "61-90 Days": 0.0,
+            "> 90 Days": 0.0,
+        }
         total_r = 0.0
         for inv in inv_query.scalars().all():
             days_old = (today_date - inv.created_at.date()).days
             amt = float(inv.pending_amount if inv.pending_amount else inv.total_amount)
             total_r += amt
-            if days_old <= 30: r_buckets["0-30 Days"] += amt
-            elif days_old <= 60: r_buckets["31-60 Days"] += amt
-            elif days_old <= 90: r_buckets["61-90 Days"] += amt
-            else: r_buckets["> 90 Days"] += amt
+            if days_old <= 30:
+                r_buckets["0-30 Days"] += amt
+            elif days_old <= 60:
+                r_buckets["31-60 Days"] += amt
+            elif days_old <= 90:
+                r_buckets["61-90 Days"] += amt
+            else:
+                r_buckets["> 90 Days"] += amt
 
         receivable_aging = [
             AgingBucket(
-                period=k, 
-                amount=v, 
-                percentage=round((v/total_r)*100) if total_r > 0 else 0
-            ) for k, v in r_buckets.items()
+                period=k,
+                amount=v,
+                percentage=round((v / total_r) * 100) if total_r > 0 else 0,
+            )
+            for k, v in r_buckets.items()
         ]
 
         # 6. Payable Aging
-        vb_query = await db.execute(select(VendorBill).where(VendorBill.status == "PENDING"))
-        p_buckets = {"0-30 Days": 0.0, "31-60 Days": 0.0, "61-90 Days": 0.0, "> 90 Days": 0.0}
+        vb_query = await db.execute(
+            select(VendorBill).where(VendorBill.status == "PENDING")
+        )
+        p_buckets = {
+            "0-30 Days": 0.0,
+            "31-60 Days": 0.0,
+            "61-90 Days": 0.0,
+            "> 90 Days": 0.0,
+        }
         total_p = 0.0
         for vb in vb_query.scalars().all():
             days_old = (today_date - vb.bill_date).days
             amt = float(vb.total_amount - vb.amount_paid)
             total_p += amt
-            if days_old <= 30: p_buckets["0-30 Days"] += amt
-            elif days_old <= 60: p_buckets["31-60 Days"] += amt
-            elif days_old <= 90: p_buckets["61-90 Days"] += amt
-            else: p_buckets["> 90 Days"] += amt
+            if days_old <= 30:
+                p_buckets["0-30 Days"] += amt
+            elif days_old <= 60:
+                p_buckets["31-60 Days"] += amt
+            elif days_old <= 90:
+                p_buckets["61-90 Days"] += amt
+            else:
+                p_buckets["> 90 Days"] += amt
 
         payable_aging = [
             AgingBucket(
-                period=k, 
-                amount=v, 
-                percentage=round((v/total_p)*100) if total_p > 0 else 0
-            ) for k, v in p_buckets.items()
+                period=k,
+                amount=v,
+                percentage=round((v / total_p) * 100) if total_p > 0 else 0,
+            )
+            for k, v in p_buckets.items()
         ]
 
         # 7. Upcoming Payments
@@ -780,7 +815,7 @@ async def accountant_dashboard(
                 UpcomingTransactionItem(
                     entity_name=sup.supplier_name,
                     date=vb.due_date.strftime("%d %b %Y"),
-                    amount=float(vb.total_amount - vb.amount_paid)
+                    amount=float(vb.total_amount - vb.amount_paid),
                 )
             )
 
@@ -799,7 +834,9 @@ async def accountant_dashboard(
                 UpcomingTransactionItem(
                     entity_name=own.owner_name,
                     date=due,
-                    amount=float(inv.pending_amount if inv.pending_amount else inv.total_amount)
+                    amount=float(
+                        inv.pending_amount if inv.pending_amount else inv.total_amount
+                    ),
                 )
             )
 
@@ -809,8 +846,10 @@ async def accountant_dashboard(
             select(func.count(GSTReturn.id)).where(GSTReturn.status == "Draft")
         )
         if gst_due_upcoming and gst_due_upcoming > 0:
-            notifications.append(f"GST Return filing due for {gst_due_upcoming} periods.")
-            
+            notifications.append(
+                f"GST Return filing due for {gst_due_upcoming} periods."
+            )
+
         pending_approvals = await db.scalar(
             select(func.count(Approval.id)).where(Approval.status == "Pending")
         )
@@ -896,21 +935,49 @@ async def pm_command_center(
 
         # Pending Reviews - Application Level Filtering
         all_pending_approvals = (
-            await db.execute(select(Approval).where(Approval.status == "Pending"))
-        ).scalars().all()
-        
-        expense_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "expense"]
-        material_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "material"]
-        bill_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "bill"]
-        
+            (await db.execute(select(Approval).where(Approval.status == "Pending")))
+            .scalars()
+            .all()
+        )
+
+        expense_ids = [
+            a.entity_id for a in all_pending_approvals if a.entity_type == "expense"
+        ]
+        material_ids = [
+            a.entity_id for a in all_pending_approvals if a.entity_type == "material"
+        ]
+        bill_ids = [
+            a.entity_id for a in all_pending_approvals if a.entity_type == "bill"
+        ]
+
         valid_reviews = 0
         if expense_ids:
-            valid_reviews += (await db.scalar(select(func.count(Expense.id)).where(Expense.id.in_(expense_ids), Expense.project_id.in_(project_ids)))) or 0
+            valid_reviews += (
+                await db.scalar(
+                    select(func.count(Expense.id)).where(
+                        Expense.id.in_(expense_ids), Expense.project_id.in_(project_ids)
+                    )
+                )
+            ) or 0
         if material_ids:
-            valid_reviews += (await db.scalar(select(func.count(Material.id)).where(Material.id.in_(material_ids), Material.project_id.in_(project_ids)))) or 0
+            valid_reviews += (
+                await db.scalar(
+                    select(func.count(Material.id)).where(
+                        Material.id.in_(material_ids),
+                        Material.project_id.in_(project_ids),
+                    )
+                )
+            ) or 0
         if bill_ids:
-            valid_reviews += (await db.scalar(select(func.count(VendorBill.id)).where(VendorBill.id.in_(bill_ids), VendorBill.project_id.in_(project_ids)))) or 0
-            
+            valid_reviews += (
+                await db.scalar(
+                    select(func.count(VendorBill.id)).where(
+                        VendorBill.id.in_(bill_ids),
+                        VendorBill.project_id.in_(project_ids),
+                    )
+                )
+            ) or 0
+
         pending_reviews = valid_reviews
 
         kpis = PMKpiCards(
@@ -1005,18 +1072,28 @@ async def pm_command_center(
         CHECKLIST_FAILURE_PENALTY = 2
 
         penalty_expr = (
-            BASE_INCIDENT_PENALTY 
-            + case((m.SafetyIncident.ppe_compliance == False, PPE_NON_COMPLIANCE_PENALTY), else_=0) 
-            + case((m.SafetyIncident.safety_checklist_status == SafetyChecklistStatus.FAILED, CHECKLIST_FAILURE_PENALTY), else_=0)
+            BASE_INCIDENT_PENALTY
+            + case(
+                (m.SafetyIncident.ppe_compliance == False, PPE_NON_COMPLIANCE_PENALTY),
+                else_=0,
+            )
+            + case(
+                (
+                    m.SafetyIncident.safety_checklist_status
+                    == SafetyChecklistStatus.FAILED,
+                    CHECKLIST_FAILURE_PENALTY,
+                ),
+                else_=0,
+            )
         )
 
         total_penalty = await db.scalar(
-            select(func.sum(penalty_expr)).where(m.SafetyIncident.project_id.in_(project_ids))
+            select(func.sum(penalty_expr)).where(
+                m.SafetyIncident.project_id.in_(project_ids)
+            )
         )
-        
+
         safety_score = max(0, 100 - int(total_penalty or 0))
-
-
 
         # 5. Cost Tracking (Last 7 months)
         cost_tracking = []
@@ -1076,7 +1153,10 @@ async def pm_command_center(
         alerts = []
         # Budget alert check
         for p in performance:
-            if p.budget_utilization_total > 0 and p.budget_utilization_actual > p.budget_utilization_total:
+            if (
+                p.budget_utilization_total > 0
+                and p.budget_utilization_actual > p.budget_utilization_total
+            ):
                 alerts.append(
                     PMCriticalAlert(
                         id=len(alerts) + 1,
@@ -1206,20 +1286,44 @@ async def pm_summary(
 
     # Approvals
     all_pending_approvals = (
-        await db.execute(select(Approval).where(Approval.status == "Pending"))
-    ).scalars().all()
-    
-    expense_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "expense"]
-    material_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "material"]
+        (await db.execute(select(Approval).where(Approval.status == "Pending")))
+        .scalars()
+        .all()
+    )
+
+    expense_ids = [
+        a.entity_id for a in all_pending_approvals if a.entity_type == "expense"
+    ]
+    material_ids = [
+        a.entity_id for a in all_pending_approvals if a.entity_type == "material"
+    ]
     bill_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "bill"]
-    
+
     pending_approvals = 0
     if expense_ids:
-        pending_approvals += (await db.scalar(select(func.count(Expense.id)).where(Expense.id.in_(expense_ids), Expense.project_id.in_(project_ids)))) or 0
+        pending_approvals += (
+            await db.scalar(
+                select(func.count(Expense.id)).where(
+                    Expense.id.in_(expense_ids), Expense.project_id.in_(project_ids)
+                )
+            )
+        ) or 0
     if material_ids:
-        pending_approvals += (await db.scalar(select(func.count(Material.id)).where(Material.id.in_(material_ids), Material.project_id.in_(project_ids)))) or 0
+        pending_approvals += (
+            await db.scalar(
+                select(func.count(Material.id)).where(
+                    Material.id.in_(material_ids), Material.project_id.in_(project_ids)
+                )
+            )
+        ) or 0
     if bill_ids:
-        pending_approvals += (await db.scalar(select(func.count(VendorBill.id)).where(VendorBill.id.in_(bill_ids), VendorBill.project_id.in_(project_ids)))) or 0
+        pending_approvals += (
+            await db.scalar(
+                select(func.count(VendorBill.id)).where(
+                    VendorBill.id.in_(bill_ids), VendorBill.project_id.in_(project_ids)
+                )
+            )
+        ) or 0
 
     # Issues
     open_issues = await db.scalar(
@@ -1255,7 +1359,7 @@ async def pm_summary(
             select(func.count(ActivityLog.id)).where(
                 ActivityLog.created_at >= today_dt,
                 ActivityLog.entity == "project",
-                ActivityLog.entity_id.in_(project_ids)
+                ActivityLog.entity_id.in_(project_ids),
             )
         )
         or 0
@@ -1279,7 +1383,7 @@ async def pm_summary(
 @router.post("/refresh")
 async def refresh_dashboard(
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
-    redis=Depends(d.get_request_redis)
+    redis=Depends(d.get_request_redis),
 ):
     await r.bump_cache_version(redis, VERSION_KEY)
     return {"message": "Dashboard cache invalidated successfully"}
@@ -1290,6 +1394,7 @@ async def refresh_dashboard(
 # =========================================
 import csv
 import io
+
 
 @router.get("/accountant/export")
 async def export_dashboard(
@@ -1306,7 +1411,16 @@ async def export_dashboard(
     writer.writerow(["=== FINANCIAL SUMMARY ==="])
     kpi = dash_out.kpi_cards
     writer.writerow(["Cash", "Bank", "Receivable", "Payable", "GST Due", "Profit"])
-    writer.writerow([kpi.cash_balance, kpi.bank_balance, kpi.receivables, kpi.payables, kpi.gst_due, kpi.net_profit])
+    writer.writerow(
+        [
+            kpi.cash_balance,
+            kpi.bank_balance,
+            kpi.receivables,
+            kpi.payables,
+            kpi.gst_due,
+            kpi.net_profit,
+        ]
+    )
     writer.writerow([])
 
     # B) Revenue vs Expense
@@ -1347,7 +1461,9 @@ async def export_dashboard(
     return StreamingResponse(
         iter([buffer.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=accountant_dashboard.csv"},
+        headers={
+            "Content-Disposition": "attachment; filename=accountant_dashboard.csv"
+        },
     )
 
 
@@ -1444,6 +1560,11 @@ async def export_master_projects_pdf(
     )
 
 
+# =========================================
+# client_dashboard
+# =========================================
+
+
 @router.get("/client")
 async def client_dashboard(
     project_id: int,
@@ -1469,7 +1590,11 @@ async def client_dashboard(
                 m.Project.status,
                 m.Project.start_date,
                 m.Project.end_date,
-            ).where(m.Project.id == project_id, m.Project.id.in_(project_ids))
+                m.Project.budget_amount,  # Added
+            ).where(
+                m.Project.id == project_id,
+                m.Project.id.in_(project_ids),
+            )
         )
 
         project = project.first()
@@ -1477,7 +1602,13 @@ async def client_dashboard(
         if not project:
             return {"error": "No project found"}
 
-        db_project_id, status, start_date, end_date = project
+        (
+            db_project_id,
+            status,
+            start_date,
+            end_date,
+            budget_amount,
+        ) = project
 
         # ========================
         # PROGRESS
@@ -1489,18 +1620,13 @@ async def client_dashboard(
         )
 
         # ========================
-        # BUDGET
-        # ========================
-        budget_total = await get_waterfall_budget(db, [db_project_id])
-
-        # ========================
         # EXPENSE
         # ========================
         total_expense = await db.scalar(
             select(func.sum(Expense.amount)).where(Expense.project_id == db_project_id)
         )
 
-        budget_val = float(budget_total or 0)
+        budget_val = float(budget_amount or 0)
         expense_val = float(total_expense or 0)
 
         budget_used_percent = (expense_val / budget_val) * 100 if budget_val else 0
@@ -1552,8 +1678,8 @@ async def client_dashboard(
             "project_id": db_project_id,
             "status": status,
             "progress_percent": round(progress or 0, 2),
-            "budget_total": budget_val,
-            "total_expense": expense_val,
+            "budget_amount": round(budget_val, 2),  # Changed
+            # "total_expense": round(expense_val, 2),
             "budget_used_percent": round(budget_used_percent, 2),
             "remaining_budget": round(remaining_budget, 2),
             "milestones_total": milestones_total or 0,
@@ -1578,6 +1704,8 @@ async def client_dashboard(
 # =========================================
 # GRAPH APIs
 # =========================================
+
+
 @router.get("/graph/labour")
 async def labour_trend(
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
@@ -2102,7 +2230,6 @@ async def ml_forecast(
     }
 
 
-@router.get("/engineer/{project_id}", response_model=EnhancedDashboardOut)
 @router.get("/engineer/details", response_model=EnhancedDashboardOut)
 async def site_engineer_dashboard(
     current_user: User = Depends(d.require_roles([UserRole.SITE_ENGINEER.value])),
@@ -2123,13 +2250,13 @@ async def site_engineer_dashboard(
         wa_filter_cond = WorkActivity.project_id == project_id
         ms_filter_cond = Milestone.project_id == project_id
         exp_filter_cond = Expense.project_id == project_id
-        
+
         project = await db.get(m.Project, project_id)
         if not project:
             raise NotFoundError("Project not found")
         project_name = project.project_name
         status = str(project.status)
-        
+
         # Planned progress for single project
         planned_progress = 0
         today = date.today()
@@ -2152,13 +2279,13 @@ async def site_engineer_dashboard(
                     total_labour_today=0,
                     active_activities=0,
                     open_issues=IssueStats(total=0, high_priority=0),
-                    material_stock_status=[]
+                    material_stock_status=[],
                 ),
                 today_work_summary=[],
                 discipline_progress=[],
                 timeline=[],
                 recent_expenses=[],
-                weather=None
+                weather=None,
             )
         filter_cond = m.DailySiteReport.project_id.in_(project_ids)
         att_filter_cond = UserAttendance.project_id.in_(project_ids)
@@ -2168,13 +2295,15 @@ async def site_engineer_dashboard(
         wa_filter_cond = WorkActivity.project_id.in_(project_ids)
         ms_filter_cond = Milestone.project_id.in_(project_ids)
         exp_filter_cond = Expense.project_id.in_(project_ids)
-        
+
         project_name = "All Assigned Projects"
         status = "Multiple"
         project_id = 0
-        
+
         # Calculate avg planned progress across all assigned projects
-        projects_query = await db.execute(select(m.Project).where(m.Project.id.in_(project_ids)))
+        projects_query = await db.execute(
+            select(m.Project).where(m.Project.id.in_(project_ids))
+        )
         projects = projects_query.scalars().all()
         today = date.today()
         total_planned = 0
@@ -2193,15 +2322,16 @@ async def site_engineer_dashboard(
         select(func.count(UserAttendance.id)).where(
             att_filter_cond,
             UserAttendance.attendance_date == today,
-            UserAttendance.in_time.is_not(None)
+            UserAttendance.in_time.is_not(None),
         )
     )
     total_labour = labor_stats.scalar() or 0
 
     # 2. Material Stock Status
     material_stats = await db.execute(
-        select(Material.category, Material.remaining_stock, Material.minimum_stock_level)
-        .where(mat_filter_cond, Material.is_deleted == False)
+        select(
+            Material.category, Material.remaining_stock, Material.minimum_stock_level
+        ).where(mat_filter_cond, Material.is_deleted == False)
     )
     materials = []
     for cat, stock, min_level in material_stats.all():
@@ -2267,7 +2397,10 @@ async def site_engineer_dashboard(
 
     # 7. Recent Expenses
     expenses_query = await db.execute(
-        select(Expense).where(exp_filter_cond).order_by(Expense.expense_date.desc()).limit(5)
+        select(Expense)
+        .where(exp_filter_cond)
+        .order_by(Expense.expense_date.desc())
+        .limit(5)
     )
     recent_expenses = [
         RecentExpense(
@@ -2281,8 +2414,10 @@ async def site_engineer_dashboard(
     ]
 
     # 8. Overall Progress & Planned
-    progress = await db.scalar(select(func.avg(m.Task.completion_percentage)).where(task_filter_cond))
-    
+    progress = await db.scalar(
+        select(func.avg(m.Task.completion_percentage)).where(task_filter_cond)
+    )
+
     variance = float(progress or 0) - planned_progress
 
     # 9. Vitals Aggregation
@@ -2319,350 +2454,6 @@ async def site_engineer_dashboard(
 def success_response(message, data=None):
 
     return {"success": True, "message": message, "data": data}
-
-
-# =========================================
-# ENTERPRISE CLIENT COMMAND CENTER
-# =========================================
-
-
-@router.get(
-    "/client-command-center",
-    summary="Enterprise Client Dashboard",
-)
-async def client_command_center(
-    project_id: int = Query(..., gt=0, description="Project ID"),
-    current_user: User = Depends(
-        d.require_roles(
-            [
-                UserRole.ADMIN.value,
-                UserRole.CLIENT.value,
-                UserRole.PROJECT_MANAGER.value,
-            ]
-        )
-    ),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(d.get_request_redis),
-):
-
-    logger.info(
-        f"Dashboard accessed " f"user={current_user.id} " f"project={project_id}"
-    )
-
-    # =========================================
-    # CACHE
-    # =========================================
-
-    cache_key = f"dashboard:" f"{project_id}:" f"{current_user.id}"
-
-    try:
-
-        cached = await r.cache_get_json(redis, cache_key)
-
-        if cached:
-            return cached
-
-    except Exception as cache_error:
-
-        logger.warning(f"Cache read failed: " f"{str(cache_error)}")
-
-    # =========================================
-    # PROJECT VALIDATION
-    # =========================================
-
-    project = await db.get(m.Project, project_id)
-
-    if not project:
-
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    # =========================================
-    # TASK ANALYTICS
-    # =========================================
-
-    total_tasks = (
-        await db.scalar(
-            select(func.count(m.Task.id)).where(m.Task.project_id == project_id)
-        )
-        or 0
-    )
-
-    completed_tasks = (
-        await db.scalar(
-            select(func.count(m.Task.id)).where(
-                m.Task.project_id == project_id,
-                func.lower(m.Task.status) == "completed",
-            )
-        )
-        or 0
-    )
-
-    pending_tasks = total_tasks - completed_tasks
-
-    overall_progress = validate_percentage(
-        safe_divide(completed_tasks * 100, total_tasks)
-    )
-
-    # =========================================
-    # MILESTONE ANALYTICS
-    # =========================================
-
-    total_milestones = (
-        await db.scalar(
-            select(func.count(m.Milestone.id)).where(
-                m.Milestone.project_id == project_id
-            )
-        )
-        or 0
-    )
-
-    completed_milestones = (
-        await db.scalar(
-            select(func.count(m.Milestone.id)).where(
-                m.Milestone.project_id == project_id,
-                func.lower(m.Milestone.status) == "completed",
-            )
-        )
-        or 0
-    )
-
-    # =========================================
-    # BUDGET ANALYTICS
-    # =========================================
-
-    total_budget = (
-        await db.scalar(
-            select(func.sum(BOQ.total_cost)).where(
-                BOQ.project_id == project_id, BOQ.is_latest == True
-            )
-        )
-        or 0
-    )
-
-    total_expense = (
-        await db.scalar(
-            select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
-        )
-        or 0
-    )
-
-    total_budget = float(total_budget or 0)
-
-    total_expense = float(total_expense or 0)
-
-    remaining_budget = round(total_budget - total_expense, 2)
-
-    budget_used_percent = validate_percentage(
-        safe_divide(total_expense * 100, total_budget)
-    )
-
-    # =========================================
-    # DAYS REMAINING
-    # =========================================
-
-    from datetime import date
-
-    days_remaining = 0
-
-    if project.end_date:
-
-        days_remaining = (project.end_date - date.today()).days
-
-        if days_remaining < 0:
-            days_remaining = 0
-
-    # =========================================
-    # ACTIVE TASK
-    # =========================================
-
-    active_task_result = await db.execute(
-        select(
-            m.Task.title,
-            m.Task.description,
-            m.Task.status,
-        )
-        .where(m.Task.project_id == project_id)
-        .order_by(desc(m.Task.id))
-        .limit(1)
-    )
-
-    active_task = active_task_result.first()
-
-    # =========================================
-    # COMPLETED TASK
-    # =========================================
-
-    completed_task_result = await db.execute(
-        select(m.Task.title)
-        .where(
-            m.Task.project_id == project_id, func.lower(m.Task.status) == "completed"
-        )
-        .order_by(desc(m.Task.id))
-        .limit(1)
-    )
-
-    completed_task = completed_task_result.scalar()
-
-    # =========================================
-    # UPCOMING TASK
-    # =========================================
-
-    upcoming_task_result = await db.execute(
-        select(m.Task.title)
-        .where(
-            m.Task.project_id == project_id, func.lower(m.Task.status) != "completed"
-        )
-        .order_by(m.Task.id.asc())
-        .limit(1)
-    )
-
-    upcoming_task = upcoming_task_result.scalar()
-
-    # =========================================
-    # WORK PROGRESS
-    # =========================================
-
-    work_progress = {
-        "progress_percent": overall_progress,
-        "current_task": active_task[0] if active_task else None,
-        "task_description": active_task[1] if active_task else None,
-        "task_status": str(active_task[2]) if active_task else None,
-        "last_completed": completed_task,
-        "upcoming": upcoming_task,
-    }
-
-    # =========================================
-    # LIVE EXECUTION FEED
-    # =========================================
-
-    activity_result = await db.execute(
-        select(
-            ActivityLog.id,
-            ActivityLog.action,
-            ActivityLog.created_at,
-            ActivityLog.entity,
-        )
-        .where(ActivityLog.entity_id == project_id)
-        .order_by(desc(ActivityLog.created_at))
-        .limit(10)
-    )
-
-    activity_rows = activity_result.all()
-
-    live_execution_feed = []
-
-    for row in activity_rows:
-
-        live_execution_feed.append(
-            {
-                "id": row[0],
-                "action": row[1],
-                "entity": row[3],
-                "created_at": row[2],
-            }
-        )
-
-    # =========================================
-    # COST MANAGEMENT AUDIT
-    # =========================================
-
-    expense_result = await db.execute(
-        select(Expense.category, func.sum(Expense.amount))
-        .where(Expense.project_id == project_id)
-        .group_by(Expense.category)
-    )
-
-    expense_rows = expense_result.all()
-
-    cost_management_audit = []
-
-    for row in expense_rows:
-
-        actual = float(row[1] or 0)
-
-        projected = round(actual * 1.1, 2)
-
-        variance = round(projected - actual, 2)
-
-        cost_management_audit.append(
-            {
-                "phase": row[0] or "General",
-                "actual": actual,
-                "projected": projected,
-                "variance": variance,
-            }
-        )
-
-    # =========================================
-    # PROJECT HEALTH
-    # =========================================
-
-    project_status = (
-        project.status.value
-        if hasattr(project.status, "value")
-        else str(project.status)
-    )
-
-    project_health = {
-        "status": project_status,
-        "overall_progress": overall_progress,
-        "budget_health": "Good" if budget_used_percent < 80 else "Warning",
-        "schedule_health": "On Track" if overall_progress >= 50 else "Delayed",
-        "task_completion_rate": overall_progress,
-        "budget_used_percent": budget_used_percent,
-    }
-
-    # =========================================
-    # RESPONSE
-    # =========================================
-
-    response = success_response(
-        "Client command center fetched successfully",
-        {
-            "project": {
-                "id": project.id,
-                "name": project.project_name,
-                "status": project_status,
-                "start_date": project.start_date,
-                "end_date": project.end_date,
-                "days_remaining": days_remaining,
-            },
-            "summary": {
-                "overall_progress": overall_progress,
-                "budget_total": total_budget,
-                "total_expense": total_expense,
-                "remaining_budget": remaining_budget,
-                "budget_used_percent": budget_used_percent,
-                "tasks": {
-                    "completed": completed_tasks,
-                    "pending": pending_tasks,
-                    "total": total_tasks,
-                },
-                "milestones": {
-                    "completed": completed_milestones,
-                    "total": total_milestones,
-                },
-            },
-            "work_progress": work_progress,
-            "live_execution_feed": live_execution_feed,
-            "cost_management_audit": cost_management_audit,
-            "project_health": project_health,
-        },
-    )
-
-    # =========================================
-    # CACHE SAVE
-    # =========================================
-
-    try:
-
-        await r.cache_set_json(redis, cache_key, response)
-
-    except Exception as cache_error:
-
-        logger.warning(f"Cache save failed: " f"{str(cache_error)}")
-
-    return response
 
 
 # =========================================
@@ -2735,6 +2526,7 @@ async def get_labour_dashboard(
 
     # 4. Get Tasks (Assigned to this user)
     from sqlalchemy.orm import selectinload
+
     tasks_res = await db.execute(
         select(Task)
         .options(selectinload(Task.project))
@@ -2758,13 +2550,23 @@ async def get_labour_dashboard(
             start_date=t.start_date,
             end_date=t.end_date,
             progress=t.completion_percentage,
-            project_name=t.project.project_name if getattr(t, "project", None) else "Project",
+            project_name=(
+                t.project.project_name if getattr(t, "project", None) else "Project"
+            ),
         )
         for t in recent_tasks_models
     ]
 
     if not project_name and all_tasks:
-        active_project_names = list(set([t.project.project_name for t in all_tasks if getattr(t, "project", None)]))
+        active_project_names = list(
+            set(
+                [
+                    t.project.project_name
+                    for t in all_tasks
+                    if getattr(t, "project", None)
+                ]
+            )
+        )
         if len(active_project_names) > 1:
             project_name = "Multiple Active Sites"
         elif len(active_project_names) == 1:
@@ -2801,47 +2603,88 @@ async def get_labour_dashboard(
 
     # 6. Recent Activity
     recent_activity = []
-    
+
     # Task Assignments
+
     for t in all_tasks[:2]:
-        recent_activity.append({
-            "title": "Task Assigned",
-            "description": f"Assigned to {t.title}",
-            "time": t.start_date.strftime("%d %b %Y") if t.start_date else "Recent",
-            "timestamp": getattr(t, "created_at", datetime.utcnow()) or datetime.utcnow()
-        })
-        
+        assignment = await db.scalar(
+            select(TaskAssignment).where(
+                TaskAssignment.task_id == t.id,
+                TaskAssignment.user_id == current_user.id,
+            )
+        )
+
+        assigned_at = assignment.assigned_at if assignment else None
+
+        recent_activity.append(
+            {
+                "title": "Task Assigned",
+                "description": f"Assigned to {t.title}",
+                "time": (
+                    assigned_at.strftime("%d %b %Y, %I:%M %p")
+                    if assigned_at
+                    else (t.start_date.strftime("%d %b %Y") if t.start_date else "--")
+                ),
+                "timestamp": (
+                    assigned_at
+                    or (
+                        datetime.combine(t.start_date, datetime.min.time())
+                        if t.start_date
+                        else datetime.min
+                    )
+                ),
+            }
+        )
+
     # Attendance events
     att_res = await db.execute(
-        select(UserAttendance).where(
-            UserAttendance.user_id == current_user.id
-        ).order_by(desc(UserAttendance.attendance_date)).limit(2)
+        select(UserAttendance)
+        .where(UserAttendance.user_id == current_user.id)
+        .order_by(desc(UserAttendance.attendance_date))
+        .limit(2)
     )
     for a in att_res.scalars().all():
-        recent_activity.append({
-            "title": "Attendance Logged",
-            "description": f"Present on {a.attendance_date.strftime('%d %b')}",
-            "time": a.in_time.strftime("%I:%M %p") if a.in_time else "Logged",
-            "timestamp": a.in_time if a.in_time else datetime.combine(a.attendance_date, datetime.min.time())
-        })
-        
+        recent_activity.append(
+            {
+                "title": "Attendance Logged",
+                "description": f"Present on {a.attendance_date.strftime('%d %b')}",
+                "time": (
+                    datetime.combine(a.attendance_date, a.in_time.time()).strftime(
+                        "%d %b %Y, %I:%M %p"
+                    )
+                    if a.in_time
+                    else a.attendance_date.strftime("%d %b %Y")
+                ),
+                "timestamp": (
+                    a.in_time
+                    if a.in_time
+                    else datetime.combine(a.attendance_date, datetime.min.time())
+                ),
+            }
+        )
+
     # Payroll Updates
     for p in payrolls[:2]:
-        recent_activity.append({
-            "title": "Payroll Generated",
-            "description": f"Wage ₹{p.total_wage} for {p.month}/{p.year}",
-            "time": p.created_at.strftime("%d %b") if getattr(p, "created_at", None) else "Recent",
-            "timestamp": getattr(p, "created_at", datetime.utcnow()) or datetime.utcnow()
-        })
-        
+        recent_activity.append(
+            {
+                "title": "Payroll Generated",
+                "description": f"Wage ₹{p.total_wage} for {p.month}/{p.year}",
+                "time": (
+                    p.created_at.strftime("%d %b %Y, %I:%M %p")
+                    if getattr(p, "created_at", None)
+                    else "Recent"
+                ),
+                "timestamp": getattr(p, "created_at", datetime.utcnow())
+                or datetime.utcnow(),
+            }
+        )
+
     # Sort and take top 5
     recent_activity.sort(key=lambda x: x["timestamp"], reverse=True)
-    
+
     recent_activity_items = [
         LabourActivityItem(
-            title=item["title"],
-            description=item["description"],
-            time=item["time"]
+            title=item["title"], description=item["description"], time=item["time"]
         )
         for item in recent_activity[:5]
     ]
@@ -2864,7 +2707,9 @@ async def get_labour_dashboard(
     )
 
 
-def apply_payroll_time_filter(stmt, time_filter: Optional[str], month: Optional[int], year: Optional[int]):
+def apply_payroll_time_filter(
+    stmt, time_filter: Optional[str], month: Optional[int], year: Optional[int]
+):
     if time_filter:
         today = get_naive_utc_now().replace(tzinfo=timezone.utc).date()
         start_date = None
@@ -2880,7 +2725,7 @@ def apply_payroll_time_filter(stmt, time_filter: Optional[str], month: Optional[
             start_date = today - timedelta(days=180)
         elif time_filter == "1_year":
             start_date = today - timedelta(days=365)
-            
+
         if start_date is not None:
             stmt = stmt.where(cast(LabourPayroll.created_at, Date) >= start_date)
     else:
@@ -2890,6 +2735,7 @@ def apply_payroll_time_filter(stmt, time_filter: Optional[str], month: Optional[
             stmt = stmt.where(LabourPayroll.year == year)
     return stmt
 
+
 @router.get("/labour/payments", response_model=dict)
 async def get_labour_payments(
     month: Optional[int] = None,
@@ -2898,9 +2744,11 @@ async def get_labour_payments(
     page: int = 1,
     page_size: int = 10,
     current_user: User = Depends(d.get_current_active_user),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
-    labour_res = await db.execute(select(Labour).where(Labour.user_id == current_user.id))
+    labour_res = await db.execute(
+        select(Labour).where(Labour.user_id == current_user.id)
+    )
     labour = labour_res.scalars().first()
     if not labour:
         raise HTTPException(status_code=404, detail="Labour profile not found for user")
@@ -2908,11 +2756,15 @@ async def get_labour_payments(
     # Metrics
     metrics_stmt = select(
         func.sum(LabourPayroll.total_wage).label("total_payout"),
-        func.sum(case((LabourPayroll.total_wage > 5000, 1), else_=0)).label("high_payouts"),
-        func.sum(case((LabourPayroll.total_overtime_hours > 0, 1), else_=0)).label("ot_intensive"),
-        func.sum(LabourPayroll.advance_adjusted).label("advance_adjusted")
+        func.sum(case((LabourPayroll.total_wage > 5000, 1), else_=0)).label(
+            "high_payouts"
+        ),
+        func.sum(case((LabourPayroll.total_overtime_hours > 0, 1), else_=0)).label(
+            "ot_intensive"
+        ),
+        func.sum(LabourPayroll.advance_adjusted).label("advance_adjusted"),
     ).where(LabourPayroll.labour_id == labour.id)
-    
+
     metrics_stmt = apply_payroll_time_filter(metrics_stmt, time_filter, month, year)
 
     metrics_res = await db.execute(metrics_stmt)
@@ -2922,11 +2774,12 @@ async def get_labour_payments(
         "total_payout": float(metrics_row.total_payout or 0),
         "high_payouts": int(metrics_row.high_payouts or 0),
         "ot_intensive": int(metrics_row.ot_intensive or 0),
-        "advance_adjusted": float(metrics_row.advance_adjusted or 0)
+        "advance_adjusted": float(metrics_row.advance_adjusted or 0),
     }
 
     # Records
     from sqlalchemy.orm import selectinload
+
     records_stmt = (
         select(LabourPayroll, Labour)
         .join(Labour, LabourPayroll.labour_id == Labour.id)
@@ -2935,30 +2788,63 @@ async def get_labour_payments(
     )
     records_stmt = apply_payroll_time_filter(records_stmt, time_filter, month, year)
 
-    count_stmt = select(func.count(LabourPayroll.id)).where(LabourPayroll.labour_id == labour.id)
+    count_stmt = select(func.count(LabourPayroll.id)).where(
+        LabourPayroll.labour_id == labour.id
+    )
     count_stmt = apply_payroll_time_filter(count_stmt, time_filter, month, year)
-        
+
     count_res = await db.execute(count_stmt)
     total_records = count_res.scalar() or 0
 
-    records_stmt = records_stmt.order_by(desc(LabourPayroll.created_at)).offset((page - 1) * page_size).limit(page_size)
+    records_stmt = (
+        records_stmt.order_by(desc(LabourPayroll.created_at))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
     records_res = await db.execute(records_stmt)
 
     records_data = []
     for pr, lab in records_res.all():
-        date_str = pr.created_at.strftime("%d %b %Y") if pr.created_at else f"{pr.month}/{pr.year}"
-        skill_type = lab.skill_category.value if hasattr(lab.skill_category, "value") else str(lab.skill_category)
-        
-        records_data.append({
-            "id": f"{pr.id:03d}",
-            "date": date_str,
-            "skill_type": skill_type.capitalize(),
-            "daily_wage": f"₹{lab.daily_wage_rate}" if hasattr(lab, 'daily_wage_rate') and lab.daily_wage_rate else "₹800",
-            "ot_hours": f"{int(pr.total_overtime_hours)}h" if pr.total_overtime_hours else "0h",
-            "total_wage_earned": f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
-            "remarks": pr.remarks or ("STANDARD PAYOUT" if hasattr(pr.status, "value") and pr.status.value == "PAID" else "PENDING"),
-            "status": pr.status.value if hasattr(pr.status, "value") else str(pr.status)
-        })
+        date_str = (
+            pr.created_at.strftime("%d %b %Y")
+            if pr.created_at
+            else f"{pr.month}/{pr.year}"
+        )
+        skill_type = (
+            lab.skill_category.value
+            if hasattr(lab.skill_category, "value")
+            else str(lab.skill_category)
+        )
+
+        records_data.append(
+            {
+                "id": f"{pr.id:03d}",
+                "date": date_str,
+                "skill_type": skill_type.capitalize(),
+                "daily_wage": (
+                    f"₹{lab.daily_wage_rate}"
+                    if hasattr(lab, "daily_wage_rate") and lab.daily_wage_rate
+                    else "₹800"
+                ),
+                "ot_hours": (
+                    f"{int(pr.total_overtime_hours)}h"
+                    if pr.total_overtime_hours
+                    else "0h"
+                ),
+                "total_wage_earned": (
+                    f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0"
+                ),
+                "remarks": pr.remarks
+                or (
+                    "STANDARD PAYOUT"
+                    if hasattr(pr.status, "value") and pr.status.value == "PAID"
+                    else "PENDING"
+                ),
+                "status": (
+                    pr.status.value if hasattr(pr.status, "value") else str(pr.status)
+                ),
+            }
+        )
 
     return success_response(
         message="Labour payments fetched",
@@ -2968,9 +2854,12 @@ async def get_labour_payments(
             "total_records": total_records,
             "page": page,
             "page_size": page_size,
-            "total_pages": (total_records + page_size - 1) // page_size if page_size > 0 else 0
-        }
+            "total_pages": (
+                (total_records + page_size - 1) // page_size if page_size > 0 else 0
+            ),
+        },
     )
+
 
 @router.get("/labour/payments/export")
 async def export_labour_payments(
@@ -2979,14 +2868,17 @@ async def export_labour_payments(
     time_filter: Optional[str] = None,
     export_format: str = Query("csv", description="csv or pdf"),
     current_user: User = Depends(d.get_current_active_user),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
-    labour_res = await db.execute(select(Labour).where(Labour.user_id == current_user.id))
+    labour_res = await db.execute(
+        select(Labour).where(Labour.user_id == current_user.id)
+    )
     labour = labour_res.scalars().first()
     if not labour:
         raise HTTPException(status_code=404, detail="Labour profile not found for user")
 
     from sqlalchemy.orm import selectinload
+
     records_stmt = (
         select(LabourPayroll, Labour)
         .join(Labour, LabourPayroll.labour_id == Labour.id)
@@ -2999,32 +2891,76 @@ async def export_labour_payments(
     records = records_res.all()
 
     import io, csv
+
     if export_format == "csv":
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["ID", "Date", "Skill Type", "Daily Wage", "OT Hours", "Total Wage Earned", "Remarks", "Status"])
+        writer.writerow(
+            [
+                "ID",
+                "Date",
+                "Skill Type",
+                "Daily Wage",
+                "OT Hours",
+                "Total Wage Earned",
+                "Remarks",
+                "Status",
+            ]
+        )
         for pr, lab in records:
-            date_str = pr.created_at.strftime("%d %b %Y") if pr.created_at else f"{pr.month}/{pr.year}"
-            skill_type = lab.skill_category.value if hasattr(lab.skill_category, "value") else str(lab.skill_category)
-            writer.writerow([
-                f"{pr.id:03d}",
-                date_str,
-                skill_type.capitalize(),
-                f"₹{lab.daily_wage_rate}" if hasattr(lab, 'daily_wage_rate') and lab.daily_wage_rate else "₹800",
-                f"{int(pr.total_overtime_hours)}h" if pr.total_overtime_hours else "0h",
-                f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
-                pr.remarks or ("STANDARD PAYOUT" if hasattr(pr.status, "value") and pr.status.value == "PAID" else "PENDING"),
-                pr.status.value if hasattr(pr.status, "value") else str(pr.status)
-            ])
+            date_str = (
+                pr.created_at.strftime("%d %b %Y")
+                if pr.created_at
+                else f"{pr.month}/{pr.year}"
+            )
+            skill_type = (
+                lab.skill_category.value
+                if hasattr(lab.skill_category, "value")
+                else str(lab.skill_category)
+            )
+            writer.writerow(
+                [
+                    f"{pr.id:03d}",
+                    date_str,
+                    skill_type.capitalize(),
+                    (
+                        f"₹{lab.daily_wage_rate}"
+                        if hasattr(lab, "daily_wage_rate") and lab.daily_wage_rate
+                        else "₹800"
+                    ),
+                    (
+                        f"{int(pr.total_overtime_hours)}h"
+                        if pr.total_overtime_hours
+                        else "0h"
+                    ),
+                    f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
+                    pr.remarks
+                    or (
+                        "STANDARD PAYOUT"
+                        if hasattr(pr.status, "value") and pr.status.value == "PAID"
+                        else "PENDING"
+                    ),
+                    pr.status.value if hasattr(pr.status, "value") else str(pr.status),
+                ]
+            )
         output.seek(0)
         from fastapi.responses import StreamingResponse
+
         return StreamingResponse(
-            iter([output.getvalue()]), 
-            media_type="text/csv", 
-            headers={"Content-Disposition": f"attachment; filename=labour_payments.csv"}
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f"attachment; filename=labour_payments.csv"
+            },
         )
     elif export_format == "pdf":
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Table,
+            TableStyle,
+            Spacer,
+        )
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
@@ -3032,44 +2968,79 @@ async def export_labour_payments(
         from fastapi.responses import StreamingResponse
 
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=18)
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            rightMargin=30,
+            leftMargin=30,
+            topMargin=30,
+            bottomMargin=18,
+        )
         elements = []
         styles = getSampleStyleSheet()
-        
-        elements.append(Paragraph(f"Labour Payments Report: {current_user.full_name}", styles['Heading1']))
+
+        elements.append(
+            Paragraph(
+                f"Labour Payments Report: {current_user.full_name}", styles["Heading1"]
+            )
+        )
         elements.append(Spacer(1, 0.2 * inch))
-        
+
         data = [["ID", "Date", "Skill", "Wage", "OT", "Total", "Status"]]
         for pr, lab in records:
-            date_str = pr.created_at.strftime("%d %b %Y") if pr.created_at else f"{pr.month}/{pr.year}"
-            skill_type = lab.skill_category.value if hasattr(lab.skill_category, "value") else str(lab.skill_category)
-            data.append([
-                f"{pr.id:03d}",
-                date_str,
-                skill_type.capitalize()[:10],
-                f"₹{lab.daily_wage_rate}" if hasattr(lab, 'daily_wage_rate') and lab.daily_wage_rate else "₹800",
-                f"{int(pr.total_overtime_hours)}h" if pr.total_overtime_hours else "0h",
-                f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
-                pr.status.value if hasattr(pr.status, "value") else str(pr.status)
-            ])
-            
+            date_str = (
+                pr.created_at.strftime("%d %b %Y")
+                if pr.created_at
+                else f"{pr.month}/{pr.year}"
+            )
+            skill_type = (
+                lab.skill_category.value
+                if hasattr(lab.skill_category, "value")
+                else str(lab.skill_category)
+            )
+            data.append(
+                [
+                    f"{pr.id:03d}",
+                    date_str,
+                    skill_type.capitalize()[:10],
+                    (
+                        f"₹{lab.daily_wage_rate}"
+                        if hasattr(lab, "daily_wage_rate") and lab.daily_wage_rate
+                        else "₹800"
+                    ),
+                    (
+                        f"{int(pr.total_overtime_hours)}h"
+                        if pr.total_overtime_hours
+                        else "0h"
+                    ),
+                    f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
+                    pr.status.value if hasattr(pr.status, "value") else str(pr.status),
+                ]
+            )
+
         t = Table(data)
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.grey),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('BOTTOMPADDING', (0,0), (-1,0), 12),
-            ('BACKGROUND', (0,1), (-1,-1), colors.beige),
-            ('GRID', (0,0), (-1,-1), 1, colors.black)
-        ]))
+        t.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.beige),
+                    ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ]
+            )
+        )
         elements.append(t)
         doc.build(elements)
         buffer.seek(0)
         return StreamingResponse(
-            buffer, 
-            media_type="application/pdf", 
-            headers={"Content-Disposition": f"attachment; filename=labour_payments.pdf"}
+            buffer,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename=labour_payments.pdf"
+            },
         )
     else:
         raise HTTPException(status_code=400, detail="Invalid export format")
