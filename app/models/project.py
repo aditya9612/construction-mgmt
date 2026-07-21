@@ -864,12 +864,11 @@ class ChecklistLog(Base):
 
     status = Column(SAEnum(ChecklistStatus), nullable=False)
     remarks = Column(Text)
-    
+
     executed_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     checklist = relationship("Checklist", back_populates="logs")
     executor = relationship("User", foreign_keys=[executed_by], lazy="selectin")
-
 
 
 # ======================
@@ -1063,14 +1062,27 @@ class SiteRequest(Base, TimestampMixin):
     project = relationship("Project")
 
 
-# =================work progress===========================
-
+# ============================================
+# Work progress
+# ===========================================
 
 class WorkActivity(Base, TimestampMixin):
-
     __tablename__ = "work_activities"
 
-    id = Column(Integer, primary_key=True, index=True)
+    # =========================================================
+    # PRIMARY KEY
+    # =========================================================
+
+    id = Column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+        index=True,
+    )
+
+    # =========================================================
+    # PROJECT
+    # =========================================================
 
     project_id = Column(
         Integer,
@@ -1079,13 +1091,56 @@ class WorkActivity(Base, TimestampMixin):
         index=True,
     )
 
-    boq_code = Column(Integer, nullable=True)
+    # =========================================================
+    # BOQ (Required)
+    # =========================================================
 
-    activity_name = Column(String(255), nullable=False)
+    boq_item_id = Column(
+        Integer,
+        ForeignKey("boq_items.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
 
-    planned_quantity = Column(DECIMAL(18, 2), default=0)
+    # =========================================================
+    # WORK ORDER (Optional)
+    # =========================================================
 
-    unit = Column(String(50))
+    work_order_id = Column(
+        Integer,
+        ForeignKey("work_orders.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # =========================================================
+    # ACTIVITY DETAILS
+    # =========================================================
+
+    activity_name = Column(
+        String(255),
+        nullable=False,
+    )
+
+    discipline = Column(
+        String(100),
+        nullable=True,
+    )
+
+    planned_quantity = Column(
+        DECIMAL(18, 2),
+        nullable=False,
+        default=Decimal("0.00"),
+    )
+
+    unit = Column(
+        String(50),
+        nullable=False,
+    )
+
+    # =========================================================
+    # ASSIGNED ENGINEER
+    # =========================================================
 
     engineer_id = Column(
         Integer,
@@ -1094,72 +1149,152 @@ class WorkActivity(Base, TimestampMixin):
         index=True,
     )
 
-    work_order_id = Column(
-        Integer,
-        ForeignKey("work_orders.id", ondelete="CASCADE"),
+    # =========================================================
+    # PROGRESS
+    # =========================================================
+
+    total_completed = Column(
+        DECIMAL(18, 2),
         nullable=False,
-        index=True,
+        default=Decimal("0.00"),
     )
 
-    total_completed = Column(DECIMAL(18, 2), default=0)
+    remaining_quantity = Column(
+        DECIMAL(18, 2),
+        nullable=False,
+        default=Decimal("0.00"),
+    )
 
-    remaining_quantity = Column(DECIMAL(18, 2), default=0)
-
-    completion_percentage = Column(DECIMAL(5, 2), default=0)
-
-    discipline = Column(String(100), nullable=True)
+    completion_percentage = Column(
+        DECIMAL(5, 2),
+        nullable=False,
+        default=Decimal("0.00"),
+    )
 
     status = Column(
         SAEnum(WorkActivityStatus),
+        nullable=False,
         default=WorkActivityStatus.NOT_STARTED,
+        index=True,
+    )
+
+    # =========================================================
+    # SCHEDULE
+    # =========================================================
+
+    start_date = Column(
+        Date,
         nullable=False,
     )
 
-    start_date = Column(Date)
-
-    end_date = Column(Date)
-
-    created_at = Column(
-        TIMESTAMP,
-        server_default=func.now(),
+    end_date = Column(
+        Date,
+        nullable=False,
     )
 
-    # ================= RELATIONSHIPS =================
+    # =========================================================
+    # RELATIONSHIPS
+    # =========================================================
 
-    project = relationship("Project")
+    project = relationship(
+        "Project",
+        lazy="selectin",
+    )
 
-    engineer = relationship("User")
+    boq_item = relationship(
+        "BOQ",
+        lazy="selectin",
+    )
+
+    work_order = relationship(
+        "WorkOrder",
+        lazy="selectin",
+    )
+
+    engineer = relationship(
+        "User",
+        foreign_keys=[engineer_id],
+        lazy="selectin",
+    )
 
     progress_entries = relationship(
         "DailyProgressEntry",
         back_populates="activity",
         cascade="all, delete-orphan",
+        lazy="selectin",
     )
-
-    # ================= UPDATED HISTORY RELATIONSHIP =================
 
     history_logs = relationship(
         "ActivityHistory",
         back_populates="activity",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
-    # ================= CONSTRAINTS =================
+    # =========================================================
+    # CONSTRAINTS & INDEXES
+    # =========================================================
 
     __table_args__ = (
+
         CheckConstraint(
-            "planned_quantity >= 0",
-            name="check_planned_quantity_positive",
+            "planned_quantity > 0",
+            name="ck_activity_planned_quantity",
         ),
+
         CheckConstraint(
-            "end_date >= start_date",
-            name="check_activity_dates",
+            "total_completed >= 0",
+            name="ck_activity_total_completed",
         ),
+
+        CheckConstraint(
+            "remaining_quantity >= 0",
+            name="ck_activity_remaining_quantity",
+        ),
+
+        CheckConstraint(
+            "total_completed <= planned_quantity",
+            name="ck_activity_completed_quantity",
+        ),
+
         CheckConstraint(
             "completion_percentage >= 0 AND completion_percentage <= 100",
-            name="check_completion_percentage_range",
+            name="ck_activity_completion_percentage",
+        ),
+
+        CheckConstraint(
+            "end_date >= start_date",
+            name="ck_activity_dates",
+        ),
+
+        UniqueConstraint(
+            "project_id",
+            "boq_item_id",
+            name="uq_activity_project_boq",
+        ),
+
+        Index(
+            "idx_activity_project_status",
+            "project_id",
+            "status",
+        ),
+
+        Index(
+            "idx_activity_project_engineer",
+            "project_id",
+            "engineer_id",
+        ),
+
+        Index(
+            "idx_activity_work_order",
+            "work_order_id",
+        ),
+
+        Index(
+            "idx_activity_boq_item",
+            "boq_item_id",
         ),
     )
-
 
 # ================= DAILY PROGRESS ENTRY =================
 

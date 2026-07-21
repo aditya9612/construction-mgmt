@@ -1095,13 +1095,16 @@ class MessageCreate(BaseSchema):
 
 # =========================================================
 # WORK ACTIVITY CREATE
+# =========================================================
 
 
 class WorkActivityCreate(BaseSchema):
 
     project_id: int = Field(gt=0)
 
-    boq_code: Optional[int] = Field(
+    boq_item_id: int = Field(gt=0)
+
+    work_order_id: Optional[int] = Field(
         default=None,
         gt=0,
     )
@@ -1111,9 +1114,14 @@ class WorkActivityCreate(BaseSchema):
         max_length=255,
     )
 
+    discipline: Optional[str] = Field(
+        default=None,
+        max_length=100,
+    )
+
     planned_quantity: Decimal = Field(
         gt=0,
-        max_digits=12,
+        max_digits=18,
         decimal_places=2,
     )
 
@@ -1122,128 +1130,139 @@ class WorkActivityCreate(BaseSchema):
         max_length=50,
     )
 
-    start_date: date
-
-    end_date: date
-
-    work_order_id: int = Field(gt=0)
-
     engineer_id: Optional[int] = Field(
         default=None,
         gt=0,
     )
 
-    # ================= ACTIVITY NAME =================
+    start_date: date
+
+    end_date: date
 
     @field_validator("activity_name")
+    @classmethod
     def validate_activity(cls, v):
-
         return validate_activity_name(v)
 
-    # ================= UNIT =================
-
     @field_validator("unit")
-    def validate_activity_unit(cls, v):
-
+    @classmethod
+    def validate_unit_name(cls, v):
         return validate_unit(v)
 
-    # ================= DATE RANGE =================
-
     @field_validator("end_date")
-    def validate_dates(cls, v, info: ValidationInfo):
-
-        return validate_start_end_dates(
-            info.data.get("start_date"),
-            v,
-        )
-
-    # ================= DATE VALIDATION =================
+    @classmethod
+    def validate_date_range(cls, v, info: ValidationInfo):
+        start_date = info.data.get("start_date")
+        if start_date:
+            return validate_start_end_dates(start_date, v)
+        return v
 
     @field_validator("start_date", "end_date")
+    @classmethod
     def validate_activity_dates(cls, v):
-
         return validate_work_activity_date(v)
 
 
 # =========================================================
 # WORK ACTIVITY UPDATE
+# =========================================================
 
 
 class WorkActivityUpdate(BaseSchema):
 
-    activity_name: Optional[str] = None
+    work_order_id: Optional[int] = Field(
+        default=None,
+        gt=0,
+    )
+
+    activity_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+    )
+
+    discipline: Optional[str] = Field(
+        default=None,
+        max_length=100,
+    )
 
     planned_quantity: Optional[Decimal] = Field(
         default=None,
         gt=0,
-        max_digits=12,
+        max_digits=18,
         decimal_places=2,
     )
 
-    unit: Optional[str] = None
-
-    start_date: Optional[date] = None
-
-    end_date: Optional[date] = None
+    unit: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=50,
+    )
 
     engineer_id: Optional[int] = Field(
         default=None,
         gt=0,
     )
 
-    # ================= ACTIVITY NAME =================
+    start_date: Optional[date] = None
+
+    end_date: Optional[date] = None
 
     @field_validator("activity_name")
+    @classmethod
     def validate_activity(cls, v):
-
+        if v is None:
+            return v
         return validate_activity_name(v)
 
-    # ================= UNIT =================
-
     @field_validator("unit")
-    def validate_activity_unit(cls, v):
-
+    @classmethod
+    def validate_unit_name(cls, v):
+        if v is None:
+            return v
         return validate_unit(v)
 
-    # ================= DATE RANGE =================
+    @field_validator("start_date", "end_date")
+    @classmethod
+    def validate_activity_dates(cls, v):
+        if v is None:
+            return v
+        return validate_work_activity_date(v)
 
     @field_validator("end_date")
-    def validate_dates(cls, v, info: ValidationInfo):
-
-        return validate_start_end_dates(
-            info.data.get("start_date"),
-            v,
-        )
-
-    # ================= DATE VALIDATION =================
-
-    @field_validator("start_date", "end_date")
-    def validate_activity_dates(cls, v):
-
+    @classmethod
+    def validate_date_range(cls, v, info: ValidationInfo):
         if v is None:
             return v
 
-        return validate_work_activity_date(v)
+        start_date = info.data.get("start_date")
+
+        if start_date:
+            return validate_start_end_dates(start_date, v)
+
+        return v
 
 
 # =========================================================
 # WORK ACTIVITY RESPONSE
+# =========================================================
 
 
 class WorkActivityResponse(BaseSchema):
+
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
 
     project_id: int
 
-    work_order_id: int
+    boq_item_id: int
 
-    boq_code: Optional[int] = None
+    work_order_id: Optional[int] = None
 
-    activity_name: str = Field(
-        min_length=1,
-        max_length=255,
-    )
+    activity_name: str
+
+    discipline: Optional[str] = None
 
     planned_quantity: Decimal
 
@@ -1253,29 +1272,53 @@ class WorkActivityResponse(BaseSchema):
 
     completion_percentage: Decimal
 
-    unit: str = Field(
-        min_length=1,
-        max_length=50,
-    )
+    unit: str
+
+    engineer_id: Optional[int] = None
+
+    status: WorkActivityStatus
 
     start_date: date
 
     end_date: date
 
-    status: WorkActivityStatus
-
-    engineer_id: Optional[int] = None
-
-    discipline: Optional[str] = None
-
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    updated_at: datetime
 
 
-# =========================================================
-# DAILY PROGRESS CREATE
+class WorkActivityCreateResponse(BaseSchema):
+
+    message: str
+
+    data: WorkActivityResponse
+
+
+class WorkActivityUpdateResponse(BaseSchema):
+
+    message: str
+
+    data: WorkActivityResponse
+
+
+class WorkActivityDeleteResponse(BaseSchema):
+
+    message: str
+
+
+class WorkActivityListResponse(BaseSchema):
+
+    success: bool
+
+    limit: int
+
+    offset: int
+
+    page_count: int
+
+    total_count: int
+
+    data: list[WorkActivityResponse]
 
 
 class DailyProgressCreate(BaseSchema):
@@ -1310,8 +1353,6 @@ class DailyProgressCreate(BaseSchema):
         return validate_progress_remarks(v)
 
 
-# =========================================================
-# DAILY PROGRESS UPDATE
 class DailyProgressUpdate(BaseSchema):
 
     today_progress: Optional[Decimal] = Field(
@@ -1334,8 +1375,6 @@ class DailyProgressUpdate(BaseSchema):
         return validate_progress_remarks(v)
 
 
-# =========================================================
-# DAILY PROGRESS RESPONSE
 class DailyProgressResponse(BaseSchema):
 
     id: int
@@ -1356,32 +1395,76 @@ class DailyProgressResponse(BaseSchema):
         from_attributes = True
 
 
-# =========================================================
-# DAILY PROGRESS WITH ACTIVITY RESPONSE
+class DailyProgressListResponse(BaseSchema):
+    success: bool = True
+    message: str
+    data: list[DailyProgressResponse]
+    pagination: PaginationMeta
+
+class TodayProgressResponse(BaseSchema):
+    success: bool = True
+    message: str
+    engineer_id: int
+    entry_date: date
+    limit: int
+    offset: int
+    page_count: int
+    total_count: int
+    data: list[DailyProgressResponse]
+
 class DailyProgressWithActivityResponse(BaseSchema):
 
     message: str
-
     progress: DailyProgressResponse
-
     activity: WorkActivityResponse
 
     class Config:
         from_attributes = True
 
 
+class DailyProgressDeleteResponse(BaseModel):
+    success: bool
+    message: str
+
+
+class WorkOrderProgressSummary(BaseModel):
+    work_order_id: int
+    work_order_number: str
+    total_activities: int
+    completed_activities: int
+    in_progress_activities: int
+    pending_activities: int
+    completion_percentage: float
+
+
+class WorkOrderProgressSummaryResponse(BaseModel):
+    success: bool
+    message: str
+    data: WorkOrderProgressSummary
+
+
+class ActivityProgressHistory(BaseModel):
+    activity_id: int
+    activity_name: str
+    progress_date: date
+    completed_quantity: float
+    completion_percentage: float
+    remarks: str | None = None
+
+
+class ActivityProgressHistoryResponse(BaseModel):
+    success: bool
+    message: str
+    data: list[ActivityProgressHistory]
+    
 # =========================================================
 # PROJECTS MODULE SUMMARY
 
 
 class ProjectsModuleSummary(BaseSchema):
-
     total_projects: int
-
     ongoing_sites: int
-
     completed_projects: int
-
     delayed_projects: int
 
 
@@ -1392,13 +1475,9 @@ class ProjectsModuleSummary(BaseSchema):
 class ProjectActivityItem(BaseSchema):
 
     type: str
-
     user_name: str
-
     description: str
-
     project_name: str
-
     timestamp: datetime
 
     # ================= STRING VALIDATIONS =================
@@ -1419,9 +1498,7 @@ class ProjectActivityItem(BaseSchema):
 
 
 class ProjectsModuleResponse(BaseSchema):
-
     summary: ProjectsModuleSummary
-
     activities: List[ProjectActivityItem]
 
 
@@ -1431,13 +1508,9 @@ class ProjectsModuleResponse(BaseSchema):
 class ProjectOTPolicyCreate(BaseModel):
 
     policy_type: OTPolicyType
-
     normal_day_multiplier: Optional[Decimal] = Decimal("1.5")
-
     sunday_multiplier: Optional[Decimal] = Decimal("2.0")
-
     holiday_multiplier: Optional[Decimal] = Decimal("3.0")
-
     fixed_ot_rate: Optional[Decimal] = None
 
     @model_validator(mode="after")
