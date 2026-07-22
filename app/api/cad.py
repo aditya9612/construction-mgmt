@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Depends
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -171,11 +171,19 @@ async def csv_to_dxf(file_path: str, db: AsyncSession):
 # -------------------- API --------------------
 @router.post("/csv-to-dxf")
 async def convert(file: UploadFile = File(...), db: AsyncSession = Depends(get_db_session)):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+    
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
+    await file.seek(0)
+
     temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.csv")
 
     def _save_cad():
         with open(temp_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
+            f.write(content)
             
     await run_in_threadpool(_save_cad)
 

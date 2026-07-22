@@ -399,44 +399,55 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
         f"project:{chat_id}"
     )
 
-    try:
-        # =========================
-        #  DB SESSION (ADDED)
-        # =========================
-        async with AsyncSessionLocal() as db:
+    async def redis_listener():
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
 
-            async for message in pubsub.listen():
+            data = json.loads(message["data"])
 
-                if message["type"] != "message":
-                    continue
-
-                data = json.loads(message["data"])
-
-                # =========================
-                #  MARK DELIVERED (ADDED)
-                # =========================
-                if data.get("type") == "message":
-                    msg_id = data.get("message_id")
-
-                    if msg_id:
+            if data.get("type") == "message":
+                msg_id = data.get("message_id")
+                if msg_id:
+                    async with AsyncSessionLocal() as db:
                         msg = await db.get(ChatMessage, msg_id)
-
                         if msg and msg.status == MessageStatus.SENT:
                             msg.status = MessageStatus.DELIVERED
                             await db.commit()
 
-                        #  broadcast delivered event (NEW)
-                        await redis.publish(
-                            f"chat:{chat_id}",
-                            json.dumps({
-                                "type": "delivered",
-                                "chat_id": chat_id,
-                                "message_id": msg_id
-                            })
-                        )
+                    await redis.publish(
+                        f"chat:{chat_id}",
+                        json.dumps({
+                            "type": "delivered",
+                            "chat_id": chat_id,
+                            "message_id": msg_id
+                        })
+                    )
 
-                #  broadcast ALL event types
-                await manager.broadcast(chat_id, data)
+            await manager.broadcast(chat_id, data)
+
+    async def websocket_listener():
+        while True:
+            await websocket.receive_text()
+
+    redis_task = asyncio.create_task(redis_listener())
+    ws_task = asyncio.create_task(websocket_listener())
+
+    try:
+        done, pending = await asyncio.wait(
+            [redis_task, ws_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Re-raise exceptions from completed tasks (like WebSocketDisconnect)
+        for task in done:
+            task.result()
 
     except WebSocketDisconnect:
         manager.disconnect(chat_id, websocket)

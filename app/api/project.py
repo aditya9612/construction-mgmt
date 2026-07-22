@@ -3865,30 +3865,11 @@ async def create_task(
     audio_instruction_url = None
 
     if audio_file:
-
-        allowed_audio = ["mp3", "wav", "m4a", "webm", "aac", "ogg"]
-
-        if "." not in audio_file.filename:
-
-            raise ValidationError("Audio file must have extension")
-
-        ext = audio_file.filename.rsplit(".", 1)[-1].lower()
-
-        if ext not in allowed_audio:
-
-            raise ValidationError("Invalid audio format")
-
-        filename = f"{uuid.uuid4().hex}.{ext}"
-
-        filepath = os.path.join(AUDIO_DIR, filename)
-
-        def _save_audio():
-            with open(filepath, "wb") as buffer:
-                shutil.copyfileobj(audio_file.file, buffer)
-                
-        await run_in_threadpool(_save_audio)
-
-        audio_instruction_url = filepath.replace("\\", "/")
+        from app.core.validators import validate_and_save_audio
+        audio_instruction_url = await validate_and_save_audio(
+            file=audio_file, upload_dir=AUDIO_DIR, prefix="audio"
+        )
+        audio_instruction_url = audio_instruction_url.replace("\\", "/")
 
     # =========================================
     # SAVE IMAGE FILE
@@ -3897,30 +3878,11 @@ async def create_task(
     instruction_image_url = None
 
     if instruction_image:
-
-        allowed_images = ["jpg", "jpeg", "png", "webp"]
-
-        if "." not in instruction_image.filename:
-
-            raise ValidationError("Image file must have extension")
-
-        ext = instruction_image.filename.rsplit(".", 1)[-1].lower()
-
-        if ext not in allowed_images:
-
-            raise ValidationError("Invalid image format")
-
-        filename = f"{uuid.uuid4().hex}.{ext}"
-
-        filepath = os.path.join(IMAGE_DIR, filename)
-
-        def _save_image():
-            with open(filepath, "wb") as buffer:
-                shutil.copyfileobj(instruction_image.file, buffer)
-                
-        await run_in_threadpool(_save_image)
-
-        instruction_image_url = filepath.replace("\\", "/")
+        from app.core.validators import validate_and_save_image
+        instruction_image_url = await validate_and_save_image(
+            file=instruction_image, upload_dir=IMAGE_DIR, prefix="img"
+        )
+        instruction_image_url = instruction_image_url.replace("\\", "/")
 
     try:
 
@@ -4012,30 +3974,11 @@ async def update_task(
     audio_instruction_url = None
 
     if audio_file:
-
-        allowed_audio = ["mp3", "wav", "m4a", "webm"]
-
-        if "." not in audio_file.filename:
-
-            raise BadRequestError("Audio file must have extension")
-
-        ext = audio_file.filename.rsplit(".", 1)[-1].lower()
-
-        if ext not in allowed_audio:
-
-            raise BadRequestError("Invalid audio format")
-
-        filename = f"{uuid.uuid4().hex}.{ext}"
-
-        filepath = os.path.join(AUDIO_DIR, filename)
-
-        def _save_update_audio():
-            with open(filepath, "wb") as buffer:
-                shutil.copyfileobj(audio_file.file, buffer)
-                
-        await run_in_threadpool(_save_update_audio)
-
-        audio_instruction_url = filepath.replace("\\", "/")
+        from app.core.validators import validate_and_save_audio
+        audio_instruction_url = await validate_and_save_audio(
+            file=audio_file, upload_dir=AUDIO_DIR, prefix="audio"
+        )
+        audio_instruction_url = audio_instruction_url.replace("\\", "/")
 
     # =========================================
     # SAVE IMAGE FILE
@@ -4043,30 +3986,11 @@ async def update_task(
 
     instruction_image_url = None
     if instruction_image:
-
-        allowed_images = ["jpg", "jpeg", "png", "webp"]
-
-        if "." not in instruction_image.filename:
-
-            raise BadRequestError("Image file must have extension")
-
-        ext = instruction_image.filename.rsplit(".", 1)[-1].lower()
-
-        if ext not in allowed_images:
-
-            raise BadRequestError("Invalid image format")
-
-        filename = f"{uuid.uuid4().hex}.{ext}"
-
-        filepath = os.path.join(IMAGE_DIR, filename)
-
-        def _save_update_image():
-            with open(filepath, "wb") as buffer:
-                shutil.copyfileobj(instruction_image.file, buffer)
-                
-        await run_in_threadpool(_save_update_image)
-
-        instruction_image_url = filepath.replace("\\", "/")
+        from app.core.validators import validate_and_save_image
+        instruction_image_url = await validate_and_save_image(
+            file=instruction_image, upload_dir=IMAGE_DIR, prefix="img"
+        )
+        instruction_image_url = instruction_image_url.replace("\\", "/")
 
     try:
 
@@ -9275,7 +9199,7 @@ async def upload_drawing(
 ):
     os.makedirs("uploads/drawings", exist_ok=True)
 
-    validate_drawing_file(file.filename)
+    await validate_drawing_file(file)
 
     MAX_DRAWING_SIZE = 20 * 1024 * 1024
 

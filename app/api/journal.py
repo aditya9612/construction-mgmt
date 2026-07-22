@@ -175,8 +175,13 @@ async def import_adjustment_journals(
     import csv
     from datetime import date
     from app.models.accountant import Account
+    
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
 
     content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
     text = content.decode('utf-8')
     lines = text.splitlines()
     

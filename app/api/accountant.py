@@ -493,7 +493,19 @@ async def import_accounts(
     except StopIteration:
         pass
 
+    rows_data = []
+    codes_to_check = set()
     for i, parts in enumerate(reader, start=2):
+        rows_data.append((i, parts))
+        if parts and any(parts) and len(parts) >= 3:
+            codes_to_check.add(parts[1].strip())
+            
+    existing_codes = set()
+    if codes_to_check:
+        existing_accounts = await db.scalars(select(Account.code).where(Account.code.in_(codes_to_check)))
+        existing_codes = set(existing_accounts.all())
+
+    for i, parts in rows_data:
         if not parts or not any(parts):
             continue
         if len(parts) < 3:
@@ -511,10 +523,11 @@ async def import_accounts(
             errors.append(f"Line {i}: Invalid account type '{type_str}'")
             continue
             
-        existing = await db.scalar(select(Account).where(Account.code == code).limit(1))
-        if existing:
+        if code in existing_codes:
             errors.append(f"Line {i}: Account with code '{code}' already exists")
             continue
+            
+        existing_codes.add(code)
             
         parent_id = None
         if parent_id_str:
@@ -1360,7 +1373,12 @@ async def export_cash_book(
 
 @router.post("/cash-book/import")
 async def import_cash_book(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+    
     content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
     text = content.decode('utf-8')
     lines = text.splitlines()
     
@@ -1464,7 +1482,12 @@ async def export_bank_book(
 
 @router.post("/bank-book/import")
 async def import_bank_book(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+    
     content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
     text = content.decode('utf-8')
     lines = text.splitlines()
     
@@ -1991,7 +2014,10 @@ async def import_bank_transactions(
     added = 0
     skipped = 0
 
-    for row in csvReader:
+    rows_data = list(csvReader)
+    parsed_rows = []
+    
+    for row in rows_data:
         try:
             txn_date_str = row.get("date", "").strip()
             amount_str = row.get("amount", "0").strip()
@@ -2004,33 +2030,44 @@ async def import_bank_transactions(
                 
             txn_date = datetime.strptime(txn_date_str, "%Y-%m-%d").date()
             amount = Decimal(amount_str)
-            
-            # Check for duplicate
-            stmt = select(BankTransaction).where(
-                BankTransaction.bank_account_id == ledger_account_id,
-                BankTransaction.transaction_date == txn_date,
-                BankTransaction.amount == amount,
-                BankTransaction.reference_number == ref
-            ).limit(1)
-            existing = await db.scalar(stmt)
-            
-            if existing:
-                skipped += 1
-                continue
-                
-            bt = BankTransaction(
-                bank_account_id=ledger_account_id,
-                transaction_date=txn_date,
-                amount=amount,
-                type=txn_type,
-                description=desc,
-                reference_number=ref,
-                is_reconciled=0
-            )
-            db.add(bt)
-            added += 1
+            parsed_rows.append((txn_date, amount, txn_type, desc, ref))
         except Exception:
             continue
+
+    existing_keys = set()
+    if parsed_rows:
+        dates = {r[0] for r in parsed_rows}
+        stmt = select(
+            BankTransaction.transaction_date, 
+            BankTransaction.amount, 
+            BankTransaction.reference_number
+        ).where(
+            BankTransaction.bank_account_id == ledger_account_id,
+            BankTransaction.transaction_date.in_(dates)
+        )
+        existing_txns = await db.execute(stmt)
+        for t_date, t_amount, t_ref in existing_txns:
+            existing_keys.add((t_date, t_amount, t_ref))
+
+    for txn_date, amount, txn_type, desc, ref in parsed_rows:
+        key = (txn_date, amount, ref)
+        if key in existing_keys:
+            skipped += 1
+            continue
+            
+        existing_keys.add(key)
+        
+        bt = BankTransaction(
+            bank_account_id=ledger_account_id,
+            transaction_date=txn_date,
+            amount=amount,
+            type=txn_type,
+            description=desc,
+            reference_number=ref,
+            is_reconciled=0
+        )
+        db.add(bt)
+        added += 1
             
     await db.commit()
     

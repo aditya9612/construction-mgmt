@@ -1,6 +1,6 @@
 from typing import Optional
 from datetime import date
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
 from sqlalchemy import or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import OwnerReferenceType, OwnerTransactionType
@@ -526,7 +526,12 @@ async def import_expenses(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
 ):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+
     content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
     decoded = content.decode("utf-8")
     reader = csv.DictReader(io.StringIO(decoded))
     valid = 0
