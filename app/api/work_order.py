@@ -29,6 +29,7 @@ router = APIRouter(prefix="/work-orders", tags=["Work Orders"])
 WORK_ORDER_CREATE_ROLES = [
     UserRole.ADMIN.value,
     UserRole.PROJECT_MANAGER.value,
+    
 ]
 
 WORK_ORDER_READ_ROLES = [
@@ -36,6 +37,7 @@ WORK_ORDER_READ_ROLES = [
     UserRole.PROJECT_MANAGER.value,
     UserRole.SITE_ENGINEER.value,
     UserRole.CLIENT.value,
+    UserRole.ACCOUNTANT.value,
 ]
 
 

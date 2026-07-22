@@ -7,6 +7,7 @@ from ezdxf import colors
 from openpyxl import Workbook
 from typing import Annotated, List, Optional, Union
 from fastapi import APIRouter, Body, Depends, Path, Query, Request, Form
+from openpyxl.utils import get_column_letter
 from starlette.concurrency import run_in_threadpool
 from openpyxl.styles import Alignment, Font, PatternFill
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,7 +51,7 @@ import uuid
 import os
 from app.services.notification_service import create_notification
 from app.models.contractor import Contractor
-from sqlalchemy import case, delete, select, func, or_, update
+from sqlalchemy import and_, case, delete, select, func, or_, update
 from app.models import project as m
 from app.models.user import User, UserRole
 from app.models.owner import Owner
@@ -96,7 +97,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
-from app.models.project import ActivityHistory, DailyProgressEntry, Project, ProjectMember, WorkActivity
+from app.models.project import (
+    ActivityHistory,
+    DailyProgressEntry,
+    Project,
+    ProjectMember,
+    WorkActivity,
+)
 from app.models.work_order import WorkOrder
 from app.models.boq import BOQ
 from app.models.user import User
@@ -5756,8 +5763,9 @@ async def issue_analytics(
     }
 
 
-# =======================work_progress===================================
-
+# ==========================================================
+# work-progress
+# ==========================================================
 work_progress_router = APIRouter(
     prefix="/work-progress",
     tags=["Work Progress"],
@@ -6008,10 +6016,6 @@ async def create_activity(
                     detail="Engineer is not assigned to this project",
                 )
 
-                # =====================================
-        # CREATE ACTIVITY
-        # =====================================
-
         activity = WorkActivity(
             project_id=data.project_id,
             boq_item_id=data.boq_item_id,
@@ -6141,7 +6145,7 @@ async def create_activity(
     response_model=s.WorkActivityListResponse,
 )
 async def list_activities(
-    project_id: int | None = Query(default=None, gt=0),
+    project_id: int = Query(..., gt=0),
     work_order_id: int | None = Query(default=None, gt=0),
     engineer_id: int | None = Query(default=None, gt=0),
     status: WorkActivityStatus | None = None,
@@ -6158,34 +6162,29 @@ async def list_activities(
         # PROJECT VALIDATION & ACCESS
         # =====================================================
 
-        if project_id is not None:
+        project = await db.get(
+            Project,
+            project_id,
+        )
 
-            project = await db.get(
-                Project,
-                project_id,
+        if not project:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found",
             )
 
-            if not project:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Project not found",
-                )
-
-            await assert_project_access(
-                db=db,
-                current_user=current_user,
-                project_id=project_id,
-            )
+        await assert_project_access(
+            db=db,
+            current_user=current_user,
+            project_id=project_id,
+        )
 
         # =====================================================
         # REALTIME STATUS REFRESH
         # =====================================================
 
-        refresh_stmt = select(WorkActivity)
-
-        if project_id is not None:
-            refresh_stmt = refresh_stmt.where(WorkActivity.project_id == project_id)
+        refresh_stmt = select(WorkActivity).where(WorkActivity.project_id == project_id)
 
         refresh_result = await db.execute(refresh_stmt)
 
@@ -6220,15 +6219,9 @@ async def list_activities(
 
         count_stmt = select(func.count()).select_from(WorkActivity)
 
-        filters = []
-
-        # =====================================================
-        # PROJECT FILTER
-        # =====================================================
-
-        if project_id is not None:
-
-            filters.append(WorkActivity.project_id == project_id)
+        filters = [
+            WorkActivity.project_id == project_id,
+        ]
 
         # =====================================================
         # WORK ORDER FILTER
@@ -6248,7 +6241,7 @@ async def list_activities(
                     detail="Work order not found",
                 )
 
-            if project_id is not None and work_order.project_id != project_id:
+            if work_order.project_id != project_id:
 
                 raise HTTPException(
                     status_code=400,
@@ -6311,13 +6304,11 @@ async def list_activities(
         # APPLY FILTERS
         # =====================================================
 
-        if filters:
+        stmt = stmt.where(*filters)
 
-            stmt = stmt.where(*filters)
+        count_stmt = count_stmt.where(*filters)
 
-            count_stmt = count_stmt.where(*filters)
-
-            # =====================================================
+        # =====================================================
         # ORDERING
         # =====================================================
 
@@ -6657,12 +6648,42 @@ async def update_activity(
 
         # =====================================
         # UPDATE EDITABLE FIELDS
+        #
+        # FIX (ERROR): was `exclude_unset=True, exclude_none=True`.
+        # exclude_none dropped explicit `{"engineer_id": null}` /
+        # `{"work_order_id": null}` payloads, making it impossible
+        # to ever unassign an engineer or unlink a work order via
+        # this endpoint. Dropping exclude_none restores that
+        # ability while exclude_unset still ensures fields the
+        # client didn't send are left untouched.
         # =====================================
 
         update_data = data.model_dump(
             exclude_unset=True,
-            exclude_none=True,
         )
+
+        # =====================================
+        # FIX (WARNING): guard against lowering planned_quantity
+        # below what has already been completed. Previously this
+        # only surfaced as a generic 400 "Database integrity error"
+        # once the DB CheckConstraint (total_completed <=
+        # planned_quantity) was hit.
+        # =====================================
+
+        if (
+            "planned_quantity" in update_data
+            and update_data["planned_quantity"] is not None
+            and update_data["planned_quantity"] < activity.total_completed
+        ):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"planned_quantity ({update_data['planned_quantity']}) cannot "
+                    f"be less than already completed quantity "
+                    f"({activity.total_completed})."
+                ),
+            )
 
         for field, value in update_data.items():
 
@@ -6842,6 +6863,14 @@ async def delete_activity(
 
         # =====================================
         # FETCH ACTIVITY
+        #
+        # FIX (CRITICAL): the model defines these relationships as
+        # `progress_entries` and `history_logs` (see WorkActivity
+        # model) — the previous code referenced
+        # `daily_progress_entries` / `history`, which don't exist
+        # and raised AttributeError before the handler could even
+        # run its business checks. No model change needed — just
+        # using the relationship names that already exist.
         # =====================================
 
         stmt = (
@@ -6850,8 +6879,8 @@ async def delete_activity(
                 WorkActivity.id == activity_id,
             )
             .options(
-                selectinload(WorkActivity.daily_progress_entries),
-                selectinload(WorkActivity.history),
+                selectinload(WorkActivity.progress_entries),
+                selectinload(WorkActivity.history_logs),
             )
         )
 
@@ -7272,11 +7301,29 @@ async def add_daily_progress(
             ),
         )
 
+        logger.info(
+            "Before commit -> completed=%s remaining=%s percentage=%s",
+            activity.total_completed,
+            activity.remaining_quantity,
+            activity.completion_percentage,
+        )
+
+        await db.flush()
+
         # =====================================================
         # SAVE CHANGES
         # =====================================================
 
         await db.commit()
+
+        await db.refresh(activity)
+
+        logger.info(
+            "After refresh -> completed=%s remaining=%s percentage=%s",
+            activity.total_completed,
+            activity.remaining_quantity,
+            activity.completion_percentage,
+        )
 
         # =====================================================
         # REFRESH OBJECTS
@@ -7371,13 +7418,9 @@ async def list_daily_entries(
         # VALIDATE PROJECT ACCESS
         # =====================================================
 
-        project = await db.get(
-            Project,
-            project_id,
-        )
+        project = await db.get(Project, project_id)
 
         if project is None:
-
             raise HTTPException(
                 status_code=404,
                 detail="Project not found",
@@ -7394,7 +7437,6 @@ async def list_daily_entries(
         # =====================================================
 
         if from_date and to_date and from_date > to_date:
-
             raise HTTPException(
                 status_code=400,
                 detail="From date cannot be greater than To date",
@@ -7411,9 +7453,7 @@ async def list_daily_entries(
                 DailyProgressEntry.activity_id == WorkActivity.id,
             )
             .options(
-                selectinload(
-                    DailyProgressEntry.activity,
-                ).load_only(
+                selectinload(DailyProgressEntry.activity).load_only(
                     WorkActivity.id,
                     WorkActivity.activity_name,
                     WorkActivity.status,
@@ -7433,15 +7473,9 @@ async def list_daily_entries(
             )
         )
 
-        filters = []
-
-        # =====================================================
-        # PROJECT FILTER (MANDATORY)
-        # =====================================================
-
-        filters.append(
+        filters = [
             WorkActivity.project_id == project_id,
-        )
+        ]
 
         # =====================================================
         # ACTIVITY FILTER
@@ -7455,14 +7489,12 @@ async def list_daily_entries(
             )
 
             if activity is None:
-
                 raise HTTPException(
                     status_code=404,
                     detail="Work activity not found",
                 )
 
             if activity.project_id != project_id:
-
                 raise HTTPException(
                     status_code=400,
                     detail="Activity does not belong to this project",
@@ -7477,7 +7509,6 @@ async def list_daily_entries(
         # =====================================================
 
         if work_order_id is not None:
-
             filters.append(
                 WorkActivity.work_order_id == work_order_id,
             )
@@ -7487,66 +7518,38 @@ async def list_daily_entries(
         # =====================================================
 
         if engineer_id is not None:
-
             filters.append(
                 WorkActivity.engineer_id == engineer_id,
             )
 
         # =====================================================
-        # DATE RANGE FILTER
+        # DATE FILTER
         # =====================================================
 
         if from_date:
-
             filters.append(
                 DailyProgressEntry.entry_date >= from_date,
             )
 
         if to_date:
-
             filters.append(
                 DailyProgressEntry.entry_date <= to_date,
             )
 
-        # =====================================================
-        # APPLY FILTERS
-        # =====================================================
-
         stmt = stmt.where(*filters)
-
         count_stmt = count_stmt.where(*filters)
-
-        # =====================================================
-        # ORDERING
-        # =====================================================
 
         stmt = stmt.order_by(
             DailyProgressEntry.entry_date.desc(),
             DailyProgressEntry.id.desc(),
         )
 
-        # =====================================================
-        # PAGINATION
-        # =====================================================
-
         stmt = stmt.offset(offset).limit(limit)
 
-        # =====================================================
-        # EXECUTE QUERY
-        # =====================================================
-
         result = await db.execute(stmt)
-
         entries = result.scalars().all()
 
-        # =====================================================
-        # TOTAL COUNT
-        # =====================================================
-
-        total_result = await db.execute(
-            count_stmt,
-        )
-
+        total_result = await db.execute(count_stmt)
         total_count = total_result.scalar_one()
 
         # =====================================================
@@ -7554,25 +7557,24 @@ async def list_daily_entries(
         # =====================================================
 
         return s.DailyProgressListResponse(
+            success=True,
             message="Daily progress fetched successfully",
-            items=entries,
-            pagination=s.PaginationResponse(
+            data=entries,
+            pagination=s.PaginationMeta(
                 total=total_count,
                 limit=limit,
                 offset=offset,
-                page_count=len(entries),
             ),
         )
 
     except HTTPException:
-
         raise
 
     except Exception as e:
 
         logger.exception(
-            "Failed to fetch daily progress entries",
-            exc_info=e,
+            "Failed to fetch daily progress entries: %s",
+            str(e),
         )
 
         raise HTTPException(
@@ -7685,6 +7687,10 @@ async def update_daily_entry(
 
         # =====================================================
         # VALIDATE ENTRY DATE
+        #
+        # NOTE: this now works correctly because DailyProgressUpdate
+        # includes `entry_date` (see schemas.py fix). Previously
+        # `data.entry_date` raised AttributeError immediately.
         # =====================================================
 
         if data.entry_date is not None:
@@ -8196,6 +8202,11 @@ async def delete_daily_entry(
 
         # =====================================================
         # RESPONSE
+        #
+        # NOTE: this now works correctly because
+        # DailyProgressDeleteResponse.success defaults to True
+        # (see schemas.py fix). Previously `success` was required
+        # with no default and this call raised a ValidationError.
         # =====================================================
 
         return s.DailyProgressDeleteResponse(
@@ -8519,6 +8530,14 @@ async def get_work_order_progress_summary(
 
         # =====================================================
         # RESPONSE
+        #
+        # NOTE: this now works correctly because
+        # WorkOrderProgressSummary / WorkOrderActivitySummary /
+        # WorkOrderProgressSummaryResponse in schemas.py have been
+        # rewritten to match exactly what is constructed here.
+        # Previously WorkOrderActivitySummary didn't exist at all
+        # and the response schema didn't declare work_order=/
+        # activities= kwargs.
         # =====================================================
 
         return s.WorkOrderProgressSummaryResponse(
@@ -8571,13 +8590,13 @@ async def get_work_order_progress_summary(
 
 # =========================================================
 # 11. SITE ENGINEER TODAY PROGRESS
-
-
+# =========================================================
 @work_progress_router.get(
     "/site-engineer/today-progress",
     response_model=s.TodayProgressResponse,
 )
 async def today_progress(
+    engineer_id: int | None = Query(default=None, gt=0),
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
@@ -8585,7 +8604,19 @@ async def today_progress(
 ):
     try:
 
-        engineer_id = current_user.id
+        stmt = (
+            select(DailyProgressEntry)
+            .join(
+                WorkActivity,
+                WorkActivity.id == DailyProgressEntry.activity_id,
+            )
+            .options(
+                selectinload(DailyProgressEntry.activity),
+            )
+            .where(
+                DailyProgressEntry.entry_date == date.today(),
+            )
+        )
 
         count_stmt = (
             select(func.count())
@@ -8595,23 +8626,32 @@ async def today_progress(
                 WorkActivity.id == DailyProgressEntry.activity_id,
             )
             .where(
-                WorkActivity.engineer_id == engineer_id,
                 DailyProgressEntry.entry_date == date.today(),
             )
         )
 
-        stmt = (
-            select(DailyProgressEntry)
-            .options(selectinload(DailyProgressEntry.activity))
-            .join(
-                WorkActivity,
-                WorkActivity.id == DailyProgressEntry.activity_id,
+        # Site Engineer -> only own entries
+        if current_user.role == UserRole.SITE_ENGINEER:
+            stmt = stmt.where(
+                WorkActivity.engineer_id == current_user.id,
             )
-            .where(
+
+            count_stmt = count_stmt.where(
+                WorkActivity.engineer_id == current_user.id,
+            )
+
+        # Admin / PM / Others -> optional engineer filter
+        elif engineer_id:
+            stmt = stmt.where(
                 WorkActivity.engineer_id == engineer_id,
-                DailyProgressEntry.entry_date == date.today(),
             )
-            .order_by(
+
+            count_stmt = count_stmt.where(
+                WorkActivity.engineer_id == engineer_id,
+            )
+
+        stmt = (
+            stmt.order_by(
                 DailyProgressEntry.created_at.desc(),
             )
             .offset(offset)
@@ -8625,8 +8665,9 @@ async def today_progress(
         total_count = total_result.scalar() or 0
 
         return s.TodayProgressResponse(
+            success=True,
             message="Today's progress fetched successfully",
-            engineer_id=engineer_id,
+            engineer_id=engineer_id if engineer_id else current_user.id,
             entry_date=date.today(),
             limit=limit,
             offset=offset,
@@ -8639,10 +8680,8 @@ async def today_progress(
         raise
 
     except Exception as e:
-
         logger.exception(
-            "Failed to fetch today's progress for engineer %s",
-            engineer_id,
+            "Failed to fetch today's progress",
             exc_info=e,
         )
 
@@ -8654,6 +8693,7 @@ async def today_progress(
 
 # =========================================================
 # 12. ACTIVITY HISTORY
+# =========================================================
 
 
 @work_progress_router.get(
@@ -8841,6 +8881,13 @@ async def get_activity_progress_history(
 
         # =====================================================
         # RESPONSE
+        #
+        # NOTE: this now works correctly because
+        # ActivityProgressSummary, ActivityProgressHistoryItem, and
+        # PaginationResponse are all defined in schemas.py and
+        # ActivityProgressHistoryResponse has been rewritten to
+        # match this exact shape. Previously all three referenced
+        # classes did not exist anywhere in the schema module.
         # =====================================================
 
         return s.ActivityProgressHistoryResponse(
@@ -8891,16 +8938,450 @@ async def get_activity_progress_history(
         )
 
 
-# ==================================
-# 13 work progress pdf report
-# ==================================
+# =========================================================
+# 13. PROJECT PROGRESS SUMMARY
+# =========================================================
 
+
+@work_progress_router.get(
+    "/project/{project_id}/summary",
+    response_model=s.WorkProgressProjectSummaryResponse,
+    summary="Project Progress Summary",
+)
+async def project_progress_summary(
+    project_id: int = Path(..., gt=0),
+    current_user: User = Depends(
+        require_roles(READ_ROLES),
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    try:
+
+        # =====================================================
+        # VALIDATE PROJECT
+        # =====================================================
+
+        project = await db.get(
+            Project,
+            project_id,
+        )
+
+        if project is None:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found",
+            )
+
+        # =====================================================
+        # PROJECT ACCESS
+        # =====================================================
+
+        await assert_project_access(
+            db=db,
+            current_user=current_user,
+            project_id=project_id,
+        )
+
+        # =====================================================
+        # PROJECT SUMMARY QUERY
+        # =====================================================
+
+        summary_stmt = select(
+            func.count(WorkActivity.id).label("total_activities"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            WorkActivity.status == WorkActivityStatus.COMPLETED,
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("completed_activities"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            WorkActivity.status == WorkActivityStatus.ON_TRACK,
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("on_track_activities"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            WorkActivity.status == WorkActivityStatus.DELAY,
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("delayed_activities"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            WorkActivity.status == WorkActivityStatus.NOT_STARTED,
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("not_started_activities"),
+            func.coalesce(
+                func.sum(WorkActivity.planned_quantity),
+                Decimal("0.00"),
+            ).label("planned_quantity"),
+            func.coalesce(
+                func.sum(WorkActivity.total_completed),
+                Decimal("0.00"),
+            ).label("completed_quantity"),
+            func.coalesce(
+                func.sum(WorkActivity.remaining_quantity),
+                Decimal("0.00"),
+            ).label("remaining_quantity"),
+            func.coalesce(
+                func.avg(WorkActivity.completion_percentage),
+                Decimal("0.00"),
+            ).label("average_progress"),
+        ).where(
+            WorkActivity.project_id == project_id,
+        )
+
+        result = await db.execute(summary_stmt)
+
+        (
+            total_activities,
+            completed_activities,
+            on_track_activities,
+            delayed_activities,
+            not_started_activities,
+            planned_quantity,
+            completed_quantity,
+            remaining_quantity,
+            average_progress,
+        ) = result.one()
+
+        # =====================================================
+        # CALCULATE OVERALL PROGRESS
+        # =====================================================
+
+        if planned_quantity > Decimal("0"):
+
+            overall_progress = (
+                (completed_quantity / planned_quantity) * Decimal("100")
+            ).quantize(Decimal("0.01"))
+
+        else:
+
+            overall_progress = Decimal("0.00")
+
+        # =====================================================
+        # RESPONSE
+        # =====================================================
+
+        project_info = s.ProjectInfoResponse(
+            id=project.id,
+            project_name=project.project_name,
+        )
+
+        summary = s.ProjectProgressSummaryData(
+            total_activities=total_activities,
+            completed_activities=completed_activities,
+            on_track_activities=on_track_activities,
+            delayed_activities=delayed_activities,
+            not_started_activities=not_started_activities,
+            planned_quantity=Decimal(str(planned_quantity or 0)).quantize(
+                Decimal("0.01")
+            ),
+            completed_quantity=Decimal(str(completed_quantity or 0)).quantize(
+                Decimal("0.01")
+            ),
+            remaining_quantity=Decimal(str(remaining_quantity or 0)).quantize(
+                Decimal("0.01")
+            ),
+            overall_progress_percentage=overall_progress,
+            average_activity_progress=Decimal(str(average_progress or 0)).quantize(
+                Decimal("0.01")
+            ),
+        )
+
+        logger.info(
+            "Project summary generated successfully. "
+            "Project=%s Activities=%s Progress=%s%%",
+            project.id,
+            total_activities,
+            overall_progress,
+        )
+
+        return s.WorkProgressProjectSummaryResponse(
+            success=True,
+            message="Project progress summary fetched successfully",
+            project=project_info,
+            summary=summary,
+        )
+
+    # =====================================================
+    # HTTP EXCEPTION
+    # =====================================================
+
+    except HTTPException:
+
+        raise
+
+    # =====================================================
+    # DATABASE ERROR
+    # =====================================================
+
+    except IntegrityError as e:
+
+        logger.exception(
+            "Database error while fetching " "project progress summary %s",
+            project_id,
+            exc_info=e,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Database error occurred",
+        )
+
+    # =====================================================
+    # UNKNOWN ERROR
+    # =====================================================
+
+    except Exception as e:
+
+        logger.exception(
+            "Failed to fetch project summary %s : %s",
+            project_id,
+            str(e),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch project progress summary",
+        )
+
+
+# =========================================================
+# 14. DELAYED ACTIVITIES
+# =========================================================
+
+
+@work_progress_router.get(
+    "/project/{project_id}/delayed-activities",
+    response_model=s.DelayedActivityListResponse,
+    summary="Get Delayed Activities",
+)
+async def get_delayed_activities(
+    project_id: int = Path(..., gt=0),
+    engineer_id: int | None = Query(None),
+    work_order_id: int | None = Query(None),
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(
+        require_roles(READ_ROLES),
+    ),
+    db: AsyncSession = Depends(get_db_session),
+):
+    try:
+
+        # =====================================================
+        # VALIDATE PROJECT
+        # =====================================================
+
+        project = await db.get(Project, project_id)
+
+        if project is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found",
+            )
+
+        # =====================================================
+        # ACCESS VALIDATION
+        # =====================================================
+
+        await assert_project_access(
+            db=db,
+            current_user=current_user,
+            project_id=project_id,
+        )
+
+        # =====================================================
+        # FILTERS
+        # =====================================================
+
+        filters = [
+            WorkActivity.project_id == project_id,
+            or_(
+                WorkActivity.status == WorkActivityStatus.DELAY,
+                and_(
+                    WorkActivity.end_date < date.today(),
+                    WorkActivity.status != WorkActivityStatus.COMPLETED,
+                ),
+            ),
+        ]
+
+        if engineer_id:
+
+            filters.append(WorkActivity.engineer_id == engineer_id)
+
+        if work_order_id:
+
+            filters.append(WorkActivity.work_order_id == work_order_id)
+
+        # =====================================================
+        # TOTAL COUNT
+        # =====================================================
+
+        count_stmt = select(func.count(WorkActivity.id)).where(*filters)
+
+        total_count = await db.scalar(count_stmt)
+
+        # =====================================================
+        # FETCH ACTIVITIES
+        # =====================================================
+
+        stmt = (
+            select(WorkActivity)
+            .where(*filters)
+            .options(
+                selectinload(WorkActivity.engineer),
+                selectinload(WorkActivity.work_order),
+            )
+            .order_by(
+                WorkActivity.end_date.asc(),
+                WorkActivity.created_at.asc(),
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+
+        result = await db.execute(stmt)
+
+        activities = result.scalars().all()
+
+        delayed_list = []
+
+        # =====================================================
+        # PREPARE RESPONSE
+        # =====================================================
+
+        for activity in activities:
+
+            delayed_days = (
+                max(
+                    0,
+                    (date.today() - activity.end_date).days,
+                )
+                if activity.end_date
+                else 0
+            )
+
+            delayed_list.append(
+                s.DelayedActivityResponse(
+                    id=activity.id,
+                    activity_name=activity.activity_name,
+                    discipline=activity.discipline,
+                    work_order_id=activity.work_order_id,
+                    engineer_id=activity.engineer_id,
+                    planned_quantity=(
+                        activity.planned_quantity or Decimal("0.00")
+                    ).quantize(Decimal("0.01")),
+                    completed_quantity=(
+                        activity.total_completed or Decimal("0.00")
+                    ).quantize(Decimal("0.01")),
+                    remaining_quantity=(
+                        activity.remaining_quantity or Decimal("0.00")
+                    ).quantize(Decimal("0.01")),
+                    completion_percentage=(
+                        activity.completion_percentage or Decimal("0.00")
+                    ).quantize(Decimal("0.01")),
+                    start_date=activity.start_date,
+                    end_date=activity.end_date,
+                    delayed_days=delayed_days,
+                    status=activity.status,
+                )
+            )
+
+        # ==============================
+        # OUTSIDE THE LOOP
+        # ==============================
+
+        page_count = len(delayed_list)
+
+        return s.DelayedActivityListResponse(
+            success=True,
+            message="Delayed activities fetched successfully",
+            limit=limit,
+            offset=offset,
+            page_count=page_count,
+            total_count=total_count or 0,
+            data=delayed_list,
+        )
+
+    # =====================================================
+    # HTTP EXCEPTION
+    # =====================================================
+
+    except HTTPException:
+        raise
+
+    # =====================================================
+    # DATABASE ERROR
+    # =====================================================
+
+    except IntegrityError as e:
+
+        logger.exception(
+            "Database error while fetching delayed activities for project %s",
+            project_id,
+            exc_info=e,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Database error occurred",
+        )
+
+    # =====================================================
+    # UNKNOWN ERROR
+    # =====================================================
+
+    except Exception as e:
+
+        logger.exception(
+            "Failed to fetch delayed activities for project %s: %s",
+            project_id,
+            str(e),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch delayed activities",
+        )
+
+
+# ==================================
+# 15. work progress pdf report
+# ==================================
 
 import io
 from decimal import Decimal
 from datetime import datetime
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from sqlalchemy import select
@@ -8917,10 +9398,14 @@ from reportlab.platypus import (
 from reportlab.lib import colors as pdf_colors
 from reportlab.lib.styles import getSampleStyleSheet
 
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
 
 @work_progress_router.get("/reports/pdf")
 async def work_progress_pdf_report(
-    project_id: int,
+    project_id: int = Query(..., gt=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -8931,9 +9416,6 @@ async def work_progress_pdf_report(
         # VALIDATE PROJECT
         # ==================================
 
-        if project_id <= 0:
-            raise HTTPException(status_code=400, detail="Invalid project id")
-
         project_result = await db.execute(
             select(Project).where(Project.id == project_id)
         )
@@ -8942,6 +9424,21 @@ async def work_progress_pdf_report(
 
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
+
+        # ==================================
+        # PROJECT ACCESS
+        #
+        # FIX (CRITICAL / SECURITY): this was completely missing.
+        # Any user with READ_ROLES could download the full activity
+        # report for ANY project_id, regardless of whether they were
+        # a member of that project — a cross-tenant data leak.
+        # ==================================
+
+        await assert_project_access(
+            db=db,
+            current_user=current_user,
+            project_id=project_id,
+        )
 
         # ==================================
         # GET ACTIVITIES
@@ -9050,7 +9547,10 @@ async def work_progress_pdf_report(
                 ]
             )
 
-            if status_value == "DELAY":
+            # FIX (minor): compare against the enum's value instead of a
+            # bare "DELAY" magic string, so a rename/typo in
+            # WorkActivityStatus can't silently break this filter.
+            if status_value == WorkActivityStatus.DELAY.value:
                 delayed_activities.append(activity)
 
         # ==================================
@@ -9109,7 +9609,9 @@ async def work_progress_pdf_report(
 
         if total_planned > 0:
 
-            overall_completion = (total_completed / total_planned) * Decimal("100")
+            overall_completion = (
+                (total_completed / total_planned) * Decimal("100")
+            ).quantize(Decimal("0.01"))
 
         elements.append(Paragraph("PROJECT SUMMARY", styles["Heading2"]))
 
@@ -9127,7 +9629,7 @@ async def work_progress_pdf_report(
 
         elements.append(
             Paragraph(
-                f"Overall Completion : {round(float(overall_completion),2)}%",
+                f"Overall Completion : {overall_completion}%",
                 styles["Normal"],
             )
         )
@@ -9215,33 +9717,33 @@ async def work_progress_pdf_report(
 
     except Exception as e:
 
-        import traceback
+        # FIX: don't leak internal exception details (type/message) back
+        # to the client, and log via the standard logger (consistent
+        # with every other endpoint in this router) instead of a bare
+        # traceback.print_exc() to stdout.
+        logger.exception(
+            "Failed to generate PDF report for project %s",
+            project_id,
+        )
 
-        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate work progress PDF report",
+        )
 
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
-
-# 14. ===========work progress excel report========
+# ==========================================
+# 16. work progress excel report
+# ==========================================
 
 
 @work_progress_router.get("/reports/excel")
 async def work_progress_excel_report(
-    project_id: int,
+    project_id: int = Query(..., gt=0),
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================
-        # VALIDATE PROJECT
-        # =====================================
-
-        if project_id <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid project id",
-            )
 
         # =====================================
         # GET PROJECT
@@ -9258,6 +9760,20 @@ async def work_progress_excel_report(
                 status_code=404,
                 detail="Project not found",
             )
+
+        # =====================================
+        # PROJECT ACCESS
+        #
+        # FIX (CRITICAL / SECURITY): same gap as the PDF endpoint —
+        # missing entirely before. Any READ_ROLES user could export
+        # the Excel report for any project_id with no ownership check.
+        # =====================================
+
+        await assert_project_access(
+            db=db,
+            current_user=current_user,
+            project_id=project_id,
+        )
 
         # =====================================
         # PROJECT NAME SAFE
@@ -9401,11 +9917,16 @@ async def work_progress_excel_report(
 
         total_remaining = sum(float(x.remaining_quantity or 0) for x in activities)
 
+        # FIX (minor): compare against the enum's value instead of a
+        # bare "DELAY" magic string, matching the PDF endpoint fix.
         total_delayed = len(
             [
                 x
                 for x in activities
-                if (hasattr(x.status, "value") and x.status.value == "DELAY")
+                if (
+                    hasattr(x.status, "value")
+                    and x.status.value == WorkActivityStatus.DELAY.value
+                )
             ]
         )
 
@@ -9456,7 +9977,7 @@ async def work_progress_excel_report(
                 else str(item.status or "")
             )
 
-            if status_value == "DELAY":
+            if status_value == WorkActivityStatus.DELAY.value:
 
                 delay_sheet.append(
                     [
@@ -9524,13 +10045,16 @@ async def work_progress_excel_report(
 
     except Exception as e:
 
-        import traceback
-
-        traceback.print_exc()
+        # FIX: same as PDF endpoint — no raw exception details in the
+        # response, use the standard logger instead of print_exc().
+        logger.exception(
+            "Failed to generate Excel report for project %s",
+            project_id,
+        )
 
         raise HTTPException(
             status_code=500,
-            detail=f"{type(e).__name__}: {str(e)}",
+            detail="Failed to generate work progress Excel report",
         )
 
 

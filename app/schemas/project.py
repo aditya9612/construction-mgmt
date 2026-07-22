@@ -1109,27 +1109,6 @@ class WorkActivityCreate(BaseSchema):
         gt=0,
     )
 
-    activity_name: str = Field(
-        min_length=1,
-        max_length=255,
-    )
-
-    discipline: Optional[str] = Field(
-        default=None,
-        max_length=100,
-    )
-
-    planned_quantity: Decimal = Field(
-        gt=0,
-        max_digits=18,
-        decimal_places=2,
-    )
-
-    unit: str = Field(
-        min_length=1,
-        max_length=50,
-    )
-
     engineer_id: Optional[int] = Field(
         default=None,
         gt=0,
@@ -1139,27 +1118,21 @@ class WorkActivityCreate(BaseSchema):
 
     end_date: date
 
-    @field_validator("activity_name")
-    @classmethod
-    def validate_activity(cls, v):
-        return validate_activity_name(v)
-
-    @field_validator("unit")
-    @classmethod
-    def validate_unit_name(cls, v):
-        return validate_unit(v)
-
     @field_validator("end_date")
     @classmethod
     def validate_date_range(cls, v, info: ValidationInfo):
+
         start_date = info.data.get("start_date")
+
         if start_date:
             return validate_start_end_dates(start_date, v)
+
         return v
 
     @field_validator("start_date", "end_date")
     @classmethod
     def validate_activity_dates(cls, v):
+
         return validate_work_activity_date(v)
 
 
@@ -1170,33 +1143,11 @@ class WorkActivityCreate(BaseSchema):
 
 class WorkActivityUpdate(BaseSchema):
 
+    boq_item_id: int = Field(gt=0)
+
     work_order_id: Optional[int] = Field(
         default=None,
         gt=0,
-    )
-
-    activity_name: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        max_length=255,
-    )
-
-    discipline: Optional[str] = Field(
-        default=None,
-        max_length=100,
-    )
-
-    planned_quantity: Optional[Decimal] = Field(
-        default=None,
-        gt=0,
-        max_digits=18,
-        decimal_places=2,
-    )
-
-    unit: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        max_length=50,
     )
 
     engineer_id: Optional[int] = Field(
@@ -1208,30 +1159,19 @@ class WorkActivityUpdate(BaseSchema):
 
     end_date: Optional[date] = None
 
-    @field_validator("activity_name")
-    @classmethod
-    def validate_activity(cls, v):
-        if v is None:
-            return v
-        return validate_activity_name(v)
-
-    @field_validator("unit")
-    @classmethod
-    def validate_unit_name(cls, v):
-        if v is None:
-            return v
-        return validate_unit(v)
-
     @field_validator("start_date", "end_date")
     @classmethod
     def validate_activity_dates(cls, v):
+
         if v is None:
             return v
+
         return validate_work_activity_date(v)
 
     @field_validator("end_date")
     @classmethod
     def validate_date_range(cls, v, info: ValidationInfo):
+
         if v is None:
             return v
 
@@ -1249,84 +1189,55 @@ class WorkActivityUpdate(BaseSchema):
 
 
 class WorkActivityResponse(BaseSchema):
-
     model_config = ConfigDict(from_attributes=True)
-
     id: int
-
     project_id: int
-
     boq_item_id: int
-
     work_order_id: Optional[int] = None
-
     activity_name: str
-
     discipline: Optional[str] = None
-
     planned_quantity: Decimal
-
     total_completed: Decimal
-
     remaining_quantity: Decimal
-
     completion_percentage: Decimal
-
     unit: str
-
     engineer_id: Optional[int] = None
-
     status: WorkActivityStatus
-
     start_date: date
-
     end_date: date
-
     created_at: datetime
-
     updated_at: datetime
 
 
 class WorkActivityCreateResponse(BaseSchema):
 
     message: str
-
     data: WorkActivityResponse
 
 
 class WorkActivityUpdateResponse(BaseSchema):
 
     message: str
-
     data: WorkActivityResponse
 
 
 class WorkActivityDeleteResponse(BaseSchema):
-
     message: str
 
 
 class WorkActivityListResponse(BaseSchema):
-
     success: bool
-
     limit: int
-
     offset: int
-
     page_count: int
-
     total_count: int
-
     data: list[WorkActivityResponse]
 
 
 class DailyProgressCreate(BaseSchema):
 
     activity_id: int = Field(gt=0)
-
     entry_date: date
-
     today_progress: Decimal = Field(
         gt=0,
         max_digits=12,
@@ -1354,6 +1265,7 @@ class DailyProgressCreate(BaseSchema):
 
 
 class DailyProgressUpdate(BaseSchema):
+    entry_date: Optional[date] = None
 
     today_progress: Optional[Decimal] = Field(
         default=None,
@@ -1367,6 +1279,16 @@ class DailyProgressUpdate(BaseSchema):
         max_length=500,
     )
 
+    # ================= ENTRY DATE =================
+
+    @field_validator("entry_date")
+    def validate_entry_dates(cls, v):
+
+        if v is None:
+            return v
+
+        return validate_progress_date(v)
+
     # ================= REMARKS =================
 
     @field_validator("remarks")
@@ -1376,23 +1298,14 @@ class DailyProgressUpdate(BaseSchema):
 
 
 class DailyProgressResponse(BaseSchema):
-
     id: int
-
     activity_id: int
-
     entry_date: date
-
     today_progress: Decimal
-
     remarks: Optional[str] = None
-
     created_by: Optional[int] = None
-
     created_at: datetime
-
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DailyProgressListResponse(BaseSchema):
@@ -1400,6 +1313,7 @@ class DailyProgressListResponse(BaseSchema):
     message: str
     data: list[DailyProgressResponse]
     pagination: PaginationMeta
+
 
 class TodayProgressResponse(BaseSchema):
     success: bool = True
@@ -1412,53 +1326,157 @@ class TodayProgressResponse(BaseSchema):
     total_count: int
     data: list[DailyProgressResponse]
 
+
 class DailyProgressWithActivityResponse(BaseSchema):
 
     message: str
     progress: DailyProgressResponse
     activity: WorkActivityResponse
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class DailyProgressDeleteResponse(BaseModel):
-    success: bool
+class DailyProgressDeleteResponse(BaseSchema):
+    success: bool = True
     message: str
 
 
-class WorkOrderProgressSummary(BaseModel):
-    work_order_id: int
+class WorkOrderProgressSummary(BaseSchema):
+
+    id: int
     work_order_number: str
+    project_id: int
+    planned_quantity: Decimal
+    completed_quantity: Decimal
+    remaining_quantity: Decimal
+    completion_percentage: Decimal
+    average_progress: Decimal
+    status: WorkActivityStatus
+
+
+class WorkOrderActivitySummary(BaseSchema):
+
+    total: int
+    completed: int
+    on_track: int
+    delayed: int
+    not_started: int
+
+
+class WorkOrderProgressSummaryResponse(BaseSchema):
+
+    message: str
+    work_order: WorkOrderProgressSummary
+    activities: WorkOrderActivitySummary
+
+
+class ActivityProgressSummary(BaseSchema):
+
+    id: int
+    activity_name: str
+    discipline: Optional[str] = None
+    planned_quantity: Decimal
+    completed_quantity: Decimal
+    remaining_quantity: Decimal
+    completion_percentage: Decimal
+    status: WorkActivityStatus
+    unit: str
+    start_date: date
+    end_date: date
+    engineer_id: Optional[int] = None
+    work_order_id: Optional[int] = None
+    boq_item_id: int
+
+
+class ActivityProgressHistoryItem(BaseSchema):
+
+    id: int
+    entry_date: date
+    today_progress: Decimal
+    running_total: Decimal
+    remaining_quantity: Decimal
+    remarks: Optional[str] = None
+    created_at: datetime
+
+
+class PaginationResponse(BaseSchema):
+
+    total: int
+    limit: int
+    offset: int
+    page_count: int
+
+
+class ActivityProgressHistoryResponse(BaseSchema):
+
+    message: str
+    activity: ActivityProgressSummary
+    history: list[ActivityProgressHistoryItem]
+    pagination: PaginationResponse
+
+
+class ProjectInfoResponse(BaseModel):
+    id: int
+    project_name: str
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ProjectProgressSummaryData(BaseModel):
     total_activities: int
     completed_activities: int
-    in_progress_activities: int
-    pending_activities: int
-    completion_percentage: float
+    on_track_activities: int
+    delayed_activities: int
+    not_started_activities: int
+    planned_quantity: Decimal
+    completed_quantity: Decimal
+    remaining_quantity: Decimal
+    overall_progress_percentage: Decimal
+    average_activity_progress: Decimal
+
+    model_config = ConfigDict(from_attributes=True)
 
 
-class WorkOrderProgressSummaryResponse(BaseModel):
-    success: bool
+class WorkProgressProjectSummaryResponse(BaseModel):
+    success: bool = True
     message: str
-    data: WorkOrderProgressSummary
+    project: ProjectInfoResponse
+    summary: ProjectProgressSummaryData
+    model_config = ConfigDict(from_attributes=True)
 
 
-class ActivityProgressHistory(BaseModel):
-    activity_id: int
+class DelayedActivityResponse(BaseSchema):
+    id: int
     activity_name: str
-    progress_date: date
-    completed_quantity: float
-    completion_percentage: float
-    remarks: str | None = None
+    discipline: str | None = None
+    work_order_id: int | None = None
+    engineer_id: int | None = None
+    planned_quantity: Decimal
+    completed_quantity: Decimal
+    remaining_quantity: Decimal
+    completion_percentage: Decimal
+
+    start_date: date
+    end_date: date
+
+    delayed_days: int
+    status: WorkActivityStatus
+    model_config = ConfigDict(from_attributes=True)
 
 
-class ActivityProgressHistoryResponse(BaseModel):
-    success: bool
+class DelayedActivityListResponse(BaseSchema):
+
+    success: bool = True
     message: str
-    data: list[ActivityProgressHistory]
-    
+    limit: int
+    offset: int
+    page_count: int
+    total_count: int
+    data: list[DelayedActivityResponse]
+
+
 # =========================================================
 # PROJECTS MODULE SUMMARY
+# ==========================================================
 
 
 class ProjectsModuleSummary(BaseSchema):
