@@ -2,13 +2,16 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import date, datetime
 
+
 class MaterialStockStatus(BaseModel):
     category: str
     status: str  # OK, Low, Out of Stock
 
+
 class IssueStats(BaseModel):
     total: int
     high_priority: int
+
 
 class TodayWorkSummary(BaseModel):
     activity_name: str
@@ -16,10 +19,12 @@ class TodayWorkSummary(BaseModel):
     start_time: Optional[str] = None
     finish_time: Optional[str] = None
 
+
 class DisciplineProgress(BaseModel):
     discipline: str
     planned_percent: float
     actual_percent: float
+
 
 class RecentExpense(BaseModel):
     date: date
@@ -28,6 +33,7 @@ class RecentExpense(BaseModel):
     note: Optional[str]
     amount: float
 
+
 class MilestoneTimelineEntry(BaseModel):
     id: int
     title: str
@@ -35,11 +41,13 @@ class MilestoneTimelineEntry(BaseModel):
     start_date: Optional[date]
     end_date: Optional[date]
 
+
 class DashboardVitals(BaseModel):
     total_labour_today: int
     active_activities: int
     open_issues: IssueStats
     material_stock_status: List[MaterialStockStatus]
+
 
 class EnhancedDashboardOut(BaseModel):
     project_id: Optional[int] = None
@@ -55,12 +63,14 @@ class EnhancedDashboardOut(BaseModel):
     recent_expenses: List[RecentExpense]
     weather: Optional[dict] = None
 
+
 class AdminVitals(BaseModel):
     total_labour_today: int
     pending_approvals: int
     action_items: int  # High priority open issues
     material_used_today: int
     site_issues_open: int
+
 
 class AdminProjectOverview(BaseModel):
     id: int
@@ -71,6 +81,7 @@ class AdminProjectOverview(BaseModel):
     performance_score: float  # variance
     health: str  # Active, Delayed, etc.
 
+
 class ProjectActivity(BaseModel):
     type: str  # task_completion, invoice_submission, site_photo, issue_report
     user: str
@@ -78,15 +89,17 @@ class ProjectActivity(BaseModel):
     time: str
     project_name: Optional[str] = None
 
+
 class AdminDashboardOut(BaseModel):
     project_overview: dict  # {total, active, completed, delayed}
-    financial: dict       # {revenue, expense, profit}
+    financial: dict  # {revenue, expense, profit}
     vitals: AdminVitals
     active_users: int
     discipline_progress: List[DisciplineProgress]
     master_projects: List[AdminProjectOverview]
     recent_activities: List[ProjectActivity]
     kpi_comparison: Optional[dict] = None
+
 
 class ProjectsManagementDashboardOut(BaseModel):
     summary: dict  # {total, ongoing, completed, delayed}
@@ -104,15 +117,18 @@ class AccountantKpiCards(BaseModel):
     net_profit: float
     gst_due: float
 
+
 class RevenueExpenseTrend(BaseModel):
     month: str
     revenue: float
     expense: float
 
+
 class CashFlowTrend(BaseModel):
     month: str
     inflow: float
     outflow: float
+
 
 class ProjectCostSummaryItem(BaseModel):
     project_name: str
@@ -120,19 +136,23 @@ class ProjectCostSummaryItem(BaseModel):
     spent: float
     remaining: float
 
+
 class AgingBucket(BaseModel):
     period: str
     amount: float
     percentage: float
+
 
 class UpcomingTransactionItem(BaseModel):
     entity_name: str
     date: str
     amount: float
 
+
 class RecentActivityItem(BaseModel):
     time: str
     activity: str
+
 
 class AccountantDashboardOut(BaseModel):
     kpi_cards: AccountantKpiCards
@@ -151,12 +171,14 @@ class AccountantDashboardOut(BaseModel):
 # PM COMMAND CENTER (NEW)
 # =========================================
 
+
 class PMKpiCards(BaseModel):
     total_managed_projects: int
     active_site_deployments: int
     avg_completion_percent: float
     delayed_sites_count: int
     pending_reviews_count: int
+
 
 class PMProjectPerformance(BaseModel):
     id: int
@@ -169,6 +191,7 @@ class PMProjectPerformance(BaseModel):
     budget_utilization_actual: float
     budget_utilization_total: float
 
+
 class PMResourceOrchestration(BaseModel):
     user_id: int
     full_name: str
@@ -177,16 +200,19 @@ class PMResourceOrchestration(BaseModel):
     status: str  # On Site, Travelling, Off Duty
     last_seen: str  # "10 mins ago"
 
+
 class PMCostTrackingItem(BaseModel):
     month: str
     actual_cost: float
     budget: float
 
+
 class PMDelayRiskAnalysis(BaseModel):
     project_name: str
     risk_type: str
     priority: str  # High, Medium, Low
-    status: str    # CRITICAL, WARNING, MONITORED
+    status: str  # CRITICAL, WARNING, MONITORED
+
 
 class PMCriticalAlert(BaseModel):
     id: int
@@ -195,12 +221,14 @@ class PMCriticalAlert(BaseModel):
     project_name: str
     timestamp: datetime
 
+
 class PMTaskOverview(BaseModel):
     id: int
     task_name: str
     engineer_name: str
     status: str  # In Progress, Pending, Completed
     due_date: Optional[date]
+
 
 class PMCommandCenterOut(BaseModel):
     header_date: str
@@ -214,9 +242,11 @@ class PMCommandCenterOut(BaseModel):
     task_management: List[PMTaskOverview]
     recent_activities: List[ProjectActivity]
 
+
 # =========================================
 # LABOUR DASHBOARD (NEW)
 # =========================================
+
 
 class LabourTaskItem(BaseModel):
     task_id: int
@@ -228,29 +258,79 @@ class LabourTaskItem(BaseModel):
     progress: float
     project_name: Optional[str] = None
 
+
 class LabourActivityItem(BaseModel):
     title: str
     description: str
     time: str
 
-class LabourDashboardOut(BaseModel):
+
+class LabourProfile(BaseModel):
     user_name: str
-    project_name: Optional[str]
-    contractor_name: Optional[str]
-    
+    profile_image: Optional[str] = None
+    project_name: Optional[str] = None
+    contractor_name: Optional[str] = None
+    labour_type: Optional[str] = None
+    skill_category: Optional[str] = None
     check_in_status: str
-    
+
+
+class LabourOverview(BaseModel):
+    today_hours: float
+    overtime_hours: float
+
     total_tasks: int
     completed_tasks: int
     pending_tasks: int
+
     this_month_earnings: float
-    
-    recent_tasks: List[LabourTaskItem]
-    recent_activity: List[LabourActivityItem]
+
+
+class LabourAttendanceSummary(BaseModel):
+    present_days: int
+    absent_days: int
+    half_days: int
+
+    total_days: int
+    attendance_percentage: float
+
+
+class LabourDetails(BaseModel):
+    site_name: Optional[str] = None
+    site_address: Optional[str] = None
+    daily_wage: float
+    overtime_rate: float
+
+
+class LabourPayment(BaseModel):
+    paid_amount: float
+    pending_amount: float
+    next_payment_date: Optional[date]
+
+
+class LabourStats(BaseModel):
+    weekly_earnings: float
+    attendance_streak: int
+    safety_score: int
+    ppe_status: str
+
+
+class LabourDashboardOut(BaseModel):
+
+    profile: LabourProfile
+    overview: LabourOverview
+    attendance_summary: LabourAttendanceSummary
+    labour_details: LabourDetails
+    payment: LabourPayment
+    # stats: LabourStats
+    recent_tasks: list[LabourTaskItem]
+    recent_activity: list[LabourActivityItem]
+
 
 # =========================================
 # PROJECT MANAGER DASHBOARD
 # =========================================
+
 
 class PMSummaryOut(BaseModel):
     total_projects: int

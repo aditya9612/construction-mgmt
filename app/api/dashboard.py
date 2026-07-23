@@ -8,15 +8,19 @@ import io
 from typing import Optional, List, Dict, Any
 
 from app.core.enums import (
+    PRIORITY_MAP,
+    AttendanceStatus,
     InvoiceStatus,
     ProjectStatus,
     IssueStatus,
     IssuePriority,
     MilestoneStatus,
     SafetyChecklistStatus,
+    TaskPriority,
 )
 from app.db.session import get_db_session
 from app.core import dependencies as d
+from app.models.settings import UserSettings
 from app.models.user import User, UserRole
 from app.models.owner import Owner
 from app.models.material import Supplier
@@ -98,10 +102,11 @@ import csv
 
 from app.utils.common import assert_project_access
 from app.utils.helpers import NotFoundError, safe_divide, validate_percentage
-from app.utils.timezone import get_naive_utc_now
+from app.utils.timezone import get_naive_utc_now, get_naive_local_now, localize_datetime
 from datetime import timezone
 from app.models.labour import Labour, LabourProject, LabourAttendance, LabourPayroll
 from app.core.enums import TaskStatus
+from app.models.contractor import Contractor, ContractorProject
 
 DASHBOARD_READ_ROLES = [
     r.value
@@ -215,7 +220,7 @@ async def cache_get_set(redis, key, version, func):
 # KPI COMPARISON (NEW)
 # =========================================
 async def get_kpi_comparison(db):
-    now = datetime.utcnow()
+    now = get_naive_local_now()
     last_month = now - timedelta(days=30)
 
     current = await db.scalar(
@@ -246,7 +251,7 @@ async def admin_dashboard(
         return {"error": "Access denied"}
 
     async def logic():
-        today = date.today()
+        today = get_naive_local_now().date()
 
         # 1. Project Overview
         project_stats = await db.execute(
@@ -454,7 +459,7 @@ async def engineer_dashboard(
 
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
-        today = date.today()
+        today = get_naive_local_now().date()
 
         labour = await db.scalar(
             select(func.count(func.distinct(UserAttendance.user_id)))
@@ -617,7 +622,7 @@ async def accountant_dashboard(
         # 2. Revenue vs Expense Trend
         rev_exp_trends = []
         for i in range(5, -1, -1):
-            target_date = datetime.utcnow() - relativedelta(months=i)
+            target_date = get_naive_local_now() - relativedelta(months=i)
             month_str = target_date.strftime("%b")
 
             month_start = target_date.replace(
@@ -626,7 +631,7 @@ async def accountant_dashboard(
             month_end = (
                 (month_start + relativedelta(months=1)) - timedelta(seconds=1)
                 if i != 0
-                else datetime.utcnow()
+                else get_naive_local_now()
             )
 
             month_expense = (
@@ -660,7 +665,7 @@ async def accountant_dashboard(
             # 3. Cash Flow (Monthly Trend)
         cash_flow = []
         for i in range(5, -1, -1):
-            target_date = datetime.utcnow() - relativedelta(months=i)
+            target_date = get_naive_local_now() - relativedelta(months=i)
             month_str = target_date.strftime("%b")
 
             month_start = target_date.replace(
@@ -669,7 +674,7 @@ async def accountant_dashboard(
             month_end = (
                 (month_start + relativedelta(months=1)) - timedelta(seconds=1)
                 if i != 0
-                else datetime.utcnow()
+                else get_naive_local_now()
             )
 
             c_inflow = (
@@ -734,7 +739,7 @@ async def accountant_dashboard(
             )
 
         # 5. Receivable Aging
-        today_date = datetime.utcnow().date()
+        today_date = get_naive_local_now().date()
         inv_query = await db.execute(
             select(Invoice).where(Invoice.status == InvoiceStatus.PENDING.value)
         )
@@ -898,7 +903,7 @@ async def pm_command_center(
 ):
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
-        today = date.today()
+        today = get_naive_local_now().date()
         now = datetime.utcnow()
 
         # 1. KPIs
@@ -1353,7 +1358,7 @@ async def pm_summary(
         budget_utilized_percent = float(total_expense / total_budget) * 100.0
 
     # Today's Activities
-    today_dt = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_dt = get_naive_local_now().replace(hour=0, minute=0, second=0, microsecond=0)
     todays_activities = (
         await db.scalar(
             select(func.count(ActivityLog.id)).where(
@@ -1560,11 +1565,6 @@ async def export_master_projects_pdf(
     )
 
 
-# =========================================
-# client_dashboard
-# =========================================
-
-
 @router.get("/client")
 async def client_dashboard(
     project_id: int,
@@ -1590,11 +1590,7 @@ async def client_dashboard(
                 m.Project.status,
                 m.Project.start_date,
                 m.Project.end_date,
-                m.Project.budget_amount,  # Added
-            ).where(
-                m.Project.id == project_id,
-                m.Project.id.in_(project_ids),
-            )
+            ).where(m.Project.id == project_id, m.Project.id.in_(project_ids))
         )
 
         project = project.first()
@@ -1602,13 +1598,7 @@ async def client_dashboard(
         if not project:
             return {"error": "No project found"}
 
-        (
-            db_project_id,
-            status,
-            start_date,
-            end_date,
-            budget_amount,
-        ) = project
+        db_project_id, status, start_date, end_date = project
 
         # ========================
         # PROGRESS
@@ -1620,13 +1610,18 @@ async def client_dashboard(
         )
 
         # ========================
+        # BUDGET
+        # ========================
+        budget_total = await get_waterfall_budget(db, [db_project_id])
+
+        # ========================
         # EXPENSE
         # ========================
         total_expense = await db.scalar(
             select(func.sum(Expense.amount)).where(Expense.project_id == db_project_id)
         )
 
-        budget_val = float(budget_amount or 0)
+        budget_val = float(budget_total or 0)
         expense_val = float(total_expense or 0)
 
         budget_used_percent = (expense_val / budget_val) * 100 if budget_val else 0
@@ -1669,7 +1664,7 @@ async def client_dashboard(
         days_remaining = 0
 
         if end_date:
-            days_remaining = (end_date - date.today()).days
+            days_remaining = (end_date - get_naive_local_now().date()).days
 
         # ========================
         # RESPONSE
@@ -1678,8 +1673,8 @@ async def client_dashboard(
             "project_id": db_project_id,
             "status": status,
             "progress_percent": round(progress or 0, 2),
-            "budget_amount": round(budget_val, 2),  # Changed
-            # "total_expense": round(expense_val, 2),
+            "budget_total": budget_val,
+            "total_expense": expense_val,
             "budget_used_percent": round(budget_used_percent, 2),
             "remaining_budget": round(remaining_budget, 2),
             "milestones_total": milestones_total or 0,
@@ -1704,8 +1699,6 @@ async def client_dashboard(
 # =========================================
 # GRAPH APIs
 # =========================================
-
-
 @router.get("/graph/labour")
 async def labour_trend(
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
@@ -2230,6 +2223,7 @@ async def ml_forecast(
     }
 
 
+@router.get("/engineer/{project_id}", response_model=EnhancedDashboardOut)
 @router.get("/engineer/details", response_model=EnhancedDashboardOut)
 async def site_engineer_dashboard(
     current_user: User = Depends(d.require_roles([UserRole.SITE_ENGINEER.value])),
@@ -2259,7 +2253,7 @@ async def site_engineer_dashboard(
 
         # Planned progress for single project
         planned_progress = 0
-        today = date.today()
+        today = get_naive_local_now().date()
         if project.start_date and project.end_date:
             total_days = (project.end_date - project.start_date).days
             elapsed_days = (today - project.start_date).days
@@ -2305,7 +2299,7 @@ async def site_engineer_dashboard(
             select(m.Project).where(m.Project.id.in_(project_ids))
         )
         projects = projects_query.scalars().all()
-        today = date.today()
+        today = get_naive_local_now().date()
         total_planned = 0
         valid_projs = 0
         for p in projects:
@@ -2445,273 +2439,17 @@ async def site_engineer_dashboard(
         weather={"condition": "Clear", "temperature": 32},  # Placeholder
     )
 
-    if value > 100:
-        return 100
-
-    return round(value, 2)
-
 
 def success_response(message, data=None):
 
     return {"success": True, "message": message, "data": data}
 
 
-# =========================================
-# LABOUR DASHBOARD
-# =========================================
-
-
-@router.get("/labour", response_model=dict)
-async def get_labour_dashboard(
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.get_current_active_user),
-):
-    if current_user.role != UserRole.LABOUR.value:
-        raise HTTPException(
-            status_code=403, detail="Not authorized for Labour Dashboard"
-        )
-
-    # 1. Fetch Labour Profile
-    from sqlalchemy.orm import selectinload
-
-    result = await db.execute(
-        select(Labour)
-        .where(Labour.user_id == current_user.id)
-        .options(
-            selectinload(Labour.contractor),
-            selectinload(Labour.labour_type),
-            selectinload(Labour.user),
-        )
-    )
-    labour = result.scalar_one_or_none()
-
-    if not labour:
-        raise HTTPException(status_code=404, detail="Labour profile not found")
-
-    # 2. Get active project from LabourProject
-    lp_result = await db.execute(
-        select(LabourProject)
-        .where(LabourProject.labour_id == labour.id)
-        .order_by(desc(LabourProject.assigned_date))
-    )
-    labour_projects = lp_result.scalars().all()
-
-    project_name = None
-    if len(labour_projects) > 1:
-        project_name = "Multiple Active Sites"
-    elif len(labour_projects) == 1:
-        project_id = labour_projects[0].project_id
-        # get project name
-        proj_res = await db.execute(
-            select(m.Project.project_name).where(m.Project.id == project_id)
-        )
-        project_name = proj_res.scalar_one_or_none()
-
-    # 3. Get Attendance Status for today
-    today = date.today()
-    att_res = await db.execute(
-        select(UserAttendance).where(
-            UserAttendance.user_id == current_user.id,
-            UserAttendance.attendance_date == today,
-        )
-    )
-    today_attendance = att_res.scalar_one_or_none()
-
-    check_in_status = "NOT CHECKED IN"
-    if today_attendance:
-        if today_attendance.out_time:
-            check_in_status = "CHECKED OUT"
-        elif today_attendance.in_time:
-            check_in_status = "CHECKED IN"
-
-    # 4. Get Tasks (Assigned to this user)
-    from sqlalchemy.orm import selectinload
-
-    tasks_res = await db.execute(
-        select(Task)
-        .options(selectinload(Task.project))
-        .where(Task.assignments.any(TaskAssignment.user_id == current_user.id))
-        .order_by(desc(Task.start_date))
-    )
-    all_tasks = tasks_res.scalars().all()
-
-    total_tasks = len(all_tasks)
-    completed_tasks = sum(1 for t in all_tasks if t.status == TaskStatus.COMPLETED)
-    pending_tasks = total_tasks - completed_tasks
-
-    # Recent Tasks
-    recent_tasks_models = all_tasks[:5]
-    recent_tasks = [
-        LabourTaskItem(
-            task_id=t.id,
-            title=t.title,
-            status=t.status.value,
-            priority=str(t.priority),
-            start_date=t.start_date,
-            end_date=t.end_date,
-            progress=t.completion_percentage,
-            project_name=(
-                t.project.project_name if getattr(t, "project", None) else "Project"
-            ),
-        )
-        for t in recent_tasks_models
-    ]
-
-    if not project_name and all_tasks:
-        active_project_names = list(
-            set(
-                [
-                    t.project.project_name
-                    for t in all_tasks
-                    if getattr(t, "project", None)
-                ]
-            )
-        )
-        if len(active_project_names) > 1:
-            project_name = "Multiple Active Sites"
-        elif len(active_project_names) == 1:
-            project_name = active_project_names[0]
-
-    # 5. This Month Earnings
-    current_month = today.month
-    current_year = today.year
-    payroll_res = await db.execute(
-        select(LabourPayroll).where(
-            LabourPayroll.labour_id == labour.id,
-            LabourPayroll.month == current_month,
-            LabourPayroll.year == current_year,
-        )
-    )
-    payrolls = payroll_res.scalars().all()
-    this_month_earnings = sum(float(p.total_wage or 0) for p in payrolls)
-
-    # If no payroll generated, fallback to attendance
-    if this_month_earnings == 0:
-        att_month_res = await db.execute(
-            select(UserAttendance).where(
-                UserAttendance.user_id == current_user.id,
-                func.extract("month", UserAttendance.attendance_date) == current_month,
-                func.extract("year", UserAttendance.attendance_date) == current_year,
-            )
-        )
-        month_attendances = att_month_res.scalars().all()
-        wage = labour.effective_daily_wage
-        ot_rate = labour.effective_ot_rate
-        for a in month_attendances:
-            this_month_earnings += float(wage) * (float(a.working_hours) / 8.0)
-            this_month_earnings += float(ot_rate) * float(a.overtime_hours)
-
-    # 6. Recent Activity
-    recent_activity = []
-
-    # Task Assignments
-
-    for t in all_tasks[:2]:
-        assignment = await db.scalar(
-            select(TaskAssignment).where(
-                TaskAssignment.task_id == t.id,
-                TaskAssignment.user_id == current_user.id,
-            )
-        )
-
-        assigned_at = assignment.assigned_at if assignment else None
-
-        recent_activity.append(
-            {
-                "title": "Task Assigned",
-                "description": f"Assigned to {t.title}",
-                "time": (
-                    assigned_at.strftime("%d %b %Y, %I:%M %p")
-                    if assigned_at
-                    else (t.start_date.strftime("%d %b %Y") if t.start_date else "--")
-                ),
-                "timestamp": (
-                    assigned_at
-                    or (
-                        datetime.combine(t.start_date, datetime.min.time())
-                        if t.start_date
-                        else datetime.min
-                    )
-                ),
-            }
-        )
-
-    # Attendance events
-    att_res = await db.execute(
-        select(UserAttendance)
-        .where(UserAttendance.user_id == current_user.id)
-        .order_by(desc(UserAttendance.attendance_date))
-        .limit(2)
-    )
-    for a in att_res.scalars().all():
-        recent_activity.append(
-            {
-                "title": "Attendance Logged",
-                "description": f"Present on {a.attendance_date.strftime('%d %b')}",
-                "time": (
-                    datetime.combine(a.attendance_date, a.in_time.time()).strftime(
-                        "%d %b %Y, %I:%M %p"
-                    )
-                    if a.in_time
-                    else a.attendance_date.strftime("%d %b %Y")
-                ),
-                "timestamp": (
-                    a.in_time
-                    if a.in_time
-                    else datetime.combine(a.attendance_date, datetime.min.time())
-                ),
-            }
-        )
-
-    # Payroll Updates
-    for p in payrolls[:2]:
-        recent_activity.append(
-            {
-                "title": "Payroll Generated",
-                "description": f"Wage ₹{p.total_wage} for {p.month}/{p.year}",
-                "time": (
-                    p.created_at.strftime("%d %b %Y, %I:%M %p")
-                    if getattr(p, "created_at", None)
-                    else "Recent"
-                ),
-                "timestamp": getattr(p, "created_at", datetime.utcnow())
-                or datetime.utcnow(),
-            }
-        )
-
-    # Sort and take top 5
-    recent_activity.sort(key=lambda x: x["timestamp"], reverse=True)
-
-    recent_activity_items = [
-        LabourActivityItem(
-            title=item["title"], description=item["description"], time=item["time"]
-        )
-        for item in recent_activity[:5]
-    ]
-
-    data = LabourDashboardOut(
-        user_name=current_user.full_name or "Labour User",
-        project_name=project_name,
-        contractor_name=labour.contractor.name if labour.contractor else None,
-        check_in_status=check_in_status,
-        total_tasks=total_tasks,
-        completed_tasks=completed_tasks,
-        pending_tasks=pending_tasks,
-        this_month_earnings=float(this_month_earnings),
-        recent_tasks=recent_tasks,
-        recent_activity=recent_activity_items,
-    )
-
-    return success_response(
-        message="Labour dashboard fetched successfully", data=data.model_dump()
-    )
-
-
 def apply_payroll_time_filter(
     stmt, time_filter: Optional[str], month: Optional[int], year: Optional[int]
 ):
     if time_filter:
-        today = get_naive_utc_now().replace(tzinfo=timezone.utc).date()
+        today = get_naive_local_now().date()
         start_date = None
         if time_filter == "daily":
             start_date = today
@@ -2734,6 +2472,465 @@ def apply_payroll_time_filter(
         if year:
             stmt = stmt.where(LabourPayroll.year == year)
     return stmt
+
+
+# =========================================
+# LABOUR DASHBOARD
+# =========================================
+
+
+from datetime import date, datetime
+from decimal import Decimal
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import (
+    select,
+    func,
+    case,
+    desc,
+)
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.db.session import get_db_session
+from app.models.user import User, UserAttendance
+from app.models.labour import Labour, LabourProject, LabourPayroll
+from app.models.project import Project, Task, TaskAssignment
+from app.schemas.dashboard import (
+    LabourDashboardOut,
+    LabourProfile,
+    LabourOverview,
+    LabourAttendanceSummary,
+    LabourPayment,
+    LabourStats,
+    LabourTaskItem,
+    LabourActivityItem,
+    LabourDetails,
+)
+from app.models.user import UserRole
+from app.core.enums import TaskStatus
+from app.models.settings import UserSettings
+from app.models.contractor import Contractor, ContractorProject
+from app.core.enums import AttendanceStatus
+
+
+@router.get(
+    "/labour",
+    response_model=dict,
+)
+async def labour_dashboard(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(d.get_current_active_user),
+):
+
+    if current_user.role != UserRole.LABOUR.value:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized",
+        )
+
+    today = date.today()
+
+    current_month = today.month
+    current_year = today.year
+
+    labour = await db.scalar(
+        select(Labour)
+        .options(
+            selectinload(Labour.user),
+            selectinload(Labour.contractor),
+            selectinload(Labour.labour_type),
+        )
+        .where(Labour.user_id == current_user.id)
+    )
+
+    if labour is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Labour profile not found",
+        )
+
+    user_settings = await db.scalar(
+        select(UserSettings).where(UserSettings.user_id == current_user.id)
+    )
+
+    project = None
+
+    if user_settings and user_settings.default_project_id:
+
+        mapping = await db.scalar(
+            select(LabourProject).where(
+                LabourProject.labour_id == labour.id,
+                LabourProject.project_id == user_settings.default_project_id,
+            )
+        )
+
+        if mapping:
+            project = await db.get(
+                Project,
+                user_settings.default_project_id,
+            )
+
+    # Fallback
+    if project is None:
+
+        mapping = await db.scalar(
+            select(LabourProject)
+            .where(LabourProject.labour_id == labour.id)
+            .order_by(
+                LabourProject.assigned_date.desc(),
+                LabourProject.id.desc(),
+            )
+        )
+
+        if mapping:
+            project = await db.get(Project, mapping.project_id)
+
+    contractors = []
+    contractor_name = None
+
+    if project:
+        contractors = (
+            (
+                await db.execute(
+                    select(Contractor)
+                    .distinct()
+                    .join(
+                        ContractorProject,
+                        ContractorProject.contractor_id == Contractor.id,
+                    )
+                    .where(ContractorProject.project_id == project.id)
+                    .order_by(Contractor.name.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        if contractors:
+            contractor_name = ", ".join(contractor.name for contractor in contractors)
+
+    profile = LabourProfile(
+        user_name=current_user.full_name,
+        profile_image=current_user.profile_image,
+        project_name=(project.project_name if project else None),
+        contractor_name=contractor_name,
+        labour_type=labour.labour_type_name,
+        skill_category=labour.skill_category,
+        check_in_status="NOT CHECKED IN",
+    )
+
+    # =========================================
+    # TODAY ATTENDANCE
+    # =========================================
+
+    attendance_query = select(UserAttendance).where(
+        UserAttendance.user_id == current_user.id,
+        UserAttendance.attendance_date == today,
+    )
+
+    if project:
+        attendance_query = attendance_query.where(
+            UserAttendance.project_id == project.id
+        )
+
+    attendance_result = await db.execute(attendance_query)
+
+    today_attendance = attendance_result.scalar_one_or_none()
+
+    if today_attendance:
+
+        if today_attendance.out_time:
+            profile.check_in_status = "CHECKED OUT"
+
+        elif today_attendance.in_time:
+            profile.check_in_status = "CHECKED IN"
+
+    # =========================================
+    # MONTHLY ATTENDANCE SUMMARY
+    # =========================================
+
+    attendance_summary_query = select(
+        func.count(UserAttendance.id).label("total_days"),
+        func.sum(
+            case(
+                (
+                    UserAttendance.status == AttendanceStatus.PRESENT,
+                    1,
+                ),
+                else_=0,
+            )
+        ).label("present_days"),
+        func.sum(
+            case(
+                (
+                    UserAttendance.status == AttendanceStatus.ABSENT,
+                    1,
+                ),
+                else_=0,
+            )
+        ).label("absent_days"),
+        func.sum(
+            case(
+                (
+                    UserAttendance.status == AttendanceStatus.HALF_DAY,
+                    1,
+                ),
+                else_=0,
+            )
+        ).label("half_days"),
+        func.sum(UserAttendance.working_hours).label("working_hours"),
+        func.sum(UserAttendance.overtime_hours).label("overtime_hours"),
+    ).where(
+        UserAttendance.user_id == current_user.id,
+        func.extract(
+            "month",
+            UserAttendance.attendance_date,
+        )
+        == current_month,
+        func.extract(
+            "year",
+            UserAttendance.attendance_date,
+        )
+        == current_year,
+    )
+
+    if project:
+        attendance_summary_query = attendance_summary_query.where(
+            UserAttendance.project_id == project.id
+        )
+
+    attendance_summary_result = await db.execute(attendance_summary_query)
+
+    attendance_data = attendance_summary_result.one()
+
+    total_days = attendance_data.total_days or 0
+    present_days = attendance_data.present_days or 0
+    absent_days = attendance_data.absent_days or 0
+    half_days = attendance_data.half_days or 0
+
+    # total_hours = float(attendance_data.working_hours or 0)
+    # total_ot = float(attendance_data.overtime_hours or 0)
+
+    attendance_percentage = (
+        round((present_days / total_days) * 100, 2) if total_days else 0
+    )
+
+    today_hours = (
+        float(today_attendance.working_hours or 0) if today_attendance else 0.0
+    )
+
+    today_ot = float(today_attendance.overtime_hours or 0) if today_attendance else 0.0
+
+    # =========================================
+    # TASKS
+    # =========================================
+
+    task_query = (
+        select(Task)
+        .options(
+            selectinload(Task.project),
+        )
+        .where(Task.assignments.any(TaskAssignment.user_id == current_user.id))
+    )
+
+    if project:
+        task_query = task_query.where(Task.project_id == project.id)
+
+    task_query = task_query.order_by(desc(Task.start_date))
+
+    task_result = await db.execute(task_query)
+
+    all_tasks = task_result.scalars().all()
+
+    total_tasks = len(all_tasks)
+
+    completed_tasks = sum(
+        1 for task in all_tasks if task.status == TaskStatus.COMPLETED
+    )
+
+    pending_tasks = total_tasks - completed_tasks
+
+    recent_tasks = []
+
+    for task in all_tasks[:5]:
+
+        recent_tasks.append(
+            LabourTaskItem(
+                task_id=task.id,
+                title=task.title,
+                status=task.status.value,
+                priority=PRIORITY_MAP.get(
+                    task.priority,
+                    TaskPriority.LOW,
+                ).value,
+                start_date=task.start_date,
+                end_date=task.end_date,
+                progress=task.completion_percentage,
+                project_name=(task.project.project_name if task.project else None),
+            )
+        )
+
+    attendance_summary = LabourAttendanceSummary(
+        present_days=present_days,
+        absent_days=absent_days,
+        half_days=half_days,
+        total_days=total_days,
+        attendance_percentage=attendance_percentage,
+    )
+
+    payroll_query = select(LabourPayroll).where(
+        LabourPayroll.labour_id == labour.id,
+        LabourPayroll.month == current_month,
+        LabourPayroll.year == current_year,
+    )
+
+    if project:
+        payroll_query = payroll_query.where(LabourPayroll.project_id == project.id)
+
+    payroll = await db.scalar(payroll_query)
+
+    paid_amount = 0.0
+    pending_amount = 0.0
+    this_month_earnings = 0.0
+    next_payment_date = None
+
+    if payroll:
+        paid_amount = float(payroll.paid_amount or 0)
+        pending_amount = float(payroll.remaining_amount or 0)
+        this_month_earnings = float(payroll.total_wage or 0)
+
+    overview = LabourOverview(
+        today_hours=today_hours,
+        overtime_hours=today_ot,
+        total_tasks=total_tasks,
+        completed_tasks=completed_tasks,
+        pending_tasks=pending_tasks,
+        this_month_earnings=this_month_earnings,
+    )
+
+    labour_details = LabourDetails(
+        site_name=project.project_name if project else None,
+        site_address=project.site_address if project else None,
+        daily_wage=float(labour.effective_daily_wage),
+        overtime_rate=float(labour.effective_ot_rate),
+    )
+
+    payment = LabourPayment(
+        paid_amount=paid_amount,
+        pending_amount=pending_amount,
+        next_payment_date=next_payment_date,
+    )
+
+    weekly_query = select(func.count(UserAttendance.id)).where(
+        UserAttendance.user_id == current_user.id,
+        UserAttendance.status == AttendanceStatus.PRESENT,
+        func.yearweek(
+            UserAttendance.attendance_date,
+            3,
+        )
+        == func.yearweek(
+            func.curdate(),
+            3,
+        ),
+    )
+
+    if project:
+        weekly_query = weekly_query.where(UserAttendance.project_id == project.id)
+
+    weekly_present = (await db.execute(weekly_query)).scalar() or 0
+
+    weekly_earnings = weekly_present * float(labour.effective_daily_wage)
+
+    # =========================================
+    # ATTENDANCE STREAK
+    # =========================================
+
+    attendance_streak = 0
+
+    attendance_query = select(UserAttendance).where(
+        UserAttendance.user_id == current_user.id
+    )
+
+    if project:
+        attendance_query = attendance_query.where(
+            UserAttendance.project_id == project.id
+        )
+
+    attendance_query = attendance_query.order_by(
+        UserAttendance.attendance_date.desc()
+    ).limit(30)
+
+    attendance_rows = (await db.execute(attendance_query)).scalars().all()
+
+    for row in attendance_rows:
+
+        # If status is stored as string
+        if row.status == AttendanceStatus.PRESENT:
+            attendance_streak += 1
+        else:
+            break
+
+    # # =========================================
+    # # STATS
+    # # =========================================
+
+    # safety_score = 100
+    # ppe_status = "COMPLIANT"
+
+    # stats = LabourStats(
+    #     weekly_earnings=weekly_earnings,
+    #     attendance_streak=attendance_streak,
+    #     safety_score=safety_score,
+    #     ppe_status=ppe_status,
+    # )
+
+    # =========================================
+    # RECENT ACTIVITY
+    # =========================================
+
+    recent_activity = []
+
+    if today_attendance:
+        recent_activity.append(
+            LabourActivityItem(
+                title="Checked In",
+                description="Attendance marked",
+                time=str(today_attendance.in_time),
+            )
+        )
+
+    for task in all_tasks[:3]:
+        recent_activity.append(
+            LabourActivityItem(
+                title="Task Assigned",
+                description=task.title,
+                time=str(task.start_date) if task.start_date else "-",
+            )
+        )
+
+    dashboard = LabourDashboardOut(
+        profile=profile,
+        overview=overview,
+        attendance_summary=attendance_summary,
+        labour_details=labour_details,
+        payment=payment,
+        #stats=stats,
+        recent_tasks=recent_tasks,
+        recent_activity=recent_activity,
+    )
+
+    return {
+        "success": True,
+        "message": "Labour dashboard loaded successfully",
+        "data": dashboard.model_dump(),
+    }
+
+
+# =============================================
+# get_labour_payments
+# ============================================
 
 
 @router.get("/labour/payments", response_model=dict)

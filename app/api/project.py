@@ -107,6 +107,8 @@ from app.models.project import (
 from app.models.work_order import WorkOrder
 from app.models.boq import BOQ
 from app.models.user import User
+from app.models.labour import Labour, LabourProject
+from sqlalchemy import select
 
 
 def compute_project_status(project):
@@ -981,35 +983,66 @@ class ProjectMembersService:
         )
         self._assert_member_mutation_role(current_user)
 
-        project = await self.projects_repo.get_project(db, project_id=project_id)
+        project = await self.projects_repo.get_project(
+            db, project_id=project_id
+        )
         if project is None:
             raise NotFoundError("Project not found")
 
-        user = await db.scalar(select(User).where(User.id == user_id))
+        user = await db.scalar(
+            select(User).where(User.id == user_id)
+        )
         if user is None:
             raise NotFoundError("User not found")
 
         existing = await self.members_repo.get_member(
-            db, project_id=project_id, user_id=user_id
+            db,
+            project_id=project_id,
+            user_id=user_id,
         )
         if existing is not None:
             raise ConflictError("User is already assigned to this project")
 
         try:
+            # Create Project Member
             await self.members_repo.assign_member(
-                db, project_id=project_id, user_id=user_id
+                db,
+                project_id=project_id,
+                user_id=user_id,
             )
+
+            # If the assigned user is Labour, create LabourProject mapping
+            labour = await db.scalar(
+                select(Labour).where(Labour.user_id == user_id)
+            )
+
+            if labour:
+                existing_labour_project = await db.scalar(
+                    select(LabourProject).where(
+                        LabourProject.labour_id == labour.id,
+                        LabourProject.project_id == project_id,
+                    )
+                )
+
+                if existing_labour_project is None:
+                    db.add(
+                        LabourProject(
+                            labour_id=labour.id,
+                            project_id=project_id,
+                        )
+                    )
+
+            await db.flush()
+
         except IntegrityError:
             await db.rollback()
             raise ConflictError("User is already assigned to this project")
-
-        role = user.role
 
         return s.ProjectMemberOut(
             user_id=user.id,
             full_name=user.full_name,
             email=user.email,
-            role=role,
+            role=user.role,
         )
 
     async def list_members(
