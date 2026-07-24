@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import date, datetime
 
@@ -253,9 +253,9 @@ class LabourTaskItem(BaseModel):
     title: str
     status: str
     priority: str
-    start_date: Optional[date]
+    start_date: Optional[date] = None
     end_date: Optional[date] = None
-    progress: float
+    progress: float = Field(ge=0, le=100)
     project_name: Optional[str] = None
 
 
@@ -273,6 +273,7 @@ class LabourProfile(BaseModel):
     labour_type: Optional[str] = None
     skill_category: Optional[str] = None
     check_in_status: str
+    is_multi_project: bool = False
 
 
 class LabourOverview(BaseModel):
@@ -305,7 +306,9 @@ class LabourDetails(BaseModel):
 class LabourPayment(BaseModel):
     paid_amount: float
     pending_amount: float
-    next_payment_date: Optional[date]
+    next_payment_date: Optional[date] = None
+    is_overdue: bool = False
+    payment_status: Optional[str] = None
 
 
 class LabourStats(BaseModel):
@@ -327,6 +330,12 @@ class LabourDashboardOut(BaseModel):
     recent_activity: list[LabourActivityItem]
 
 
+class LabourDashboardResponse(BaseModel):
+    success: bool
+    message: str
+    data: LabourDashboardOut
+
+
 # =========================================
 # PROJECT MANAGER DASHBOARD
 # =========================================
@@ -341,3 +350,128 @@ class PMSummaryOut(BaseModel):
     open_issues: int
     budget_utilized_percent: float
     todays_activities: int
+
+
+# =========================================================
+# CLIENT DASHBOARD
+# =========================================================
+
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import date
+
+
+class ClientProjectInfo(BaseModel):
+    project_id: int
+    project_name: str
+    status: str
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    days_remaining: int
+
+
+class ClientDashboardOverview(BaseModel):
+    progress_percent: float
+    project_health: str  # Good / At Risk / Critical
+    budget_total: float
+    total_expense: float
+    remaining_budget: float
+    budget_used_percent: float
+    budget_status: str  # Under Budget / On Budget / Over Budget
+
+
+class ClientBudgetAnalysis(BaseModel):
+    budget: float
+    spent: float
+    remaining: float
+    variance_percent: float  # variance / budget * 100
+
+
+class ClientTimelineInfo(BaseModel):
+    project_duration: int  # total days start->end
+    elapsed_days: int
+    remaining_days: int
+    timeline_progress: float  # elapsed / duration * 100
+
+
+class ClientScheduleInfo(BaseModel):
+    actual_progress: float
+    expected_progress: float
+    variance: float  # actual - expected
+    status: str  # Ahead of Schedule / On Track / Behind Schedule
+
+
+class ClientRiskInfo(BaseModel):
+    score: int  # 0-100, higher = riskier
+    level: str  # Low / Medium / High
+
+
+class ClientKPIs(BaseModel):
+    progress: float
+    budget_used: float
+    remaining_budget: float
+    overdue_tasks: int
+    overdue_milestones: int
+    high_priority_tasks: int
+
+
+class ClientMilestoneSummaryInfo(BaseModel):
+    total: int
+    completed: int
+    pending: int
+    completion_percent: float
+
+
+class ClientTaskSummaryInfo(BaseModel):
+    total: int
+    completed: int
+    pending: int
+    completion_percent: float
+
+
+class ClientMilestoneItem(BaseModel):
+    id: int
+    title: str
+    status: str
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    completion_percentage: float
+
+
+class ClientExpenseItem(BaseModel):
+    id: int
+    category: str
+    description: Optional[str] = None
+    amount: float
+    expense_date: date
+    payment_mode: Optional[str] = None
+
+
+class ClientExpenseTrendItem(BaseModel):
+    month: str  # e.g. "2026-01"
+    total_amount: float
+
+
+class ClientUpcomingMilestoneItem(BaseModel):
+    id: int
+    title: str
+    status: str
+    end_date: Optional[date] = None
+    days_remaining: Optional[int] = None
+
+
+class ClientDashboardV2Out(BaseModel):
+    project: ClientProjectInfo
+    overview: ClientDashboardOverview
+    budget_analysis: ClientBudgetAnalysis
+    timeline: ClientTimelineInfo
+    schedule: ClientScheduleInfo
+    risk: ClientRiskInfo
+    kpis: ClientKPIs
+    milestone_summary: ClientMilestoneSummaryInfo
+    task_summary: ClientTaskSummaryInfo
+    recent_milestones: List[ClientMilestoneItem]
+    recent_expenses: List[ClientExpenseItem]
+    expense_trend: List[ClientExpenseTrendItem]
+    upcoming_milestones: List[ClientUpcomingMilestoneItem]
+    executive_summary: str

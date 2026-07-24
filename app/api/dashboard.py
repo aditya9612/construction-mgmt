@@ -241,6 +241,8 @@ async def get_kpi_comparison(db):
 # =========================================
 # ADMIN DASHBOARD
 # =========================================
+
+
 @router.get("/admin", response_model=AdminDashboardOut)
 async def admin_dashboard(
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
@@ -1565,7 +1567,38 @@ async def export_master_projects_pdf(
     )
 
 
-@router.get("/client")
+# ============================================
+# client_dashboard
+# ============================================
+
+
+from fastapi import HTTPException
+from sqlalchemy import select, func, case
+from app.schemas.dashboard import (
+    ClientDashboardV2Out,
+    ClientProjectInfo,
+    ClientDashboardOverview,
+    ClientBudgetAnalysis,
+    ClientTimelineInfo,
+    ClientScheduleInfo,
+    ClientRiskInfo,
+    ClientKPIs,
+    ClientMilestoneSummaryInfo,
+    ClientTaskSummaryInfo,
+    ClientMilestoneItem,
+    ClientExpenseItem,
+    ClientExpenseTrendItem,
+    ClientUpcomingMilestoneItem,
+)
+
+# Computed once at import time instead of on every request — PRIORITY_MAP
+# is a static mapping, no need to rebuild this list on every call.
+_HIGH_PRIORITY_KEYS = [
+    key for key, value in PRIORITY_MAP.items() if value == TaskPriority.HIGH
+]
+
+
+@router.get("/client", response_model=ClientDashboardV2Out)
 async def client_dashboard(
     project_id: int,
     current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
@@ -1576,121 +1609,436 @@ async def client_dashboard(
         UserRole.CLIENT.value,
         UserRole.ADMIN.value,
     ]:
-        return {"error": "Access denied"}
+        raise HTTPException(status_code=403, detail="Access denied")
 
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
 
         # ========================
         # PROJECT
+        # ------------------------
+        # budget_amount is fetched here too now (was a separate query
+        # further down) — one fewer SQL round trip per request.
         # ========================
-        project = await db.execute(
+        project_row = await db.execute(
             select(
                 m.Project.id,
+                m.Project.project_name,
                 m.Project.status,
                 m.Project.start_date,
                 m.Project.end_date,
+                m.Project.budget_amount,
             ).where(m.Project.id == project_id, m.Project.id.in_(project_ids))
         )
+        project_row = project_row.first()
 
-        project = project.first()
+        if not project_row:
+            raise HTTPException(status_code=404, detail="No project found")
 
-        if not project:
-            return {"error": "No project found"}
+        (
+            db_project_id,
+            project_name,
+            status,
+            start_date,
+            end_date,
+            budget_amount,
+        ) = project_row
 
-        db_project_id, status, start_date, end_date = project
+        today = get_naive_local_now().date()
+        status_value = status.value if hasattr(status, "value") else str(status)
 
         # ========================
-        # PROGRESS
+        # PERFORMANCE NOTE
+        # ------------------------
+        # AsyncSession does not support concurrent operations on a single
+        # shared session (asyncio.gather over db.execute() calls on the
+        # same `db` will intermittently raise InvalidRequestError / cursor
+        # corruption). Round trips are minimized instead by folding many
+        # separate COUNT()/AVG() calls into a small number of single-pass
+        # conditional-aggregation (CASE/SUM) queries below.
         # ========================
-        progress = await db.scalar(
-            select(func.avg(m.Task.completion_percentage)).where(
-                m.Task.project_id == db_project_id
-            )
+
+        # ---- TASK AGGREGATES (1 query) ----
+        # Includes overdue_high_priority_tasks: used only for risk scoring
+        # (see RISK SCORE below) — riding on this same aggregate query
+        # instead of firing an extra one.
+        task_stats_row = await db.execute(
+            select(
+                func.count(m.Task.id),
+                func.sum(
+                    case((m.Task.status == TaskStatus.COMPLETED.value, 1), else_=0)
+                ),
+                func.avg(m.Task.completion_percentage),
+                func.sum(
+                    case(
+                        (
+                            (m.Task.end_date < today)
+                            & (m.Task.status != TaskStatus.COMPLETED.value),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                func.sum(case((m.Task.priority.in_(_HIGH_PRIORITY_KEYS), 1), else_=0)),
+                func.sum(
+                    case(
+                        (
+                            m.Task.priority.in_(_HIGH_PRIORITY_KEYS)
+                            & (m.Task.end_date < today)
+                            & (m.Task.status != TaskStatus.COMPLETED.value),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+            ).where(m.Task.project_id == db_project_id)
+        )
+        (
+            tasks_total,
+            tasks_completed,
+            avg_task_progress,
+            overdue_tasks,
+            high_priority_tasks,
+            overdue_high_priority_tasks,
+        ) = task_stats_row.one()
+
+        tasks_total = tasks_total or 0
+        tasks_completed = tasks_completed or 0
+        tasks_pending = tasks_total - tasks_completed
+        overdue_tasks = overdue_tasks or 0
+        high_priority_tasks = high_priority_tasks or 0
+        overdue_high_priority_tasks = overdue_high_priority_tasks or 0
+        task_completion_percent = (
+            round((tasks_completed / tasks_total) * 100, 2) if tasks_total else 0.0
         )
 
-        # ========================
-        # BUDGET
-        # ========================
-        budget_total = await get_waterfall_budget(db, [db_project_id])
+        # ---- MILESTONE AGGREGATES (1 query) ----
+        # NOTE: Milestone.completion_percentage is a Python @property
+        # (derived from loaded child tasks), not a DB column, so it can't
+        # be used in a SQL aggregate. completion_percent here is a
+        # count-based ratio (completed / total).
+        milestone_stats_row = await db.execute(
+            select(
+                func.count(m.Milestone.id),
+                func.sum(
+                    case(
+                        (m.Milestone.status == MilestoneStatus.COMPLETED.value, 1),
+                        else_=0,
+                    )
+                ),
+                func.sum(
+                    case(
+                        (
+                            (m.Milestone.end_date < today)
+                            & (m.Milestone.status != MilestoneStatus.COMPLETED.value),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+            ).where(m.Milestone.project_id == db_project_id)
+        )
+        milestones_total, milestones_completed, overdue_milestones = (
+            milestone_stats_row.one()
+        )
 
-        # ========================
-        # EXPENSE
-        # ========================
+        milestones_total = milestones_total or 0
+        milestones_completed = milestones_completed or 0
+        milestones_pending = milestones_total - milestones_completed
+        overdue_milestones = overdue_milestones or 0
+        milestone_completion_percent = (
+            round((milestones_completed / milestones_total) * 100, 2)
+            if milestones_total
+            else 0.0
+        )
+
+        # ---- BUDGET / EXPENSE ----
+        # budget_amount already fetched in the PROJECT query above — the
+        # standalone `select(m.Project.budget_amount)` query is gone.
+
         total_expense = await db.scalar(
             select(func.sum(Expense.amount)).where(Expense.project_id == db_project_id)
         )
 
-        budget_val = float(budget_total or 0)
+        budget_val = float(budget_amount or 0)
         expense_val = float(total_expense or 0)
 
-        budget_used_percent = (expense_val / budget_val) * 100 if budget_val else 0
+        # Remaining Budget (single source of truth — computed once,
+        # reused everywhere below instead of being re-derived/re-rounded
+        # for every schema section).
+        remaining_budget = max(budget_val - expense_val, 0)
+        remaining_budget_rounded = round(remaining_budget, 2)
 
-        remaining_budget = budget_val - expense_val
-
-        # ========================
-        # MILESTONES
-        # ========================
-        milestones_total = await db.scalar(
-            select(func.count(m.Milestone.id)).where(
-                m.Milestone.project_id == db_project_id
-            )
+        # Budget Utilization
+        budget_used_percent = (
+            round((expense_val / budget_val) * 100, 2) if budget_val else 0.0
         )
 
-        milestones_completed = await db.scalar(
-            select(func.count(m.Milestone.id)).where(
+        # `variance_percent` is derived directly from `remaining_budget` —
+        # there is no separate "variance" number computed anymore, since
+        # it was numerically identical to `remaining` and only produced a
+        # dead/duplicate field.
+        budget_variance_percent = (
+            round((remaining_budget / budget_val) * 100, 2) if budget_val else 0.0
+        )
+
+        # Budget Status
+        if expense_val > budget_val:
+            budget_status = "Over Budget"
+        elif budget_used_percent >= 90:
+            budget_status = "Critical"
+        elif budget_used_percent >= 75:
+            budget_status = "Warning"
+        elif budget_used_percent >= 40:
+            budget_status = "Normal"
+        else:
+            budget_status = "Healthy"
+
+        # ---- TIMELINE / SCHEDULE ----
+        project_duration = 0
+        elapsed_days = 0
+        remaining_days = 0
+        timeline_progress = 0.0
+
+        if start_date and end_date:
+            project_duration = max((end_date - start_date).days, 0)
+            elapsed_days = max((today - start_date).days, 0)
+            remaining_days = max((end_date - today).days, 0)
+            if project_duration > 0:
+                timeline_progress = round(
+                    min(100.0, (elapsed_days / project_duration) * 100), 2
+                )
+        elif end_date:
+            remaining_days = max((end_date - today).days, 0)
+
+        actual_progress = round(float(avg_task_progress or 0), 2)
+        expected_progress = timeline_progress
+        schedule_variance = round(actual_progress - expected_progress, 2)
+
+        if schedule_variance >= 5:
+            schedule_status = "Ahead of Schedule"
+        elif schedule_variance >= -5:
+            schedule_status = "On Track"
+        else:
+            schedule_status = "Behind Schedule"
+
+        # ---- PROJECT HEALTH ----
+        if (
+            schedule_variance >= -5
+            and budget_used_percent <= 90
+            and overdue_tasks == 0
+            and overdue_milestones == 0
+        ):
+            project_health = "Good"
+
+        elif (
+            schedule_variance >= -15
+            and budget_used_percent <= 110
+            and overdue_tasks <= 5
+            and overdue_milestones <= 1
+        ):
+            # 2+ overdue milestones is a strong enough client-facing red
+            # flag on its own to block "At Risk" and fall through to
+            # "Critical", even when schedule/budget numbers look tolerable.
+            project_health = "At Risk"
+
+        else:
+            project_health = "Critical"
+
+        # ---- RISK SCORE ----
+        risk_score = 0
+        if budget_used_percent > 100:
+            risk_score += 30
+        elif budget_used_percent > 90:
+            risk_score += 15
+
+        if schedule_variance < -15:
+            risk_score += 30
+        elif schedule_variance < -5:
+            risk_score += 15
+
+        risk_score += min(overdue_tasks * 3, 20)
+        risk_score += min(overdue_milestones * 5, 20)
+        # Weighted by *overdue* high-priority tasks, not the raw
+        # high-priority count — a large, on-track project can have many
+        # high-priority tasks without being risky; what matters is
+        # whether important work is actually late.
+        risk_score += min(overdue_high_priority_tasks * 4, 20)
+        risk_score = min(risk_score, 100)
+
+        if risk_score < 30:
+            risk_level = "Low"
+        elif risk_score < 60:
+            risk_level = "Medium"
+        else:
+            risk_level = "High"
+
+        # ---- RECENT MILESTONES (latest 5) ----
+        # No created_at column exists on Milestone, so "recent" is
+        # approximated by primary key descending (insertion order).
+        recent_milestones_result = await db.execute(
+            select(m.Milestone)
+            .where(m.Milestone.project_id == db_project_id)
+            .order_by(m.Milestone.id.desc())
+            .limit(5)
+        )
+        recent_milestones = [
+            ClientMilestoneItem(
+                id=ms.id,
+                title=ms.title,
+                status=(
+                    ms.status.value if hasattr(ms.status, "value") else str(ms.status)
+                ),
+                start_date=ms.start_date,
+                end_date=ms.end_date,
+                completion_percentage=round(ms.completion_percentage, 2),
+            )
+            for ms in recent_milestones_result.scalars().all()
+        ]
+
+        # ---- RECENT EXPENSES (latest 5) ----
+        recent_expenses_result = await db.execute(
+            select(Expense)
+            .where(Expense.project_id == db_project_id)
+            .order_by(Expense.expense_date.desc(), Expense.id.desc())
+            .limit(5)
+        )
+        recent_expenses = [
+            ClientExpenseItem(
+                id=e.id,
+                category=e.category,
+                description=e.description,
+                amount=float(e.amount),
+                expense_date=e.expense_date,
+                payment_mode=e.payment_mode,
+            )
+            for e in recent_expenses_result.scalars().all()
+        ]
+
+        # ---- EXPENSE TREND (monthly, last 6 months) ----
+        six_months_ago = (today.replace(day=1)) - relativedelta(months=5)
+        expense_trend_result = await db.execute(
+            select(
+                func.date_format(Expense.expense_date, "%Y-%m").label("month"),
+                func.sum(Expense.amount),
+            )
+            .where(
+                Expense.project_id == db_project_id,
+                Expense.expense_date >= six_months_ago,
+            )
+            .group_by("month")
+            .order_by("month")
+        )
+        expense_trend = [
+            ClientExpenseTrendItem(month=row[0], total_amount=float(row[1] or 0))
+            for row in expense_trend_result.all()
+        ]
+
+        # ---- UPCOMING MILESTONES ----
+        upcoming_milestones_result = await db.execute(
+            select(m.Milestone)
+            .where(
                 m.Milestone.project_id == db_project_id,
-                m.Milestone.status == MilestoneStatus.COMPLETED.value,
+                m.Milestone.status != MilestoneStatus.COMPLETED.value,
+                m.Milestone.end_date >= today,
             )
+            .order_by(m.Milestone.end_date.asc())
+            .limit(5)
         )
-
-        # ========================
-        # TASKS
-        # ========================
-        tasks_total = await db.scalar(
-            select(func.count(m.Task.id)).where(m.Task.project_id == db_project_id)
-        )
-
-        tasks_completed = await db.scalar(
-            select(func.count(m.Task.id)).where(
-                m.Task.project_id == db_project_id,
-                m.Task.status == TaskStatus.COMPLETED.value,
+        upcoming_milestones = [
+            ClientUpcomingMilestoneItem(
+                id=ms.id,
+                title=ms.title,
+                status=(
+                    ms.status.value if hasattr(ms.status, "value") else str(ms.status)
+                ),
+                end_date=ms.end_date,
+                days_remaining=(ms.end_date - today).days if ms.end_date else None,
             )
+            for ms in upcoming_milestones_result.scalars().all()
+        ]
+
+        # ---- EXECUTIVE SUMMARY ----
+        executive_summary = (
+            f"Project {project_name} is {actual_progress:.2f}% complete. "
+            f"Budget utilization is {budget_used_percent:.2f}%. "
+            f"Project health is {project_health}. "
+            f"There are {tasks_pending} pending tasks and "
+            f"{milestones_pending} pending milestones."
         )
-
-        # ========================
-        # DAYS REMAINING
-        # ========================
-        days_remaining = 0
-
-        if end_date:
-            days_remaining = (end_date - get_naive_local_now().date()).days
 
         # ========================
         # RESPONSE
         # ========================
-        return {
-            "project_id": db_project_id,
-            "status": status,
-            "progress_percent": round(progress or 0, 2),
-            "budget_total": budget_val,
-            "total_expense": expense_val,
-            "budget_used_percent": round(budget_used_percent, 2),
-            "remaining_budget": round(remaining_budget, 2),
-            "milestones_total": milestones_total or 0,
-            "milestones_completed": milestones_completed or 0,
-            "tasks_total": tasks_total or 0,
-            "tasks_completed": tasks_completed or 0,
-            "start_date": start_date,
-            "end_date": end_date,
-            "days_remaining": max(days_remaining, 0),
-        }
+        return ClientDashboardV2Out(
+            project=ClientProjectInfo(
+                project_id=db_project_id,
+                project_name=project_name,
+                status=status_value,
+                start_date=start_date,
+                end_date=end_date,
+                days_remaining=remaining_days,
+            ),
+            overview=ClientDashboardOverview(
+                progress_percent=actual_progress,
+                project_health=project_health,
+                budget_total=budget_val,
+                total_expense=expense_val,
+                remaining_budget=remaining_budget_rounded,
+                budget_used_percent=budget_used_percent,
+                budget_status=budget_status,
+            ),
+            budget_analysis=ClientBudgetAnalysis(
+                budget=budget_val,
+                spent=expense_val,
+                remaining=remaining_budget_rounded,
+                variance_percent=budget_variance_percent,
+            ),
+            timeline=ClientTimelineInfo(
+                project_duration=project_duration,
+                elapsed_days=elapsed_days,
+                remaining_days=remaining_days,
+                timeline_progress=timeline_progress,
+            ),
+            schedule=ClientScheduleInfo(
+                actual_progress=actual_progress,
+                expected_progress=expected_progress,
+                variance=schedule_variance,
+                status=schedule_status,
+            ),
+            risk=ClientRiskInfo(score=risk_score, level=risk_level),
+            kpis=ClientKPIs(
+                progress=actual_progress,
+                budget_used=budget_used_percent,
+                remaining_budget=remaining_budget_rounded,
+                overdue_tasks=overdue_tasks,
+                overdue_milestones=overdue_milestones,
+                high_priority_tasks=high_priority_tasks,
+            ),
+            milestone_summary=ClientMilestoneSummaryInfo(
+                total=milestones_total,
+                completed=milestones_completed,
+                pending=milestones_pending,
+                completion_percent=milestone_completion_percent,
+            ),
+            task_summary=ClientTaskSummaryInfo(
+                total=tasks_total,
+                completed=tasks_completed,
+                pending=tasks_pending,
+                completion_percent=task_completion_percent,
+            ),
+            recent_milestones=recent_milestones,
+            recent_expenses=recent_expenses,
+            expense_trend=expense_trend,
+            upcoming_milestones=upcoming_milestones,
+            executive_summary=executive_summary,
+        ).dict()
 
     version = await r.get_cache_version(redis, VERSION_KEY)
 
     return await cache_get_set(
         redis,
-        f"client_dashboard:{current_user.id}:{project_id}",
+        f"client_dashboard_v2:{current_user.id}:{project_id}",
         version,
         logic,
     )
@@ -2478,9 +2826,7 @@ def apply_payroll_time_filter(
 # LABOUR DASHBOARD
 # =========================================
 
-
-from datetime import date, datetime
-from decimal import Decimal
+from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import (
@@ -2492,31 +2838,42 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+#from app.core.time import get_naive_local_now  # adjust import path to actual location
 from app.db.session import get_db_session
-from app.models.user import User, UserAttendance
+from app.models.user import User
 from app.models.labour import Labour, LabourProject, LabourPayroll
+from app.models.user import UserAttendance
 from app.models.project import Project, Task, TaskAssignment
 from app.schemas.dashboard import (
     LabourDashboardOut,
+    LabourDashboardResponse,
     LabourProfile,
     LabourOverview,
     LabourAttendanceSummary,
     LabourPayment,
-    LabourStats,
     LabourTaskItem,
     LabourActivityItem,
     LabourDetails,
 )
 from app.models.user import UserRole
-from app.core.enums import TaskStatus
+from app.core.enums import TaskStatus, TaskPriority, PRIORITY_MAP, AttendanceStatus, PayrollStatus
 from app.models.settings import UserSettings
 from app.models.contractor import Contractor, ContractorProject
-from app.core.enums import AttendanceStatus
+
+
+RECENT_TASKS_LIMIT = 5
+RECENT_ACTIVITY_TASK_LIMIT = 3
+STREAK_LOOKBACK_DAYS = 45  # enough to cover a running streak across month boundaries
+
+
+def _scope_to_project(query, column, project):
+    """Apply project filter only when a project context exists."""
+    return query.where(column == project.id) if project else query
 
 
 @router.get(
     "/labour",
-    response_model=dict,
+    response_model=LabourDashboardResponse,
 )
 async def labour_dashboard(
     db: AsyncSession = Depends(get_db_session),
@@ -2530,9 +2887,9 @@ async def labour_dashboard(
         )
 
     today = date.today()
-
     current_month = today.month
     current_year = today.year
+    month_start = today.replace(day=1)
 
     labour = await db.scalar(
         select(Labour)
@@ -2545,7 +2902,6 @@ async def labour_dashboard(
     )
 
     if labour is None:
-
         raise HTTPException(
             status_code=404,
             detail="Labour profile not found",
@@ -2555,37 +2911,37 @@ async def labour_dashboard(
         select(UserSettings).where(UserSettings.user_id == current_user.id)
     )
 
+    # =========================================
+    # PROJECT RESOLUTION (joined, single query per branch)
+    # =========================================
+
     project = None
 
     if user_settings and user_settings.default_project_id:
-
-        mapping = await db.scalar(
-            select(LabourProject).where(
+        project = await db.scalar(
+            select(Project)
+            .join(LabourProject, LabourProject.project_id == Project.id)
+            .where(
                 LabourProject.labour_id == labour.id,
                 LabourProject.project_id == user_settings.default_project_id,
             )
         )
 
-        if mapping:
-            project = await db.get(
-                Project,
-                user_settings.default_project_id,
-            )
-
-    # Fallback
     if project is None:
-
-        mapping = await db.scalar(
-            select(LabourProject)
+        project = await db.scalar(
+            select(Project)
+            .join(LabourProject, LabourProject.project_id == Project.id)
             .where(LabourProject.labour_id == labour.id)
-            .order_by(
-                LabourProject.assigned_date.desc(),
-                LabourProject.id.desc(),
-            )
+            .order_by(LabourProject.assigned_date.desc(), LabourProject.id.desc())
+            .limit(1)
         )
 
-        if mapping:
-            project = await db.get(Project, mapping.project_id)
+    project_count = await db.scalar(
+        select(func.count(func.distinct(LabourProject.project_id))).where(
+            LabourProject.labour_id == labour.id
+        )
+    )
+    is_multi_project = (project_count or 0) > 1
 
     contractors = []
     contractor_name = None
@@ -2611,6 +2967,10 @@ async def labour_dashboard(
         if contractors:
             contractor_name = ", ".join(contractor.name for contractor in contractors)
 
+    # Fallback to the labourer's own contractor if the project has none mapped
+    if contractor_name is None and labour.contractor:
+        contractor_name = labour.contractor.name
+
     profile = LabourProfile(
         user_name=current_user.full_name,
         profile_image=current_user.profile_image,
@@ -2619,99 +2979,50 @@ async def labour_dashboard(
         labour_type=labour.labour_type_name,
         skill_category=labour.skill_category,
         check_in_status="NOT CHECKED IN",
+        is_multi_project=is_multi_project,
     )
 
     # =========================================
-    # TODAY ATTENDANCE
+    # ATTENDANCE (single windowed fetch on UserAttendance, keyed by labour_id)
     # =========================================
+
+    streak_lookback_start = today - timedelta(days=STREAK_LOOKBACK_DAYS)
 
     attendance_query = select(UserAttendance).where(
         UserAttendance.user_id == current_user.id,
-        UserAttendance.attendance_date == today,
+        UserAttendance.attendance_date <= today,
+        UserAttendance.attendance_date >= streak_lookback_start,
     )
 
-    if project:
-        attendance_query = attendance_query.where(
-            UserAttendance.project_id == project.id
-        )
+    attendance_query = _scope_to_project(
+        attendance_query, UserAttendance.project_id, project
+    )
+    attendance_query = attendance_query.order_by(UserAttendance.attendance_date.desc())
 
-    attendance_result = await db.execute(attendance_query)
+    attendance_rows = (await db.execute(attendance_query)).scalars().all()
 
-    today_attendance = attendance_result.scalar_one_or_none()
+    today_attendance = next(
+        (row for row in attendance_rows if row.attendance_date == today),
+        None,
+    )
 
     if today_attendance:
-
         if today_attendance.out_time:
             profile.check_in_status = "CHECKED OUT"
-
         elif today_attendance.in_time:
             profile.check_in_status = "CHECKED IN"
 
-    # =========================================
-    # MONTHLY ATTENDANCE SUMMARY
-    # =========================================
+    month_rows = [
+        row
+        for row in attendance_rows
+        if row.attendance_date.month == current_month
+        and row.attendance_date.year == current_year
+    ]
 
-    attendance_summary_query = select(
-        func.count(UserAttendance.id).label("total_days"),
-        func.sum(
-            case(
-                (
-                    UserAttendance.status == AttendanceStatus.PRESENT,
-                    1,
-                ),
-                else_=0,
-            )
-        ).label("present_days"),
-        func.sum(
-            case(
-                (
-                    UserAttendance.status == AttendanceStatus.ABSENT,
-                    1,
-                ),
-                else_=0,
-            )
-        ).label("absent_days"),
-        func.sum(
-            case(
-                (
-                    UserAttendance.status == AttendanceStatus.HALF_DAY,
-                    1,
-                ),
-                else_=0,
-            )
-        ).label("half_days"),
-        func.sum(UserAttendance.working_hours).label("working_hours"),
-        func.sum(UserAttendance.overtime_hours).label("overtime_hours"),
-    ).where(
-        UserAttendance.user_id == current_user.id,
-        func.extract(
-            "month",
-            UserAttendance.attendance_date,
-        )
-        == current_month,
-        func.extract(
-            "year",
-            UserAttendance.attendance_date,
-        )
-        == current_year,
-    )
-
-    if project:
-        attendance_summary_query = attendance_summary_query.where(
-            UserAttendance.project_id == project.id
-        )
-
-    attendance_summary_result = await db.execute(attendance_summary_query)
-
-    attendance_data = attendance_summary_result.one()
-
-    total_days = attendance_data.total_days or 0
-    present_days = attendance_data.present_days or 0
-    absent_days = attendance_data.absent_days or 0
-    half_days = attendance_data.half_days or 0
-
-    # total_hours = float(attendance_data.working_hours or 0)
-    # total_ot = float(attendance_data.overtime_hours or 0)
+    total_days = len(month_rows)
+    present_days = sum(1 for r in month_rows if r.status == AttendanceStatus.PRESENT)
+    absent_days = sum(1 for r in month_rows if r.status == AttendanceStatus.ABSENT)
+    half_days = sum(1 for r in month_rows if r.status == AttendanceStatus.HALF_DAY)
 
     attendance_percentage = (
         round((present_days / total_days) * 100, 2) if total_days else 0
@@ -2720,57 +3031,77 @@ async def labour_dashboard(
     today_hours = (
         float(today_attendance.working_hours or 0) if today_attendance else 0.0
     )
-
     today_ot = float(today_attendance.overtime_hours or 0) if today_attendance else 0.0
 
-    # =========================================
-    # TASKS
-    # =========================================
+    # Attendance streak — rows already sorted desc by date
+    attendance_streak = 0
+    for row in attendance_rows:
+        if row.status == AttendanceStatus.PRESENT:
+            attendance_streak += 1
+        else:
+            break
 
-    task_query = (
-        select(Task)
-        .options(
-            selectinload(Task.project),
-        )
-        .where(Task.assignments.any(TaskAssignment.user_id == current_user.id))
+    # Weekly earnings derived from the same fetched window (current ISO week)
+    current_week = today.isocalendar()[1]
+    weekly_present = sum(
+        1
+        for r in attendance_rows
+        if r.status == AttendanceStatus.PRESENT
+        and r.attendance_date.isocalendar()[1] == current_week
+        and r.attendance_date.year == today.year
     )
+    weekly_earnings = weekly_present * float(labour.effective_daily_wage)
 
+    # =========================================
+    # TASKS — conditional aggregation + limited recent list
+    # =========================================
+
+    task_filters = [Task.assignments.any(TaskAssignment.user_id == current_user.id)]
     if project:
-        task_query = task_query.where(Task.project_id == project.id)
+        task_filters.append(Task.project_id == project.id)
 
-    task_query = task_query.order_by(desc(Task.start_date))
+    task_counts = (
+        await db.execute(
+            select(
+                func.count(Task.id).label("total"),
+                func.sum(case((Task.status == TaskStatus.COMPLETED, 1), else_=0)).label(
+                    "completed"
+                ),
+            ).where(*task_filters)
+        )
+    ).one()
 
-    task_result = await db.execute(task_query)
-
-    all_tasks = task_result.scalars().all()
-
-    total_tasks = len(all_tasks)
-
-    completed_tasks = sum(
-        1 for task in all_tasks if task.status == TaskStatus.COMPLETED
-    )
-
+    total_tasks = task_counts.total or 0
+    completed_tasks = task_counts.completed or 0
     pending_tasks = total_tasks - completed_tasks
 
-    recent_tasks = []
-
-    for task in all_tasks[:5]:
-
-        recent_tasks.append(
-            LabourTaskItem(
-                task_id=task.id,
-                title=task.title,
-                status=task.status.value,
-                priority=PRIORITY_MAP.get(
-                    task.priority,
-                    TaskPriority.LOW,
-                ).value,
-                start_date=task.start_date,
-                end_date=task.end_date,
-                progress=task.completion_percentage,
-                project_name=(task.project.project_name if task.project else None),
+    recent_task_rows = (
+        (
+            await db.execute(
+                select(Task)
+                .options(selectinload(Task.project))
+                .where(*task_filters)
+                .order_by(desc(Task.start_date))
+                .limit(RECENT_TASKS_LIMIT)
             )
         )
+        .scalars()
+        .all()
+    )
+
+    recent_tasks = [
+        LabourTaskItem(
+            task_id=task.id,
+            title=task.title,
+            status=task.status.value if task.status else "-",
+            priority=PRIORITY_MAP.get(task.priority, TaskPriority.LOW).value,
+            start_date=task.start_date,
+            end_date=task.end_date,
+            progress=float(task.completion_percentage or 0),
+            project_name=(task.project.project_name if task.project else None),
+        )
+        for task in recent_task_rows
+    ]
 
     attendance_summary = LabourAttendanceSummary(
         present_days=present_days,
@@ -2780,26 +3111,39 @@ async def labour_dashboard(
         attendance_percentage=attendance_percentage,
     )
 
+    # =========================================
+    # PAYROLL
+    # =========================================
+
     payroll_query = select(LabourPayroll).where(
         LabourPayroll.labour_id == labour.id,
         LabourPayroll.month == current_month,
         LabourPayroll.year == current_year,
     )
-
-    if project:
-        payroll_query = payroll_query.where(LabourPayroll.project_id == project.id)
+    payroll_query = _scope_to_project(payroll_query, LabourPayroll.project_id, project)
 
     payroll = await db.scalar(payroll_query)
 
     paid_amount = 0.0
     pending_amount = 0.0
     this_month_earnings = 0.0
-    next_payment_date = None
+    payment_status = None
 
     if payroll:
         paid_amount = float(payroll.paid_amount or 0)
         pending_amount = float(payroll.remaining_amount or 0)
         this_month_earnings = float(payroll.total_wage or 0)
+        payment_status = (
+        payroll.status.value
+        if payroll and payroll.status
+        else None
+    )
+
+    # LabourPayroll has no due_date column today, so "overdue" is derived
+    # from status + pending balance rather than a date comparison.
+    is_overdue = bool(
+        payroll and payroll.status == PayrollStatus.PENDING and pending_amount > 0
+    )
 
     overview = LabourOverview(
         today_hours=today_hours,
@@ -2820,71 +3164,10 @@ async def labour_dashboard(
     payment = LabourPayment(
         paid_amount=paid_amount,
         pending_amount=pending_amount,
-        next_payment_date=next_payment_date,
+        next_payment_date=None,  # no due_date column on LabourPayroll yet
+        is_overdue=is_overdue,
+        payment_status=payment_status,
     )
-
-    weekly_query = select(func.count(UserAttendance.id)).where(
-        UserAttendance.user_id == current_user.id,
-        UserAttendance.status == AttendanceStatus.PRESENT,
-        func.yearweek(
-            UserAttendance.attendance_date,
-            3,
-        )
-        == func.yearweek(
-            func.curdate(),
-            3,
-        ),
-    )
-
-    if project:
-        weekly_query = weekly_query.where(UserAttendance.project_id == project.id)
-
-    weekly_present = (await db.execute(weekly_query)).scalar() or 0
-
-    weekly_earnings = weekly_present * float(labour.effective_daily_wage)
-
-    # =========================================
-    # ATTENDANCE STREAK
-    # =========================================
-
-    attendance_streak = 0
-
-    attendance_query = select(UserAttendance).where(
-        UserAttendance.user_id == current_user.id
-    )
-
-    if project:
-        attendance_query = attendance_query.where(
-            UserAttendance.project_id == project.id
-        )
-
-    attendance_query = attendance_query.order_by(
-        UserAttendance.attendance_date.desc()
-    ).limit(30)
-
-    attendance_rows = (await db.execute(attendance_query)).scalars().all()
-
-    for row in attendance_rows:
-
-        # If status is stored as string
-        if row.status == AttendanceStatus.PRESENT:
-            attendance_streak += 1
-        else:
-            break
-
-    # # =========================================
-    # # STATS
-    # # =========================================
-
-    # safety_score = 100
-    # ppe_status = "COMPLIANT"
-
-    # stats = LabourStats(
-    #     weekly_earnings=weekly_earnings,
-    #     attendance_streak=attendance_streak,
-    #     safety_score=safety_score,
-    #     ppe_status=ppe_status,
-    # )
 
     # =========================================
     # RECENT ACTIVITY
@@ -2897,16 +3180,24 @@ async def labour_dashboard(
             LabourActivityItem(
                 title="Checked In",
                 description="Attendance marked",
-                time=str(today_attendance.in_time),
-            )
+                time = (
+                    today_attendance.in_time.strftime("%d %b %Y %I:%M %p")
+                    if today_attendance.in_time
+                    else "-"
+                )
+        )
         )
 
-    for task in all_tasks[:3]:
+    for task in recent_task_rows[:RECENT_ACTIVITY_TASK_LIMIT]:
         recent_activity.append(
             LabourActivityItem(
                 title="Task Assigned",
                 description=task.title,
-                time=str(task.start_date) if task.start_date else "-",
+                time = (
+                    task.start_date.strftime("%d %b %Y")
+                    if task.start_date
+                    else "-"
+                )
             )
         )
 
@@ -2916,16 +3207,15 @@ async def labour_dashboard(
         attendance_summary=attendance_summary,
         labour_details=labour_details,
         payment=payment,
-        #stats=stats,
         recent_tasks=recent_tasks,
         recent_activity=recent_activity,
     )
 
-    return {
-        "success": True,
-        "message": "Labour dashboard loaded successfully",
-        "data": dashboard.model_dump(),
-    }
+    return LabourDashboardResponse(
+        success=True,
+        message="Labour dashboard loaded successfully",
+        data=dashboard,
+    )
 
 
 # =============================================
