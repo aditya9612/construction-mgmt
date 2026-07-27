@@ -79,7 +79,10 @@ class Material(Base, TimestampMixin):
         nullable=False,
     )
 
-    unit = relationship("Unit")
+    unit = relationship(
+        "Unit",
+        lazy="selectin",
+    )
 
     supplier_id: Mapped[int] = mapped_column(
         ForeignKey("suppliers.id"),
@@ -330,29 +333,39 @@ class Supplier(Base, TimestampMixin):
 
 
 # ================= PURCHASE ORDER =================
+
+
 class PurchaseOrder(Base, TimestampMixin):
     __tablename__ = "purchase_orders"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+
     boq_item_id = Column(
         Integer,
         ForeignKey("boq_items.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
+
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"))
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
-
     material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"))
+
     material_name: Mapped[str] = mapped_column(String(255))
 
-    quantity: Mapped[Decimal] = mapped_column(DECIMAL(18, 3), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(DECIMAL(18, 3))
     rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
-
     total_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
+
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    status: Mapped[str] = mapped_column(String(50), default="CREATED")
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="CREATED", server_default=text("'CREATED'")
+    )
+
+    supplier = relationship("Supplier", lazy="selectin")
+    project = relationship("Project", lazy="selectin")
+    material = relationship("Material", lazy="selectin")
 
     __table_args__ = (Index("idx_po_project", "project_id"),)
 

@@ -52,6 +52,7 @@ class TransactionType(str, Enum):
     TRANSFER_IN = "TRANSFER_IN"
     TRANSFER_OUT = "TRANSFER_OUT"
     ADJUSTMENT = "ADJUSTMENT"
+    ISSUE = "ISSUE"
 
 
 class IssueType(str, Enum):

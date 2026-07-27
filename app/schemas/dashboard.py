@@ -265,6 +265,14 @@ class LabourActivityItem(BaseModel):
     time: str
 
 
+class LabourPayment(BaseModel):
+    total_amount: float
+    paid_amount: float
+    pending_amount: float
+    payment_status: Optional[str]
+    is_overdue: bool
+
+
 class LabourProfile(BaseModel):
     user_name: str
     profile_image: Optional[str] = None
@@ -273,6 +281,7 @@ class LabourProfile(BaseModel):
     labour_type: Optional[str] = None
     skill_category: Optional[str] = None
     check_in_status: str
+    is_checked_in: bool
     is_multi_project: bool = False
 
 
@@ -284,6 +293,7 @@ class LabourOverview(BaseModel):
     completed_tasks: int
     pending_tasks: int
 
+    weekly_earnings: float
     this_month_earnings: float
 
 
@@ -291,9 +301,9 @@ class LabourAttendanceSummary(BaseModel):
     present_days: int
     absent_days: int
     half_days: int
-
     total_days: int
     attendance_percentage: float
+    attendance_streak: int
 
 
 class LabourDetails(BaseModel):
@@ -303,29 +313,12 @@ class LabourDetails(BaseModel):
     overtime_rate: float
 
 
-class LabourPayment(BaseModel):
-    paid_amount: float
-    pending_amount: float
-    next_payment_date: Optional[date] = None
-    is_overdue: bool = False
-    payment_status: Optional[str] = None
-
-
-class LabourStats(BaseModel):
-    weekly_earnings: float
-    attendance_streak: int
-    safety_score: int
-    ppe_status: str
-
-
 class LabourDashboardOut(BaseModel):
-
     profile: LabourProfile
     overview: LabourOverview
     attendance_summary: LabourAttendanceSummary
     labour_details: LabourDetails
     payment: LabourPayment
-    # stats: LabourStats
     recent_tasks: list[LabourTaskItem]
     recent_activity: list[LabourActivityItem]
 
@@ -367,49 +360,40 @@ class ClientProjectInfo(BaseModel):
     status: str
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    days_remaining: int
 
 
 class ClientDashboardOverview(BaseModel):
-    progress_percent: float
-    project_health: str  # Good / At Risk / Critical
-    budget_total: float
-    total_expense: float
-    remaining_budget: float
-    budget_used_percent: float
-    budget_status: str  # Under Budget / On Budget / Over Budget
+    project_health: str
+    budget_status: str
 
 
 class ClientBudgetAnalysis(BaseModel):
     budget: float
     spent: float
     remaining: float
-    variance_percent: float  # variance / budget * 100
+    remaining_percent: float
 
 
 class ClientTimelineInfo(BaseModel):
-    project_duration: int  # total days start->end
+    project_duration: int
     elapsed_days: int
     remaining_days: int
-    timeline_progress: float  # elapsed / duration * 100
+    timeline_progress: float
 
 
 class ClientScheduleInfo(BaseModel):
     actual_progress: float
     expected_progress: float
-    variance: float  # actual - expected
-    status: str  # Ahead of Schedule / On Track / Behind Schedule
+    variance: float
+    status: str
 
 
 class ClientRiskInfo(BaseModel):
-    score: int  # 0-100, higher = riskier
-    level: str  # Low / Medium / High
+    score: int
+    level: str
 
 
 class ClientKPIs(BaseModel):
-    progress: float
-    budget_used: float
-    remaining_budget: float
     overdue_tasks: int
     overdue_milestones: int
     high_priority_tasks: int

@@ -1,3 +1,7 @@
+from pyrate_limiter import abstracts
+from pyrate_limiter import abstracts
+from pyrate_limiter import abstracts
+from pyrate_limiter import abstracts
 from fastapi import APIRouter, Depends, HTTPException, Query, logger
 from fastapi.responses import StreamingResponse
 from sqlalchemy import desc, select, func, case, cast, Date
@@ -2838,7 +2842,7 @@ from sqlalchemy import (
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-#from app.core.time import get_naive_local_now  # adjust import path to actual location
+# from app.core.time import get_naive_local_now  # adjust import path to actual location
 from app.db.session import get_db_session
 from app.models.user import User
 from app.models.labour import Labour, LabourProject, LabourPayroll
@@ -2856,7 +2860,13 @@ from app.schemas.dashboard import (
     LabourDetails,
 )
 from app.models.user import UserRole
-from app.core.enums import TaskStatus, TaskPriority, PRIORITY_MAP, AttendanceStatus, PayrollStatus
+from app.core.enums import (
+    TaskStatus,
+    TaskPriority,
+    PRIORITY_MAP,
+    AttendanceStatus,
+    PayrollStatus,
+)
 from app.models.settings import UserSettings
 from app.models.contractor import Contractor, ContractorProject
 
@@ -2979,6 +2989,7 @@ async def labour_dashboard(
         labour_type=labour.labour_type_name,
         skill_category=labour.skill_category,
         check_in_status="NOT CHECKED IN",
+        is_checked_in=False,
         is_multi_project=is_multi_project,
     )
 
@@ -3009,8 +3020,10 @@ async def labour_dashboard(
     if today_attendance:
         if today_attendance.out_time:
             profile.check_in_status = "CHECKED OUT"
+            profile.is_checked_in = False
         elif today_attendance.in_time:
             profile.check_in_status = "CHECKED IN"
+            profile.is_checked_in = True
 
     month_rows = [
         row
@@ -3109,6 +3122,7 @@ async def labour_dashboard(
         half_days=half_days,
         total_days=total_days,
         attendance_percentage=attendance_percentage,
+        attendance_streak=attendance_streak,
     )
 
     # =========================================
@@ -3133,11 +3147,7 @@ async def labour_dashboard(
         paid_amount = float(payroll.paid_amount or 0)
         pending_amount = float(payroll.remaining_amount or 0)
         this_month_earnings = float(payroll.total_wage or 0)
-        payment_status = (
-        payroll.status.value
-        if payroll and payroll.status
-        else None
-    )
+        payment_status = payroll.status.value if payroll and payroll.status else None
 
     # LabourPayroll has no due_date column today, so "overdue" is derived
     # from status + pending balance rather than a date comparison.
@@ -3151,6 +3161,7 @@ async def labour_dashboard(
         total_tasks=total_tasks,
         completed_tasks=completed_tasks,
         pending_tasks=pending_tasks,
+        weekly_earnings=weekly_earnings,
         this_month_earnings=this_month_earnings,
     )
 
@@ -3162,11 +3173,11 @@ async def labour_dashboard(
     )
 
     payment = LabourPayment(
+        total_amount=paid_amount + pending_amount,
         paid_amount=paid_amount,
         pending_amount=pending_amount,
-        next_payment_date=None,  # no due_date column on LabourPayroll yet
-        is_overdue=is_overdue,
         payment_status=payment_status,
+        is_overdue=is_overdue,
     )
 
     # =========================================
@@ -3180,12 +3191,12 @@ async def labour_dashboard(
             LabourActivityItem(
                 title="Checked In",
                 description="Attendance marked",
-                time = (
+                time=(
                     today_attendance.in_time.strftime("%d %b %Y %I:%M %p")
                     if today_attendance.in_time
                     else "-"
-                )
-        )
+                ),
+            )
         )
 
     for task in recent_task_rows[:RECENT_ACTIVITY_TASK_LIMIT]:
@@ -3193,11 +3204,7 @@ async def labour_dashboard(
             LabourActivityItem(
                 title="Task Assigned",
                 description=task.title,
-                time = (
-                    task.start_date.strftime("%d %b %Y")
-                    if task.start_date
-                    else "-"
-                )
+                time=(task.start_date.strftime("%d %b %Y") if task.start_date else "-"),
             )
         )
 

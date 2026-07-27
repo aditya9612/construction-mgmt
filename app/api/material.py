@@ -1,3 +1,4 @@
+from app.utils.helpers import NotFoundError
 from datetime import date
 from typing import Optional, List
 from decimal import Decimal, InvalidOperation
@@ -18,17 +19,55 @@ from app.schemas.material import (
     TransferMaterial,
     TransferProject,
 )
-from app.cache.redis import bump_cache_version
-from app.core.dependencies import get_request_redis, require_roles
+from app.cache.redis import (
+    bump_cache_version,
+    cache_get_json,
+    cache_set_json,
+    get_cache_version,
+)
+
+from app.core.dependencies import (
+    get_current_active_user,
+    get_request_redis,
+    require_roles,
+)
 from app.db.session import get_db_session
-from app.schemas.material import MaterialReport
-from app.schemas.material import PriceHistoryOut
+from app.models.ai_prediction import AIPrediction
+from app.schemas.material import (
+    MaterialReport,
+    PriceHistoryOut,
+    AIMaterialRecommendationRequest,
+    AIMaterialRecommendationResponse,
+    SupplierRecommendationResponse,
+    AIProcurementSummaryResponse,
+    MaterialConsumptionTrendResponse,
+    ReorderAlertsResponse,
+    ProjectTransactionOut,
+    TransferListResponse,
+    MessageResponse,
+    AIMaterialRecommendationRequest,
+    AIMaterialRecommendationResponse,
+    RecommendationSummary,
+    MaterialRecommendationDetail,
+    SupplierRecommendationDetail,
+    SupplierRecommendationResponse,
+    AIProcurementSummaryResponse,
+    DailyConsumptionItem,
+    ConsumptionDaySummary,
+    MaterialConsumptionTrendResponse,
+    ReorderAlertOut,
+    ReorderAlertsResponse,
+)
+
+from app.utils.project_report_pdf import generate_procurement_report_pdf
+
 from app.core.enums import IssueType, TransactionType, TransferStatus
 from app.utils.common import generate_business_id
 from sqlalchemy.orm import selectinload
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from app.services.notification_service import create_notification
+
 from app.models import project as proj_model
 import os
 from app.models.project import Project
@@ -337,6 +376,620 @@ def generate_chart(rows, path):
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
+
+
+from decimal import Decimal
+from typing import Any, Dict
+
+
+async def calculate_best_supplier_for_material(db, material) -> Dict[str, Any]:
+    from sqlalchemy import select, or_
+    from app.models.material import Supplier, PurchaseOrder, Material
+
+    stmt = select(Supplier).where(Supplier.is_deleted == False)
+    res = await db.execute(stmt)
+    suppliers = res.scalars().all()
+
+    if not suppliers:
+        return {
+            "supplier_id": material.supplier_id or 0,
+            "supplier_name": "Default Supplier",
+            "last_purchase_rate": round(float(material.purchase_rate or 0), 2),
+            "average_delivery_days": 3.0,
+            "supplier_score": 75.0,
+            "recommendation_reason": "Default supplier assigned to material.",
+        }
+
+    supplier_ids = [s.id for s in suppliers]
+    all_pos_stmt = (
+        select(PurchaseOrder)
+        .where(
+            PurchaseOrder.supplier_id.in_(supplier_ids),
+            PurchaseOrder.is_deleted == False,
+        )
+        .order_by(PurchaseOrder.id.desc())
+    )
+    all_pos_res = await db.execute(all_pos_stmt)
+    all_pos = all_pos_res.scalars().all()
+
+    po_by_supplier = {}
+    for p in all_pos:
+        po_by_supplier.setdefault(p.supplier_id, []).append(p)
+
+    supp_mats_stmt = select(Material).where(
+        Material.supplier_id.in_(supplier_ids), Material.is_deleted == False
+    )
+    supp_mats_res = await db.execute(supp_mats_stmt)
+    supp_mats = supp_mats_res.scalars().all()
+    mats_by_supplier = {}
+    for m in supp_mats:
+        mats_by_supplier.setdefault(m.supplier_id, []).append(m)
+
+    supplier_evals = []
+    rates = []
+
+    for supp in suppliers:
+        pos = po_by_supplier.get(supp.id, [])
+        mat_pos = [
+            p
+            for p in pos
+            if p.material_id == material.id
+            or (
+                material.material_name
+                and material.material_name.lower() in (p.material_name or "").lower()
+            )
+        ]
+        if mat_pos and float(mat_pos[0].rate or 0) > 0:
+            rates.append(float(mat_pos[0].rate))
+        elif supp.id == material.supplier_id and material.purchase_rate:
+            rates.append(float(material.purchase_rate))
+
+    min_rate = min(rates) if rates else float(material.purchase_rate or 1.0)
+    if min_rate <= 0:
+        min_rate = 1.0
+
+    for supp in suppliers:
+        pos = po_by_supplier.get(supp.id, [])
+        mat_pos = [
+            p
+            for p in pos
+            if p.material_id == material.id
+            or (
+                material.material_name
+                and material.material_name.lower() in (p.material_name or "").lower()
+            )
+        ]
+
+        if mat_pos and float(mat_pos[0].rate or 0) > 0:
+            last_rate = float(mat_pos[0].rate)
+        elif supp.id == material.supplier_id:
+            last_rate = float(material.purchase_rate or 0)
+        else:
+            sm_list = mats_by_supplier.get(supp.id, [])
+            last_rate = (
+                float(sm_list[0].purchase_rate)
+                if sm_list and sm_list[0].purchase_rate
+                else float(material.purchase_rate or 0)
+            )
+
+        total_pos = len(pos)
+        completed_pos = sum(
+            1
+            for p in pos
+            if str(p.status).upper() in ["COMPLETED", "DELIVERED", "APPROVED"]
+        )
+        rejected_pos = sum(
+            1 for p in pos if str(p.status).upper() in ["REJECTED", "CANCELLED"]
+        )
+
+        rejection_rate = (rejected_pos / total_pos) if total_pos > 0 else 0.0
+
+        deliv_days_list = []
+        for p in pos:
+            if (
+                str(p.status).upper() in ["COMPLETED", "DELIVERED", "APPROVED"]
+                and p.created_at
+                and p.updated_at
+            ):
+                diff = (p.updated_at - p.created_at).total_seconds() / 86400.0
+                if diff >= 0:
+                    deliv_days_list.append(diff)
+
+        avg_delivery_days = (
+            (sum(deliv_days_list) / len(deliv_days_list)) if deliv_days_list else 3.0
+        )
+        if avg_delivery_days <= 0:
+            avg_delivery_days = 1.0
+
+        price_ratio = (last_rate - min_rate) / min_rate if min_rate > 0 else 0
+        price_score = max(0.0, 100.0 * (1.0 - price_ratio))
+        delivery_score = max(0.0, 100.0 * (1.0 - (avg_delivery_days / 14.0)))
+        completed_po_score = min(100.0, completed_pos * 20.0)
+        rejection_score = 100.0 * (1.0 - rejection_rate)
+
+        is_preferred = supp.id == material.supplier_id
+        preferred_bonus = (
+            100.0
+            if (is_preferred and completed_pos > 0 and rejection_rate == 0)
+            else (50.0 if is_preferred else 0.0)
+        )
+
+        score = round(
+            0.35 * price_score
+            + 0.25 * delivery_score
+            + 0.20 * completed_po_score
+            + 0.10 * rejection_score
+            + 0.10 * preferred_bonus,
+            2,
+        )
+        score = max(0.0, min(100.0, score))
+
+        reasons = []
+        if last_rate <= min_rate:
+            reasons.append(f"lowest purchase rate (₹{last_rate:,.2f})")
+        else:
+            reasons.append(f"competitive rate (₹{last_rate:,.2f})")
+        if completed_pos > 0:
+            reasons.append(f"{completed_pos} completed order(s)")
+        reasons.append(f"fast avg delivery ({round(avg_delivery_days, 1)} days)")
+        if rejection_rate == 0 and total_pos > 0:
+            reasons.append("0% rejection rate")
+        if is_preferred:
+            reasons.append("preferred supplier on record")
+
+        rec_reason = f"Recommended based on {', '.join(reasons)}."
+
+        supplier_evals.append(
+            {
+                "supplier_id": supp.id,
+                "supplier_name": supp.supplier_name,
+                "last_purchase_rate": round(last_rate, 2),
+                "average_delivery_days": round(avg_delivery_days, 1),
+                "supplier_score": score,
+                "recommendation_reason": rec_reason,
+            }
+        )
+
+    supplier_evals.sort(key=lambda x: x["supplier_score"], reverse=True)
+    return supplier_evals[0]
+
+
+async def generate_supplier_recommendations(db, project_id: int) -> Dict[str, Any]:
+    from sqlalchemy import select
+    from app.models.material import Material
+    from app.models.project import Project
+
+    project = await db.scalar(select(Project).where(Project.id == project_id))
+    if not project:
+        raise NotFoundError(f"Project with id {project_id} not found")
+
+    materials = (
+        (
+            await db.execute(
+                select(Material).where(
+                    Material.project_id == project_id, Material.is_deleted == False
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    supplier_recs = []
+    for mat in materials:
+        best_supp = await calculate_best_supplier_for_material(db, mat)
+        supplier_recs.append(
+            {
+                "material_id": mat.id,
+                "material_name": mat.material_name,
+                "recommended_supplier": best_supp,
+            }
+        )
+
+    return {
+        "project_id": project_id,
+        "supplier_recommendations": supplier_recs,
+    }
+
+
+async def generate_material_recommendations(
+    db, project_id: int, target_days: int = 30
+) -> Dict[str, Any]:
+    from sqlalchemy import select
+    from app.models.material import Material
+    from app.models.project import Project
+
+    project = await db.scalar(select(Project).where(Project.id == project_id))
+    if not project:
+        raise NotFoundError(f"Project with id {project_id} not found")
+
+    target_days = max(1, target_days)
+
+    stmt = (
+        select(Material)
+        .options(
+            selectinload(Material.unit),
+            selectinload(Material.supplier),
+        )
+        .where(
+            Material.project_id == project_id,
+            Material.is_deleted == False,
+        )
+    )
+    result = await db.execute(stmt)
+    materials = result.scalars().all()
+
+    recommendations = []
+    critical_items = 0
+    warning_items = 0
+    total_estimated_budget = Decimal("0.00")
+
+    for mat in materials:
+        qty_used = Decimal(str(mat.quantity_used or 0))
+        remaining_stock = Decimal(str(mat.remaining_stock or 0))
+        min_stock = Decimal(str(mat.minimum_stock_level or 0))
+        rate = Decimal(str(mat.purchase_rate or 0))
+
+        avg_daily_consumption = qty_used / Decimal(str(target_days))
+
+        if avg_daily_consumption > Decimal("0"):
+            remaining_days = float(remaining_stock / avg_daily_consumption)
+        else:
+            remaining_days = 999.0 if remaining_stock > Decimal("0") else 0.0
+
+        buffer_qty = avg_daily_consumption * Decimal("7")
+        needed_qty = (min_stock + buffer_qty) - remaining_stock
+        if remaining_stock <= min_stock and needed_qty <= Decimal("0"):
+            needed_qty = min_stock - remaining_stock
+        recommended_purchase = max(Decimal("0.000"), needed_qty)
+
+        estimated_cost = recommended_purchase * rate
+
+        if remaining_days <= 3:
+            priority = "High"
+            critical_items += 1
+        elif remaining_days <= 7:
+            priority = "High"
+            critical_items += 1
+        elif remaining_days <= 15:
+            priority = "Medium"
+            warning_items += 1
+        else:
+            priority = "Low"
+
+        if remaining_stock <= Decimal("0"):
+            reason = "Material is completely out of stock."
+            risk = "Active work dependent on this material is halted."
+        elif remaining_stock <= min_stock:
+            reason = f"Current stock ({round(float(remaining_stock), 2)}) is below minimum level ({round(float(min_stock), 2)})."
+            risk = "Potential site delay due to material depletion."
+        elif remaining_days <= 7:
+            reason = f"Stock estimated to run out within {round(remaining_days, 1)} days based on consumption rate."
+            risk = "Work interruption expected within a week if not reordered."
+        else:
+            reason = "Stock level is adequate for target period."
+            risk = "Low operational risk."
+
+        total_estimated_budget += estimated_cost
+
+        # Calculate AI Best Supplier Recommendation (FEATURE 1)
+        best_supplier = await calculate_best_supplier_for_material(db, mat)
+
+        recommendations.append(
+            {
+                "material_id": mat.id,
+                "material_name": (mat.material_name or "Material").strip().title(),
+                "unit_name": (mat.unit.name if getattr(mat, "unit", None) else None),
+                "supplier_name": (
+                    mat.supplier.supplier_name
+                    if getattr(mat, "supplier", None)
+                    else None
+                ),
+                "current_stock": round(float(remaining_stock), 2),
+                "minimum_stock": round(float(min_stock), 2),
+                "remaining_days": round(remaining_days, 1),
+                "recommended_purchase": round(float(recommended_purchase), 2),
+                "estimated_cost": round(float(estimated_cost), 2),
+                "priority": priority,
+                "reason": reason,
+                "risk": risk,
+                "recommended_supplier": best_supplier,
+            }
+        )
+
+    priority_order = {"High": 0, "Medium": 1, "Low": 2}
+    recommendations.sort(
+        key=lambda x: (priority_order.get(x["priority"], 3), x["remaining_days"])
+    )
+
+    return {
+        "project_id": project_id,
+        "summary": {
+            "critical_items": critical_items,
+            "warning_items": warning_items,
+            "estimated_budget": round(float(total_estimated_budget), 2),
+        },
+        "recommendations": recommendations,
+    }
+
+
+async def generate_procurement_summary(db, project_id: int) -> Dict[str, Any]:
+    from sqlalchemy import select
+    from app.models.project import Project
+
+    project = await db.scalar(select(Project).where(Project.id == project_id))
+    if not project:
+        raise NotFoundError(f"Project with id {project_id} not found")
+
+    rec_data = await generate_material_recommendations(db, project_id, target_days=30)
+    recommendations = rec_data.get("recommendations", [])
+    summary = rec_data.get("summary", {})
+
+    critical_items = [
+        item
+        for item in recommendations
+        if item.get("remaining_days", 999) <= 7
+        or item.get("priority") in ["High", "Medium"]
+    ]
+
+    critical_names = [item["material_name"] for item in critical_items]
+    total_budget = float(summary.get("estimated_budget", 0.0))
+
+    if summary.get("critical_items", 0) > 0:
+        overall_risk = "HIGH"
+    elif summary.get("warning_items", 0) > 0:
+        overall_risk = "MEDIUM"
+    else:
+        overall_risk = "LOW"
+
+    if critical_items:
+        first_mat = critical_items[0]
+        rem_days = first_mat.get("remaining_days", 0)
+        p_text = f"{first_mat['material_name']} inventory is projected to finish within {rem_days} days. Immediate procurement is recommended."
+        if len(critical_items) > 1:
+            second_mat = critical_items[1]
+            p_text += f" {second_mat['material_name']} stock is low and requires reordering soon."
+        healthy = [
+            item["material_name"]
+            for item in recommendations
+            if item["material_name"] not in critical_names
+        ]
+        if healthy:
+            p_text += f" {healthy[0]} inventory is healthy for the next week."
+    else:
+        p_text = "All material inventory levels are healthy and within safe operational limits for the target period."
+
+    action_text = (
+        f"Initiate purchase orders for {len(critical_names)} critical material(s): {', '.join(critical_names)}. Estimated budget required: ₹{total_budget:,.2f}."
+        if critical_names
+        else "Maintain routine inventory monitoring; no immediate procurement required."
+    )
+
+    return {
+        "project_id": project_id,
+        "procurement_summary": p_text,
+        "overall_risk": overall_risk,
+        "recommended_action": action_text,
+        "estimated_budget": round(total_budget, 2),
+        "critical_materials": critical_names,
+    }
+
+
+async def get_material_consumption_trend(
+    db, project_id: int, days: int = 30
+) -> Dict[str, Any]:
+    from datetime import datetime, timedelta
+    from sqlalchemy import select
+    from app.models.material import MaterialUsage, Material, MaterialTransaction
+    from app.models.project import Project
+    from app.core.enums import TransactionType
+
+    project = await db.scalar(select(Project).where(Project.id == project_id))
+    if not project:
+        raise NotFoundError(f"Project with id {project_id} not found")
+
+    cutoff_date = datetime.utcnow() - timedelta(days=days)
+
+    stmt = (
+        select(MaterialUsage, Material.material_name)
+        .join(Material, Material.id == MaterialUsage.material_id)
+        .where(
+            MaterialUsage.project_id == project_id,
+            MaterialUsage.usage_date >= cutoff_date,
+        )
+        .order_by(MaterialUsage.usage_date.asc())
+    )
+    result = await db.execute(stmt)
+    usage_rows = result.all()
+
+    daily_map = {}
+    day_total_map = {}
+
+    for usage, mat_name in usage_rows:
+        d_str = (
+            usage.usage_date.strftime("%Y-%m-%d")
+            if usage.usage_date
+            else datetime.utcnow().strftime("%Y-%m-%d")
+        )
+        qty = float(usage.quantity_used or 0)
+        key = (d_str, mat_name or "Material")
+        daily_map[key] = daily_map.get(key, 0.0) + qty
+        day_total_map[d_str] = day_total_map.get(d_str, 0.0) + qty
+
+    if not daily_map:
+        tx_stmt = (
+            select(MaterialTransaction, Material.material_name)
+            .join(Material, Material.id == MaterialTransaction.material_id)
+            .where(
+                MaterialTransaction.project_id == project_id,
+                MaterialTransaction.created_at >= cutoff_date,
+                MaterialTransaction.type.in_(
+                    [TransactionType.USAGE, TransactionType.ISSUE]
+                ),
+            )
+            .order_by(MaterialTransaction.created_at.asc())
+        )
+        tx_rows = (await db.execute(tx_stmt)).all()
+        for tx, mat_name in tx_rows:
+            d_str = (
+                tx.created_at.strftime("%Y-%m-%d")
+                if tx.created_at
+                else datetime.utcnow().strftime("%Y-%m-%d")
+            )
+            qty = float(tx.quantity or 0)
+            key = (d_str, mat_name or "Material")
+            daily_map[key] = daily_map.get(key, 0.0) + qty
+            day_total_map[d_str] = day_total_map.get(d_str, 0.0) + qty
+
+    daily_trends = [
+        {
+            "date": d_str,
+            "material_name": mat_name,
+            "quantity_used": round(qty, 2),
+        }
+        for (d_str, mat_name), qty in sorted(daily_map.items(), key=lambda x: x[0][0])
+    ]
+
+    total_consumed = sum(item["quantity_used"] for item in daily_trends)
+    avg_daily = round(total_consumed / float(days), 2)
+
+    highest_day = None
+    lowest_day = None
+
+    if day_total_map:
+        sorted_days = sorted(day_total_map.items(), key=lambda x: x[1], reverse=True)
+        max_d, max_q = sorted_days[0]
+        min_d, min_q = sorted_days[-1]
+
+        max_mats = [m for (d, m), q in daily_map.items() if d == max_d]
+        min_mats = [m for (d, m), q in daily_map.items() if d == min_d]
+
+        highest_day = {
+            "date": max_d,
+            "quantity_used": round(max_q, 2),
+            "material_name": max_mats[0] if max_mats else None,
+        }
+        lowest_day = {
+            "date": min_d,
+            "quantity_used": round(min_q, 2),
+            "material_name": min_mats[0] if min_mats else None,
+        }
+
+    return {
+        "project_id": project_id,
+        "period_days": days,
+        "daily_trends": daily_trends,
+        "average_daily_consumption": avg_daily,
+        "highest_consumption_day": highest_day,
+        "lowest_consumption_day": lowest_day,
+    }
+
+
+async def check_and_trigger_reorder_alerts(
+    db, project_id: int, current_user_id: Optional[int] = None
+) -> Dict[str, Any]:
+    from datetime import datetime, timedelta
+    from sqlalchemy import select
+    from app.models.material import Material
+    from app.models.notification import Notification
+    from app.models.alert import Alert
+    from app.models.user import User, UserRole
+    from app.services.notification_service import create_notification
+
+    stmt = (
+        select(Material)
+        .options(
+            selectinload(Material.unit),
+            selectinload(Material.supplier),
+        )
+        .where(
+            Material.project_id == project_id,
+            Material.is_deleted == False,
+        )
+    )
+    materials = (await db.execute(stmt)).scalars().all()
+
+    target_user_id = current_user_id
+    if not target_user_id:
+        user_stmt = select(User.id).where(User.role == UserRole.ADMIN.value).limit(1)
+        target_user_id = await db.scalar(user_stmt) or 1
+
+    alerts_list = []
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_time = datetime.utcnow() - timedelta(hours=24)
+
+    for mat in materials:
+        rem_stock = float(mat.remaining_stock or 0)
+        min_stock = float(mat.minimum_stock_level or 0)
+        qty_used = float(mat.quantity_used or 0)
+
+        avg_daily = qty_used / 30.0
+        buffer_qty = avg_daily * 7.0
+        rec_qty = max(1.0, (min_stock + buffer_qty) - rem_stock)
+
+        priority = "HIGH" if rem_stock <= 0 else "MEDIUM"
+        msg = (
+            f"AUTOMATIC REORDER ALERT: Material '{mat.material_name}' (Code: {mat.material_code}) "
+            f"in Project ID {project_id} has remaining stock of {round(rem_stock, 2)} "
+            f"which is <= minimum stock ({round(min_stock, 2)}). "
+            f"Recommended reorder quantity: {round(rec_qty, 2)} units. Priority: {priority}."
+        )
+
+        dup_stmt = select(Notification).where(
+            Notification.user_id == target_user_id,
+            Notification.title.ilike(f"%REORDER ALERT: {mat.material_name}%"),
+            Notification.created_at >= cutoff_time,
+        )
+        existing_notif = await db.scalar(dup_stmt)
+
+        notif_id = None
+        if not existing_notif:
+            notif = await create_notification(
+                db=db,
+                user_id=target_user_id,
+                title=f"AUTOMATIC REORDER ALERT: {mat.material_name}",
+                message=msg,
+                type="alert" if priority == "HIGH" else "warning",
+                link=f"/materials/{mat.id}",
+            )
+            await db.flush()
+            notif_id = notif.id
+
+            try:
+                alert_obj = Alert(
+                    project_id=project_id,
+                    alert_type="REORDER_ALERT",
+                    message=msg,
+                    user_id=target_user_id,
+                    status="active",
+                )
+                db.add(alert_obj)
+                await db.flush()
+            except Exception as e:
+                pass
+        else:
+            notif_id = existing_notif.id
+
+        alerts_list.append(
+            {
+                "id": notif_id,
+                "material_id": mat.id,
+                "material_name": mat.material_name,
+                "project_id": project_id,
+                "remaining_stock": round(rem_stock, 2),
+                "minimum_stock": round(min_stock, 2),
+                "recommended_quantity": round(rec_qty, 2),
+                "priority": priority,
+                "timestamp": now_str,
+                "message": msg,
+            }
+        )
+
+    return {
+        "project_id": project_id,
+        "alerts": alerts_list,
+        "total_alerts": len(alerts_list),
+    }
 
 
 # ================= SUMMARY =================
@@ -726,7 +1379,12 @@ async def update_supplier(
 # =============delete_supplier============
 
 
-@router.delete("/suppliers/{id}")
+@router.delete(
+    "/suppliers/{id}",
+    response_model=MessageResponse,
+    summary="Delete Supplier",
+    description="Soft deletes a supplier if not currently assigned to active materials.",
+)
 async def delete_supplier(
     id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -735,9 +1393,8 @@ async def delete_supplier(
     obj = await db.get(Supplier, id)
 
     if not obj or obj.is_deleted:
-        raise HTTPException(404, "Supplier not found")
+        raise HTTPException(status_code=404, detail="Supplier not found")
 
-    # ignore deleted materials
     in_use = await db.scalar(
         select(func.count()).where(
             Material.supplier_id == id, Material.is_deleted == False
@@ -745,12 +1402,16 @@ async def delete_supplier(
     )
 
     if in_use > 0:
-        raise HTTPException(400, "Supplier is used in materials")
+        raise HTTPException(status_code=400, detail="Supplier is used in materials")
 
     obj.is_deleted = True
     await db.commit()
 
-    return {"message": "Deleted successfully"}
+    return MessageResponse(
+        success=True,
+        message="Deleted successfully",
+        resource_id=id,
+    )
 
 
 # ================= supplier materials =================
@@ -1066,7 +1727,12 @@ async def update_po(
 # ==============================================================
 
 
-@router.delete("/purchase-orders/{id}")
+@router.delete(
+    "/purchase-orders/{id}",
+    response_model=MessageResponse,
+    summary="Delete Purchase Order",
+    description="Soft deletes a purchase order if not pending or approved.",
+)
 async def delete_po(
     id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -1076,29 +1742,37 @@ async def delete_po(
     obj = await db.get(PurchaseOrder, id)
 
     if not obj or obj.is_deleted:
-        raise HTTPException(404, "PO not found")
+        raise HTTPException(status_code=404, detail="PO not found")
 
     if current_user.role != UserRole.ADMIN.value and obj.project_id not in (
         current_user.allowed_projects or []
     ):
-        raise HTTPException(403, "Access denied")
+        raise HTTPException(status_code=403, detail="Access denied")
 
     if obj.status in ["PENDING", "APPROVED"]:
         raise HTTPException(
-            400, "Cannot delete a Purchase Order that is pending or approved."
+            status_code=400,
+            detail="Cannot delete a Purchase Order that is pending or approved.",
         )
 
     obj.is_deleted = True
 
     await db.commit()
 
-    return {"message": "Purchase order deleted successfully"}
+    return MessageResponse(
+        success=True,
+        message="Purchase order deleted successfully",
+        resource_id=id,
+    )
 
 
 # =========================project_transactions=============================
 
 
-@router.get("/projects/{project_id}/transactions")
+@router.get(
+    "/projects/{project_id}/transactions",
+    response_model=List[ProjectTransactionOut],
+)
 async def project_transactions(
     project_id: int,
     limit: int = 50,
@@ -1478,7 +2152,7 @@ async def create_transfer(
 # ================= LIST TRANSFERS =================
 
 
-@router.get("/transfers")
+@router.get("/transfers", response_model=TransferListResponse)
 async def list_transfers(
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
     skip: int = 0,
@@ -2764,31 +3438,31 @@ async def material_report(
     )
 
 
-# ======================PDF REPORT=============================================
+# ======================================================================
+#  MATERIAL INVENTORY REPORT  —  PDF + EXCEL
+# ======================================================================
 
-import tempfile
-from app.models.master_data import Unit as _UnitAlias  # noqa: F401 (kept for compat)
+from reportlab.lib.units import inch, cm
+from openpyxl.utils import get_column_letter
 
-# ─────────────────────────── SIMPLE COLOR PALETTE ─────────────────────────
+# ─────────────────────────── COLOR PALETTE (matches sample) ────────────────
+NAVY_BLUE = colors.HexColor("#0B2B5C")
+LIGHT_BLUE = colors.HexColor("#3498DB")
+GREEN = colors.HexColor("#27AE60")
+RED = colors.HexColor("#E74C3C")
+ORANGE = colors.HexColor("#F39C12")
+LIGHT_GRAY = colors.HexColor("#F8F9FA")
+BORDER_GRAY = colors.HexColor("#E2E8F0")
 
-PRIMARY_DARK = colors.HexColor("#1F2937")
-PRIMARY_BLUE = colors.HexColor("#2563EB")
-TEXT_DARK = colors.HexColor("#1F2937")
-TEXT_GRAY = colors.HexColor("#6B7280")
-BORDER_LIGHT = colors.HexColor("#D1D5DB")
-HEADER_BG = colors.HexColor("#1F2937")
-ZEBRA_BG = colors.HexColor("#F3F4F6")
-CARD_BG = colors.HexColor("#FFFFFF")
-
-STATUS_OK_FG = colors.HexColor("#166534")
-STATUS_LOW_FG = colors.HexColor("#92400E")
-STATUS_OUT_FG = colors.HexColor("#991B1B")
-STATUS_OK_BG = colors.HexColor("#DCFCE7")
-STATUS_LOW_BG = colors.HexColor("#FEF3C7")
-STATUS_OUT_BG = colors.HexColor("#FEE2E2")
+NAVY_HEX = "0B2B5C"
+LIGHT_GRAY_HEX = "F8F9FA"
+BORDER_GRAY_HEX = "E2E8F0"
+GREEN_HEX = "27AE60"
+RED_HEX = "E74C3C"
+ORANGE_HEX = "F39C12"
 
 
-# ─────────────────────────── FORMATTING HELPERS ────────────────────────────
+# ─────────────────────────── FORMATTING HELPERS ─────────────────────────────
 def fmt(val, dec: int = 2) -> str:
     try:
         val = val or Decimal("0")
@@ -2798,7 +3472,7 @@ def fmt(val, dec: int = 2) -> str:
 
 
 def rs(val, dec: int = 2) -> str:
-    return f"\u20b9 {fmt(val, dec)}"
+    return f"Rs. {fmt(val, dec)}"
 
 
 def alert_to_status(alert_type: str) -> str:
@@ -2807,9 +3481,7 @@ def alert_to_status(alert_type: str) -> str:
 
 
 def compute_avg_rate(total_amount, quantity_purchased) -> Decimal:
-    """Weighted average cost per unit = total purchase cost / total qty purchased.
-    This is the correct basis for stock valuation (NOT material.purchase_rate,
-    which only reflects a single/last rate and ignores price changes across POs)."""
+    """Weighted average cost per unit = total purchase cost / total qty purchased."""
     total_amount = total_amount or Decimal("0")
     quantity_purchased = quantity_purchased or Decimal("0")
     if quantity_purchased > 0:
@@ -2817,257 +3489,116 @@ def compute_avg_rate(total_amount, quantity_purchased) -> Decimal:
     return Decimal("0")
 
 
-# ─────────────────────────── PDF STYLE FACTORY ───────────────────────────────
-def _styles():
-    return {
-        "title": ParagraphStyle(
-            "title",
-            fontName="Helvetica-Bold",
-            fontSize=18,
-            textColor=PRIMARY_DARK,
-            leading=22,
-            alignment=1,
-        ),
-        "subtitle": ParagraphStyle(
-            "subtitle",
-            fontName="Helvetica",
-            fontSize=9.5,
-            textColor=TEXT_GRAY,
-            leading=12,
-            alignment=1,
-        ),
-        "section": ParagraphStyle(
-            "section",
-            fontName="Helvetica-Bold",
-            fontSize=10.5,
-            textColor=PRIMARY_DARK,
-            leading=13,
-            leftIndent=2,
-        ),
-        "th": ParagraphStyle(
-            "th",
-            fontName="Helvetica-Bold",
-            fontSize=8,
-            textColor=colors.white,
-            leading=9.5,
-            alignment=0,
-        ),
-        "th_c": ParagraphStyle(
-            "th_c",
-            fontName="Helvetica-Bold",
-            fontSize=8,
-            textColor=colors.white,
-            leading=9.5,
-            alignment=1,
-        ),
-        "th_r": ParagraphStyle(
-            "th_r",
-            fontName="Helvetica-Bold",
-            fontSize=8,
-            textColor=colors.white,
-            leading=9.5,
-            alignment=2,
-        ),
-        "td": ParagraphStyle(
-            "td",
-            fontName="Helvetica",
-            fontSize=8,
-            textColor=TEXT_DARK,
-            leading=10,
-            alignment=0,
-        ),
-        "td_c": ParagraphStyle(
-            "td_c",
-            fontName="Helvetica",
-            fontSize=8,
-            textColor=TEXT_DARK,
-            leading=10,
-            alignment=1,
-        ),
-        "td_r": ParagraphStyle(
-            "td_r",
-            fontName="Helvetica",
-            fontSize=8,
-            textColor=TEXT_DARK,
-            leading=10,
-            alignment=2,
-        ),
-        "td_bold_r": ParagraphStyle(
-            "td_bold_r",
-            fontName="Helvetica-Bold",
-            fontSize=8,
-            textColor=PRIMARY_DARK,
-            leading=10,
-            alignment=2,
-        ),
-        "td_bold_l": ParagraphStyle(
-            "td_bold_l",
-            fontName="Helvetica-Bold",
-            fontSize=8,
-            textColor=PRIMARY_DARK,
-            leading=10,
-            alignment=0,
-        ),
-        "card_label": ParagraphStyle(
-            "card_label",
-            fontName="Helvetica",
-            fontSize=7.3,
-            textColor=TEXT_GRAY,
-            leading=9,
-            alignment=1,
-        ),
-        "card_value": ParagraphStyle(
-            "card_value",
-            fontName="Helvetica-Bold",
-            fontSize=13,
-            textColor=PRIMARY_BLUE,
-            leading=15,
-            alignment=1,
-        ),
-    }
-
-
-def _section_header(title: str, s, doc_width: float) -> Table:
-    t = Table([[Paragraph(title, s["section"])]], colWidths=[doc_width])
-    t.setStyle(
-        TableStyle(
-            [
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("LINEBELOW", (0, 0), (-1, -1), 1.2, PRIMARY_BLUE),
-            ]
-        )
-    )
-    return t
-
-
-def _status_badge(status: str) -> Table:
-    status_config = {
-        "OK": (STATUS_OK_FG, STATUS_OK_BG, "IN STOCK"),
-        "LOW": (STATUS_LOW_FG, STATUS_LOW_BG, "LOW STOCK"),
-        "OUT": (STATUS_OUT_FG, STATUS_OUT_BG, "OUT OF STOCK"),
-    }
-    fg, bg, label = status_config.get(status, status_config["OK"])
-    ps = ParagraphStyle(
-        f"badge_{status}",
-        fontName="Helvetica-Bold",
-        fontSize=6.3,
-        textColor=fg,
-        leading=8,
-        alignment=1,
-    )
-    t = Table([[Paragraph(label, ps)]], colWidths=[15.5 * mm])
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, -1), bg),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]
-        )
-    )
-    return t
-
-
-def _draw_simple_header(canvas_obj, doc):
-    canvas_obj.saveState()
-    w, h = A4
-
-    canvas_obj.setFillColor(PRIMARY_DARK)
-    canvas_obj.rect(0, h - 40, w, 40, fill=1, stroke=0)
-
-    canvas_obj.setFillColor(colors.white)
-    canvas_obj.setFont("Helvetica-Bold", 14)
-    canvas_obj.drawString(18 * mm, h - 25, "INFRA PILOT")
-
-    canvas_obj.setFillColor(colors.HexColor("#9CA3AF"))
-    canvas_obj.setFont("Helvetica", 7.5)
-    canvas_obj.drawString(18 * mm, h - 34, "Material Inventory Management")
-
-    ts = datetime.utcnow().strftime("%d %b %Y, %H:%M UTC")
-    canvas_obj.setFillColor(colors.HexColor("#D1D5DB"))
-    canvas_obj.setFont("Helvetica", 7.5)
-    canvas_obj.drawRightString(w - 18 * mm, h - 25, ts)
-
-    if doc.page == 1:
-        title_y = h - 40 - 22
-        canvas_obj.setFillColor(PRIMARY_DARK)
-        canvas_obj.setFont("Helvetica-Bold", 15)
-        canvas_obj.drawCentredString(w / 2, title_y, "Material Inventory Report")
-
-        proj_line = getattr(doc, "_project_line", None)
-        sub_y = title_y - 14
-        if proj_line:
-            canvas_obj.setFillColor(PRIMARY_BLUE)
-            canvas_obj.setFont("Helvetica-Bold", 9)
-            canvas_obj.drawCentredString(w / 2, sub_y, proj_line)
-            sub_y -= 12
-
-        canvas_obj.setFillColor(TEXT_GRAY)
-        canvas_obj.setFont("Helvetica", 8)
-        canvas_obj.drawCentredString(
-            w / 2, sub_y, datetime.utcnow().strftime("%d %B %Y")
-        )
-
-    canvas_obj.setStrokeColor(BORDER_LIGHT)
-    canvas_obj.setLineWidth(0.5)
-    canvas_obj.line(18 * mm, 18, w - 18 * mm, 18)
-
-    canvas_obj.setFillColor(TEXT_GRAY)
-    canvas_obj.setFont("Helvetica", 6.5)
-    canvas_obj.drawString(18 * mm, 8, "Confidential \u2022 Infra Pilot")
-    canvas_obj.drawRightString(w - 18 * mm, 8, f"Page {doc.page}")
-
-    canvas_obj.restoreState()
-
-
-# ─────────────────────────── PDF BUILDER ──────────────────────────────────
+# ═══════════════════════════ PDF BUILDER ════════════════════════════════════
 def _build_pdf(
     file_path: str,
     rows: list,
     project_name: Optional[str] = None,
     project_code: Optional[str] = None,
 ):
-    doc = BaseDocTemplate(
+    doc = SimpleDocTemplate(
         file_path,
         pagesize=A4,
-        leftMargin=18 * mm,
-        rightMargin=18 * mm,
-        topMargin=125,
-        bottomMargin=28,
+        rightMargin=cm,
+        leftMargin=cm,
+        topMargin=cm,
+        bottomMargin=cm,
     )
 
-    if project_name or project_code:
-        parts = [
-            p
-            for p in (project_name, f"[{project_code}]" if project_code else None)
-            if p
-        ]
-        doc._project_line = " \u2022 ".join(parts)
-    else:
-        doc._project_line = None
-
-    frame = Frame(
-        doc.leftMargin,
-        doc.bottomMargin,
-        doc.width,
-        doc.height,
-        id="main",
-        leftPadding=0,
-        rightPadding=0,
-        topPadding=0,
-        bottomPadding=0,
-    )
-    doc.addPageTemplates(
-        [PageTemplate(id="main", frames=frame, onPage=_draw_simple_header)]
-    )
-
-    s = _styles()
-    DW = doc.width
     elements = []
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "MatTitle",
+        parent=styles["Heading1"],
+        fontSize=20,
+        textColor=NAVY_BLUE,
+        alignment=0,
+        spaceAfter=15,
+        fontName="Helvetica-Bold",
+    )
+    heading2_style = ParagraphStyle(
+        "MatH2",
+        parent=styles["Heading2"],
+        fontSize=12,
+        textColor=NAVY_BLUE,
+        spaceBefore=6,
+        spaceAfter=10,
+        fontName="Helvetica-Bold",
+    )
+    normal_style = ParagraphStyle(
+        "MatNormal",
+        fontSize=9,
+        textColor=colors.black,
+        fontName="Helvetica",
+        leading=11,
+    )
+    bold_style = ParagraphStyle(
+        "MatBold",
+        fontSize=9,
+        textColor=colors.black,
+        fontName="Helvetica-Bold",
+        leading=11,
+    )
+    small_style = ParagraphStyle(
+        "MatSmall", fontSize=8, textColor=colors.black, fontName="Helvetica", leading=10
+    )
+
+    # ── 1. HEADER (logo left, title right — same as sample) ────────────────
+    logo_path = "static/logo.png"
+    if os.path.exists(logo_path):
+        logo_img = Image(logo_path, width=2 * inch, height=0.75 * inch)
+    else:
+        logo_img = Paragraph("<b>INFRA PILOT</b>", title_style)
+
+    header_data = [
+        [logo_img, Paragraph("<b>MATERIAL INVENTORY REPORT</b>", title_style)]
+    ]
+    header_table = Table(header_data, colWidths=[2.5 * inch, 4.5 * inch])
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ]
+        )
+    )
+    elements.append(header_table)
+    elements.append(Spacer(1, 0.15 * inch))
+
+    # ── 2. PROJECT INFORMATION ──────────────────────────────────────────────
+    pi_data = [
+        [
+            Paragraph("<b>Project Name</b>", bold_style),
+            project_name or "N/A",
+            Paragraph("<b>Report Date</b>", bold_style),
+            datetime.now().strftime("%Y-%m-%d"),
+        ],
+        [
+            Paragraph("<b>Project Code</b>", bold_style),
+            project_code or "N/A",
+            Paragraph("<b>Report Type</b>", bold_style),
+            "Material Inventory Report",
+        ],
+    ]
+    pi_table = Table(pi_data, colWidths=[1.5 * inch, 2 * inch, 1.5 * inch, 2 * inch])
+    pi_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), LIGHT_GRAY),
+                ("BACKGROUND", (2, 0), (2, -1), LIGHT_GRAY),
+                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elements.append(Paragraph("1. PROJECT INFORMATION", heading2_style))
+    elements.append(pi_table)
+    elements.append(Spacer(1, 0.2 * inch))
 
     # ── PROCESS DATA (single source of truth for avg_rate / stock value) ───
     totals = {
@@ -3120,276 +3651,410 @@ def _build_pdf(
             (m, sup, unit_name, purchased, used, remaining, avg_rate, value, status)
         )
 
-    # ── SUMMARY (single row of 5 plain cards, no double row) ───────────────
-    elements.append(_section_header("SUMMARY", s, DW))
-    elements.append(Spacer(1, 8))
-
-    card_configs = [
-        ("MATERIALS", str(len(rows)), PRIMARY_DARK),
-        ("STOCK VALUE", rs(totals["value"], 0), PRIMARY_BLUE),
-        ("PENDING PAYMENT", rs(totals["pending"], 0), STATUS_OUT_FG),
-        ("LOW STOCK", str(len(alerts_low)), STATUS_LOW_FG),
-        ("OUT OF STOCK", str(len(alerts_out)), STATUS_OUT_FG),
-    ]
-
-    def _create_card(label, value, color, w):
-        lbl_ps = ParagraphStyle(
-            f"cl_{label[:4]}",
-            fontName="Helvetica",
-            fontSize=7,
-            textColor=TEXT_GRAY,
-            leading=8.5,
-            alignment=1,
-        )
-        val_ps = ParagraphStyle(
-            f"cv_{label[:4]}",
-            fontName="Helvetica-Bold",
-            fontSize=12,
-            textColor=color,
-            leading=15,
-            alignment=1,
-        )
-        t = Table(
-            [[Paragraph(label, lbl_ps)], [Paragraph(value, val_ps)]], colWidths=[w]
-        )
-        t.setStyle(
-            TableStyle(
-                [
-                    ("BOX", (0, 0), (-1, -1), 0.6, BORDER_LIGHT),
-                    ("TOPPADDING", (0, 0), (-1, 0), 8),
-                    ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
-                    ("TOPPADDING", (0, 1), (-1, 1), 1),
-                    ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
-                ]
+    # ── 3. INVENTORY SUMMARY ────────────────────────────────────────────────
+    overall = "HIGH" if alerts_out else ("MEDIUM" if alerts_low else "LOW")
+    elements.append(Paragraph("2. INVENTORY SUMMARY", heading2_style))
+    summary_box_data = [
+        [
+            Paragraph(
+                f"<b>Overall Stock Risk:</b> {overall} | "
+                f"<b>Total Materials:</b> {len(rows)} | "
+                f"<b>Total Stock Value:</b> {rs(totals['value'], 0)}",
+                bold_style,
             )
-        )
-        return t
-
-    gap = 4
-    card_w = (DW - gap * (len(card_configs) - 1)) / len(card_configs)
-    cells, widths = [], []
-    for i, cfg in enumerate(card_configs):
-        cells.append(_create_card(*cfg, card_w))
-        widths.append(card_w)
-        if i < len(card_configs) - 1:
-            cells.append("")
-            widths.append(gap)
-    elements.append(
-        Table(
-            [cells],
-            colWidths=widths,
-            style=TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]),
-        )
-    )
-    elements.append(Spacer(1, 16))
-
-    # ── MATERIAL DETAILS TABLE ───────────────────────────────────────────
-    elements.append(_section_header("MATERIAL DETAILS", s, DW))
-    elements.append(Spacer(1, 8))
-
-    col_spec = [
-        ("#", 4, s["th_c"]),
-        ("Material", 21, s["th"]),
-        ("Unit", 7, s["th_c"]),
-        ("Supplier", 17, s["th"]),
-        ("Purchased", 11, s["th_r"]),
-        ("Used", 9, s["th_r"]),
-        ("Remaining", 11, s["th_r"]),
-        ("Avg Rate", 10, s["th_r"]),
-        ("Stock Value", 12, s["th_r"]),
-        ("Pending", 11, s["th_r"]),
-        ("Status", 17, s["th_c"]),
+        ],
+        [
+            Paragraph(
+                f"<b>Summary:</b> {len(alerts_out)} material(s) out of stock, "
+                f"{len(alerts_low)} material(s) running low on stock.",
+                normal_style,
+            )
+        ],
+        [
+            Paragraph(
+                f"<b>Pending Payment:</b> {rs(totals['pending'], 2)} across all suppliers.",
+                normal_style,
+            )
+        ],
     ]
-    total_units = sum(c[1] for c in col_spec)
-    col_widths = [c[1] * DW / total_units for c in col_spec]
-    headers = [Paragraph(c[0], c[2]) for c in col_spec]
-    tdata = [headers]
-
-    for i, item in enumerate(processed):
-        m, sup, unit_name, purchased, used, remaining, avg_rate, value, status = item
-        tdata.append(
+    summary_box = Table(summary_box_data, colWidths=[7 * inch])
+    summary_box.setStyle(
+        TableStyle(
             [
-                Paragraph(str(i + 1), s["td_c"]),
-                Paragraph((m.material_name or "").title(), s["td"]),
-                Paragraph(unit_name or "\u2014", s["td_c"]),
-                Paragraph(sup or "N/A", s["td"]),
-                Paragraph(fmt(purchased, 1), s["td_r"]),
-                Paragraph(fmt(used, 1), s["td_r"]),
-                Paragraph(fmt(remaining, 1), s["td_r"]),
-                Paragraph(fmt(avg_rate, 2), s["td_r"]),
-                Paragraph(fmt(value, 2), s["td_r"]),
-                Paragraph(fmt(m.payment_pending, 2), s["td_r"]),
-                _status_badge(status),
+                ("BACKGROUND", (0, 0), (-1, -1), LIGHT_GRAY),
+                ("BOX", (0, 0), (-1, -1), 1, NAVY_BLUE),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
             ]
         )
+    )
+    elements.append(summary_box)
+    elements.append(Spacer(1, 0.2 * inch))
 
-    frow = len(tdata)
-    tdata.append(
+    # ── 4. MATERIAL DETAILS ──────────────────────────────────────────────
+    elements.append(Paragraph("3. MATERIAL DETAILS", heading2_style))
+    det_headers = [
+        Paragraph("<b>Material</b>", bold_style),
+        Paragraph("<b>Unit</b>", bold_style),
+        Paragraph("<b>Supplier</b>", bold_style),
+        Paragraph("<b>Purchased</b>", bold_style),
+        Paragraph("<b>Used</b>", bold_style),
+        Paragraph("<b>Remaining</b>", bold_style),
+        Paragraph("<b>Avg Rate</b>", bold_style),
+        Paragraph("<b>Stock Value</b>", bold_style),
+    ]
+    det_data = [det_headers]
+    for item in processed:
+        m, sup, unit_name, purchased, used, remaining, avg_rate, value, status = item
+        det_data.append(
+            [
+                Paragraph((m.material_name or "").title(), small_style),
+                unit_name or "-",
+                Paragraph(sup or "N/A", small_style),
+                fmt(purchased, 1),
+                fmt(used, 1),
+                fmt(remaining, 1),
+                rs(avg_rate, 2),
+                rs(value, 2),
+            ]
+        )
+    det_data.append(
         [
+            Paragraph("<b>TOTAL</b>", bold_style),
             "",
-            Paragraph("TOTAL", s["td_bold_l"]),
             "",
+            fmt(totals["purchased"], 1),
+            fmt(totals["used"], 1),
+            fmt(totals["remaining"], 1),
             "",
-            Paragraph(fmt(totals["purchased"], 1), s["td_bold_r"]),
-            Paragraph(fmt(totals["used"], 1), s["td_bold_r"]),
-            Paragraph(fmt(totals["remaining"], 1), s["td_bold_r"]),
-            "",
-            Paragraph(fmt(totals["value"], 2), s["td_bold_r"]),
-            Paragraph(fmt(totals["pending"], 2), s["td_bold_r"]),
-            "",
+            rs(totals["value"], 2),
         ]
     )
-
-    det_table = Table(tdata, colWidths=col_widths, repeatRows=1)
+    det_table = Table(
+        det_data,
+        colWidths=[
+            1.6 * inch,
+            0.6 * inch,
+            1.2 * inch,
+            0.8 * inch,
+            0.7 * inch,
+            0.8 * inch,
+            0.9 * inch,
+            1.0 * inch,
+        ],
+        repeatRows=1,
+    )
+    total_row_idx = len(det_data) - 1
     det_table.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
-                ("ROWBACKGROUNDS", (0, 1), (-1, frow - 1), [CARD_BG, ZEBRA_BG]),
-                ("BACKGROUND", (0, frow), (-1, frow), colors.HexColor("#E5E7EB")),
-                ("LINEABOVE", (0, frow), (-1, frow), 1, PRIMARY_DARK),
-                ("GRID", (0, 0), (-1, -1), 0.3, BORDER_LIGHT),
-                ("BOX", (0, 0), (-1, -1), 0.5, PRIMARY_DARK),
-                ("TOPPADDING", (0, 0), (-1, -1), 5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("ALIGN", (0, 0), (0, -1), "CENTER"),
-                ("ALIGN", (10, 0), (10, -1), "CENTER"),
+                ("BACKGROUND", (0, 0), (-1, 0), NAVY_BLUE),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
+                ("BACKGROUND", (0, total_row_idx), (-1, total_row_idx), LIGHT_GRAY),
+                ("LINEABOVE", (0, total_row_idx), (-1, total_row_idx), 1, NAVY_BLUE),
             ]
         )
     )
     elements.append(det_table)
-    elements.append(Spacer(1, 16))
+    elements.append(Spacer(1, 0.2 * inch))
 
-    # ── CRITICAL ALERTS (if any) ──────────────────────────────────────────
-    if alerts_out or alerts_low:
-        elements.append(_section_header("CRITICAL STOCK ALERTS", s, DW))
-        elements.append(Spacer(1, 8))
-
-        alert_th = ParagraphStyle(
-            "ath",
-            fontName="Helvetica-Bold",
-            fontSize=8,
-            textColor=colors.white,
-            leading=10,
-        )
-        alert_td = ParagraphStyle(
-            "atd", fontName="Helvetica", fontSize=8, textColor=TEXT_DARK, leading=10
-        )
-
-        a_data = [
-            [
-                Paragraph("Status", alert_th),
-                Paragraph("Material", alert_th),
-                Paragraph("Action", alert_th),
-            ]
-        ]
-        for name in alerts_out:
-            a_data.append(
-                [
-                    _status_badge("OUT"),
-                    Paragraph(name, alert_td),
-                    Paragraph("Immediate replenishment required", alert_td),
-                ]
-            )
-        for name in alerts_low:
-            a_data.append(
-                [
-                    _status_badge("LOW"),
-                    Paragraph(name, alert_td),
-                    Paragraph("Schedule reorder soon", alert_td),
-                ]
-            )
-
-        a_cw = [24 * mm, DW * 0.38, DW - 24 * mm - DW * 0.38]
-        a_table = Table(a_data, colWidths=a_cw, repeatRows=1)
-        a_table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
-                    ("GRID", (0, 0), (-1, -1), 0.3, BORDER_LIGHT),
-                    ("BOX", (0, 0), (-1, -1), 0.5, PRIMARY_DARK),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [CARD_BG, ZEBRA_BG]),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("ALIGN", (0, 0), (0, -1), "CENTER"),
-                    ("TOPPADDING", (0, 0), (-1, -1), 5),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ]
-            )
-        )
-        elements.append(a_table)
-        elements.append(Spacer(1, 16))
-
-    # ── PAYMENT SUMMARY ───────────────────────────────────────────────────
-    elements.append(_section_header("PAYMENT SUMMARY", s, DW))
-    elements.append(Spacer(1, 8))
-
-    pay_configs = [
-        ("PURCHASE COST", rs(totals["purchase_cost"], 2), PRIMARY_DARK),
-        ("PAID", rs(totals["given"], 2), STATUS_OK_FG),
-        ("PENDING", rs(totals["pending"], 2), STATUS_OUT_FG),
-        ("ADVANCE", rs(totals["advance"], 2), STATUS_LOW_FG),
+    # ── 5. CRITICAL STOCK ALERTS ─────────────────────────────────────────
+    elements.append(Paragraph("4. CRITICAL STOCK ALERTS", heading2_style))
+    crit_headers = [
+        Paragraph("<b>Material</b>", bold_style),
+        Paragraph("<b>Status</b>", bold_style),
+        Paragraph("<b>Action</b>", bold_style),
     ]
-    pay_gap = 5
-    pay_card_w = (DW - pay_gap * 3) / 4
-
-    def _pay_card(label, value, color):
-        lbl_ps = ParagraphStyle(
-            f"pl_{label[:3]}",
-            fontName="Helvetica",
-            fontSize=7,
-            textColor=TEXT_GRAY,
-            leading=9,
-            alignment=1,
+    crit_data = [crit_headers]
+    for name in alerts_out:
+        crit_data.append(
+            [
+                Paragraph(name, small_style),
+                Paragraph(
+                    '<font color="#E74C3C"><b>OUT OF STOCK</b></font>', small_style
+                ),
+                Paragraph("Immediate replenishment required", small_style),
+            ]
         )
-        val_ps = ParagraphStyle(
-            f"pv_{label[:3]}",
-            fontName="Helvetica-Bold",
-            fontSize=11.5,
-            textColor=color,
-            leading=15,
-            alignment=1,
+    for name in alerts_low:
+        crit_data.append(
+            [
+                Paragraph(name, small_style),
+                Paragraph('<font color="#F39C12"><b>LOW STOCK</b></font>', small_style),
+                Paragraph("Schedule reorder soon", small_style),
+            ]
         )
-        t = Table(
-            [[Paragraph(label, lbl_ps)], [Paragraph(value, val_ps)]],
-            colWidths=[pay_card_w],
-        )
-        t.setStyle(
-            TableStyle(
-                [
-                    ("BOX", (0, 0), (-1, -1), 0.6, BORDER_LIGHT),
-                    ("TOPPADDING", (0, 0), (-1, 0), 9),
-                    ("BOTTOMPADDING", (0, 0), (-1, 0), 3),
-                    ("TOPPADDING", (0, 1), (-1, 1), 1),
-                    ("BOTTOMPADDING", (0, 1), (-1, 1), 9),
-                ]
-            )
-        )
-        return t
-
-    cells, widths = [], []
-    for i, cfg in enumerate(pay_configs):
-        cells.append(_pay_card(*cfg))
-        widths.append(pay_card_w)
-        if i < len(pay_configs) - 1:
-            cells.append("")
-            widths.append(pay_gap)
-    elements.append(
-        Table(
-            [cells],
-            colWidths=widths,
-            style=TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]),
+    if len(crit_data) == 1:
+        crit_data.append([Paragraph("No critical materials.", small_style), "-", "-"])
+    crit_table = Table(crit_data, colWidths=[2.5 * inch, 1.8 * inch, 2.7 * inch])
+    crit_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), NAVY_BLUE),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ]
         )
     )
+    elements.append(crit_table)
+    elements.append(Spacer(1, 0.2 * inch))
 
-    doc.build(elements)
+    # ── 6. PAYMENT SUMMARY ────────────────────────────────────────────────
+    elements.append(Paragraph("5. PAYMENT SUMMARY", heading2_style))
+    pay_data = [
+        [
+            Paragraph("<b>Total Purchase Cost</b>", bold_style),
+            rs(totals["purchase_cost"], 2),
+        ],
+        [Paragraph("<b>Total Paid</b>", bold_style), rs(totals["given"], 2)],
+        [Paragraph("<b>Pending Payment</b>", bold_style), rs(totals["pending"], 2)],
+        [Paragraph("<b>Advance Paid</b>", bold_style), rs(totals["advance"], 2)],
+    ]
+    pay_table = Table(pay_data, colWidths=[3.5 * inch, 3.5 * inch])
+    pay_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), LIGHT_GRAY),
+                ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    elements.append(pay_table)
+
+    # ── FOOTER (signature lines — identical to sample) ────────────────────
+    def add_footer(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setStrokeColor(NAVY_BLUE)
+        canvas.setLineWidth(1)
+        canvas.line(cm, 1.5 * cm, A4[0] - cm, 1.5 * cm)
+
+        canvas.drawString(cm, 1.2 * cm, "Prepared By: ______________")
+        canvas.drawString(A4[0] / 2 - 1.5 * cm, 1.2 * cm, "Reviewed By: ______________")
+        canvas.drawString(A4[0] - 5 * cm, 1.2 * cm, "Approved By: ______________")
+
+        canvas.drawString(
+            cm, 0.8 * cm, "Generated by InfraPilot Construction Management System"
+        )
+        canvas.drawRightString(A4[0] - cm, 0.8 * cm, f"Page {doc_.page}")
+        canvas.restoreState()
+
+    doc.build(elements, onFirstPage=add_footer, onLaterPages=add_footer)
 
 
-# ─────────────────────────── PDF ENDPOINT ─────────────────────────────────
+# ═══════════════════════════ EXCEL BUILDER (navy theme, same palette) ═══════
+def _build_excel(project, rows) -> str:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Materials"
+
+    border = Border(
+        left=Side(style="thin", color=BORDER_GRAY_HEX),
+        right=Side(style="thin", color=BORDER_GRAY_HEX),
+        top=Side(style="thin", color=BORDER_GRAY_HEX),
+        bottom=Side(style="thin", color=BORDER_GRAY_HEX),
+    )
+    header_fill = PatternFill(
+        start_color=NAVY_HEX, end_color=NAVY_HEX, fill_type="solid"
+    )
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    accent_fill = PatternFill(
+        start_color=LIGHT_GRAY_HEX, end_color=LIGHT_GRAY_HEX, fill_type="solid"
+    )
+    title_font = Font(bold=True, size=14, color=NAVY_HEX)
+    subtitle_font = Font(size=10, color="6B7280")
+
+    ws.merge_cells("A1:N1")
+    ws["A1"] = "MATERIAL INVENTORY REPORT"
+    ws["A1"].font = title_font
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    ws.merge_cells("A2:N2")
+    ws["A2"] = (
+        f"Project: {project.project_name if project else 'N/A'}  |  "
+        f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')}"
+    )
+    ws["A2"].font = subtitle_font
+    ws["A2"].alignment = Alignment(horizontal="center")
+    ws.row_dimensions[2].height = 16
+
+    row = 4
+
+    totals = {
+        k: Decimal("0")
+        for k in [
+            "purchased",
+            "used",
+            "remaining",
+            "value",
+            "paid",
+            "pending",
+            "advance",
+            "purchase_cost",
+        ]
+    }
+    status_counts = {"OK": 0, "LOW": 0, "OUT": 0}
+    computed_rows = []
+
+    for material, supplier_name, unit_name in rows:
+        purchased = material.quantity_purchased or Decimal("0")
+        used = material.quantity_used or Decimal("0")
+        remaining = material.remaining_stock or Decimal("0")
+        total_amt = material.total_amount or Decimal("0")
+        avg_rate = compute_avg_rate(total_amt, purchased)
+        value = remaining * avg_rate
+
+        totals["purchased"] += purchased
+        totals["used"] += used
+        totals["remaining"] += remaining
+        totals["value"] += value
+        totals["paid"] += material.payment_given or Decimal("0")
+        totals["pending"] += material.payment_pending or Decimal("0")
+        totals["advance"] += material.advance_amount or Decimal("0")
+        totals["purchase_cost"] += total_amt
+
+        status = alert_to_status(material.alert_type)
+        status_counts[status] += 1
+        computed_rows.append((material, supplier_name, unit_name, avg_rate, value))
+
+    ws.merge_cells(f"A{row}:D{row}")
+    ws[f"A{row}"] = "INVENTORY SUMMARY"
+    ws[f"A{row}"].font = Font(bold=True, size=10, color=NAVY_HEX)
+    ws[f"A{row}"].fill = PatternFill(
+        start_color="E5E7EB", end_color="E5E7EB", fill_type="solid"
+    )
+    row += 1
+
+    summary_data = [
+        ("Total Materials", len(rows), NAVY_HEX),
+        ("Total Stock Value", f"Rs. {fmt(totals['value'], 2)}", "3498DB"),
+        ("In Stock", status_counts["OK"], GREEN_HEX),
+        ("Low Stock", status_counts["LOW"], ORANGE_HEX),
+        ("Out of Stock", status_counts["OUT"], RED_HEX),
+    ]
+    for col, (label, value, color) in enumerate(summary_data, 1):
+        ws.cell(row, col, label).font = Font(size=9, color="6B7280")
+        ws.cell(row, col).alignment = Alignment(horizontal="center")
+        val_cell = ws.cell(row + 1, col, value)
+        val_cell.font = Font(bold=True, size=11, color=color)
+        val_cell.alignment = Alignment(horizontal="center")
+
+    row += 3
+
+    headers = [
+        "ID",
+        "Material",
+        "Code",
+        "Unit",
+        "Supplier",
+        "Purchased",
+        "Used",
+        "Remaining",
+        "Avg Rate",
+        "Stock Value",
+        "Paid",
+        "Pending",
+        "Advance",
+        "Alert",
+    ]
+    for col_num, header in enumerate(headers, 1):
+        cell = ws.cell(row, col_num, header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    ws.row_dimensions[row].height = 18
+    header_row = row
+    row += 1
+
+    for idx, (material, supplier_name, unit_name, avg_rate, value) in enumerate(
+        computed_rows
+    ):
+        values = [
+            material.id,
+            material.material_name or "-",
+            material.material_code or "-",
+            unit_name or "-",
+            supplier_name or "-",
+            float(material.quantity_purchased or 0),
+            float(material.quantity_used or 0),
+            float(material.remaining_stock or 0),
+            float(avg_rate),
+            float(value),
+            float(material.payment_given or 0),
+            float(material.payment_pending or 0),
+            float(material.advance_amount or 0),
+            material.alert_type or "-",
+        ]
+        fill = accent_fill if idx % 2 == 1 else None
+        for col_num, val in enumerate(values, 1):
+            cell = ws.cell(row, col_num, val)
+            cell.border = border
+            cell.alignment = Alignment(
+                horizontal="right" if col_num > 5 else "left", vertical="center"
+            )
+            if fill:
+                cell.fill = fill
+        row += 1
+
+    total_row = row
+    ws.cell(total_row, 2, "TOTAL").font = Font(bold=True, color=NAVY_HEX)
+    ws.cell(total_row, 6, float(totals["purchased"])).font = Font(bold=True)
+    ws.cell(total_row, 7, float(totals["used"])).font = Font(bold=True)
+    ws.cell(total_row, 8, float(totals["remaining"])).font = Font(bold=True)
+    ws.cell(total_row, 10, float(totals["value"])).font = Font(bold=True)
+    ws.cell(total_row, 11, float(totals["paid"])).font = Font(bold=True)
+    ws.cell(total_row, 12, float(totals["pending"])).font = Font(bold=True)
+    ws.cell(total_row, 13, float(totals["advance"])).font = Font(bold=True)
+
+    total_fill = PatternFill(
+        start_color=LIGHT_GRAY_HEX, end_color=LIGHT_GRAY_HEX, fill_type="solid"
+    )
+    for col in range(1, len(headers) + 1):
+        cell = ws.cell(total_row, col)
+        cell.fill = total_fill
+        cell.border = border
+        cell.alignment = Alignment(horizontal="right" if col > 5 else "left")
+
+    row = total_row + 3
+    ws.cell(row, 1, "Prepared By: ______________").font = Font(size=9)
+    ws.cell(row, 6, "Reviewed By: ______________").font = Font(size=9)
+    ws.cell(row, 11, "Approved By: ______________").font = Font(size=9)
+
+    ws.freeze_panes = f"A{header_row + 1}"
+    ws.auto_filter.ref = f"A{header_row}:N{total_row - 1}"
+
+    for col_num in range(1, len(headers) + 1):
+        col_letter = get_column_letter(col_num)
+        max_width = 12
+        for cell in ws[col_letter]:
+            try:
+                if cell.value:
+                    max_width = max(max_width, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_width + 2, 25)
+
+    file_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
+    wb.save(file_path)
+    return file_path
+
+
+# ═══════════════════════════ PDF ENDPOINT — ACTUAL ROUTE ═════════════════════
 @router.get("/reports/pdf", response_class=FileResponse)
 async def export_pdf(
     project_id: int = Query(...),
@@ -3424,12 +4089,18 @@ async def export_pdf(
 
         project = await db.get(Project, project_id)
         project_name = project.project_name if project else None
+        project_code = getattr(project, "project_code", None) if project else None
 
         file_path = os.path.join(
             tempfile.gettempdir(), f"material_report_{uuid.uuid4()}.pdf"
         )
         try:
-            _build_pdf(file_path=file_path, rows=rows, project_name=project_name)
+            _build_pdf(
+                file_path=file_path,
+                rows=rows,
+                project_name=project_name,
+                project_code=project_code,
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=500, detail=f"PDF generation failed: {str(e)}"
@@ -3447,10 +4118,7 @@ async def export_pdf(
         raise HTTPException(status_code=500, detail=f"Material report error: {str(e)}")
 
 
-# ─────────────────────────── EXCEL ENDPOINT ──────────────────────────────
-from openpyxl.utils import get_column_letter
-
-
+# ═══════════════════════════ EXCEL ENDPOINT — ACTUAL ROUTE ═══════════════════
 @router.get("/reports/excel", response_class=FileResponse)
 async def export_excel(
     project_id: int = Query(...),
@@ -3488,199 +4156,7 @@ async def export_excel(
         if not rows:
             raise HTTPException(status_code=404, detail="No material data found")
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Materials"
-
-        border = Border(
-            left=Side(style="thin", color="D1D5DB"),
-            right=Side(style="thin", color="D1D5DB"),
-            top=Side(style="thin", color="D1D5DB"),
-            bottom=Side(style="thin", color="D1D5DB"),
-        )
-        header_fill = PatternFill(
-            start_color="1F2937", end_color="1F2937", fill_type="solid"
-        )
-        header_font = Font(bold=True, color="FFFFFF", size=10)
-        accent_fill = PatternFill(
-            start_color="F9FAFB", end_color="F9FAFB", fill_type="solid"
-        )
-        title_font = Font(bold=True, size=14, color="1F2937")
-        subtitle_font = Font(size=10, color="6B7280")
-
-        # ── TITLE ────────────────────────────────────────────────────
-        ws.merge_cells("A1:K1")
-        ws["A1"] = "MATERIAL INVENTORY REPORT"
-        ws["A1"].font = title_font
-        ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 22
-
-        ws.merge_cells("A2:K2")
-        ws["A2"] = (
-            f"Project: {project.project_name}  |  Generated: {datetime.now().strftime('%d %b %Y %H:%M')}"
-        )
-        ws["A2"].font = subtitle_font
-        ws["A2"].alignment = Alignment(horizontal="center")
-        ws.row_dimensions[2].height = 16
-
-        row = 4
-
-        totals = {
-            k: Decimal("0")
-            for k in [
-                "purchased",
-                "used",
-                "remaining",
-                "value",
-                "paid",
-                "pending",
-                "advance",
-                "purchase_cost",
-            ]
-        }
-        status_counts = {"OK": 0, "LOW": 0, "OUT": 0}
-        computed_rows = []
-
-        for material, supplier_name, unit_name in rows:
-            purchased = material.quantity_purchased or Decimal("0")
-            used = material.quantity_used or Decimal("0")
-            remaining = material.remaining_stock or Decimal("0")
-            total_amt = material.total_amount or Decimal("0")
-            avg_rate = compute_avg_rate(total_amt, purchased)
-            value = remaining * avg_rate
-
-            totals["purchased"] += purchased
-            totals["used"] += used
-            totals["remaining"] += remaining
-            totals["value"] += value
-            totals["paid"] += material.payment_given or Decimal("0")
-            totals["pending"] += material.payment_pending or Decimal("0")
-            totals["advance"] += material.advance_amount or Decimal("0")
-            totals["purchase_cost"] += total_amt
-
-            status = alert_to_status(material.alert_type)
-            status_counts[status] += 1
-            computed_rows.append((material, supplier_name, unit_name, avg_rate, value))
-
-        # ── SUMMARY ───────────────────────────────────────
-        ws.merge_cells(f"A{row}:D{row}")
-        ws[f"A{row}"] = "INVENTORY SUMMARY"
-        ws[f"A{row}"].font = Font(bold=True, size=10, color="1F2937")
-        ws[f"A{row}"].fill = PatternFill(
-            start_color="E5E7EB", end_color="E5E7EB", fill_type="solid"
-        )
-        row += 1
-
-        summary_data = [
-            ("Total Materials", len(rows), "1F2937"),
-            ("Total Stock Value", f"\u20b9 {fmt(totals['value'], 2)}", "2563EB"),
-            ("In Stock", status_counts["OK"], "166534"),
-            ("Low Stock", status_counts["LOW"], "92400E"),
-            ("Out of Stock", status_counts["OUT"], "991B1B"),
-        ]
-        for col, (label, value, color) in enumerate(summary_data, 1):
-            ws.cell(row, col, label).font = Font(size=9, color="6B7280")
-            ws.cell(row, col).alignment = Alignment(horizontal="center")
-            val_cell = ws.cell(row + 1, col, value)
-            val_cell.font = Font(bold=True, size=11, color=color)
-            val_cell.alignment = Alignment(horizontal="center")
-
-        row += 3
-
-        # ── DATA TABLE ─────────────────────────────────────────
-        headers = [
-            "ID",
-            "Material",
-            "Code",
-            "Unit",
-            "Supplier",
-            "Purchased",
-            "Used",
-            "Remaining",
-            "Avg Rate",
-            "Stock Value",
-            "Paid",
-            "Pending",
-            "Advance",
-            "Alert",
-        ]
-        for col_num, header in enumerate(headers, 1):
-            cell = ws.cell(row, col_num, header)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = border
-        ws.row_dimensions[row].height = 18
-        header_row = row
-        row += 1
-
-        for idx, (material, supplier_name, unit_name, avg_rate, value) in enumerate(
-            computed_rows
-        ):
-            values = [
-                material.id,
-                material.material_name or "-",
-                material.material_code or "-",
-                unit_name or "-",
-                supplier_name or "-",
-                float(material.quantity_purchased or 0),
-                float(material.quantity_used or 0),
-                float(material.remaining_stock or 0),
-                float(avg_rate),
-                float(value),
-                float(material.payment_given or 0),
-                float(material.payment_pending or 0),
-                float(material.advance_amount or 0),
-                material.alert_type or "-",
-            ]
-            fill = accent_fill if idx % 2 == 1 else None
-            for col_num, val in enumerate(values, 1):
-                cell = ws.cell(row, col_num, val)
-                cell.border = border
-                cell.alignment = Alignment(
-                    horizontal="right" if col_num > 5 else "left", vertical="center"
-                )
-                if fill:
-                    cell.fill = fill
-            row += 1
-
-        # ── TOTALS ROW ─────────────────────────────────────
-        total_row = row
-        ws.cell(total_row, 2, "TOTAL").font = Font(bold=True, color="1F2937")
-        ws.cell(total_row, 6, float(totals["purchased"])).font = Font(bold=True)
-        ws.cell(total_row, 7, float(totals["used"])).font = Font(bold=True)
-        ws.cell(total_row, 8, float(totals["remaining"])).font = Font(bold=True)
-        ws.cell(total_row, 10, float(totals["value"])).font = Font(bold=True)
-        ws.cell(total_row, 11, float(totals["paid"])).font = Font(bold=True)
-        ws.cell(total_row, 12, float(totals["pending"])).font = Font(bold=True)
-        ws.cell(total_row, 13, float(totals["advance"])).font = Font(bold=True)
-
-        total_fill = PatternFill(
-            start_color="F3F4F6", end_color="F3F4F6", fill_type="solid"
-        )
-        for col in range(1, len(headers) + 1):
-            cell = ws.cell(total_row, col)
-            cell.fill = total_fill
-            cell.border = border
-            cell.alignment = Alignment(horizontal="right" if col > 5 else "left")
-
-        # ── FORMATTING ────────────────────────────────────────────────────
-        ws.freeze_panes = f"A{header_row + 1}"
-        ws.auto_filter.ref = f"A{header_row}:N{total_row - 1}"
-
-        for col_num in range(1, len(headers) + 1):
-            col_letter = get_column_letter(col_num)
-            max_width = 12
-            for cell in ws[col_letter]:
-                try:
-                    if cell.value:
-                        max_width = max(max_width, len(str(cell.value)))
-                except Exception:
-                    pass
-            ws.column_dimensions[col_letter].width = min(max_width + 2, 25)
-
-        file_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
-        wb.save(file_path)
+        file_path = _build_excel(project, rows)
 
         return FileResponse(
             path=file_path,
@@ -4041,6 +4517,93 @@ async def list_materials(
     ]
 
 
+# =====================================================
+# FEATURE 1: WEEKLY PROCUREMENT REPORT (PDF)
+# =====================================================
+@router.get(
+    "/procurement-report/{project_id}",
+    summary="Weekly Procurement Report (PDF)",
+    description="Generates a downloadable Weekly Procurement Report PDF including Project Info, Current Inventory, Critical Materials, Supplier Recommendations, Procurement Budget, Consumption Summary, and AI Procurement Summary.",
+)
+async def download_procurement_report_pdf(
+    project_id: int,
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    if (
+        current_user.role != UserRole.ADMIN.value
+        and current_user.allowed_projects
+        and project_id not in current_user.allowed_projects
+    ):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    project = await db.scalar(select(Project).where(Project.id == project_id))
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    mats = (
+        (
+            await db.execute(
+                select(Material).where(
+                    Material.project_id == project_id, Material.is_deleted == False
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    inv_data = []
+    for m in mats:
+        inv_data.append(
+            {
+                "material_name": m.material_name,
+                "category": m.category,
+                "remaining_stock": round(float(m.remaining_stock or 0), 2),
+                "minimum_stock_level": round(float(m.minimum_stock_level or 0), 2),
+                "purchase_rate": float(m.purchase_rate or 0),
+                "total_amount": float(m.total_amount or 0),
+            }
+        )
+
+    rec_data = await generate_material_recommendations(db=db, project_id=project_id)
+    supplier_rec_data = await generate_supplier_recommendations(
+        db=db, project_id=project_id
+    )
+    ai_summary = await generate_procurement_summary(db=db, project_id=project_id)
+    consumption_summary = await get_material_consumption_trend(
+        db=db, project_id=project_id, days=30
+    )
+
+    pdf_payload = {
+        "project": {
+            "name": project.project_name,
+            "code": getattr(project, "business_id", f"PRJ-{project_id}"),
+            "location": getattr(project, "site_address", "N/A") or "N/A",
+        },
+        "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "current_inventory": inv_data,
+        "critical_materials": rec_data.get("recommendations", []),
+        "supplier_recommendations": supplier_rec_data.get(
+            "supplier_recommendations", []
+        ),
+        "procurement_recommendations": rec_data.get("recommendations", []),
+        "ai_procurement_summary": ai_summary,
+        "consumption_summary": consumption_summary,
+    }
+
+    pdf_buffer = generate_procurement_report_pdf(pdf_payload)
+
+    headers = {
+        "Content-Disposition": f"attachment; filename=procurement_report_{project_id}.pdf"
+    }
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers=headers,
+    )
+
+
 # ==============get_material=================
 
 
@@ -4350,7 +4913,12 @@ async def update_material(
 # ============delete_material===========
 
 
-@router.delete("/{material_id}")
+@router.delete(
+    "/{material_id}",
+    response_model=MessageResponse,
+    summary="Delete Material",
+    description="Soft deletes a material record.",
+)
 async def delete_material(
     material_id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -4392,8 +4960,52 @@ async def delete_material(
         VERSION_KEY,
     )
 
-    return {
-        "success": True,
-        "message": "Material deleted successfully",
-        "material_id": material_id,
-    }
+    return MessageResponse(
+        success=True,
+        message="Material deleted successfully",
+        resource_id=material_id,
+    )
+
+
+# =====================================================
+# FEATURE 2: AI MATERIAL RECOMMENDATION ENGINE
+# =====================================================
+@router.post(
+    "/ai-recommendation",
+    response_model=AIMaterialRecommendationResponse,
+)
+async def get_ai_material_recommendation(
+    payload: AIMaterialRecommendationRequest,
+    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+
+    version = await get_cache_version(redis, VERSION_KEY)
+    cache_key = (
+        f"cache:materials:ai_rec:{version}:{payload.project_id}:{payload.target_days}"
+    )
+    cached = await cache_get_json(redis, cache_key)
+    if cached is not None:
+        return AIMaterialRecommendationResponse.model_validate(cached)
+
+    result = await generate_material_recommendations(
+        db=db,
+        project_id=payload.project_id,
+        target_days=payload.target_days,
+    )
+
+    try:
+        ai_obj = AIPrediction(
+            module_name="material_recommendation",
+            prompt=f"project_id={payload.project_id}, target_days={payload.target_days}",
+            prediction=result,
+            created_by_user_id=current_user.id,
+        )
+        db.add(ai_obj)
+        await db.flush()
+    except Exception as e:
+        logger.warning(f"Failed to store AIPrediction log: {e}")
+
+    await cache_set_json(redis, cache_key, result)
+    return AIMaterialRecommendationResponse.model_validate(result)

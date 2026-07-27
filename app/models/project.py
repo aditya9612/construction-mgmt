@@ -1066,6 +1066,7 @@ class SiteRequest(Base, TimestampMixin):
 # Work progress
 # ===========================================
 
+
 class WorkActivity(Base, TimestampMixin):
     __tablename__ = "work_activities"
 
@@ -1099,7 +1100,6 @@ class WorkActivity(Base, TimestampMixin):
         Integer,
         ForeignKey("boq_items.id", ondelete="RESTRICT"),
         nullable=True,
-        index=True,
     )
 
     # =========================================================
@@ -1236,65 +1236,55 @@ class WorkActivity(Base, TimestampMixin):
     # =========================================================
 
     __table_args__ = (
-
         CheckConstraint(
             "planned_quantity > 0",
             name="ck_activity_planned_quantity",
         ),
-
         CheckConstraint(
             "total_completed >= 0",
             name="ck_activity_total_completed",
         ),
-
         CheckConstraint(
             "remaining_quantity >= 0",
             name="ck_activity_remaining_quantity",
         ),
-
         CheckConstraint(
             "total_completed <= planned_quantity",
             name="ck_activity_completed_quantity",
         ),
-
         CheckConstraint(
             "completion_percentage >= 0 AND completion_percentage <= 100",
             name="ck_activity_completion_percentage",
         ),
-
         CheckConstraint(
             "end_date >= start_date",
             name="ck_activity_dates",
         ),
-
         UniqueConstraint(
             "project_id",
             "boq_item_id",
             name="uq_activity_project_boq",
         ),
-
         Index(
             "idx_activity_project_status",
             "project_id",
             "status",
         ),
-
         Index(
             "idx_activity_project_engineer",
             "project_id",
             "engineer_id",
         ),
-
         Index(
             "idx_activity_work_order",
             "work_order_id",
         ),
-
         Index(
             "idx_activity_boq_item",
             "boq_item_id",
         ),
     )
+
 
 # ================= DAILY PROGRESS ENTRY =================
 

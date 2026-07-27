@@ -1,5 +1,6 @@
 from datetime import datetime
-from typing import Any, Dict, Optional
+from decimal import Decimal
+from typing import Any, Dict, List, Literal, Optional
 
 from app.schemas.base import BaseSchema
 
@@ -21,4 +22,3 @@ class AIPredictionOut(BaseSchema):
     prediction: Dict[str, Any]
     created_by_user_id: Optional[int]
     predicted_at: datetime
-

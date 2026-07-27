@@ -3,6 +3,7 @@ from typing import Optional
 from datetime import datetime
 from app.models.boq import BOQ
 import re
+from typing import List, Optional
 
 
 from pydantic import (
@@ -31,6 +32,12 @@ class BaseSchema(BaseModel):
         from_attributes=True,
         json_encoders={Decimal: lambda v: round(float(v), 2)},
     )
+
+
+class MessageResponse(BaseSchema):
+    success: bool = True
+    message: str
+    resource_id: Optional[int] = None
 
 
 # ================= MATERIAL =================
@@ -693,27 +700,11 @@ class PurchaseOrderUpdate(BaseSchema):
     status: Optional[str] = None
 
 
-class PurchaseMaterialOut(BaseSchema):
-    id: int
-    boq_item_id: Optional[int]
-    project_id: int
-    material_id: int
-    quantity: float
-    rate: float
-    total_amount: float
-    amount_paid: float
-    created_at: datetime
-
-
-class UsageMaterialOut(BaseSchema):
-    id: int
-    material_id: int
-    boq_item_id: Optional[int]
-    quantity: float
-    project_id: int
-    task_id: Optional[int]
-    issue_type: Optional[str]
-    created_at: datetime
+class TransferListResponse(BaseSchema):
+    total: int
+    skip: int
+    limit: int
+    data: List[TransferOut]
 
 
 class MaterialTransactionOut(BaseSchema):
@@ -787,3 +778,99 @@ class InventoryItemOut(BaseSchema):
     total_value: float
 
     project_id: int
+
+
+class AIMaterialRecommendationRequest(BaseSchema):
+    project_id: int
+    target_days: int = 30
+
+
+class SupplierRecommendationDetail(BaseSchema):
+    supplier_id: int
+    supplier_name: str
+    last_purchase_rate: float
+    average_delivery_days: float
+    supplier_score: float
+    recommendation_reason: str
+
+
+class RecommendationSummary(BaseSchema):
+    critical_items: int
+    warning_items: int
+    estimated_budget: float
+
+
+class MaterialRecommendationDetail(BaseSchema):
+    material_id: int
+    material_name: str
+    current_stock: float
+    remaining_days: float
+    recommended_purchase: float
+    estimated_cost: float
+    priority: str
+    reason: str
+    risk: str
+    unit_name: Optional[str] = None
+    supplier_name: Optional[str] = None
+    minimum_stock: Optional[float] = None
+    recommended_supplier: Optional[SupplierRecommendationDetail] = None
+
+
+class AIMaterialRecommendationResponse(BaseSchema):
+    project_id: int
+    summary: RecommendationSummary
+    recommendations: List[MaterialRecommendationDetail]
+
+
+class SupplierRecommendationResponse(BaseSchema):
+    project_id: int
+    supplier_recommendations: List[SupplierRecommendationDetail]
+
+
+class AIProcurementSummaryResponse(BaseSchema):
+    project_id: int
+    procurement_summary: str
+    overall_risk: str
+    recommended_action: str
+    estimated_budget: float
+    critical_materials: List[str]
+
+
+class DailyConsumptionItem(BaseSchema):
+    date: str
+    material_name: str
+    quantity_used: float
+
+
+class ConsumptionDaySummary(BaseSchema):
+    date: str
+    quantity_used: float
+    material_name: Optional[str] = None
+
+
+class MaterialConsumptionTrendResponse(BaseSchema):
+    project_id: int
+    period_days: int = 30
+    daily_trends: List[DailyConsumptionItem]
+    average_daily_consumption: float
+    highest_consumption_day: Optional[ConsumptionDaySummary] = None
+    lowest_consumption_day: Optional[ConsumptionDaySummary] = None
+
+
+class ReorderAlertOut(BaseSchema):
+    id: Optional[int] = None
+    material_id: int
+    material_name: str
+    project_id: int
+    remaining_stock: float
+    minimum_stock: float
+    recommended_quantity: float
+    priority: str
+    timestamp: str
+    message: str
+
+
+class ReorderAlertsResponse(BaseSchema):
+    project_id: int
+    alerts: List[ReorderAlertOut]
+    total_alerts: int
