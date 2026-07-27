@@ -1676,22 +1676,7 @@ async def restore_equipment(
 
     return EquipmentOut.model_validate(obj)
 
-
-# ========================= CREATE USAGE===========================
-
-
-@router.post(
-    "/{equipment_id}/usage",
-    response_model=EquipmentUsageOut,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_usage(
-    equipment_id: int,
-    payload: EquipmentUsageCreate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-    redis=Depends(get_request_redis),
-):
+    # ========================= CREATE USAGE===========================
 
     equipment = await get_active_equipment_or_404(
         db,
@@ -4769,6 +4754,7 @@ async def transfer_equipment(
 
 # ============================== TRANSFER HISTORY (NEW) ========================
 
+
 @router.get("/{equipment_id}/transfer-history")
 async def get_transfer_history(
     equipment_id: int,
@@ -4784,9 +4770,9 @@ async def get_transfer_history(
         EquipmentAuditLog.action == "TRANSFER",
     )
 
-    total = await db.scalar(
-        select(func.count()).select_from(base_query.subquery())
-    ) or 0
+    total = (
+        await db.scalar(select(func.count()).select_from(base_query.subquery())) or 0
+    )
 
     result = await db.execute(
         base_query.order_by(EquipmentAuditLog.created_at.desc())
@@ -4812,9 +4798,7 @@ async def get_transfer_history(
 
     if project_ids:
         projects = await db.execute(
-            select(Project.id, Project.project_name).where(
-                Project.id.in_(project_ids)
-            )
+            select(Project.id, Project.project_name).where(Project.id.in_(project_ids))
         )
 
         project_name_map = dict(projects.all())
@@ -4851,7 +4835,9 @@ async def get_transfer_history(
         },
     }
 
-#======================= list_transfer_history =================================
+
+# ======================= list_transfer_history =================================
+
 
 @router.get("/transfer-history")
 async def list_transfer_history(
@@ -5078,11 +5064,18 @@ async def update_equipment(
     return EquipmentOut.model_validate(obj)
 
 
-# ======================== REPORTS PDF========================
+# ======================== REPORTS PDF ========================
 
 
 @router.get("/reports/pdf")
 async def equipment_full_pdf_report(
+    project_id: Optional[int] = Query(None),
+    equipment_id: Optional[int] = Query(None),
+    condition: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    vendor_name: Optional[str] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
@@ -5093,6 +5086,7 @@ async def equipment_full_pdf_report(
     """
     try:
         import io
+        import os
         from datetime import datetime
 
         from fastapi import HTTPException
@@ -5104,176 +5098,320 @@ async def equipment_full_pdf_report(
             TableStyle,
             Paragraph,
             Spacer,
-            HRFlowable,
+            Image,
         )
         from reportlab.lib import colors
-        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units import inch, cm
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
-        # ================= SIMPLE, CONSISTENT COLORS =================
-        TABLE_HDR = colors.HexColor("#305496")  # one header color for every table
-        ROW_ALT = colors.HexColor("#F5F5F5")
-        ROW_WHITE = colors.white
-        BORDER_CLR = colors.HexColor("#DDDDDD")
-        TEXT_DARK = colors.HexColor("#222222")
-        TEXT_LIGHT = colors.white
-        LABEL_GREY = colors.HexColor("#666666")
-
-        FONT = "Helvetica"
-        FONT_BOLD = "Helvetica-Bold"
+        # ================= COLOR PALETTE (matches INFRA PILOT sample) =====
+        NAVY_BLUE = colors.HexColor("#0B2B5C")
+        LIGHT_GRAY = colors.HexColor("#F8F9FA")
+        BORDER_GRAY = colors.HexColor("#E2E8F0")
+        GREEN = colors.HexColor("#27AE60")
+        RED = colors.HexColor("#E74C3C")
 
         # ================= PDF SETUP =================
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(
             buffer,
-            pagesize=letter,
-            leftMargin=36,
-            rightMargin=36,
-            topMargin=40,
-            bottomMargin=36,
+            pagesize=A4,
+            rightMargin=cm,
+            leftMargin=cm,
+            topMargin=cm,
+            bottomMargin=cm,
         )
 
-        # ================= STYLES =================
+        styles = getSampleStyleSheet()
+
         title_style = ParagraphStyle(
-            "Title",
-            fontSize=16,
-            leading=20,
-            textColor=TEXT_DARK,
-            alignment=TA_CENTER,
-            fontName=FONT_BOLD,
-            spaceAfter=6,
+            "EqTitle",
+            parent=styles["Heading1"],
+            fontSize=20,
+            textColor=NAVY_BLUE,
+            alignment=0,
+            spaceAfter=15,
+            fontName="Helvetica-Bold",
         )
-        sub_style = ParagraphStyle(
-            "Sub",
-            fontSize=9,
-            leading=12,
-            textColor=LABEL_GREY,
-            alignment=TA_CENTER,
-            spaceBefore=2,
-            spaceAfter=4,
-        )
-        empty_style = ParagraphStyle(
-            "Empty",
-            fontSize=9,
-            textColor=LABEL_GREY,
-            fontName="Helvetica-Oblique",
+        heading2_style = ParagraphStyle(
+            "EqH2",
+            parent=styles["Heading2"],
+            fontSize=12,
+            textColor=NAVY_BLUE,
+            spaceBefore=6,
             spaceAfter=10,
+            fontName="Helvetica-Bold",
         )
-        section_style = ParagraphStyle(
-            "Section",
-            fontSize=11,
-            textColor=TEXT_DARK,
-            fontName=FONT_BOLD,
-            alignment=TA_LEFT,
-            spaceBefore=14,
-            spaceAfter=6,
+        normal_style = ParagraphStyle(
+            "EqNormal",
+            fontSize=9,
+            textColor=colors.black,
+            fontName="Helvetica",
+            leading=11,
         )
-        info_label = ParagraphStyle("InfoLabel", fontSize=8, textColor=LABEL_GREY)
         bold_style = ParagraphStyle(
-            "BoldStyle", fontSize=9, textColor=TEXT_DARK, fontName=FONT_BOLD
+            "EqBold",
+            fontSize=9,
+            textColor=colors.black,
+            fontName="Helvetica-Bold",
+            leading=11,
+        )
+        small_style = ParagraphStyle(
+            "EqSmall",
+            fontSize=7.5,
+            textColor=colors.black,
+            fontName="Helvetica",
+            leading=9,
         )
 
-        # ================= FETCH DATA =================
-        eq_result = await db.execute(
-            select(Equipment).where(Equipment.is_deleted == False)
-        )
-        equipments = eq_result.scalars().all() or []
-
-        usages = (await db.execute(select(EquipmentUsage))).scalars().all() or []
-        maint = (await db.execute(select(EquipmentMaintenance))).scalars().all() or []
-        rentals = (await db.execute(select(EquipmentRental))).scalars().all() or []
-        purchases = (await db.execute(select(EquipmentPurchase))).scalars().all() or []
-
-        # ================= SAFE TOTALS =================
-        total_maint_cost = sum(float(m.cost or 0) for m in maint)
-        total_rental_cost = sum(float(r.rental_cost or 0) for r in rentals)
-        total_purchase_cost = sum(float(p.total_amount or 0) for p in purchases)
-        grand_total = total_maint_cost + total_rental_cost + total_purchase_cost
-
-        now_str = datetime.now().strftime("%d %b %Y")
-
-        # ================= HELPERS =================
         def safe_val(obj, attr):
             v = getattr(obj, attr, None)
             if v is None:
                 return "-"
             return str(getattr(v, "value", v)).upper()
 
-        TABLE_HEADER_STYLE = [
-            ("BACKGROUND", (0, 0), (-1, 0), TABLE_HDR),
-            ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_LIGHT),
-            ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
-            ("GRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [ROW_WHITE, ROW_ALT]),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ]
+        # ================= FETCH DATA WITH FILTERS =================
 
-        def make_table(data, col_widths):
-            t = Table(data, colWidths=col_widths, repeatRows=1)
-            t.setStyle(TableStyle(TABLE_HEADER_STYLE))
-            return t
+        equipment_stmt = select(Equipment).where(Equipment.is_deleted == False)
 
-        def render_section(title_text, headers, rows, col_widths, empty_text):
-            story.append(Paragraph(title_text, section_style))
-            if rows:
-                story.append(make_table([headers] + rows, col_widths))
-            else:
-                story.append(Paragraph(empty_text, empty_style))
+        if project_id:
+            equipment_stmt = equipment_stmt.where(Equipment.project_id == project_id)
 
-        # ================= STORY =================
-        story = []
+        if equipment_id:
+            equipment_stmt = equipment_stmt.where(Equipment.id == equipment_id)
 
-        story.append(Paragraph("Equipment Management Report", title_style))
-        story.append(Paragraph(f"Generated on {now_str}", sub_style))
-        story.append(
-            HRFlowable(width="100%", thickness=1, color=BORDER_CLR, spaceAfter=12)
-        )
+        if condition:
+            equipment_stmt = equipment_stmt.where(Equipment.condition == condition)
 
-        # ---------------- Summary ----------------
+        if status:
+            equipment_stmt = equipment_stmt.where(Equipment.status == status)
+
+        equipments = (await db.execute(equipment_stmt)).scalars().all() or []
+
+        usage_stmt = select(EquipmentUsage)
+
+        if equipment_id:
+            usage_stmt = usage_stmt.where(EquipmentUsage.equipment_id == equipment_id)
+
+        if start_date:
+            usage_stmt = usage_stmt.where(EquipmentUsage.usage_date >= start_date)
+
+        if end_date:
+            usage_stmt = usage_stmt.where(EquipmentUsage.usage_date <= end_date)
+
+        usages = (await db.execute(usage_stmt)).scalars().all() or []
+
+        maint_stmt = select(EquipmentMaintenance)
+
+        if equipment_id:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.equipment_id == equipment_id
+            )
+
+        if start_date:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.maintenance_date >= start_date
+            )
+
+        if end_date:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.maintenance_date <= end_date
+            )
+
+        maint = (await db.execute(maint_stmt)).scalars().all() or []
+
+        rental_stmt = select(EquipmentRental)
+
+        if equipment_id:
+            rental_stmt = rental_stmt.where(
+                EquipmentRental.equipment_id == equipment_id
+            )
+
+        if start_date:
+            rental_stmt = rental_stmt.where(EquipmentRental.start_date >= start_date)
+
+        if end_date:
+            rental_stmt = rental_stmt.where(EquipmentRental.end_date <= end_date)
+
+        rentals = (await db.execute(rental_stmt)).scalars().all() or []
+
+        purchase_stmt = select(EquipmentPurchase)
+
+        if equipment_id:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.asset_id == equipment_id
+            )
+
+        if vendor_name:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.vendor_name.ilike(f"%{vendor_name}%")
+            )
+
+        if start_date:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.purchase_date >= start_date
+            )
+
+        if end_date:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.purchase_date <= end_date
+            )
+
+        purchases = (await db.execute(purchase_stmt)).scalars().all() or []
+
+        total_maint_cost = sum(float(m.cost or 0) for m in maint)
+        total_rental_cost = sum(float(r.rental_cost or 0) for r in rentals)
+        total_purchase_cost = sum(float(p.total_amount or 0) for p in purchases)
+        grand_total = total_maint_cost + total_rental_cost + total_purchase_cost
+
         good_count = sum(1 for e in equipments if safe_val(e, "condition") == "GOOD")
         damaged_count = sum(
             1 for e in equipments if safe_val(e, "condition") == "DAMAGED"
         )
 
-        summary_data = [
-            [
-                Paragraph("Total Equipment", info_label),
-                Paragraph("Good", info_label),
-                Paragraph("Damaged", info_label),
-                Paragraph("Maint. Cost", info_label),
-                Paragraph("Rental Cost", info_label),
-                Paragraph("Purchase Cost", info_label),
-                Paragraph("Grand Total", info_label),
-            ],
-            [
-                Paragraph(str(len(equipments)), bold_style),
-                Paragraph(str(good_count), bold_style),
-                Paragraph(str(damaged_count), bold_style),
-                Paragraph(f"Rs. {total_maint_cost:,.0f}", bold_style),
-                Paragraph(f"Rs. {total_rental_cost:,.0f}", bold_style),
-                Paragraph(f"Rs. {total_purchase_cost:,.0f}", bold_style),
-                Paragraph(f"Rs. {grand_total:,.0f}", bold_style),
-            ],
+        elements = []
+
+        # ── 1. HEADER (logo left, title right — same as sample) ──────────
+        logo_path = "static/logo.png"
+        if os.path.exists(logo_path):
+            logo_img = Image(logo_path, width=2 * inch, height=0.75 * inch)
+        else:
+            logo_img = Paragraph("<b>INFRA PILOT</b>", title_style)
+
+        header_data = [
+            [logo_img, Paragraph("<b>EQUIPMENT MANAGEMENT REPORT</b>", title_style)]
         ]
-        sum_table = Table(summary_data, colWidths=[65, 50, 60, 75, 75, 80, 80])
-        sum_table.setStyle(
+        header_table = Table(header_data, colWidths=[2.5 * inch, 5 * inch])
+        header_table.setStyle(
             TableStyle(
                 [
-                    ("BOX", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                    ("INNERGRID", (0, 0), (-1, -1), 0.5, BORDER_CLR),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("TOPPADDING", (0, 0), (-1, -1), 6),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                    ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
                 ]
             )
         )
-        story.append(sum_table)
+        elements.append(header_table)
+        elements.append(Spacer(1, 0.15 * inch))
 
-        # ---------------- Equipment ----------------
+        # ── 2. REPORT INFORMATION ─────────────────────────────────────────
+        ri_data = [
+            [
+                Paragraph("<b>Report Date</b>", bold_style),
+                datetime.now().strftime("%Y-%m-%d"),
+                Paragraph("<b>Report Type</b>", bold_style),
+                "Equipment Management Report",
+            ],
+            [
+                Paragraph("<b>Total Equipment</b>", bold_style),
+                str(len(equipments)),
+                Paragraph("<b>Total Records</b>", bold_style),
+                str(len(usages) + len(maint) + len(rentals) + len(purchases)),
+            ],
+        ]
+        ri_table = Table(
+            ri_data, colWidths=[1.5 * inch, 2.25 * inch, 1.5 * inch, 2.25 * inch]
+        )
+        ri_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), LIGHT_GRAY),
+                    ("BACKGROUND", (2, 0), (2, -1), LIGHT_GRAY),
+                    ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ]
+            )
+        )
+        elements.append(Paragraph("1. REPORT INFORMATION", heading2_style))
+        elements.append(ri_table)
+        elements.append(Spacer(1, 0.2 * inch))
+
+        # ── 3. FLEET SUMMARY (boxed banner) ────────────────────────────────
+        elements.append(Paragraph("2. FLEET SUMMARY", heading2_style))
+        summary_box_data = [
+            [
+                Paragraph(
+                    f"<b>Total Equipment:</b> {len(equipments)} | "
+                    f"<b>Good Condition:</b> {good_count} | "
+                    f"<b>Damaged:</b> {damaged_count}",
+                    bold_style,
+                )
+            ],
+            [
+                Paragraph(
+                    f"<b>Cost Summary:</b> Maintenance Rs. {total_maint_cost:,.2f} | "
+                    f"Rental Rs. {total_rental_cost:,.2f} | "
+                    f"Purchase Rs. {total_purchase_cost:,.2f}",
+                    normal_style,
+                )
+            ],
+            [
+                Paragraph(
+                    f"<b>Grand Total:</b> Rs. {grand_total:,.2f}",
+                    normal_style,
+                )
+            ],
+        ]
+        summary_box = Table(summary_box_data, colWidths=[7.25 * inch])
+        summary_box.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), LIGHT_GRAY),
+                    ("BOX", (0, 0), (-1, -1), 1, NAVY_BLUE),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+        elements.append(summary_box)
+        elements.append(Spacer(1, 0.2 * inch))
+
+        # ================= SHARED TABLE STYLE (navy header) =================
+        def make_table(data, col_widths):
+            t = Table(data, colWidths=col_widths, repeatRows=1)
+            t.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), NAVY_BLUE),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                        (
+                            "ROWBACKGROUNDS",
+                            (0, 1),
+                            (-1, -1),
+                            [colors.white, LIGHT_GRAY],
+                        ),
+                        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ]
+                )
+            )
+            return t
+
+        def render_section(
+            section_no, title_text, headers, rows, col_widths, empty_text
+        ):
+            elements.append(Paragraph(f"{section_no}. {title_text}", heading2_style))
+            if rows:
+                header_row = [Paragraph(f"<b>{h}</b>", small_style) for h in headers]
+                data_rows = [
+                    [Paragraph(str(v), small_style) for v in row] for row in rows
+                ]
+                elements.append(make_table([header_row] + data_rows, col_widths))
+            else:
+                elements.append(Paragraph(empty_text, normal_style))
+            elements.append(Spacer(1, 0.2 * inch))
+
+        # ---------------- 3. Equipment ----------------
         eq_headers = [
             "#",
             "Code",
@@ -5289,89 +5427,100 @@ async def equipment_full_pdf_report(
         for i, e in enumerate(equipments, 1):
             eq_rows.append(
                 [
-                    str(i),
-                    str(e.equipment_code or "-"),
-                    str(e.equipment_name or "-"),
-                    str(e.operator_name or "-"),
+                    i,
+                    e.equipment_code or "-",
+                    e.equipment_name or "-",
+                    e.operator_name or "-",
                     safe_val(e, "condition"),
                     safe_val(e, "status"),
                     f"{float(e.working_hours or 0):,.1f}",
                     f"{float(e.fuel_used or 0):,.1f}",
-                    f"{float(e.rental_cost or 0):,.2f}",
+                    f"Rs. {float(e.rental_cost or 0):,.2f}",
                 ]
             )
         render_section(
-            "Equipment",
+            "3",
+            "EQUIPMENT DETAILS",
             eq_headers,
             eq_rows,
-            [20, 55, 95, 75, 60, 65, 45, 45, 65],
+            [
+                0.25 * inch,
+                0.7 * inch,
+                1.15 * inch,
+                0.9 * inch,
+                0.7 * inch,
+                0.75 * inch,
+                0.55 * inch,
+                0.55 * inch,
+                0.7 * inch,
+            ],
             "No equipment found.",
         )
 
-        # ---------------- Usage ----------------
+        # ---------------- 4. Usage ----------------
         u_headers = ["Equip ID", "Hours", "Fuel", "Date", "Notes"]
-        u_rows = []
-        for u in usages:
-            u_rows.append(
-                [
-                    str(u.equipment_id or "-"),
-                    f"{float(u.working_hours or 0):,.1f}",
-                    f"{float(u.fuel_used or 0):,.1f}",
-                    str(u.usage_date or "-"),
-                    str(u.notes or "-"),
-                ]
-            )
+        u_rows = [
+            [
+                u.equipment_id or "-",
+                f"{float(u.working_hours or 0):,.1f}",
+                f"{float(u.fuel_used or 0):,.1f}",
+                str(u.usage_date or "-"),
+                u.notes or "-",
+            ]
+            for u in usages
+        ]
         render_section(
-            "Usage Records",
+            "4",
+            "USAGE RECORDS",
             u_headers,
             u_rows,
-            [55, 55, 55, 80, 280],
+            [0.7 * inch, 0.7 * inch, 0.7 * inch, 1.0 * inch, 3.4 * inch],
             "No usage records found.",
         )
 
-        # ---------------- Maintenance ----------------
+        # ---------------- 5. Maintenance ----------------
         m_headers = ["Equip ID", "Description", "Date", "Cost", "Next Due"]
-        m_rows = []
-        for m in maint:
-            m_rows.append(
-                [
-                    str(m.equipment_id or "-"),
-                    str(m.description or "-"),
-                    str(m.maintenance_date or "-"),
-                    f"{float(m.cost or 0):,.2f}",
-                    str(m.next_maintenance_date or "-"),
-                ]
-            )
+        m_rows = [
+            [
+                m.equipment_id or "-",
+                m.description or "-",
+                str(m.maintenance_date or "-"),
+                f"Rs. {float(m.cost or 0):,.2f}",
+                str(m.next_maintenance_date or "-"),
+            ]
+            for m in maint
+        ]
         render_section(
-            "Maintenance Records",
+            "5",
+            "MAINTENANCE RECORDS",
             m_headers,
             m_rows,
-            [55, 195, 80, 70, 80],
+            [0.7 * inch, 2.55 * inch, 1.0 * inch, 0.95 * inch, 1.0 * inch],
             "No maintenance records found.",
         )
 
-        # ---------------- Rentals ----------------
+        # ---------------- 6. Rentals ----------------
         r_headers = ["Equip ID", "Client", "Start", "End", "Cost"]
-        r_rows = []
-        for r in rentals:
-            r_rows.append(
-                [
-                    str(r.equipment_id or "-"),
-                    str(r.client_name or "-"),
-                    str(r.start_date or "-"),
-                    str(r.end_date or "-"),
-                    f"{float(r.rental_cost or 0):,.2f}",
-                ]
-            )
+        r_rows = [
+            [
+                r.equipment_id or "-",
+                r.client_name or "-",
+                str(r.start_date or "-"),
+                str(r.end_date or "-"),
+                f"Rs. {float(r.rental_cost or 0):,.2f}",
+            ]
+            for r in rentals
+        ]
         render_section(
-            "Rental Records",
+            "6",
+            "RENTAL RECORDS",
             r_headers,
             r_rows,
-            [55, 180, 80, 80, 85],
+            [0.7 * inch, 2.35 * inch, 1.0 * inch, 1.0 * inch, 1.15 * inch],
             "No rental records found.",
         )
 
-        # ---------------- Purchases ----------------
+        # ---------------- 7. Purchases ----------------
         p_headers = [
             "Asset ID",
             "Type",
@@ -5382,39 +5531,89 @@ async def equipment_full_pdf_report(
             "Total",
             "Date",
         ]
-        p_rows = []
-        for p in purchases:
-            p_rows.append(
-                [
-                    str(p.asset_id or "-"),
-                    str(p.purchase_type or "-"),
-                    str(p.vendor_name or "-"),
-                    str(p.invoice_number or "-"),
-                    str(p.quantity or 0),
-                    f"{float(p.unit_price or 0):,.2f}",
-                    f"{float(p.total_amount or 0):,.2f}",
-                    str(p.purchase_date or "-"),
-                ]
-            )
+        p_rows = [
+            [
+                p.asset_id or "-",
+                safe_val(p, "purchase_type"),
+                p.vendor_name or "-",
+                p.invoice_number or "-",
+                p.quantity or 0,
+                f"Rs. {float(p.unit_price or 0):,.2f}",
+                f"Rs. {float(p.total_amount or 0):,.2f}",
+                str(p.purchase_date or "-"),
+            ]
+            for p in purchases
+        ]
         render_section(
-            "Purchase Records",
+            "7",
+            "PURCHASE RECORDS",
             p_headers,
             p_rows,
-            [50, 55, 100, 75, 35, 65, 65, 70],
+            [
+                0.65 * inch,
+                0.7 * inch,
+                1.2 * inch,
+                0.9 * inch,
+                0.45 * inch,
+                0.85 * inch,
+                0.85 * inch,
+                0.9 * inch,
+            ],
             "No purchase records found.",
         )
 
-        # ================= SIMPLE FOOTER (page number only) =================
-        def draw_footer(canvas, doc):
+        # ── 8. COST SUMMARY ────────────────────────────────────────────────
+        elements.append(Paragraph("8. COST SUMMARY", heading2_style))
+        cost_data = [
+            [
+                Paragraph("<b>Total Maintenance Cost</b>", bold_style),
+                f"Rs. {total_maint_cost:,.2f}",
+            ],
+            [
+                Paragraph("<b>Total Rental Cost</b>", bold_style),
+                f"Rs. {total_rental_cost:,.2f}",
+            ],
+            [
+                Paragraph("<b>Total Purchase Cost</b>", bold_style),
+                f"Rs. {total_purchase_cost:,.2f}",
+            ],
+            [Paragraph("<b>Grand Total</b>", bold_style), f"Rs. {grand_total:,.2f}"],
+        ]
+        cost_table = Table(cost_data, colWidths=[3.6 * inch, 3.6 * inch])
+        cost_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), LIGHT_GRAY),
+                    ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ]
+            )
+        )
+        elements.append(cost_table)
+
+        # ── FOOTER (signature lines — identical to sample) ───────────────
+        def add_footer(canvas, doc_):
             canvas.saveState()
-            w, h = letter
-            canvas.setFont(FONT, 8)
-            canvas.setFillColor(colors.grey)
-            canvas.drawCentredString(w / 2, 20, f"Page {doc.page}")
+            canvas.setFont("Helvetica", 8)
+            canvas.setStrokeColor(NAVY_BLUE)
+            canvas.setLineWidth(1)
+            canvas.line(cm, 1.5 * cm, A4[0] - cm, 1.5 * cm)
+
+            canvas.drawString(cm, 1.2 * cm, "Prepared By: ______________")
+            canvas.drawString(
+                A4[0] / 2 - 1.5 * cm, 1.2 * cm, "Reviewed By: ______________"
+            )
+            canvas.drawString(A4[0] - 5 * cm, 1.2 * cm, "Approved By: ______________")
+
+            canvas.drawString(
+                cm, 0.8 * cm, "Generated by InfraPilot Construction Management System"
+            )
+            canvas.drawRightString(A4[0] - cm, 0.8 * cm, f"Page {doc_.page}")
             canvas.restoreState()
 
-        # ================= BUILD PDF =================
-        doc.build(story, onFirstPage=draw_footer, onLaterPages=draw_footer)
+        doc.build(elements, onFirstPage=add_footer, onLaterPages=add_footer)
 
         buffer.seek(0)
         filename = f"equipment_report_{datetime.now().strftime('%Y%m%d')}.pdf"
@@ -5437,14 +5636,16 @@ async def equipment_full_pdf_report(
 
 @router.get("/reports/excel")
 async def equipment_excel_report(
+    project_id: Optional[int] = Query(None),
+    equipment_id: Optional[int] = Query(None),
+    condition: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    vendor_name: Optional[str] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
 ):
-    """
-    NOTE: Make sure these are imported at the top of this router file
-    (alongside Equipment, EquipmentMaintenance, EquipmentRental):
-        from app.models.equipment import EquipmentUsage, EquipmentPurchase, EquipmentAuditLog
-    """
     try:
         import io
         from datetime import datetime
@@ -5456,61 +5657,159 @@ async def equipment_excel_report(
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
 
-        # ================= FETCH DATA =================
-        stmt = select(Equipment).where(Equipment.is_deleted == False)
-        equipments = (await db.execute(stmt)).scalars().all() or []
+        # ================= COLOR PALETTE (matches INFRA PILOT sample) =====
+        NAVY_HEX = "0B2B5C"
+        LIGHT_GRAY_HEX = "F8F9FA"
+        BORDER_GRAY_HEX = "E2E8F0"
 
-        usages = (await db.execute(select(EquipmentUsage))).scalars().all() or []
-        maint = (await db.execute(select(EquipmentMaintenance))).scalars().all() or []
-        rentals = (await db.execute(select(EquipmentRental))).scalars().all() or []
-        purchases = (await db.execute(select(EquipmentPurchase))).scalars().all() or []
+        # ================= FETCH DATA WITH FILTERS =================
 
-        # ================= SAFE TOTALS =================
+        equipment_stmt = select(Equipment).where(Equipment.is_deleted == False)
+
+        if project_id:
+            equipment_stmt = equipment_stmt.where(Equipment.project_id == project_id)
+
+        if equipment_id:
+            equipment_stmt = equipment_stmt.where(Equipment.id == equipment_id)
+
+        if condition:
+            equipment_stmt = equipment_stmt.where(Equipment.condition == condition)
+
+        if status:
+            equipment_stmt = equipment_stmt.where(Equipment.status == status)
+
+        equipments = (await db.execute(equipment_stmt)).scalars().all() or []
+
+        usage_stmt = select(EquipmentUsage)
+
+        if equipment_id:
+            usage_stmt = usage_stmt.where(EquipmentUsage.equipment_id == equipment_id)
+
+        if start_date:
+            usage_stmt = usage_stmt.where(EquipmentUsage.usage_date >= start_date)
+
+        if end_date:
+            usage_stmt = usage_stmt.where(EquipmentUsage.usage_date <= end_date)
+
+        usages = (await db.execute(usage_stmt)).scalars().all() or []
+
+        maint_stmt = select(EquipmentMaintenance)
+
+        if equipment_id:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.equipment_id == equipment_id
+            )
+
+        if start_date:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.maintenance_date >= start_date
+            )
+
+        if end_date:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.maintenance_date <= end_date
+            )
+
+        maint = (await db.execute(maint_stmt)).scalars().all() or []
+
+        rental_stmt = select(EquipmentRental)
+
+        if equipment_id:
+            rental_stmt = rental_stmt.where(
+                EquipmentRental.equipment_id == equipment_id
+            )
+
+        if start_date:
+            rental_stmt = rental_stmt.where(EquipmentRental.start_date >= start_date)
+
+        if end_date:
+            rental_stmt = rental_stmt.where(EquipmentRental.end_date <= end_date)
+
+        rentals = (await db.execute(rental_stmt)).scalars().all() or []
+
+        purchase_stmt = select(EquipmentPurchase)
+
+        if equipment_id:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.asset_id == equipment_id
+            )
+
+        if vendor_name:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.vendor_name.ilike(f"%{vendor_name}%")
+            )
+
+        if start_date:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.purchase_date >= start_date
+            )
+
+        if end_date:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.purchase_date <= end_date
+            )
+
+        purchases = (await db.execute(purchase_stmt)).scalars().all() or []
+
         total_maint_cost = sum(float(m.cost or 0) for m in maint)
         total_rental_cost = sum(float(r.rental_cost or 0) for r in rentals)
         total_purchase_cost = sum(float(p.total_amount or 0) for p in purchases)
+        grand_total = total_maint_cost + total_rental_cost + total_purchase_cost
 
         now_str = datetime.now().strftime("%d %b %Y %I:%M %p")
         CURRENCY_FMT = '"Rs." #,##0.00'
 
-        # ================= SIMPLE, CONSISTENT STYLES =================
+        # ================= NAVY-THEMED STYLES (matches PDF) ================
         HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        HEADER_FILL = PatternFill("solid", fgColor="305496")
-        TITLE_FONT = Font(name="Arial", bold=True, size=14)
-        LABEL_FONT = Font(name="Arial", bold=True, size=10)
+        HEADER_FILL = PatternFill("solid", fgColor=NAVY_HEX)
+        TITLE_FONT = Font(name="Arial", bold=True, size=14, color=NAVY_HEX)
+        SUBTITLE_FONT = Font(name="Arial", italic=True, size=9, color="6B7280")
+        LABEL_FONT = Font(name="Arial", bold=True, size=10, color=NAVY_HEX)
         CELL_FONT = Font(name="Arial", size=10)
-        THIN = Side(style="thin", color="D9D9D9")
+        THIN = Side(style="thin", color=BORDER_GRAY_HEX)
         BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
         CENTER = Alignment(horizontal="center", vertical="center")
+        ACCENT_FILL = PatternFill("solid", fgColor=LIGHT_GRAY_HEX)
 
         def safe_val(obj, attr):
-            """Returns enum.value if it's an enum, else the raw value, else '-'."""
             v = getattr(obj, attr, None)
             if v is None:
                 return "-"
             return getattr(v, "value", v)
 
-        def write_table(ws, headers, rows, currency_cols=None):
-            """Writes one header row + data rows with simple, uniform styling."""
+        def write_table(ws, headers, rows, currency_cols=None, title=None):
+            """Writes an optional title row, then header row + zebra data rows,
+            navy-themed to match the PDF / sample design."""
             currency_cols = currency_cols or []
+            start_row = 1
+
+            if title:
+                ws.merge_cells(
+                    start_row=1, start_column=1, end_row=1, end_column=len(headers)
+                )
+                ws.cell(row=1, column=1, value=title).font = TITLE_FONT
+                ws.cell(row=1, column=1).alignment = Alignment(horizontal="left")
+                start_row = 3
 
             for col, header in enumerate(headers, 1):
-                cell = ws.cell(row=1, column=col, value=header)
+                cell = ws.cell(row=start_row, column=col, value=header)
                 cell.font = HEADER_FONT
                 cell.fill = HEADER_FILL
                 cell.alignment = CENTER
                 cell.border = BORDER
 
-            for r, row_values in enumerate(rows, 2):
+            for r, row_values in enumerate(rows, start_row + 1):
+                fill = ACCENT_FILL if (r - start_row) % 2 == 0 else None
                 for col, val in enumerate(row_values, 1):
                     cell = ws.cell(row=r, column=col, value=val)
                     cell.font = CELL_FONT
                     cell.alignment = CENTER
                     cell.border = BORDER
+                    if fill:
+                        cell.fill = fill
                     if col in currency_cols:
                         cell.number_format = CURRENCY_FMT
 
-            # simple autosize based on header + content length
             for col, header in enumerate(headers, 1):
                 max_len = len(str(header))
                 for row_values in rows:
@@ -5520,11 +5819,68 @@ async def equipment_excel_report(
                     max(max_len + 4, 12), 40
                 )
 
-            ws.freeze_panes = "A2"
+            ws.freeze_panes = f"A{start_row + 1}"
 
         # ================= WORKBOOK =================
         wb = Workbook()
-        wb.remove(wb.active)  # we'll add named sheets explicitly
+        wb.remove(wb.active)
+
+        # ---------------- Summary (first sheet) ----------------
+        good_count = sum(1 for e in equipments if safe_val(e, "condition") == "GOOD")
+        damaged_count = sum(
+            1 for e in equipments if safe_val(e, "condition") == "DAMAGED"
+        )
+
+        ws_summary = wb.create_sheet("Summary", 0)
+        ws_summary.merge_cells("A1:B1")
+        ws_summary["A1"] = "EQUIPMENT MANAGEMENT REPORT"
+        ws_summary["A1"].font = TITLE_FONT
+        ws_summary.merge_cells("A2:B2")
+        ws_summary["A2"] = f"Generated: {now_str}"
+        ws_summary["A2"].font = SUBTITLE_FONT
+
+        summary_rows = [
+            ("Total Equipment", len(equipments)),
+            ("Good Condition", good_count),
+            ("Damaged", damaged_count),
+            ("Usage Records", len(usages)),
+            ("Maintenance Records", len(maint)),
+            ("Rental Records", len(rentals)),
+            ("Purchase Records", len(purchases)),
+            ("Total Maintenance Cost", total_maint_cost),
+            ("Total Rental Cost", total_rental_cost),
+            ("Total Purchase Cost", total_purchase_cost),
+            ("Grand Total (Maint + Rental + Purchase)", grand_total),
+        ]
+
+        row_num = 4
+        for label, value in summary_rows:
+            label_cell = ws_summary.cell(row=row_num, column=1, value=label)
+            label_cell.font = LABEL_FONT
+            label_cell.fill = ACCENT_FILL
+            value_cell = ws_summary.cell(row=row_num, column=2, value=value)
+            value_cell.font = CELL_FONT
+            if "Cost" in label or "Total" in label:
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    value_cell.number_format = CURRENCY_FMT
+            row_num += 1
+
+        ws_summary.column_dimensions["A"].width = 38
+        ws_summary.column_dimensions["B"].width = 20
+
+        # Footer signature block on Summary sheet
+        row_num += 2
+        ws_summary.cell(
+            row=row_num, column=1, value="Prepared By: ______________"
+        ).font = CELL_FONT
+        row_num += 1
+        ws_summary.cell(
+            row=row_num, column=1, value="Reviewed By: ______________"
+        ).font = CELL_FONT
+        row_num += 1
+        ws_summary.cell(
+            row=row_num, column=1, value="Approved By: ______________"
+        ).font = CELL_FONT
 
         # ---------------- Equipment ----------------
         ws = wb.create_sheet("Equipment")
@@ -5557,7 +5913,7 @@ async def equipment_excel_report(
             ]
             for e in equipments
         ]
-        write_table(ws, headers, rows, currency_cols=[10])
+        write_table(ws, headers, rows, currency_cols=[10], title="Equipment")
 
         # ---------------- Usage ----------------
         ws = wb.create_sheet("Usage")
@@ -5572,7 +5928,7 @@ async def equipment_excel_report(
             ]
             for u in usages
         ]
-        write_table(ws, headers, rows)
+        write_table(ws, headers, rows, title="Usage Records")
 
         # ---------------- Maintenance ----------------
         ws = wb.create_sheet("Maintenance")
@@ -5587,7 +5943,7 @@ async def equipment_excel_report(
             ]
             for m in maint
         ]
-        write_table(ws, headers, rows, currency_cols=[4])
+        write_table(ws, headers, rows, currency_cols=[4], title="Maintenance Records")
 
         # ---------------- Rentals ----------------
         ws = wb.create_sheet("Rentals")
@@ -5603,7 +5959,7 @@ async def equipment_excel_report(
             ]
             for r in rentals
         ]
-        write_table(ws, headers, rows, currency_cols=[5])
+        write_table(ws, headers, rows, currency_cols=[5], title="Rental Records")
 
         # ---------------- Purchases ----------------
         ws = wb.create_sheet("Purchases")
@@ -5621,7 +5977,7 @@ async def equipment_excel_report(
         rows = [
             [
                 p.asset_id,
-                p.purchase_type or "-",
+                safe_val(p, "purchase_type"),
                 p.vendor_name or "-",
                 p.invoice_number or "-",
                 p.quantity or 0,
@@ -5632,48 +5988,7 @@ async def equipment_excel_report(
             ]
             for p in purchases
         ]
-        write_table(ws, headers, rows, currency_cols=[6, 7])
-
-        # ---------------- Summary (placed first) ----------------
-        good_count = sum(1 for e in equipments if safe_val(e, "condition") == "GOOD")
-        damaged_count = sum(
-            1 for e in equipments if safe_val(e, "condition") == "DAMAGED"
-        )
-
-        ws_summary = wb.create_sheet("Summary", 0)
-        ws_summary["A1"] = "Equipment Management Report"
-        ws_summary["A1"].font = TITLE_FONT
-        ws_summary["A2"] = f"Generated: {now_str}"
-        ws_summary["A2"].font = Font(name="Arial", italic=True, size=9, color="666666")
-
-        summary_rows = [
-            ("Total Equipment", len(equipments)),
-            ("Good Condition", good_count),
-            ("Damaged", damaged_count),
-            ("Usage Records", len(usages)),
-            ("Maintenance Records", len(maint)),
-            ("Rental Records", len(rentals)),
-            ("Purchase Records", len(purchases)),
-            ("Total Maintenance Cost", total_maint_cost),
-            ("Total Rental Cost", total_rental_cost),
-            ("Total Purchase Cost", total_purchase_cost),
-            (
-                "Grand Total (Maint + Rental + Purchase)",
-                total_maint_cost + total_rental_cost + total_purchase_cost,
-            ),
-        ]
-
-        row_num = 4
-        for label, value in summary_rows:
-            ws_summary.cell(row=row_num, column=1, value=label).font = LABEL_FONT
-            cell = ws_summary.cell(row=row_num, column=2, value=value)
-            cell.font = CELL_FONT
-            if "Cost" in label or "Total" in label and isinstance(value, float):
-                cell.number_format = CURRENCY_FMT
-            row_num += 1
-
-        ws_summary.column_dimensions["A"].width = 36
-        ws_summary.column_dimensions["B"].width = 18
+        write_table(ws, headers, rows, currency_cols=[6, 7], title="Purchase Records")
 
         # ================= SAVE FILE =================
         output = io.BytesIO()
