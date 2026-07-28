@@ -1971,6 +1971,14 @@ async def client_dashboard(
             f"{milestones_pending} pending milestones."
         )
 
+        spent_percent = (
+            round((expense_val / budget_val) * 100, 2) if budget_val else 0.0
+        )
+
+        remaining_percent = (
+            round((remaining_budget / budget_val) * 100, 2) if budget_val else 0.0
+        )
+
         # ========================
         # RESPONSE
         # ========================
@@ -1996,6 +2004,8 @@ async def client_dashboard(
                 budget=budget_val,
                 spent=expense_val,
                 remaining=remaining_budget_rounded,
+                spent_percent=spent_percent,
+                remaining_percent=remaining_percent,
                 variance_percent=budget_variance_percent,
             ),
             timeline=ClientTimelineInfo(
@@ -2576,7 +2586,7 @@ async def ml_forecast(
 
 
 @router.get("/engineer/{project_id}", response_model=EnhancedDashboardOut)
-@router.get("/engineer/details", response_model=EnhancedDashboardOut)
+# @router.get("/engineer/details", response_model=EnhancedDashboardOut)
 async def site_engineer_dashboard(
     current_user: User = Depends(d.require_roles([UserRole.SITE_ENGINEER.value])),
     db: AsyncSession = Depends(get_db_session),

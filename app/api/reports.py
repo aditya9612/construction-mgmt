@@ -1,25 +1,470 @@
-from collections import defaultdict
+# ======================================================================
+# SECTION 1: REPORT THEME (PdfReportBuilder / ExcelReportBuilder)
+# ======================================================================
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
-from sqlalchemy import select, func, case
-from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import date, datetime, timedelta
-import io
-from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
-from typing import Optional
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-from openpyxl import Workbook
-from app.models.contractor import Contractor
 from app.models.final_measurement import FinalMeasurement
-from app.models.invoice import Invoice, Transaction
-from app.models.master_data import LabourType
-from app.models.user import UserAttendance
-from app.models.material import Material
-from app.utils.common import assert_project_access
-from app.utils.email import send_email
-from app.core.dependencies import get_current_active_user, require_roles
+import os
+from datetime import datetime
+from typing import Optional, Sequence
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import inch, cm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    Spacer,
+    Image,
+)
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+
+# ─────────────────────────── COLOR PALETTE ──────────────────────────────────
+NAVY_BLUE = colors.HexColor("#0B2B5C")
+LIGHT_GRAY = colors.HexColor("#F8F9FA")
+BORDER_GRAY = colors.HexColor("#E2E8F0")
+GREEN = colors.HexColor("#27AE60")
+RED = colors.HexColor("#E74C3C")
+ORANGE = colors.HexColor("#F39C12")
+
+NAVY_HEX = "0B2B5C"
+LIGHT_GRAY_HEX = "F8F9FA"
+BORDER_GRAY_HEX = "E2E8F0"
+GREEN_HEX = "27AE60"
+RED_HEX = "E74C3C"
+ORANGE_HEX = "F39C12"
+
+LOGO_PATH = "static/logo.png"
+
+
+# ═══════════════════════════ PDF HELPERS ═════════════════════════════════════
+class PdfReportBuilder:
+    """
+    Usage:
+        b = PdfReportBuilder("EQUIPMENT MANAGEMENT REPORT", landscape_mode=True)
+        b.add_info_table([
+            ("Report Date", "2026-07-28", "Report Type", "Audit Summary"),
+        ])
+        b.add_summary_box("2. SUMMARY", [
+            "<b>Total Logs:</b> 128 | <b>Period:</b> 2026-07-01 to 2026-07-28",
+        ])
+        b.add_section_table("3. LOG DETAILS", headers, rows, col_widths)
+        pdf_bytes_io = b.build()  # BytesIO, ready for StreamingResponse
+    """
+
+    def __init__(
+        self, title: str, landscape_mode: bool = False, subtitle: Optional[str] = None
+    ):
+        import io
+
+        self.stream = io.BytesIO()
+        pagesize = landscape(A4) if landscape_mode else A4
+        self.doc = SimpleDocTemplate(
+            self.stream,
+            pagesize=pagesize,
+            rightMargin=cm,
+            leftMargin=cm,
+            topMargin=cm,
+            bottomMargin=cm,
+        )
+        self.page_width = pagesize[0]
+        self.usable_width = self.page_width - 2 * cm
+        self._section_no = 0
+        self.elements = []
+
+        styles = getSampleStyleSheet()
+        self.title_style = ParagraphStyle(
+            "RptTitle",
+            parent=styles["Heading1"],
+            fontSize=18,
+            textColor=NAVY_BLUE,
+            alignment=0,
+            spaceAfter=15,
+            fontName="Helvetica-Bold",
+        )
+        self.heading2_style = ParagraphStyle(
+            "RptH2",
+            parent=styles["Heading2"],
+            fontSize=12,
+            textColor=NAVY_BLUE,
+            spaceBefore=6,
+            spaceAfter=10,
+            fontName="Helvetica-Bold",
+        )
+        self.normal_style = ParagraphStyle(
+            "RptNormal",
+            fontSize=9,
+            textColor=colors.black,
+            fontName="Helvetica",
+            leading=11,
+        )
+        self.bold_style = ParagraphStyle(
+            "RptBold",
+            fontSize=9,
+            textColor=colors.black,
+            fontName="Helvetica-Bold",
+            leading=11,
+        )
+        self.small_style = ParagraphStyle(
+            "RptSmall",
+            fontSize=7.5,
+            textColor=colors.black,
+            fontName="Helvetica",
+            leading=9,
+        )
+
+        self._add_header(title, subtitle)
+
+    # ---------------------------------------------------------------
+    def _add_header(self, title: str, subtitle: Optional[str]):
+        if os.path.exists(LOGO_PATH):
+            logo_img = Image(LOGO_PATH, width=2 * inch, height=0.75 * inch)
+        else:
+            logo_img = Paragraph("<b>INFRA PILOT</b>", self.title_style)
+
+        title_para = Paragraph(f"<b>{title}</b>", self.title_style)
+        header_data = [[logo_img, title_para]]
+        header_table = Table(
+            header_data, colWidths=[2.5 * inch, self.usable_width - 2.5 * inch]
+        )
+        header_table.setStyle(
+            TableStyle(
+                [
+                    ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                    ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+                ]
+            )
+        )
+        self.elements.append(header_table)
+        if subtitle:
+            self.elements.append(Paragraph(subtitle, self.normal_style))
+        self.elements.append(Spacer(1, 0.15 * inch))
+
+    def _next_no(self) -> int:
+        self._section_no += 1
+        return self._section_no
+
+    # ---------------------------------------------------------------
+    def add_info_table(
+        self, rows: Sequence[tuple], heading: str = "REPORT INFORMATION"
+    ):
+        """rows: list of 4-tuples (label, value, label, value)."""
+        no = self._next_no()
+        data = []
+        for label1, value1, label2, value2 in rows:
+            data.append(
+                [
+                    Paragraph(f"<b>{label1}</b>", self.bold_style),
+                    str(value1),
+                    Paragraph(f"<b>{label2}</b>", self.bold_style),
+                    str(value2),
+                ]
+            )
+        col_w = self.usable_width / 6
+        table = Table(data, colWidths=[col_w, 2 * col_w, col_w, 2 * col_w])
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), LIGHT_GRAY),
+                    ("BACKGROUND", (2, 0), (2, -1), LIGHT_GRAY),
+                    ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ]
+            )
+        )
+        self.elements.append(Paragraph(f"{no}. {heading}", self.heading2_style))
+        self.elements.append(table)
+        self.elements.append(Spacer(1, 0.2 * inch))
+        return self
+
+    def add_summary_box(self, heading: str, lines: Sequence[str]):
+        """lines: list of HTML strings (already containing <b> tags as needed)."""
+        no = self._next_no()
+        data = [
+            [Paragraph(line, self.bold_style if i == 0 else self.normal_style)]
+            for i, line in enumerate(lines)
+        ]
+        box = Table(data, colWidths=[self.usable_width])
+        box.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), LIGHT_GRAY),
+                    ("BOX", (0, 0), (-1, -1), 1, NAVY_BLUE),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+        self.elements.append(Paragraph(f"{no}. {heading}", self.heading2_style))
+        self.elements.append(box)
+        self.elements.append(Spacer(1, 0.2 * inch))
+        return self
+
+    def add_section_table(
+        self,
+        heading: str,
+        headers: Sequence[str],
+        rows: Sequence[Sequence],
+        col_widths: Optional[Sequence[float]] = None,
+        empty_text: str = "No records found.",
+        total_row: Optional[Sequence] = None,
+    ):
+        no = self._next_no()
+        self.elements.append(Paragraph(f"{no}. {heading}", self.heading2_style))
+        if not rows:
+            self.elements.append(Paragraph(empty_text, self.normal_style))
+            self.elements.append(Spacer(1, 0.2 * inch))
+            return self
+
+        if col_widths is None:
+            col_widths = [self.usable_width / len(headers)] * len(headers)
+
+        header_row = [Paragraph(f"<b>{h}</b>", self.small_style) for h in headers]
+        data_rows = [[Paragraph(str(v), self.small_style) for v in row] for row in rows]
+        table_data = [header_row] + data_rows
+
+        style_cmds = [
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY_BLUE),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+            (
+                "ROWBACKGROUNDS",
+                (0, 1),
+                (-1, len(data_rows)),
+                [colors.white, LIGHT_GRAY],
+            ),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]
+
+        if total_row is not None:
+            total_row_p = [
+                Paragraph(f"<b>{v}</b>", self.small_style) for v in total_row
+            ]
+            table_data.append(total_row_p)
+            total_idx = len(table_data) - 1
+            style_cmds.append(
+                ("BACKGROUND", (0, total_idx), (-1, total_idx), LIGHT_GRAY)
+            )
+            style_cmds.append(
+                ("LINEABOVE", (0, total_idx), (-1, total_idx), 1, NAVY_BLUE)
+            )
+
+        table = Table(table_data, colWidths=col_widths, repeatRows=1)
+        table.setStyle(TableStyle(style_cmds))
+        self.elements.append(table)
+        self.elements.append(Spacer(1, 0.2 * inch))
+        return self
+
+    def add_paragraph(self, text: str, bold: bool = False):
+        self.elements.append(
+            Paragraph(text, self.bold_style if bold else self.normal_style)
+        )
+        return self
+
+    def add_spacer(self, height: float = 0.15):
+        self.elements.append(Spacer(1, height * inch))
+        return self
+
+    # ---------------------------------------------------------------
+    def build(
+        self,
+        footer_note: str = "Generated by InfraPilot Construction Management System",
+    ):
+        page_w = self.page_width
+
+        def add_footer(canvas, doc_):
+            canvas.saveState()
+            canvas.setFont("Helvetica", 8)
+            canvas.setStrokeColor(NAVY_BLUE)
+            canvas.setLineWidth(1)
+            canvas.line(cm, 1.5 * cm, page_w - cm, 1.5 * cm)
+
+            canvas.drawString(cm, 1.2 * cm, "Prepared By: ______________")
+            canvas.drawString(
+                page_w / 2 - 1.5 * cm, 1.2 * cm, "Reviewed By: ______________"
+            )
+            canvas.drawString(page_w - 5 * cm, 1.2 * cm, "Approved By: ______________")
+
+            canvas.drawString(cm, 0.8 * cm, footer_note)
+            canvas.drawRightString(page_w - cm, 0.8 * cm, f"Page {doc_.page}")
+            canvas.restoreState()
+
+        self.doc.build(self.elements, onFirstPage=add_footer, onLaterPages=add_footer)
+        self.stream.seek(0)
+        return self.stream
+
+
+# ═══════════════════════════ EXCEL HELPERS ═══════════════════════════════════
+class ExcelReportBuilder:
+    """
+    Usage:
+        b = ExcelReportBuilder("Audit Summary Report", project_line="All Projects")
+        b.add_summary_sheet([("Total Logs", 128), ("Period", "Jul 2026")])
+        b.add_data_sheet("Logs", headers, rows, currency_cols=[5])
+        xlsx_bytes_io = b.build()
+    """
+
+    def __init__(self, title: str, project_line: Optional[str] = None):
+        self.title = title
+        self.project_line = project_line
+        self.wb = Workbook()
+        self.wb.remove(self.wb.active)
+
+        self.header_font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        self.header_fill = PatternFill("solid", fgColor=NAVY_HEX)
+        self.title_font = Font(name="Arial", bold=True, size=14, color=NAVY_HEX)
+        self.subtitle_font = Font(name="Arial", italic=True, size=9, color="6B7280")
+        self.label_font = Font(name="Arial", bold=True, size=10, color=NAVY_HEX)
+        self.cell_font = Font(name="Arial", size=10)
+        thin = Side(style="thin", color=BORDER_GRAY_HEX)
+        self.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        self.center = Alignment(horizontal="center", vertical="center")
+        self.accent_fill = PatternFill("solid", fgColor=LIGHT_GRAY_HEX)
+        self.currency_fmt = '"Rs." #,##0.00'
+
+        self._summary_rows = []
+
+    def add_summary_row(self, label: str, value, is_currency: bool = False):
+        self._summary_rows.append((label, value, is_currency))
+        return self
+
+    def build_summary_sheet(self):
+        ws = self.wb.create_sheet("Summary", 0)
+        ws.merge_cells("A1:B1")
+        ws["A1"] = self.title.upper()
+        ws["A1"].font = self.title_font
+        row = 2
+        if self.project_line:
+            ws.merge_cells(f"A{row}:B{row}")
+            ws[f"A{row}"] = self.project_line
+            ws[f"A{row}"].font = self.subtitle_font
+            row += 1
+        ws.merge_cells(f"A{row}:B{row}")
+        ws[f"A{row}"] = f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')}"
+        ws[f"A{row}"].font = self.subtitle_font
+        row += 2
+
+        for label, value, is_currency in self._summary_rows:
+            label_cell = ws.cell(row=row, column=1, value=label)
+            label_cell.font = self.label_font
+            label_cell.fill = self.accent_fill
+            value_cell = ws.cell(row=row, column=2, value=value)
+            value_cell.font = self.cell_font
+            if is_currency:
+                value_cell.number_format = self.currency_fmt
+            row += 1
+
+        row += 2
+        ws.cell(row=row, column=1, value="Prepared By: ______________").font = (
+            self.cell_font
+        )
+        row += 1
+        ws.cell(row=row, column=1, value="Reviewed By: ______________").font = (
+            self.cell_font
+        )
+        row += 1
+        ws.cell(row=row, column=1, value="Approved By: ______________").font = (
+            self.cell_font
+        )
+
+        ws.column_dimensions["A"].width = 38
+        ws.column_dimensions["B"].width = 24
+        return self
+
+    def add_data_sheet(
+        self,
+        sheet_name: str,
+        headers: Sequence[str],
+        rows: Sequence[Sequence],
+        currency_cols: Optional[Sequence[int]] = None,
+        title: Optional[str] = None,
+    ):
+        currency_cols = currency_cols or []
+        ws = self.wb.create_sheet(sheet_name[:31])  # Excel sheet name limit
+        start_row = 1
+
+        if title:
+            ws.merge_cells(
+                start_row=1, start_column=1, end_row=1, end_column=max(len(headers), 1)
+            )
+            ws.cell(row=1, column=1, value=title).font = self.title_font
+            start_row = 3
+
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=start_row, column=col, value=header)
+            cell.font = self.header_font
+            cell.fill = self.header_fill
+            cell.alignment = self.center
+            cell.border = self.border
+
+        for r, row_values in enumerate(rows, start_row + 1):
+            fill = self.accent_fill if (r - start_row) % 2 == 0 else None
+            for col, val in enumerate(row_values, 1):
+                cell = ws.cell(row=r, column=col, value=val)
+                cell.font = self.cell_font
+                cell.alignment = self.center
+                cell.border = self.border
+                if fill:
+                    cell.fill = fill
+                if col in currency_cols:
+                    cell.number_format = self.currency_fmt
+
+        for col, header in enumerate(headers, 1):
+            max_len = len(str(header))
+            for row_values in rows:
+                val = row_values[col - 1]
+                max_len = max(max_len, len(str(val)))
+            ws.column_dimensions[get_column_letter(col)].width = min(
+                max(max_len + 4, 12), 40
+            )
+
+        ws.freeze_panes = f"A{start_row + 1}"
+        return self
+
+    def build(self):
+        import io
+
+        if "Summary" not in self.wb.sheetnames:
+            self.build_summary_sheet()
+        output = io.BytesIO()
+        self.wb.save(output)
+        output.seek(0)
+        return output
+
+
+# ======================================================================
+# SECTION 2: REPORT API ENDPOINTS
+# ======================================================================
+
+from collections import defaultdict
+from calendar import monthrange
+from datetime import date, datetime, timedelta
+from typing import Optional
+import io
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select, func, case, extract
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+from app.core.dependencies import require_roles
 from app.core.enums import (
     InvoiceStatus,
     IssueStatus,
@@ -32,10 +477,12 @@ from app.db.session import get_db_session
 from app.models import project as m
 from app.models.accountant import FixedAsset
 from app.models.expense import Expense
-from app.models.user import User, UserRole, ActivityLog
-from fastapi import BackgroundTasks
-from app.utils.helpers import NotFoundError
-from app.utils.whatsapp import send_report_template
+from app.models.invoice import Invoice, Transaction
+from app.models.master_data import LabourType, MaterialMaster
+from app.models.material import Material
+from app.models.user import User, UserRole, UserAttendance, ActivityLog
+from app.utils.common import assert_project_access
+
 
 REPORT_READ_ROLES = [role.value for role in UserRole]
 
@@ -78,72 +525,38 @@ async def export_projects_excel(
         .all()
     )
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Company Portfolio"
-
     total_projects = len(projects)
-
     ongoing = sum(
         1 for p in projects if str(getattr(p.status, "value", p.status)) == "Ongoing"
     )
-
     completed = sum(
         1 for p in projects if str(getattr(p.status, "value", p.status)) == "Completed"
     )
 
-    ws.append(["Company Portfolio Overview"])
-    ws.append([])
-    ws.append(["Generated On", str(date.today())])
-    ws.append(["Total Projects", total_projects])
-    ws.append(["Ongoing", ongoing])
-    ws.append(["Completed", completed])
-    ws.append([])
+    eb = ExcelReportBuilder("Company Portfolio Overview")
+    eb.add_summary_row("Total Projects", total_projects)
+    eb.add_summary_row("Ongoing", ongoing)
+    eb.add_summary_row("Completed", completed)
+    eb.build_summary_sheet()
 
-    headers = [
-        "Business ID",
-        "Project Name",
-        "Status",
-        "Start Date",
-        "End Date",
+    headers = ["Business ID", "Project Name", "Status", "Start Date", "End Date"]
+    rows = [
+        [
+            p.business_id,
+            (
+                p.project_name[:30] + "..."
+                if p.project_name and len(p.project_name) > 30
+                else (p.project_name or "N/A")
+            ),
+            (p.status.value if hasattr(p.status, "value") else str(p.status)),
+            str(p.start_date) if p.start_date else "N/A",
+            str(p.end_date) if p.end_date else "N/A",
+        ]
+        for p in projects
     ]
+    eb.add_data_sheet("Portfolio", headers, rows, title="Company Portfolio")
 
-    ws.append(headers)
-
-    for p in projects:
-        ws.append(
-            [
-                p.business_id,
-                (
-                    p.project_name[:30] + "..."
-                    if p.project_name and len(p.project_name) > 30
-                    else (p.project_name or "N/A")
-                ),
-                (p.status.value if hasattr(p.status, "value") else str(p.status)),
-                str(p.start_date) if p.start_date else "N/A",
-                str(p.end_date) if p.end_date else "N/A",
-            ]
-        )
-
-    from openpyxl.utils import get_column_letter
-
-    for col in range(1, ws.max_column + 1):
-
-        max_length = 0
-        column_letter = get_column_letter(col)
-
-        for row in range(1, ws.max_row + 1):
-
-            cell = ws.cell(row=row, column=col)
-
-            if cell.value is not None:
-                max_length = max(max_length, len(str(cell.value)))
-
-        ws.column_dimensions[column_letter].width = min(max_length + 4, 40)
-
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+    stream = eb.build()
 
     return StreamingResponse(
         stream,
@@ -173,23 +586,8 @@ async def export_projects_pdf(
         return await service.export_pdf(db, project_id, current_user)
 
     # Export ALL projects
-    from reportlab.lib.pagesizes import letter
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.lib import colors
-
     projects_query = select(m.Project).order_by(m.Project.id.desc())
     projects = (await db.execute(projects_query)).scalars().all()
-
-    stream = io.BytesIO()
-    doc = SimpleDocTemplate(stream, pagesize=letter)
-    styles = getSampleStyleSheet()
-    elements = []
-
-    elements.append(Paragraph("Company Portfolio Overview", styles["Title"]))
-    elements.append(Spacer(1, 12))
-
-    elements.append(Paragraph(f"Generated on: {date.today()}", styles["Normal"]))
-    elements.append(Spacer(1, 12))
 
     total_projects = len(projects)
     ongoing = sum(
@@ -199,46 +597,38 @@ async def export_projects_pdf(
         1 for p in projects if str(getattr(p.status, "value", p.status)) == "Completed"
     )
 
-    elements.append(Paragraph(f"Total Projects: {total_projects}", styles["Normal"]))
-    elements.append(Paragraph(f"Ongoing: {ongoing}", styles["Normal"]))
-    elements.append(Paragraph(f"Completed: {completed}", styles["Normal"]))
-    elements.append(Spacer(1, 24))
-
-    table_data = [["ID", "Name", "Status", "Start Date", "End Date"]]
-    for p in projects:
-        table_data.append(
-            [
-                p.business_id,
-                (
-                    p.project_name[:30] + "..."
-                    if len(p.project_name) > 30
-                    else p.project_name
-                ),
-                str(getattr(p.status, "value", p.status)),
-                str(p.start_date) if p.start_date else "N/A",
-                str(p.end_date) if p.end_date else "N/A",
-            ]
-        )
-
-    t = Table(table_data)
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.beige),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ]
-        )
+    b = PdfReportBuilder("COMPANY PORTFOLIO OVERVIEW")
+    b.add_info_table(
+        [
+            ("Generated On", str(date.today()), "Report Type", "Company Portfolio"),
+        ]
+    )
+    b.add_summary_box(
+        "SUMMARY",
+        [
+            f"<b>Total Projects:</b> {total_projects} | "
+            f"<b>Ongoing:</b> {ongoing} | <b>Completed:</b> {completed}",
+        ],
     )
 
-    elements.append(t)
-    doc.build(elements)
+    headers = ["ID", "Name", "Status", "Start Date", "End Date"]
+    rows = [
+        [
+            p.business_id,
+            (
+                p.project_name[:30] + "..."
+                if p.project_name and len(p.project_name) > 30
+                else (p.project_name or "N/A")
+            ),
+            str(getattr(p.status, "value", p.status)),
+            str(p.start_date) if p.start_date else "N/A",
+            str(p.end_date) if p.end_date else "N/A",
+        ]
+        for p in projects
+    ]
+    b.add_section_table("PROJECT LIST", headers, rows)
 
-    stream.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
         stream,
@@ -283,17 +673,22 @@ async def export_audit_excel(
     result = await db.execute(query)
     logs = result.all()
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Audit Summary"
+    eb = ExcelReportBuilder("System Audit Summary Report")
+    eb.add_summary_row("Total Logs", len(logs))
+    if start_date or end_date:
+        eb.add_summary_row("Period", f"{start_date or 'Start'} to {end_date or 'End'}")
+    if module:
+        eb.add_summary_row("Module", module)
+    if action:
+        eb.add_summary_row("Action", action)
+    eb.build_summary_sheet()
 
     headers = ["Timestamp", "User Name", "Module", "Action", "Entity ID", "Details"]
-    ws.append(headers)
-
+    rows = []
     for log, user in logs:
         details_str = str(log.details) if log.details else ""
         user_name = user.full_name if user else "System/Unknown"
-        ws.append(
+        rows.append(
             [
                 str(log.created_at),
                 user_name,
@@ -303,10 +698,9 @@ async def export_audit_excel(
                 details_str,
             ]
         )
+    eb.add_data_sheet("Audit Log", headers, rows, title="Audit Log")
 
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+    stream = eb.build()
 
     return StreamingResponse(
         stream,
@@ -329,10 +723,6 @@ async def export_audit_pdf(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from reportlab.lib.pagesizes import landscape, letter
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.lib import colors
-
     query = select(ActivityLog, User).outerjoin(
         User, ActivityLog.performed_by == User.id
     )
@@ -354,32 +744,24 @@ async def export_audit_pdf(
     result = await db.execute(query)
     logs = result.all()
 
-    stream = io.BytesIO()
-    doc = SimpleDocTemplate(stream, pagesize=landscape(letter))
-    styles = getSampleStyleSheet()
-    elements = []
-
-    elements.append(Paragraph("System Audit Summary", styles["Title"]))
-    elements.append(Spacer(1, 12))
-
-    filter_text = f"Generated: {date.today()}"
+    filter_bits = [f"Generated: {date.today()}"]
     if start_date or end_date:
-        filter_text += f" | Period: {start_date or 'Start'} to {end_date or 'End'}"
+        filter_bits.append(f"Period: {start_date or 'Start'} to {end_date or 'End'}")
     if module:
-        filter_text += f" | Module: {module}"
+        filter_bits.append(f"Module: {module}")
     if action:
-        filter_text += f" | Action: {action}"
+        filter_bits.append(f"Action: {action}")
 
-    elements.append(Paragraph(filter_text, styles["Normal"]))
-    elements.append(Spacer(1, 12))
-
-    total_logs = len(logs)
-    elements.append(
-        Paragraph(f"Total Logs Included: {total_logs} (Max 1000)", styles["Normal"])
+    b = PdfReportBuilder("SYSTEM AUDIT SUMMARY", landscape_mode=True)
+    b.add_info_table(
+        [
+            ("Generated", str(date.today()), "Total Logs", f"{len(logs)} (Max 1000)"),
+        ]
     )
-    elements.append(Spacer(1, 24))
+    b.add_summary_box("FILTERS APPLIED", [" | ".join(filter_bits)])
 
-    table_data = [["Date/Time", "User", "Module", "Action", "Details"]]
+    headers = ["Date/Time", "User", "Module", "Action", "Details"]
+    rows = []
     for log, user in logs:
         details_str = (
             str(log.details)[:50] + "..."
@@ -387,7 +769,7 @@ async def export_audit_pdf(
             else (str(log.details) if log.details else "N/A")
         )
         user_name = user.full_name if user else "System"
-        table_data.append(
+        rows.append(
             [
                 log.created_at.strftime("%Y-%m-%d %H:%M"),
                 user_name,
@@ -396,26 +778,9 @@ async def export_audit_pdf(
                 details_str,
             ]
         )
+    b.add_section_table("AUDIT LOG DETAILS", headers, rows, [100, 100, 100, 100, 300])
 
-    t = Table(table_data, colWidths=[100, 100, 100, 100, 300])
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkblue),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.aliceblue),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ]
-        )
-    )
-
-    elements.append(t)
-    doc.build(elements)
-
-    stream.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
         stream,
@@ -459,10 +824,6 @@ async def export_assets_excel(
     result = await db.execute(query)
     assets = result.all()
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Fixed Asset Register"
-
     headers = [
         "Asset ID",
         "Asset Name",
@@ -473,15 +834,19 @@ async def export_assets_excel(
         "Accumulated Depreciation",
         "Current Net Book Value",
     ]
-    ws.append(headers)
 
+    rows = []
+    total_purchase = 0.0
+    total_current = 0.0
     for asset, project in assets:
         proj_name = project.project_name if project else "Unallocated"
         purch_val = float(asset.purchase_value or 0)
         curr_val = float(asset.current_value or 0)
         depr_acc = purch_val - curr_val
+        total_purchase += purch_val
+        total_current += curr_val
 
-        ws.append(
+        rows.append(
             [
                 asset.id,
                 asset.name,
@@ -494,9 +859,18 @@ async def export_assets_excel(
             ]
         )
 
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+    eb = ExcelReportBuilder("Fixed Asset Register")
+    eb.add_summary_row("Total Assets", len(rows))
+    eb.add_summary_row(
+        "Total Original Value", round(total_purchase, 2), is_currency=True
+    )
+    eb.add_summary_row(
+        "Total Current Net Book Value", round(total_current, 2), is_currency=True
+    )
+    eb.build_summary_sheet()
+    eb.add_data_sheet("Fixed Asset Register", headers, rows, currency_cols=[5, 7, 8])
+
+    stream = eb.build()
 
     return StreamingResponse(
         stream,
@@ -519,10 +893,6 @@ async def export_assets_pdf(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from reportlab.lib.pagesizes import landscape, letter
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.lib import colors
-
     query = select(FixedAsset, m.Project).outerjoin(
         m.Project, FixedAsset.project_id == m.Project.id
     )
@@ -541,57 +911,40 @@ async def export_assets_pdf(
     result = await db.execute(query)
     assets = result.all()
 
-    stream = io.BytesIO()
-    doc = SimpleDocTemplate(stream, pagesize=landscape(letter))
-    styles = getSampleStyleSheet()
-    elements = []
-
-    elements.append(Paragraph("Fixed Asset & Depreciation Report", styles["Title"]))
-    elements.append(Spacer(1, 12))
-
-    filter_text = f"Generated: {date.today()}"
-    if project_id or start_date or end_date or min_value or max_value:
-        filter_text += " | Filters Applied"
-
-    elements.append(Paragraph(filter_text, styles["Normal"]))
-    elements.append(Spacer(1, 12))
-
     total_assets = len(assets)
     total_purchase = sum(float(a.FixedAsset.purchase_value or 0) for a in assets)
     total_current = sum(float(a.FixedAsset.current_value or 0) for a in assets)
     total_depr = total_purchase - total_current
 
-    elements.append(Paragraph(f"<b>Total Assets:</b> {total_assets}", styles["Normal"]))
-    elements.append(
-        Paragraph(
-            f"<b>Total Original Value:</b> ${total_purchase:,.2f}", styles["Normal"]
-        )
+    b = PdfReportBuilder("Fixed Asset & Depreciation Report", landscape_mode=True)
+    filters_applied = (
+        "Yes"
+        if (project_id or start_date or end_date or min_value or max_value)
+        else "No"
     )
-    elements.append(
-        Paragraph(
-            f"<b>Total Accumulated Depreciation:</b> ${total_depr:,.2f}",
-            styles["Normal"],
-        )
+    b.add_info_table(
+        [("Generated", str(date.today()), "Filters Applied", filters_applied)]
     )
-    elements.append(
-        Paragraph(
-            f"<b>Total Current Net Book Value:</b> ${total_current:,.2f}",
-            styles["Normal"],
-        )
-    )
-    elements.append(Spacer(1, 24))
-
-    table_data = [
+    b.add_summary_box(
+        "SUMMARY",
         [
-            "ID",
-            "Name",
-            "Project",
-            "Purchase Date",
-            "Orig Value",
-            "Depr",
-            "Net Book Value",
-        ]
+            f"<b>Total Assets:</b> {total_assets}",
+            f"Total Original Value: Rs. {total_purchase:,.2f}",
+            f"Total Accumulated Depreciation: Rs. {total_depr:,.2f}",
+            f"Total Current Net Book Value: Rs. {total_current:,.2f}",
+        ],
+    )
+
+    headers = [
+        "ID",
+        "Name",
+        "Project",
+        "Purchase Date",
+        "Orig Value",
+        "Depr",
+        "Net Book Value",
     ]
+    rows = []
     for asset, project in assets:
         proj_name = (
             project.project_name[:20] + "..."
@@ -602,37 +955,21 @@ async def export_assets_pdf(
         curr_val = float(asset.current_value or 0)
         depr_acc = purch_val - curr_val
 
-        table_data.append(
+        rows.append(
             [
                 str(asset.id),
                 asset.name[:25] + "..." if len(asset.name) > 25 else asset.name,
                 proj_name,
                 str(asset.purchase_date) if asset.purchase_date else "N/A",
-                f"${purch_val:,.2f}",
-                f"${depr_acc:,.2f}",
-                f"${curr_val:,.2f}",
+                f"Rs. {purch_val:,.2f}",
+                f"Rs. {depr_acc:,.2f}",
+                f"Rs. {curr_val:,.2f}",
             ]
         )
 
-    t = Table(table_data)
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkgreen),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.honeydew),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ]
-        )
-    )
+    b.add_section_table("ASSET DETAILS", headers, rows)
 
-    elements.append(t)
-    doc.build(elements)
-
-    stream.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
         stream,
@@ -681,10 +1018,6 @@ async def export_issues_excel(
     result = await db.execute(query)
     issues = result.all()
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Site Issue Log"
-
     headers = [
         "Issue ID",
         "Project Name",
@@ -697,11 +1030,10 @@ async def export_issues_excel(
         "Description",
         "Resolution Notes",
     ]
-    ws.append(headers)
-
+    rows = []
     for issue, project, user in issues:
         assigned_name = user.full_name if user else "Unassigned"
-        ws.append(
+        rows.append(
             [
                 issue.business_id or str(issue.id),
                 project.project_name,
@@ -728,9 +1060,12 @@ async def export_issues_excel(
             ]
         )
 
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+    eb = ExcelReportBuilder("Site Issue Log")
+    eb.add_summary_row("Total Issues", len(rows))
+    eb.build_summary_sheet()
+    eb.add_data_sheet("Site Issue Log", headers, rows)
+
+    stream = eb.build()
 
     return StreamingResponse(
         stream,
@@ -753,10 +1088,6 @@ async def export_issues_pdf(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from reportlab.lib.pagesizes import landscape, letter
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.lib import colors
-
     query = (
         select(m.Issue, m.Project, User)
         .join(m.Project, m.Issue.project_id == m.Project.id)
@@ -778,21 +1109,6 @@ async def export_issues_pdf(
     result = await db.execute(query)
     issues = result.all()
 
-    stream = io.BytesIO()
-    doc = SimpleDocTemplate(stream, pagesize=landscape(letter))
-    styles = getSampleStyleSheet()
-    elements = []
-
-    elements.append(Paragraph("Executive Site Issue Report", styles["Title"]))
-    elements.append(Spacer(1, 12))
-
-    filter_text = f"Generated: {date.today()}"
-    if project_id or status or priority or start_date or end_date:
-        filter_text += " | Filters Applied"
-
-    elements.append(Paragraph(filter_text, styles["Normal"]))
-    elements.append(Spacer(1, 12))
-
     total_issues = len(issues)
     open_count = sum(
         1
@@ -813,21 +1129,25 @@ async def export_issues_pdf(
         in ["HIGH", "CRITICAL"]
     )
 
-    elements.append(Paragraph(f"<b>Total Issues:</b> {total_issues}", styles["Normal"]))
-    elements.append(
-        Paragraph(f"<b>Open/In-Progress:</b> {open_count}", styles["Normal"])
+    b = PdfReportBuilder("Executive Site Issue Report", landscape_mode=True)
+    filters_applied = (
+        "Yes" if (project_id or status or priority or start_date or end_date) else "No"
     )
-    elements.append(
-        Paragraph(f"<b>Resolved/Closed:</b> {resolved_count}", styles["Normal"])
+    b.add_info_table(
+        [("Generated", str(date.today()), "Filters Applied", filters_applied)]
     )
-    elements.append(
-        Paragraph(f"<b>High Priority:</b> {critical_count}", styles["Normal"])
+    b.add_summary_box(
+        "SUMMARY",
+        [
+            f"<b>Total Issues:</b> {total_issues}",
+            f"Open/In-Progress: {open_count}",
+            f"Resolved/Closed: {resolved_count}",
+            f"High Priority: {critical_count}",
+        ],
     )
-    elements.append(Spacer(1, 24))
 
-    table_data = [
-        ["ID", "Date", "Project", "Title", "Priority", "Status", "Assigned To"]
-    ]
+    headers = ["ID", "Date", "Project", "Title", "Priority", "Status", "Assigned To"]
+    rows = []
     for issue, project, user in issues:
         proj_name = (
             project.project_name[:15] + "..."
@@ -841,7 +1161,7 @@ async def export_issues_pdf(
             else (user.full_name if user else "Unassigned")
         )
 
-        table_data.append(
+        rows.append(
             [
                 issue.business_id or str(issue.id),
                 str(issue.reported_date) if issue.reported_date else "N/A",
@@ -853,25 +1173,9 @@ async def export_issues_pdf(
             ]
         )
 
-    t = Table(table_data)
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkred),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.mistyrose),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ]
-        )
-    )
+    b.add_section_table("ISSUE DETAILS", headers, rows)
 
-    elements.append(t)
-    doc.build(elements)
-
-    stream.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
         stream,
@@ -895,9 +1199,6 @@ async def export_finance_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from sqlalchemy.future import select
-    from collections import defaultdict
-
     # 1. Fetch Projects
     proj_query = select(m.Project)
     if project_id:
@@ -946,10 +1247,6 @@ async def export_finance_excel(
             project_invoices[pid][status_str] += float(amount or 0)
 
     # 4. Generate Excel
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Financial Ledger"
-
     sorted_categories = sorted(list(all_categories))
 
     headers = [
@@ -960,14 +1257,14 @@ async def export_finance_excel(
         "Amount Pending",
         "Total Expenses",
     ]
-    # Add dynamic category headers for expenses
     for cat in sorted_categories:
         headers.append(f"Exp: {cat}")
-
     headers.append("Net Profit / Loss")
     headers.append("Profit Margin (%)")
-    ws.append(headers)
 
+    rows = []
+    grand_invoice = 0.0
+    grand_expense = 0.0
     for pid, p_name in project_map.items():
         inv_totals = project_invoices[pid]
         total_inv = sum(inv_totals.values())
@@ -982,19 +1279,27 @@ async def export_finance_excel(
         net_profit = total_inv - total_exp
         margin = (net_profit / total_inv * 100) if total_inv > 0 else 0.0
 
-        row = [pid, p_name, total_inv, paid_inv, pending_inv, total_exp]
+        grand_invoice += total_inv
+        grand_expense += total_exp
 
+        row = [pid, p_name, total_inv, paid_inv, pending_inv, total_exp]
         for cat in sorted_categories:
             row.append(exp_totals.get(cat, 0.0))
-
         row.append(net_profit)
         row.append(round(margin, 2))
 
-        ws.append(row)
+        rows.append(row)
 
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+    eb = ExcelReportBuilder("Financial Ledger")
+    eb.add_summary_row("Total Invoiced", round(grand_invoice, 2), is_currency=True)
+    eb.add_summary_row("Total Expenses", round(grand_expense, 2), is_currency=True)
+    eb.add_summary_row(
+        "Net Profit / Loss", round(grand_invoice - grand_expense, 2), is_currency=True
+    )
+    eb.build_summary_sheet()
+    eb.add_data_sheet("Financial Ledger", headers, rows)
+
+    stream = eb.build()
 
     return StreamingResponse(
         stream,
@@ -1015,12 +1320,6 @@ async def export_finance_pdf(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from sqlalchemy.future import select
-    from collections import defaultdict
-    from reportlab.lib.pagesizes import landscape, letter
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.lib import colors
-
     proj_query = select(m.Project)
     if project_id:
         proj_query = proj_query.where(m.Project.id == project_id)
@@ -1056,56 +1355,35 @@ async def export_finance_pdf(
         status_str = status.value if hasattr(status, "value") else str(status)
         project_invoices[pid][status_str] += float(amount or 0)
 
-    stream = io.BytesIO()
-    doc = SimpleDocTemplate(stream, pagesize=landscape(letter))
-    styles = getSampleStyleSheet()
-    elements = []
-
-    elements.append(Paragraph("Executive Financial Summary", styles["Title"]))
-    elements.append(Spacer(1, 12))
-
-    filter_text = f"Generated: {date.today()}"
-    if project_id or start_date or end_date:
-        filter_text += " | Filters Applied"
-
-    elements.append(Paragraph(filter_text, styles["Normal"]))
-    elements.append(Spacer(1, 12))
-
     global_exp = sum(project_expenses.values())
     global_inv = sum(sum(inv.values()) for inv in project_invoices.values())
     global_profit = global_inv - global_exp
     global_margin = (global_profit / global_inv * 100) if global_inv > 0 else 0.0
 
-    elements.append(
-        Paragraph(
-            f"<b>Total Company Expenses:</b> ${global_exp:,.2f}", styles["Normal"]
-        )
+    b = PdfReportBuilder("Executive Financial Summary", landscape_mode=True)
+    filters_applied = "Yes" if (project_id or start_date or end_date) else "No"
+    b.add_info_table(
+        [("Generated", str(date.today()), "Filters Applied", filters_applied)]
     )
-    elements.append(
-        Paragraph(
-            f"<b>Total Company Invoiced:</b> ${global_inv:,.2f}", styles["Normal"]
-        )
-    )
-    elements.append(
-        Paragraph(f"<b>Total Net Profit:</b> ${global_profit:,.2f}", styles["Normal"])
-    )
-    elements.append(
-        Paragraph(
-            f"<b>Overall Profit Margin:</b> {global_margin:,.2f}%", styles["Normal"]
-        )
-    )
-    elements.append(Spacer(1, 24))
-
-    table_data = [
+    b.add_summary_box(
+        "SUMMARY",
         [
-            "Project",
-            "Total Expenses",
-            "Total Invoiced",
-            "Pending",
-            "Net Profit",
-            "Margin",
-        ]
+            f"<b>Total Company Expenses:</b> Rs. {global_exp:,.2f}",
+            f"Total Company Invoiced: Rs. {global_inv:,.2f}",
+            f"Total Net Profit: Rs. {global_profit:,.2f}",
+            f"Overall Profit Margin: {global_margin:,.2f}%",
+        ],
+    )
+
+    headers = [
+        "Project",
+        "Total Expenses",
+        "Total Invoiced",
+        "Pending",
+        "Net Profit",
+        "Margin",
     ]
+    rows = []
     for pid, p_name in project_map.items():
         total_exp = project_expenses.get(pid, 0.0)
         inv_totals = project_invoices[pid]
@@ -1117,37 +1395,20 @@ async def export_finance_pdf(
 
         p_name_short = p_name[:25] + "..." if len(p_name) > 25 else p_name
 
-        table_data.append(
+        rows.append(
             [
                 p_name_short,
-                f"${total_exp:,.2f}",
-                f"${total_inv:,.2f}",
-                f"${pending_inv:,.2f}",
-                f"${net_profit:,.2f}",
+                f"Rs. {total_exp:,.2f}",
+                f"Rs. {total_inv:,.2f}",
+                f"Rs. {pending_inv:,.2f}",
+                f"Rs. {net_profit:,.2f}",
                 f"{margin:,.2f}%",
             ]
         )
 
-    t = Table(table_data)
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkcyan),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
-                ("ALIGN", (0, 0), (0, -1), "LEFT"),  # Left align project name
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.lightcyan),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ]
-        )
-    )
+    b.add_section_table("PROJECT FINANCIALS", headers, rows)
 
-    elements.append(t)
-    doc.build(elements)
-
-    stream.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
         stream,
@@ -1171,11 +1432,6 @@ async def export_profit_loss_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from sqlalchemy.future import select
-    from sqlalchemy import extract
-    from collections import defaultdict
-    import calendar
-
     # Base queries
     inv_query = select(Invoice)
     exp_query = select(Expense)
@@ -1243,54 +1499,51 @@ async def export_profit_loss_excel(
         all_overhead_cats.update(data["overhead"].keys())
     sorted_overhead_cats = sorted(list(all_overhead_cats))
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Profit and Loss"
-
     headers = ["Category", "Total"] + sorted_months
-    ws.append(headers)
+    rows = []
 
     def append_row(name, data_dict, overhead_cat=None):
-        row = [name]
         total = 0.0
         month_vals = []
-        for m in sorted_months:
+        for mth in sorted_months:
             if overhead_cat:
-                val = data_dict[m]["overhead"].get(overhead_cat, 0.0)
+                val = data_dict[mth]["overhead"].get(overhead_cat, 0.0)
+            elif name == "Revenue":
+                val = data_dict[mth]["revenue"]
+            elif name == "Labour Costs":
+                val = data_dict[mth]["cogs_labour"]
+            elif name == "Material Costs":
+                val = data_dict[mth]["cogs_material"]
             else:
-                val = data_dict[m].get(name.lower().replace(" ", "_"), 0.0)
-                # handle specific mappings
-                if name == "Revenue":
-                    val = data_dict[m]["revenue"]
-                elif name == "Labour Costs":
-                    val = data_dict[m]["cogs_labour"]
-                elif name == "Material Costs":
-                    val = data_dict[m]["cogs_material"]
+                val = 0.0
             total += val
             month_vals.append(val)
-        row.append(total)
-        row.extend(month_vals)
-        ws.append(row)
+        rows.append([name, total] + month_vals)
         return total, month_vals
 
-    ws.append(["--- REVENUE ---"])
+    def blank_row():
+        rows.append([""] * len(headers))
+
+    def divider_row(label):
+        rows.append([label] + [""] * (len(headers) - 1))
+
+    divider_row("--- REVENUE ---")
     total_rev, rev_months = append_row("Revenue", monthly_data)
 
-    ws.append([])
-    ws.append(["--- COST OF GOODS SOLD (COGS) ---"])
+    blank_row()
+    divider_row("--- COST OF GOODS SOLD (COGS) ---")
     t_labour, m_labour = append_row("Labour Costs", monthly_data)
     t_material, m_material = append_row("Material Costs", monthly_data)
 
     total_cogs = t_labour + t_material
-    cogs_months = [l + m for l, m in zip(m_labour, m_material)]
+    cogs_months = [l + mt for l, mt in zip(m_labour, m_material)]
 
     gross_profit = total_rev - total_cogs
     gp_months = [r - c for r, c in zip(rev_months, cogs_months)]
+    rows.append(["Gross Profit", gross_profit] + gp_months)
 
-    ws.append(["Gross Profit", gross_profit] + gp_months)
-
-    ws.append([])
-    ws.append(["--- OPERATING EXPENSES (OVERHEAD) ---"])
+    blank_row()
+    divider_row("--- OPERATING EXPENSES (OVERHEAD) ---")
     total_op_ex = 0.0
     op_ex_months = [0.0] * len(sorted_months)
     for cat in sorted_overhead_cats:
@@ -1298,17 +1551,26 @@ async def export_profit_loss_excel(
         total_op_ex += t_cat
         op_ex_months = [o + c for o, c in zip(op_ex_months, m_cat)]
 
-    ws.append(["Total Operating Expenses", total_op_ex] + op_ex_months)
+    rows.append(["Total Operating Expenses", total_op_ex] + op_ex_months)
 
-    ws.append([])
-    ws.append(["--- NET INCOME ---"])
+    blank_row()
+    divider_row("--- NET INCOME ---")
     net_income = gross_profit - total_op_ex
     ni_months = [g - o for g, o in zip(gp_months, op_ex_months)]
-    ws.append(["Net Income", net_income] + ni_months)
+    rows.append(["Net Income", net_income] + ni_months)
 
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+    eb = ExcelReportBuilder("Profit and Loss")
+    eb.add_summary_row("Total Revenue", round(total_rev, 2), is_currency=True)
+    eb.add_summary_row("Total COGS", round(total_cogs, 2), is_currency=True)
+    eb.add_summary_row("Gross Profit", round(gross_profit, 2), is_currency=True)
+    eb.add_summary_row(
+        "Total Operating Expenses", round(total_op_ex, 2), is_currency=True
+    )
+    eb.add_summary_row("Net Income", round(net_income, 2), is_currency=True)
+    eb.build_summary_sheet()
+    eb.add_data_sheet("Profit and Loss", headers, rows)
+
+    stream = eb.build()
 
     return StreamingResponse(
         stream,
@@ -1327,12 +1589,6 @@ async def export_profit_loss_pdf(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from sqlalchemy.future import select
-    from sqlalchemy import extract
-    from reportlab.lib.pagesizes import letter
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.lib import colors
-
     inv_query = select(Invoice)
     exp_query = select(Expense)
 
@@ -1388,106 +1644,42 @@ async def export_profit_loss_pdf(
     net_income = gross_profit - total_overhead
     margin = (net_income / revenue * 100) if revenue > 0 else 0.0
 
-    stream = io.BytesIO()
-    doc = SimpleDocTemplate(stream, pagesize=letter)
-    styles = getSampleStyleSheet()
-    elements = []
-
-    elements.append(Paragraph("Profit & Loss Statement", styles["Title"]))
-    elements.append(Spacer(1, 12))
-
-    filter_text = f"Generated: {date.today()}"
-    if project_id:
-        filter_text += f" | Project ID: {project_id}"
-    if year:
-        filter_text += f" | Year: {year}"
-    if quarter:
-        filter_text += f" | Quarter: {quarter}"
-
-    elements.append(Paragraph(filter_text, styles["Normal"]))
-    elements.append(Spacer(1, 20))
-
-    # Statement Table
-    table_data = [
-        ["Revenue", f"${revenue:,.2f}"],
-        ["", ""],
-        ["Cost of Goods Sold (COGS)", ""],
-        ["  Labour Costs", f"${cogs_labour:,.2f}"],
-        ["  Material Costs", f"${cogs_material:,.2f}"],
-        ["Total COGS", f"${cogs:,.2f}"],
-        ["", ""],
-        ["Gross Profit", f"${gross_profit:,.2f}"],
-        ["", ""],
-        ["Operating Expenses (Overhead)", ""],
-    ]
-
-    for cat, amt in overhead.items():
-        table_data.append([f"  {cat}", f"${amt:,.2f}"])
-
-    table_data.extend(
-        [
-            ["Total Operating Expenses", f"${total_overhead:,.2f}"],
-            ["", ""],
-            ["Net Income", f"${net_income:,.2f}"],
-            ["Net Profit Margin", f"{margin:,.2f}%"],
-        ]
-    )
-
-    t = Table(table_data, colWidths=[300, 150])
-    t.setStyle(
-        TableStyle(
-            [
-                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-                ("FONTNAME", (0, 0), (0, 0), "Helvetica-Bold"),  # Revenue
-                ("FONTNAME", (0, 2), (0, 2), "Helvetica-Bold"),  # COGS title
-                ("FONTNAME", (0, 5), (-1, 5), "Helvetica-Bold"),  # Total COGS
-                ("FONTNAME", (0, 7), (-1, 7), "Helvetica-Bold"),  # Gross Profit
-                ("FONTNAME", (0, 9), (0, 9), "Helvetica-Bold"),  # OpEx Title
-                ("FONTNAME", (0, -4), (-1, -4), "Helvetica-Bold"),  # Total OpEx
-                (
-                    "FONTNAME",
-                    (0, -2),
-                    (-1, -1),
-                    "Helvetica-Bold",
-                ),  # Net Income / Margin
-                ("LINEABOVE", (1, 5), (1, 5), 1, colors.black),  # Line above Total COGS
-                (
-                    "LINEABOVE",
-                    (1, 7),
-                    (1, 7),
-                    1,
-                    colors.black,
-                ),  # Line above Gross Profit
-                (
-                    "LINEABOVE",
-                    (1, -4),
-                    (1, -4),
-                    1,
-                    colors.black,
-                ),  # Line above Total OpEx
-                (
-                    "LINEABOVE",
-                    (1, -2),
-                    (1, -2),
-                    2,
-                    colors.black,
-                ),  # Double line above Net Income
-                (
-                    "LINEBELOW",
-                    (1, -2),
-                    (1, -2),
-                    2,
-                    colors.black,
-                ),  # Double line below Net Income
-                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-            ]
+    b = PdfReportBuilder("Profit & Loss Statement")
+    info_bits = [
+        (
+            "Generated",
+            str(date.today()),
+            "Project",
+            str(project_id) if project_id else "All Projects",
         )
-    )
+    ]
+    b.add_info_table(info_bits)
 
-    elements.append(t)
-    doc.build(elements)
+    filter_bits = []
+    if year:
+        filter_bits.append(f"Year: {year}")
+    if quarter:
+        filter_bits.append(f"Quarter: {quarter}")
+    if filter_bits:
+        b.add_summary_box("FILTERS APPLIED", [" | ".join(filter_bits)])
 
-    stream.seek(0)
+    headers = ["Particulars", "Amount (Rs.)"]
+    rows = [
+        ["Revenue", f"Rs. {revenue:,.2f}"],
+        ["Labour Costs", f"Rs. {cogs_labour:,.2f}"],
+        ["Material Costs", f"Rs. {cogs_material:,.2f}"],
+        ["Total COGS", f"Rs. {cogs:,.2f}"],
+        ["Gross Profit", f"Rs. {gross_profit:,.2f}"],
+    ]
+    for cat, amt in overhead.items():
+        rows.append([cat, f"Rs. {amt:,.2f}"])
+    rows.append(["Total Operating Expenses", f"Rs. {total_overhead:,.2f}"])
+    rows.append(["Net Income", f"Rs. {net_income:,.2f}"])
+    rows.append(["Net Profit Margin", f"{margin:,.2f}%"])
+
+    b.add_section_table("PROFIT & LOSS STATEMENT", headers, rows, col_widths=[300, 150])
+
+    stream = b.build()
 
     return StreamingResponse(
         stream,
@@ -1535,26 +1727,25 @@ async def export_daily_pdf(
         )
     )
 
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    styles = getSampleStyleSheet()
-
-    content = []
-    content.append(Paragraph(f"Daily Report - {report_date}", styles["Title"]))
-    content.append(Spacer(1, 10))
+    b = PdfReportBuilder(f"Daily Report - {report_date}")
+    b.add_info_table([("Project ID", str(project_id), "Report Date", str(report_date))])
 
     if dsr:
-        content.append(Paragraph(f"Work Done: {dsr.work_done}", styles["Normal"]))
-        content.append(Paragraph(f"Weather: {dsr.weather}", styles["Normal"]))
-        content.append(Paragraph(f"Remarks: {dsr.remarks}", styles["Normal"]))
+        b.add_summary_box(
+            "SITE DETAILS",
+            [
+                f"<b>Work Done:</b> {dsr.work_done}",
+                f"Weather: {dsr.weather}",
+                f"Remarks: {dsr.remarks}",
+            ],
+        )
     else:
-        content.append(Paragraph("No data available", styles["Normal"]))
+        b.add_summary_box("SITE DETAILS", ["No data available"])
 
-    doc.build(content)
-    buffer.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
-        buffer,
+        stream,
         media_type="application/pdf",
         headers={"Content-Disposition": "attachment; filename=daily_report.pdf"},
     )
@@ -1633,10 +1824,7 @@ async def export_labour_distribution_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from sqlalchemy.future import select
     from app.models.labour import Labour, LabourProject
-    from app.models.user import UserAttendance
-    from collections import defaultdict
 
     query = (
         select(Labour, m.Project, LabourType)
@@ -1663,14 +1851,7 @@ async def export_labour_distribution_excel(
         att_results = (await db.execute(att_query)).all()
         attendance_map = {user_id: status for user_id, status in att_results}
 
-    wb = Workbook()
-    ws_agg = wb.active
-    ws_agg.title = "Distribution Summary"
-    ws_agg.append(["Project Name", "Skill Category", "Trade", "Total Count"])
-
-    agg_data = defaultdict(int)
-
-    ws_det = wb.create_sheet(title="Detailed Roster")
+    agg_headers = ["Project Name", "Skill Category", "Trade", "Total Count"]
     det_headers = [
         "Project Name",
         "Worker Code",
@@ -1681,7 +1862,9 @@ async def export_labour_distribution_excel(
     ]
     if date:
         det_headers.append(f"Attendance ({date})")
-    ws_det.append(det_headers)
+
+    agg_data = defaultdict(int)
+    det_rows = []
 
     for labour, project, ltype in results:
         skill = (
@@ -1710,17 +1893,23 @@ async def export_labour_distribution_excel(
         ]
         if date:
             row.append(att_status)
-        ws_det.append(row)
+        det_rows.append(row)
 
         agg_key = (project.project_name, skill, trade)
         agg_data[agg_key] += 1
 
-    for (proj, skill, trade), count in sorted(agg_data.items()):
-        ws_agg.append([proj, skill, trade, count])
+    agg_rows = [
+        [proj, skill, trade, count]
+        for (proj, skill, trade), count in sorted(agg_data.items())
+    ]
 
-    stream = io.BytesIO()
-    wb.save(stream)
-    stream.seek(0)
+    eb = ExcelReportBuilder("Labour Distribution Report")
+    eb.add_summary_row("Total Active Workers", len(det_rows))
+    eb.build_summary_sheet()
+    eb.add_data_sheet("Distribution Summary", agg_headers, agg_rows)
+    eb.add_data_sheet("Detailed Roster", det_headers, det_rows)
+
+    stream = eb.build()
 
     return StreamingResponse(
         stream,
@@ -1740,12 +1929,7 @@ async def export_labour_distribution_pdf(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    from sqlalchemy.future import select
     from app.models.labour import Labour, LabourProject
-    from reportlab.lib.pagesizes import letter
-    from reportlab.platypus import Table, TableStyle
-    from reportlab.lib import colors
-    from collections import defaultdict
 
     query = (
         select(Labour, m.Project, LabourType)
@@ -1785,52 +1969,42 @@ async def export_labour_distribution_pdf(
         elif skill == "UNSKILLED":
             total_unskilled += 1
 
-    stream = io.BytesIO()
-    doc = SimpleDocTemplate(stream, pagesize=letter)
-    styles = getSampleStyleSheet()
-    elements = []
-
-    elements.append(Paragraph("Executive Labour Distribution Summary", styles["Title"]))
-    elements.append(Spacer(1, 12))
-
-    filter_text = f"Generated: {datetime.now().strftime('%Y-%m-%d')}"
-    if project_id:
-        filter_text += f" | Project ID: {project_id}"
-    elements.append(Paragraph(filter_text, styles["Normal"]))
-    elements.append(Spacer(1, 20))
-
-    elements.append(
-        Paragraph(f"<b>Total Active Workforce:</b> {total_workers}", styles["Normal"])
-    )
-    if total_workers > 0:
-        elements.append(
-            Paragraph(
-                f"<b>Skilled:</b> {total_skilled} ({total_skilled/total_workers*100:.1f}%) | <b>Unskilled:</b> {total_unskilled} ({total_unskilled/total_workers*100:.1f}%)",
-                styles["Normal"],
-            )
-        )
-    elements.append(
-        Paragraph(
-            f"<b>Total Active Projects:</b> {len(project_stats)}", styles["Normal"]
-        )
-    )
-    elements.append(Spacer(1, 24))
-
-    table_data = [
+    b = PdfReportBuilder("Executive Labour Distribution Summary")
+    filters_applied = "Yes" if project_id else "No"
+    b.add_info_table(
         [
-            "Project Name",
-            "Skilled",
-            "Semi",
-            "Unskilled",
-            "Other",
-            "Total",
-            "% of Company",
+            (
+                "Generated",
+                datetime.now().strftime("%Y-%m-%d"),
+                "Filters Applied",
+                filters_applied,
+            )
         ]
+    )
+
+    summary_lines = [f"<b>Total Active Workforce:</b> {total_workers}"]
+    if total_workers > 0:
+        summary_lines.append(
+            f"Skilled: {total_skilled} ({total_skilled/total_workers*100:.1f}%) | "
+            f"Unskilled: {total_unskilled} ({total_unskilled/total_workers*100:.1f}%)"
+        )
+    summary_lines.append(f"Total Active Projects: {len(project_stats)}")
+    b.add_summary_box("SUMMARY", summary_lines)
+
+    headers = [
+        "Project Name",
+        "Skilled",
+        "Semi",
+        "Unskilled",
+        "Other",
+        "Total",
+        "% of Company",
     ]
+    rows = []
     for proj, stats in sorted(project_stats.items()):
         p_total = sum(stats.values())
         pct = (p_total / total_workers * 100) if total_workers > 0 else 0
-        table_data.append(
+        rows.append(
             [
                 proj[:25] + "..." if len(proj) > 25 else proj,
                 stats["SKILLED"],
@@ -1842,25 +2016,9 @@ async def export_labour_distribution_pdf(
             ]
         )
 
-    t = Table(table_data)
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.darkblue),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("ALIGN", (0, 0), (0, -1), "LEFT"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.aliceblue),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ]
-        )
-    )
+    b.add_section_table("LABOUR DISTRIBUTION", headers, rows)
 
-    elements.append(t)
-    doc.build(elements)
-    stream.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
         stream,
@@ -1894,23 +2052,6 @@ async def material_report(
 # ===================== MATERIAL EXCEL =====================
 
 
-from io import BytesIO
-
-from fastapi import Depends
-from fastapi.responses import StreamingResponse
-from openpyxl import Workbook
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload
-
-from app.db.session import get_db_session
-from app.models.material import Material
-from app.models.master_data import MaterialMaster
-from app.models.user import User
-
-# ===================== MATERIAL EXCEL =====================
-
-
 @router.get("/material/export/excel")
 async def export_material_excel(
     project_id: int,
@@ -1927,31 +2068,28 @@ async def export_material_excel(
     result = await db.execute(stmt)
     materials = result.scalars().all()
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Materials"
+    headers = [
+        "Material Name",
+        "Category",
+        "Unit",
+        "Purchased Qty",
+        "Used Qty",
+        "Remaining Stock",
+        "Purchase Rate",
+        "Total Amount",
+    ]
 
-    ws.append(
-        [
-            "Material Name",
-            "Category",
-            "Unit",
-            "Purchased Qty",
-            "Used Qty",
-            "Remaining Stock",
-            "Purchase Rate",
-            "Total Amount",
-        ]
-    )
-
+    rows = []
+    total_amount = 0.0
     for mat in materials:
-
         unit_name = ""
-
         if mat.material_master and mat.material_master.unit:
             unit_name = mat.material_master.unit.name
 
-        ws.append(
+        amt = float(mat.total_amount or 0)
+        total_amount += amt
+
+        rows.append(
             [
                 mat.material_name or "",
                 mat.category or "",
@@ -1960,21 +2098,23 @@ async def export_material_excel(
                 float(mat.quantity_used or 0),
                 float(mat.remaining_stock or 0),
                 float(mat.purchase_rate or 0),
-                float(mat.total_amount or 0),
+                amt,
             ]
         )
 
-    buffer = BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
+    eb = ExcelReportBuilder("Material Report")
+    eb.add_summary_row("Total Materials", len(rows))
+    eb.add_summary_row("Total Amount", round(total_amount, 2), is_currency=True)
+    eb.build_summary_sheet()
+    eb.add_data_sheet("Materials", headers, rows, currency_cols=[7, 8])
+
+    stream = eb.build()
 
     return StreamingResponse(
-        buffer,
+        stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": (
-                f'attachment; filename="materials_project_{project_id}.xlsx"'
-            ),
+            "Content-Disposition": f"attachment; filename=material_report_{project_id}.xlsx"
         },
     )
 
@@ -2025,95 +2165,42 @@ async def export_issue_excel(
     )
     issues = result.scalars().all()
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Issues"
+    headers = [
+        "Issue ID",
+        "Title",
+        "Category",
+        "Priority",
+        "Status",
+        "Reported Date",
+        "Description",
+    ]
+    rows = [
+        [
+            issue.business_id or str(issue.id),
+            issue.title,
+            str(getattr(issue.category, "value", issue.category)),
+            str(getattr(issue.priority, "value", issue.priority)),
+            str(getattr(issue.status, "value", issue.status)),
+            str(issue.reported_date) if issue.reported_date else "N/A",
+            issue.description or "",
+        ]
+        for issue in issues
+    ]
 
-    ws.append(["Title", "Status", "Priority"])
+    eb = ExcelReportBuilder("Project Issue Report")
+    eb.add_summary_row("Total Issues", len(rows))
+    eb.build_summary_sheet()
+    eb.add_data_sheet("Issues", headers, rows)
 
-    for i in issues:
-        ws.append([i.title, i.status, i.priority])
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
+    stream = eb.build()
 
     return StreamingResponse(
-        buffer,
+        stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=issues.xlsx"},
+        headers={
+            "Content-Disposition": f"attachment; filename=project_{project_id}_issues.xlsx"
+        },
     )
-
-
-# @router.post("/daily/share/email")
-# async def share_daily_email(
-#     project_id: int,
-#     report_date: date,
-#     email: str,
-#     background_tasks: BackgroundTasks,
-#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-#     db: AsyncSession = Depends(get_db_session),
-# ):
-#     await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-#     dsr = await db.scalar(
-#         select(m.DailySiteReport).where(
-#             m.DailySiteReport.project_id == project_id,
-#             m.DailySiteReport.report_date == report_date,
-#         )
-#     )
-
-#     # PDF generation (same as yours)
-#     import io
-#     from reportlab.platypus import SimpleDocTemplate, Paragraph
-#     from reportlab.lib.styles import getSampleStyleSheet
-
-#     buffer = io.BytesIO()
-#     doc = SimpleDocTemplate(buffer)
-#     styles = getSampleStyleSheet()
-
-#     content = []
-#     content.append(Paragraph(f"Daily Report - {report_date}", styles["Title"]))
-
-#     if dsr:
-#         content.append(Paragraph(f"Work Done: {dsr.work_done}", styles["Normal"]))
-#         content.append(Paragraph(f"Weather: {dsr.weather}", styles["Normal"]))
-#     else:
-#         content.append(Paragraph("No data available", styles["Normal"]))
-
-#     doc.build(content)
-#     buffer.seek(0)
-
-#     #  Background email (NON-BLOCKING)
-#     body = f"""
-#     <html>
-#     <body style="font-family: Arial, sans-serif;">
-#         <h2> Daily Site Report</h2>
-
-#         <p><b>Date:</b> {report_date}</p>
-
-#         <p>Please find the attached report.</p>
-
-#         <br>
-
-#         <hr>
-#         <p style="font-size:12px;color:gray;">
-#         Construction Management System
-#         </p>
-#     </body>
-#     </html>
-#     """
-
-#     background_tasks.add_task(
-#         send_email,
-#         to_email=email,
-#         subject="Daily Report",
-#         body=body,
-#         attachment=buffer.read(),
-#         filename="daily_report.pdf",
-#     )
-
-#     return {"message": "Email queued successfully"}
 
 
 # ===================== FILTERED REPORT DOWNLOAD =====================
@@ -2138,31 +2225,21 @@ async def client_report_download(
     )
     reports = result.scalars().all()
 
-    import io
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
+    b = PdfReportBuilder(f"Report ({start_date} to {end_date})")
+    b.add_info_table(
+        [("Project ID", str(project_id), "Period", f"{start_date} to {end_date}")]
+    )
 
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    styles = getSampleStyleSheet()
+    headers = ["Date", "Work Done"]
+    rows = [[str(r.report_date), r.work_done] for r in reports]
+    b.add_section_table(
+        "DAILY SITE REPORTS", headers, rows, empty_text="No data available"
+    )
 
-    content = []
-    content.append(Paragraph(f"Report ({start_date} to {end_date})", styles["Title"]))
-    content.append(Spacer(1, 10))
-
-    if not reports:
-        content.append(Paragraph("No data available", styles["Normal"]))
-    else:
-        for r in reports:
-            content.append(Paragraph(f"Date: {r.report_date}", styles["Normal"]))
-            content.append(Paragraph(f"Work: {r.work_done}", styles["Normal"]))
-            content.append(Spacer(1, 10))
-
-    doc.build(content)
-    buffer.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
-        buffer,
+        stream,
         media_type="application/pdf",
         headers={"Content-Disposition": "attachment; filename=filtered_report.pdf"},
     )
@@ -2208,51 +2285,27 @@ async def combined_report(
     )
     dsr_list = reports.scalars().all()
 
-    #  Generate PDF
-    import io
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-    from reportlab.lib.styles import getSampleStyleSheet
-
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    styles = getSampleStyleSheet()
-
-    content = []
-
-    content.append(Paragraph("Combined Project Report", styles["Title"]))
-    content.append(Spacer(1, 10))
-
-    content.append(
-        Paragraph(f"Date Range: {start_date} to {end_date}", styles["Normal"])
+    b = PdfReportBuilder("Combined Project Report")
+    b.add_info_table(
+        [("Project ID", str(project_id), "Period", f"{start_date} to {end_date}")]
     )
-    content.append(Spacer(1, 10))
+    b.add_summary_box(
+        "PROGRESS & FINANCIAL SUMMARY",
+        [
+            f"<b>Progress:</b> {round(progress or 0, 2)}%",
+            f"Total Paid: Rs. {float(total_paid or 0):,.2f}",
+            f"Pending: Rs. {float(total_pending or 0):,.2f}",
+        ],
+    )
 
-    # Progress
-    content.append(Paragraph(f"Progress: {round(progress or 0, 2)}%", styles["Normal"]))
-    content.append(Spacer(1, 10))
+    headers = ["Date", "Work Done"]
+    rows = [[str(r.report_date), r.work_done] for r in dsr_list]
+    b.add_section_table("WORK SUMMARY", headers, rows, empty_text="No data available")
 
-    # Financial
-    content.append(Paragraph(f"Total Paid: {float(total_paid or 0)}", styles["Normal"]))
-    content.append(Paragraph(f"Pending: {float(total_pending or 0)}", styles["Normal"]))
-    content.append(Spacer(1, 10))
-
-    # Work Summary
-    content.append(Paragraph("Work Summary:", styles["Heading2"]))
-
-    if not dsr_list:
-        content.append(Paragraph("No data available", styles["Normal"]))
-    else:
-        for r in dsr_list:
-            content.append(
-                Paragraph(f"{r.report_date} - {r.work_done}", styles["Normal"])
-            )
-            content.append(Spacer(1, 5))
-
-    doc.build(content)
-    buffer.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
-        buffer,
+        stream,
         media_type="application/pdf",
         headers={"Content-Disposition": "attachment; filename=combined_report.pdf"},
     )
@@ -2397,116 +2450,7 @@ async def asset_report(
     return assets
 
 
-# @router.post("/combined/share/email")
-# async def share_combined_report_email(
-#     project_id: int,
-#     start_date: date,
-#     end_date: date,
-#     email: str,
-#     background_tasks: BackgroundTasks,
-#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-#     db: AsyncSession = Depends(get_db_session),
-# ):
-#     await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-#     # ===== DATA =====
-#     progress = await db.scalar(
-#         select(func.avg(m.Task.completion_percentage)).where(
-#             m.Task.project_id == project_id
-#         )
-#     )
-
-#     total_paid = await db.scalar(
-#         select(func.sum(Invoice.total_amount)).where(
-#             Invoice.project_id == project_id,
-#             Invoice.status == InvoiceStatus.PAID
-#         )
-#     )
-
-#     total_pending = await db.scalar(
-#         select(func.sum(Invoice.total_amount)).where(
-#             Invoice.project_id == project_id,
-#             Invoice.status == InvoiceStatus.PENDING
-#         )
-#     )
-
-#     reports = await db.execute(
-#         select(m.DailySiteReport).where(
-#             m.DailySiteReport.project_id == project_id,
-#             m.DailySiteReport.report_date >= start_date,
-#             m.DailySiteReport.report_date <= end_date,
-#         )
-#     )
-#     dsr_list = reports.scalars().all()
-
-#     # ===== PDF =====
-#     import io
-#     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-#     from reportlab.lib.styles import getSampleStyleSheet
-
-#     buffer = io.BytesIO()
-#     doc = SimpleDocTemplate(buffer)
-#     styles = getSampleStyleSheet()
-
-#     content = []
-#     content.append(Paragraph("Combined Project Report", styles["Title"]))
-#     content.append(Spacer(1, 10))
-
-#     content.append(Paragraph(f"{start_date} to {end_date}", styles["Normal"]))
-#     content.append(Spacer(1, 10))
-
-#     content.append(Paragraph(f"Progress: {round(progress or 0, 2)}%", styles["Normal"]))
-#     content.append(Paragraph(f"Paid: {float(total_paid or 0)}", styles["Normal"]))
-#     content.append(Paragraph(f"Pending: {float(total_pending or 0)}", styles["Normal"]))
-#     content.append(Spacer(1, 10))
-
-#     for r in dsr_list:
-#         content.append(Paragraph(f"{r.report_date} - {r.work_done}", styles["Normal"]))
-
-#     doc.build(content)
-#     buffer.seek(0)
-
-#     background_tasks.add_task(
-#         send_email,
-#         to_email=email,
-#         subject="Combined Project Report",
-#         body=f"Report from {start_date} to {end_date}",
-#         attachment=buffer.read(),
-#         filename="combined_report.pdf",
-#     )
-
-#     return {"message": "Email queued successfully"}
-
-
-# @router.post("/combined/share/whatsapp")
-# async def share_combined_whatsapp(
-#     project_id: int,
-#     start_date: date,
-#     end_date: date,
-#     phone: str,
-#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
-#     db: AsyncSession = Depends(get_db_session),
-# ):
-#     await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-#     #  Generate report URL (IMPORTANT)
-#     report_url = f"http://localhost:8000/reports/combined?project_id={project_id}&start_date={start_date}&end_date={end_date}"
-
-#     result = await send_report_template(
-#         to=phone,
-#         name="Client",
-#         report_url=report_url
-#     )
-
-#     return {
-#         "message": "WhatsApp message sent",
-#         "response": result
-#     }
-
-
-# =========================================================
-# FINANCIAL SUMMARY
-# =========================================================
+# ===================== FINANCIAL SUMMARY =====================
 @router.get("/financial-summary")
 async def financial_summary(
     project_id: int,
@@ -2542,9 +2486,7 @@ async def financial_summary(
     }
 
 
-# =========================================================
-# QUARTERLY AUDIT SUMMARY
-# =========================================================
+# ===================== QUARTERLY AUDIT SUMMARY =====================
 @router.get("/quarterly-audit-summary")
 async def quarterly_financial_audit(
     project_id: int,
@@ -2603,9 +2545,7 @@ async def quarterly_financial_audit(
     }
 
 
-# =========================================================
-# WORK SUMMARY
-# =========================================================
+# ===================== WORK SUMMARY =====================
 @router.get("/work-summary")
 async def work_summary(
     project_id: int,
@@ -2643,9 +2583,7 @@ async def work_summary(
     }
 
 
-# =========================================================
-# AUDIT PDF
-# =========================================================
+# ===================== AUDIT PDF =====================
 @router.get("/audit-pdf")
 async def audit_pdf(
     project_id: int,
@@ -2701,83 +2639,52 @@ async def audit_pdf(
             m.Task.project_id == project_id
         )
     )
-    # ================= PDF =================
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    styles = getSampleStyleSheet()
-    content = []
-    # TITLE
-    content.append(Paragraph("Detailed Audit Report", styles["Title"]))
-    content.append(Spacer(1, 20))
-    # FINANCIAL
-    content.append(Paragraph("Financial Summary", styles["Heading1"]))
-    content.append(
-        Paragraph(
+
+    b = PdfReportBuilder("Detailed Audit Report")
+    b.add_info_table(
+        [
+            (
+                "Project ID",
+                str(project_id),
+                "Generated On",
+                datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
+            )
+        ]
+    )
+    b.add_summary_box(
+        "FINANCIAL SUMMARY",
+        [
             f"Total Expense: Rs. {round(float(total_expense or 0), 2)}",
-            styles["Normal"],
-        )
-    )
-    content.append(
-        Paragraph(
             f"Total Invoice: Rs. {round(float(total_invoice or 0), 2)}",
-            styles["Normal"],
-        )
-    )
-    content.append(
-        Paragraph(
-            f"Paid Invoice: Rs. {round(float(paid_invoice or 0), 2)}", styles["Normal"]
-        )
-    )
-    content.append(
-        Paragraph(
+            f"Paid Invoice: Rs. {round(float(paid_invoice or 0), 2)}",
             f"Pending Invoice: Rs. {round(float(pending_invoice or 0), 2)}",
-            styles["Normal"],
-        )
-    )
-    content.append(
-        Paragraph(
             f"Profit: Rs. {round(float((total_invoice or 0) - (total_expense or 0)), 2)}",
-            styles["Normal"],
-        )
+        ],
     )
-    content.append(Spacer(1, 20))
-    # WORK
-    content.append(Paragraph("Work Summary", styles["Heading1"]))
-    content.append(Paragraph(f"Total Tasks: {int(total_tasks or 0)}", styles["Normal"]))
-    content.append(
-        Paragraph(f"Completed Tasks: {int(completed_tasks or 0)}", styles["Normal"])
+    b.add_summary_box(
+        "WORK SUMMARY",
+        [
+            f"Total Tasks: {int(total_tasks or 0)}",
+            f"Completed Tasks: {int(completed_tasks or 0)}",
+            f"In Progress Tasks: {int(in_progress_tasks or 0)}",
+        ],
     )
-    content.append(
-        Paragraph(f"In Progress Tasks: {int(in_progress_tasks or 0)}", styles["Normal"])
+    b.add_summary_box(
+        "ISSUE SUMMARY",
+        [
+            f"Open Issues: {int(open_issues or 0)}",
+            f"Closed Issues: {int(closed_issues or 0)}",
+        ],
     )
-    content.append(Spacer(1, 20))
-    # ISSUES
-    content.append(Paragraph("Issue Summary", styles["Heading1"]))
-    content.append(Paragraph(f"Open Issues: {int(open_issues or 0)}", styles["Normal"]))
-    content.append(
-        Paragraph(f"Closed Issues: {int(closed_issues or 0)}", styles["Normal"])
+    b.add_summary_box(
+        "PROJECT PROGRESS",
+        [f"Overall Progress: {round(float(progress or 0), 2)} %"],
     )
-    content.append(Spacer(1, 20))
-    # PROGRESS
-    content.append(Paragraph("Project Progress", styles["Heading1"]))
-    content.append(
-        Paragraph(
-            f"Overall Progress: {round(float(progress or 0), 2)} %", styles["Normal"]
-        )
-    )
-    content.append(Spacer(1, 20))
-    # FOOTER
-    content.append(
-        Paragraph(
-            f"Generated On: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}",
-            styles["Italic"],
-        )
-    )
-    # BUILD
-    doc.build(content)
-    buffer.seek(0)
+
+    stream = b.build()
+
     return StreamingResponse(
-        buffer,
+        stream,
         media_type="application/pdf",
         headers={
             "Content-Disposition": f"attachment; filename=audit_report_{project_id}.pdf"
@@ -2788,17 +2695,6 @@ async def audit_pdf(
 # =========================================================
 # UNIFIED PROJECT REPORT
 # =========================================================
-
-from calendar import monthrange
-
-# =========================================================
-# UNIFIED PROJECT REPORT
-# =========================================================
-
-from calendar import monthrange
-
-
-from typing import Optional
 
 
 @router.get("/project")
@@ -3030,7 +2926,6 @@ async def project_report(
 
 
 @router.get("/project/export/pdf")
-@router.get("/project/export/pdf")
 async def export_project_report_pdf(
     type: str,
     project_id: Optional[int] = None,
@@ -3056,52 +2951,36 @@ async def export_project_report_pdf(
         db=db,
     )
 
-    buffer = io.BytesIO()
-
-    doc = SimpleDocTemplate(buffer)
-
-    styles = getSampleStyleSheet()
-
-    content = []
-
-    content.append(Paragraph(f"{type.title()} Project Report", styles["Title"]))
-
-    content.append(Spacer(1, 20))
-
-    Paragraph(f"Project: {response['project']['project_name']}", styles["Heading2"])
-
-    content.append(
-        Paragraph(
-            f"Progress: {response['summary']['overall_progress']}%", styles["Normal"]
-        )
+    b = PdfReportBuilder(f"{type.title()} Project Report")
+    b.add_info_table(
+        [
+            (
+                "Project",
+                response["project"]["project_name"],
+                "Report Type",
+                type.title(),
+            )
+        ]
     )
-
-    content.append(
-        Paragraph(
+    b.add_summary_box(
+        "SUMMARY",
+        [
+            f"<b>Progress:</b> {response['summary']['overall_progress']}%",
             f"Completed Tasks: {response['summary']['completed_tasks']}",
-            styles["Normal"],
-        )
+            f"Open Issues: {response['summary']['open_issues']}",
+        ],
     )
 
-    content.append(
-        Paragraph(
-            f"Open Issues: {response['summary']['open_issues']}", styles["Normal"]
-        )
+    headers = ["Date", "Work Done"]
+    rows = [[str(r["date"]), r["work_done"]] for r in response["daily_reports"]]
+    b.add_section_table(
+        "DAILY WORK LOGS", headers, rows, empty_text="No data available"
     )
 
-    content.append(Spacer(1, 20))
-
-    content.append(Paragraph("Daily Work Logs", styles["Heading2"]))
-
-    for r in response["daily_reports"]:
-        content.append(Paragraph(f"{r['date']} - {r['work_done']}", styles["Normal"]))
-
-    doc.build(content)
-
-    buffer.seek(0)
+    stream = b.build()
 
     return StreamingResponse(
-        buffer,
+        stream,
         media_type="application/pdf",
         headers={
             "Content-Disposition": f"attachment; filename={type}_project_report.pdf"
@@ -3127,7 +3006,6 @@ async def export_project_report_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-
     response = await project_report(
         project_id=project_id,
         type=type,
@@ -3141,63 +3019,34 @@ async def export_project_report_excel(
         db=db,
     )
 
-    wb = Workbook()
-
-    ws = wb.active
-
-    ws.title = "Project Report"
-
-    # =====================================================
-    # SUMMARY
-    # =====================================================
-
-    ws.append(["Project", response["project"]["project_name"]])
-    ws.append(["Report Type", response["report_type"]])
-    ws.append([])
-
-    ws.append(["Overall Progress", response["summary"]["overall_progress"]])
-    ws.append(["Completed Tasks", response["summary"]["completed_tasks"]])
-    ws.append(["Open Issues", response["summary"]["open_issues"]])
-
-    ws.append([])
-
-    ws.append(["Total Invoice", response["financials"]["total_invoice"]])
-    ws.append(["Total Expense", response["financials"]["total_expense"]])
-    ws.append(["Profit", response["financials"]["profit"]])
-
-    ws.append([])
-
-    # =====================================================
-    # DSR
-    # =====================================================
-
-    ws.append(
-        [
-            "Date",
-            "Work Done",
-            "Weather",
-            "Remarks",
-        ]
+    eb = ExcelReportBuilder(
+        f"{type.title()} Project Report",
+        project_line=response["project"]["project_name"],
     )
+    eb.add_summary_row("Report Type", response["report_type"])
+    eb.add_summary_row("Overall Progress (%)", response["summary"]["overall_progress"])
+    eb.add_summary_row("Completed Tasks", response["summary"]["completed_tasks"])
+    eb.add_summary_row("Open Issues", response["summary"]["open_issues"])
+    eb.add_summary_row(
+        "Total Invoice", response["financials"]["total_invoice"], is_currency=True
+    )
+    eb.add_summary_row(
+        "Total Expense", response["financials"]["total_expense"], is_currency=True
+    )
+    eb.add_summary_row("Profit", response["financials"]["profit"], is_currency=True)
+    eb.build_summary_sheet()
 
-    for r in response["daily_reports"]:
-        ws.append(
-            [
-                str(r["date"]),
-                r["work_done"],
-                r["weather"],
-                r["remarks"],
-            ]
-        )
+    headers = ["Date", "Work Done", "Weather", "Remarks"]
+    rows = [
+        [str(r["date"]), r["work_done"], r["weather"], r["remarks"]]
+        for r in response["daily_reports"]
+    ]
+    eb.add_data_sheet("Daily Reports", headers, rows)
 
-    buffer = io.BytesIO()
-
-    wb.save(buffer)
-
-    buffer.seek(0)
+    stream = eb.build()
 
     return StreamingResponse(
-        buffer,
+        stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
             "Content-Disposition": f"attachment; filename={type}_project_report.xlsx"
@@ -3341,7 +3190,6 @@ async def commercial_execution_analytics(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
 ):
     from app.models.boq import BOQ
-    from app.models.final_measurement import FinalMeasurement
 
     # BOQ Items
     boq_items = (
@@ -3369,7 +3217,7 @@ async def commercial_execution_analytics(
 
     # Actual Certified Amount
     actual_certified_amount = sum(
-        float(getattr(m, "total_amount", 0) or 0) for m in measurements
+        float(getattr(meas, "total_amount", 0) or 0) for meas in measurements
     )
 
     variance = boq_total_planned_cost - actual_certified_amount
@@ -3425,3 +3273,150 @@ async def contractor_execution_analytics(
             contractor_stats[cid]["paid_amount"] += float(bill.net_amount)
 
     return {"project_id": project_id, "contractor_stats": contractor_stats}
+
+
+# NOTE: The following email/WhatsApp sharing endpoints were commented out in the
+# original implementation and relied on send_email / send_report_template /
+# BackgroundTasks. They are preserved here as-is (still disabled) for reference.
+# Re-enable by uncommenting and restoring the relevant imports if needed.
+
+# @router.post("/combined/share/email")
+# async def share_combined_report_email(
+#     project_id: int,
+#     start_date: date,
+#     end_date: date,
+#     email: str,
+#     background_tasks: BackgroundTasks,
+#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+#     db: AsyncSession = Depends(get_db_session),
+# ):
+#     await assert_project_access(db, project_id=project_id, current_user=current_user)
+#
+#     progress = await db.scalar(
+#         select(func.avg(m.Task.completion_percentage)).where(
+#             m.Task.project_id == project_id
+#         )
+#     )
+#
+#     total_paid = await db.scalar(
+#         select(func.sum(Invoice.total_amount)).where(
+#             Invoice.project_id == project_id,
+#             Invoice.status == InvoiceStatus.PAID
+#         )
+#     )
+#
+#     total_pending = await db.scalar(
+#         select(func.sum(Invoice.total_amount)).where(
+#             Invoice.project_id == project_id,
+#             Invoice.status == InvoiceStatus.PENDING
+#         )
+#     )
+#
+#     reports = await db.execute(
+#         select(m.DailySiteReport).where(
+#             m.DailySiteReport.project_id == project_id,
+#             m.DailySiteReport.report_date >= start_date,
+#             m.DailySiteReport.report_date <= end_date,
+#         )
+#     )
+#     dsr_list = reports.scalars().all()
+#
+#     b = PdfReportBuilder("Combined Project Report")
+#     b.add_info_table([("Project ID", str(project_id), "Period", f"{start_date} to {end_date}")])
+#     b.add_summary_box("SUMMARY", [
+#         f"Progress: {round(progress or 0, 2)}%",
+#         f"Paid: {float(total_paid or 0)}",
+#         f"Pending: {float(total_pending or 0)}",
+#     ])
+#     headers = ["Date", "Work Done"]
+#     rows = [[str(r.report_date), r.work_done] for r in dsr_list]
+#     b.add_section_table("WORK SUMMARY", headers, rows)
+#     buffer = b.build()
+#
+#     background_tasks.add_task(
+#         send_email,
+#         to_email=email,
+#         subject="Combined Project Report",
+#         body=f"Report from {start_date} to {end_date}",
+#         attachment=buffer.read(),
+#         filename="combined_report.pdf",
+#     )
+#
+#     return {"message": "Email queued successfully"}
+
+
+# @router.post("/combined/share/whatsapp")
+# async def share_combined_whatsapp(
+#     project_id: int,
+#     start_date: date,
+#     end_date: date,
+#     phone: str,
+#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+#     db: AsyncSession = Depends(get_db_session),
+# ):
+#     await assert_project_access(db, project_id=project_id, current_user=current_user)
+#
+#     report_url = f"http://localhost:8000/reports/combined?project_id={project_id}&start_date={start_date}&end_date={end_date}"
+#
+#     result = await send_report_template(
+#         to=phone,
+#         name="Client",
+#         report_url=report_url
+#     )
+#
+#     return {
+#         "message": "WhatsApp message sent",
+#         "response": result
+#     }
+
+
+# @router.post("/daily/share/email")
+# async def share_daily_email(
+#     project_id: int,
+#     report_date: date,
+#     email: str,
+#     background_tasks: BackgroundTasks,
+#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+#     db: AsyncSession = Depends(get_db_session),
+# ):
+#     await assert_project_access(db, project_id=project_id, current_user=current_user)
+#
+#     dsr = await db.scalar(
+#         select(m.DailySiteReport).where(
+#             m.DailySiteReport.project_id == project_id,
+#             m.DailySiteReport.report_date == report_date,
+#         )
+#     )
+#
+#     b = PdfReportBuilder(f"Daily Report - {report_date}")
+#     if dsr:
+#         b.add_summary_box("SITE DETAILS", [
+#             f"Work Done: {dsr.work_done}",
+#             f"Weather: {dsr.weather}",
+#         ])
+#     else:
+#         b.add_summary_box("SITE DETAILS", ["No data available"])
+#     buffer = b.build()
+#
+#     body = f"""
+#     <html>
+#     <body style="font-family: Arial, sans-serif;">
+#         <h2>Daily Site Report</h2>
+#         <p><b>Date:</b> {report_date}</p>
+#         <p>Please find the attached report.</p>
+#         <hr>
+#         <p style="font-size:12px;color:gray;">Construction Management System</p>
+#     </body>
+#     </html>
+#     """
+#
+#     background_tasks.add_task(
+#         send_email,
+#         to_email=email,
+#         subject="Daily Report",
+#         body=body,
+#         attachment=buffer.read(),
+#         filename="daily_report.pdf",
+#     )
+#
+#     return {"message": "Email queued successfully"}

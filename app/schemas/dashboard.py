@@ -371,7 +371,9 @@ class ClientBudgetAnalysis(BaseModel):
     budget: float
     spent: float
     remaining: float
+    spent_percent: float
     remaining_percent: float
+    variance_percent: float
 
 
 class ClientTimelineInfo(BaseModel):
