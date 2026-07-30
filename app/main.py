@@ -133,7 +133,8 @@ def create_app() -> FastAPI:
         "http://127.0.0.1:5173",
         "http://localhost:4200",
         "https://infrapilot.in",
-        "https://infra-pilot.netlify.app",
+        "https://infra-pilot.netlify.app"
+        "https://infrapilot-testing.netlify.app",
     ]
 
     application.add_middleware(
