@@ -34,6 +34,7 @@ from app.models.user import User
 from app.core.dependencies import require_roles
 
 from app.utils.helpers import NotFoundError, ValidationError
+from app.utils.qr import generate_qr
 
 from app.models.user import UserRole
 
@@ -470,7 +471,15 @@ async def export_accounts(
     )
 
 @router.post("/accounts/import")
-async def import_accounts(file: UploadFile = File(...)):
+async def import_accounts(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    import csv
+    from app.core.enums import AccountType
+    from sqlalchemy import select
+
     content = await file.read()
     text = content.decode('utf-8')
     lines = text.splitlines()
@@ -478,17 +487,69 @@ async def import_accounts(file: UploadFile = File(...)):
     valid = 0
     errors = []
     
-    for i, line in enumerate(lines[1:], start=2):
-        if not line.strip(): continue
-        parts = line.split(',')
+    reader = csv.reader(lines)
+    try:
+        next(reader)
+    except StopIteration:
+        pass
+
+    rows_data = []
+    codes_to_check = set()
+    for i, parts in enumerate(reader, start=2):
+        rows_data.append((i, parts))
+        if parts and any(parts) and len(parts) >= 3:
+            codes_to_check.add(parts[1].strip())
+            
+    existing_codes = set()
+    if codes_to_check:
+        existing_accounts = await db.scalars(select(Account.code).where(Account.code.in_(codes_to_check)))
+        existing_codes = set(existing_accounts.all())
+
+    for i, parts in rows_data:
+        if not parts or not any(parts):
+            continue
         if len(parts) < 3:
             errors.append(f"Line {i}: Invalid format")
-        else:
-            valid += 1
+            continue
             
+        name = parts[0].strip()
+        code = parts[1].strip()
+        type_str = parts[2].strip()
+        parent_id_str = parts[3].strip() if len(parts) > 3 else None
+
+        try:
+            acc_type = AccountType(type_str.lower())
+        except ValueError:
+            errors.append(f"Line {i}: Invalid account type '{type_str}'")
+            continue
+            
+        if code in existing_codes:
+            errors.append(f"Line {i}: Account with code '{code}' already exists")
+            continue
+            
+        existing_codes.add(code)
+            
+        parent_id = None
+        if parent_id_str:
+            try:
+                parent_id = int(parent_id_str)
+            except ValueError:
+                errors.append(f"Line {i}: Invalid parent ID '{parent_id_str}'")
+                continue
+
+        acc = Account(name=name, code=code, type=acc_type, parent_id=parent_id)
+        db.add(acc)
+        valid += 1
+            
+    if valid > 0 and len(errors) == 0:
+        await db.commit()
+    else:
+        await db.rollback()
+        
     return {
-        "valid_records": valid,
-        "errors": errors
+        "valid_records": valid if len(errors) == 0 else 0,
+        "errors": errors,
+        "message": "Import successful" if len(errors) == 0 else "Import failed due to errors"
     }
 
 @router.get("/accounts/{id}", response_model=AccountDetailOut)
@@ -1082,7 +1143,16 @@ async def export_bank_accounts(
     )
 
 @router.post("/bank-accounts/import")
-async def import_bank_accounts(file: UploadFile = File(...)):
+async def import_bank_accounts(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    import csv
+    from sqlalchemy import select
+    from app.core.validators import validate_ifsc
+    from app.core.enums import AccountType
+
     content = await file.read()
     text = content.decode('utf-8')
     lines = text.splitlines()
@@ -1090,17 +1160,64 @@ async def import_bank_accounts(file: UploadFile = File(...)):
     valid = 0
     errors = []
     
-    for i, line in enumerate(lines[1:], start=2):
-        if not line.strip(): continue
-        parts = line.split(',')
+    reader = csv.reader(lines)
+    try:
+        next(reader)
+    except StopIteration:
+        pass
+
+    for i, parts in enumerate(reader, start=2):
+        if not parts or not any(parts):
+            continue
         if len(parts) < 3:
             errors.append(f"Line {i}: Invalid format")
-        else:
-            valid += 1
+            continue
             
+        account_id_str = parts[0].strip()
+        bank_name = parts[1].strip()
+        account_number = parts[2].strip()
+        ifsc_code = parts[3].strip() if len(parts) > 3 else None
+
+        try:
+            account_id = int(account_id_str)
+        except ValueError:
+            errors.append(f"Line {i}: Invalid account ID '{account_id_str}'")
+            continue
+            
+        acc = await db.get(Account, account_id)
+        if not acc or acc.type != AccountType.ASSET:
+            errors.append(f"Line {i}: Account must be a valid ASSET account")
+            continue
+
+        if "bank" not in acc.name.lower() and (acc.parent and "bank" not in acc.parent.name.lower()):
+            errors.append(f"Line {i}: Account name or parent must contain 'Bank'")
+            continue
+
+        if ifsc_code:
+            try:
+                validate_ifsc(ifsc_code)
+            except ValueError as e:
+                errors.append(f"Line {i}: {str(e)}")
+                continue
+
+        bank_acc = BankAccount(
+            account_id=account_id,
+            bank_name=bank_name,
+            account_number=account_number,
+            ifsc_code=ifsc_code
+        )
+        db.add(bank_acc)
+        valid += 1
+            
+    if valid > 0 and len(errors) == 0:
+        await db.commit()
+    else:
+        await db.rollback()
+        
     return {
-        "valid_records": valid,
-        "errors": errors
+        "valid_records": valid if len(errors) == 0 else 0,
+        "errors": errors,
+        "message": "Import successful" if len(errors) == 0 else "Import failed due to errors"
     }
 
 @router.get("/bank-accounts/{id}", response_model=BankAccountOut)
@@ -1256,7 +1373,12 @@ async def export_cash_book(
 
 @router.post("/cash-book/import")
 async def import_cash_book(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+    
     content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
     text = content.decode('utf-8')
     lines = text.splitlines()
     
@@ -1360,7 +1482,12 @@ async def export_bank_book(
 
 @router.post("/bank-book/import")
 async def import_bank_book(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+    
     content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
     text = content.decode('utf-8')
     lines = text.splitlines()
     
@@ -1581,6 +1708,30 @@ async def create_asset(
 
     return obj
 
+
+@router.get("/assets/{id}/qr", response_class=StreamingResponse)
+async def generate_asset_qr(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+):
+    asset = await db.get(FixedAsset, id)
+
+    if not asset:
+        raise NotFoundError("Asset not found")
+
+    qr_buf = generate_qr(entity_type="AST", entity_id=asset.id)
+
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="asset_{asset.id}.png"'
+    }
+
+    return StreamingResponse(
+        qr_buf,
+        media_type="image/png",
+        headers=headers,
+    )
 
 @router.post("/assets/{id}/depreciate")
 async def depreciate_asset(
@@ -1863,7 +2014,10 @@ async def import_bank_transactions(
     added = 0
     skipped = 0
 
-    for row in csvReader:
+    rows_data = list(csvReader)
+    parsed_rows = []
+    
+    for row in rows_data:
         try:
             txn_date_str = row.get("date", "").strip()
             amount_str = row.get("amount", "0").strip()
@@ -1876,33 +2030,44 @@ async def import_bank_transactions(
                 
             txn_date = datetime.strptime(txn_date_str, "%Y-%m-%d").date()
             amount = Decimal(amount_str)
-            
-            # Check for duplicate
-            stmt = select(BankTransaction).where(
-                BankTransaction.bank_account_id == ledger_account_id,
-                BankTransaction.transaction_date == txn_date,
-                BankTransaction.amount == amount,
-                BankTransaction.reference_number == ref
-            ).limit(1)
-            existing = await db.scalar(stmt)
-            
-            if existing:
-                skipped += 1
-                continue
-                
-            bt = BankTransaction(
-                bank_account_id=ledger_account_id,
-                transaction_date=txn_date,
-                amount=amount,
-                type=txn_type,
-                description=desc,
-                reference_number=ref,
-                is_reconciled=0
-            )
-            db.add(bt)
-            added += 1
+            parsed_rows.append((txn_date, amount, txn_type, desc, ref))
         except Exception:
             continue
+
+    existing_keys = set()
+    if parsed_rows:
+        dates = {r[0] for r in parsed_rows}
+        stmt = select(
+            BankTransaction.transaction_date, 
+            BankTransaction.amount, 
+            BankTransaction.reference_number
+        ).where(
+            BankTransaction.bank_account_id == ledger_account_id,
+            BankTransaction.transaction_date.in_(dates)
+        )
+        existing_txns = await db.execute(stmt)
+        for t_date, t_amount, t_ref in existing_txns:
+            existing_keys.add((t_date, t_amount, t_ref))
+
+    for txn_date, amount, txn_type, desc, ref in parsed_rows:
+        key = (txn_date, amount, ref)
+        if key in existing_keys:
+            skipped += 1
+            continue
+            
+        existing_keys.add(key)
+        
+        bt = BankTransaction(
+            bank_account_id=ledger_account_id,
+            transaction_date=txn_date,
+            amount=amount,
+            type=txn_type,
+            description=desc,
+            reference_number=ref,
+            is_reconciled=0
+        )
+        db.add(bt)
+        added += 1
             
     await db.commit()
     
@@ -2260,7 +2425,7 @@ async def gst_invoice_register(
     for inv in invoices:
         items.append(GSTRegisterItem(
             date=inv.created_at.date(), # assuming created_at as date for now
-            invoice_no=inv.invoice_number,
+            invoice_no=str(inv.id),
             type='SALES',
             party_name='Customer', # Would join customer/project
             taxable_amount=float(inv.amount),
@@ -2444,7 +2609,7 @@ async def gst_invoice_register(
     for inv in invoices:
         items.append(GSTRegisterItem(
             date=inv.created_at.date(), # assuming created_at as date for now
-            invoice_no=inv.invoice_number,
+            invoice_no=str(inv.id),
             type='SALES',
             party_name='Customer', # Would join customer/project
             taxable_amount=float(inv.amount),
@@ -2575,7 +2740,7 @@ async def export_gst(
     
     for inv in invoices:
         writer.writerow([
-            inv.invoice_number,
+            str(inv.id),
             inv.created_at.date().isoformat(),
             'SALES',
             'Customer', # Simplified

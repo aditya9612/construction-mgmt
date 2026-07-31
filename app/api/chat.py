@@ -291,6 +291,10 @@ async def send_message(
     chat.last_message = payload.message if payload.message else "📎 Attachment"
     chat.last_message_at = get_naive_local_now()
 
+    # Commit the transaction so the Redis listener can read the message from the DB
+    await db.commit()
+    await db.refresh(msg)
+
     #  4. REDIS FAIL SAFETY
     try:
         redis = request.app.state.redis
@@ -314,7 +318,6 @@ async def send_message(
     except Exception:
         pass
 
-    await db.refresh(msg)
     return msg
 
 
@@ -2212,13 +2215,19 @@ async def edit_message(
     msg.message = new_text.strip()
     msg.is_edited = True
 
+    await db.commit()
+    await db.refresh(msg)
+
     #  REAL-TIME edit event
     redis = getattr(request.app.state, "redis", None)
     if redis:
-        await redis.publish(
-            f"chat:{msg.chat_id}",
-            json.dumps({"type": "edit", "message_id": msg.id, "new_text": new_text}),
-        )
+        try:
+            await redis.publish(
+                f"chat:{msg.chat_id}",
+                json.dumps({"type": "edit", "message_id": msg.id, "new_text": new_text}),
+            )
+        except Exception:
+            pass
 
     return {"status": "edited"}
 
@@ -2247,12 +2256,18 @@ async def delete_message(
     #  soft delete
     msg.is_deleted = True
 
+    await db.commit()
+    await db.refresh(msg)
+
     #  REAL-TIME delete event
     redis = getattr(request.app.state, "redis", None)
     if redis:
-        await redis.publish(
-            f"chat:{msg.chat_id}", json.dumps({"type": "delete", "message_id": msg.id})
-        )
+        try:
+            await redis.publish(
+                f"chat:{msg.chat_id}", json.dumps({"type": "delete", "message_id": msg.id})
+            )
+        except Exception:
+            pass
 
     return {"status": "deleted"}
 
@@ -2629,36 +2644,40 @@ async def forward_message(
         )
         chat.last_message_at = get_naive_local_now()
 
+    await db.commit()
+    await db.refresh(forwarded)
+
     # realtime websocket event
     redis = getattr(request.app.state, "redis", None)
 
     if redis:
-        await redis.publish(
-            f"chat:{target_chat_id}",
-            json.dumps(
-                {
-                    "type": "forward",
-                    "chat_id": target_chat_id,
-                    "message_id": forwarded.id,
-                    "sender": current_user.id,
-                    "forwarded_from_message_id": original.id,
-                    "message": original.message,
-                    "attachments": [
-                        {
-                            "id": a.id,
-                            "file_url": a.file_url,
-                            "file_name": a.file_name,
-                            "file_type": a.file_type,
-                            "file_size": a.file_size,
-                            "thumbnail_url": a.thumbnail_url,
-                        }
-                        for a in original.attachments
-                    ],
-                }
-            ),
-        )
-
-    await db.commit()
+        try:
+            await redis.publish(
+                f"chat:{target_chat_id}",
+                json.dumps(
+                    {
+                        "type": "forward",
+                        "chat_id": target_chat_id,
+                        "message_id": forwarded.id,
+                        "sender": current_user.id,
+                        "forwarded_from_message_id": original.id,
+                        "message": original.message,
+                        "attachments": [
+                            {
+                                "id": a.id,
+                                "file_url": a.file_url,
+                                "file_name": a.file_name,
+                                "file_type": a.file_type,
+                                "file_size": a.file_size,
+                                "thumbnail_url": a.thumbnail_url,
+                            }
+                            for a in original.attachments
+                        ],
+                    }
+                ),
+            )
+        except Exception:
+            pass
 
     return {"status": "forwarded", "message_id": forwarded.id}
 

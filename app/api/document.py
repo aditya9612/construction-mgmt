@@ -88,16 +88,16 @@ async def create_document(
     """
     Uploads a physical file and creates a document record.
     """
-    file_extension = Path(file.filename).suffix
-    unique_filename = f"{uuid.uuid4()}{file_extension}"
-    file_path = UPLOAD_DIR / unique_filename
-
-    # Save file
-    def _save_file():
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-    await run_in_threadpool(_save_file)
+    # =====================================
+    # SECURE VALIDATION AND SAVE
+    # =====================================
+    from app.core.validators import validate_and_save_document
+    file_path_str = await validate_and_save_document(
+        file=file,
+        upload_dir=str(UPLOAD_DIR),
+        prefix="doc"
+    )
+    file_path = Path(file_path_str)
 
     file_size = os.path.getsize(file_path)
 
@@ -300,15 +300,13 @@ async def update_document(
             os.remove(obj.file_url)
 
         # Save new file
-        file_extension = Path(file.filename).suffix
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
-        file_path = UPLOAD_DIR / unique_filename
-
-        def _save_updated_file():
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-                
-        await run_in_threadpool(_save_updated_file)
+        from app.core.validators import validate_and_save_document
+        file_path_str = await validate_and_save_document(
+            file=file,
+            upload_dir=str(UPLOAD_DIR),
+            prefix="doc"
+        )
+        file_path = Path(file_path_str)
 
         obj.file_url = str(file_path)
         obj.file_size = os.path.getsize(file_path)

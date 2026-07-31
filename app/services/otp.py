@@ -17,6 +17,8 @@ from app.core.config import settings
 
 OTP_PREFIX = "otp:"
 OTP_RATE_PREFIX = "otp:rate:"
+OTP_FAIL_PREFIX = "otp:fail:"
+OTP_LOCK_PREFIX = "otp:lock:"
 
 
 
@@ -135,3 +137,49 @@ async def check_otp_rate_limit(redis: Optional[Redis], mobile: str) -> bool:
         logger.warning(f"OTP rate limit exceeded mobile={mobile}")
 
     return count <= 3 # max 3 otp per minute
+
+
+async def is_otp_locked(redis: Optional[Redis], mobile: str) -> bool:
+    """Check if the account is temporarily locked due to too many failed attempts."""
+    if redis is None:
+        return False
+        
+    key = f"{OTP_LOCK_PREFIX}{_normalize_mobile(mobile)}"
+    return await redis.exists(key) > 0
+
+
+async def clear_otp_lockout(redis: Optional[Redis], mobile: str) -> None:
+    """Clear failed attempts and locks atomically."""
+    if redis is None:
+        return
+        
+    fail_key = f"{OTP_FAIL_PREFIX}{_normalize_mobile(mobile)}"
+    lock_key = f"{OTP_LOCK_PREFIX}{_normalize_mobile(mobile)}"
+    await redis.delete(fail_key, lock_key)
+
+
+async def record_failed_otp_attempt(redis: Optional[Redis], mobile: str, max_attempts: int = 6, lock_minutes: int = 5) -> bool:
+    """
+    Atomically increment the failed attempt counter.
+    Returns True if the account has just been locked as a result of this failure.
+    """
+    if redis is None:
+        return False
+        
+    mobile_norm = _normalize_mobile(mobile)
+    fail_key = f"{OTP_FAIL_PREFIX}{mobile_norm}"
+    lock_key = f"{OTP_LOCK_PREFIX}{mobile_norm}"
+    
+    # Atomic increment
+    count = await redis.incr(fail_key)
+    
+    # If first failure, set expiry on the fail counter (e.g., 15 mins)
+    if count == 1:
+        await redis.expire(fail_key, lock_minutes * 60)
+        
+    if count >= max_attempts:
+        logger.warning(f"OTP brute force lockout triggered mobile={mobile_norm}")
+        await redis.setex(lock_key, lock_minutes * 60, "true")
+        return True
+        
+    return False

@@ -1,13 +1,15 @@
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from pyrate_limiter import Duration, Rate
+import time
 from app import db
-from app.core.dependencies import get_request_redis
-from app.core.security import create_access_token, get_password_hash
+from app.core.dependencies import get_request_redis, get_current_user, security
+from app.core.security import create_access_token, get_password_hash, decode_access_token
 from app.db.session import get_db_session
 from app.core.config import settings
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
@@ -19,6 +21,9 @@ from app.services.otp import (
     generate_otp,
     store_otp,
     verify_otp as verify_otp_service,
+    is_otp_locked,
+    clear_otp_lockout,
+    record_failed_otp_attempt,
 )
 from app.services.sms import send_otp_sms
 from app.utils.helpers import AppError
@@ -87,6 +92,10 @@ async def login(
     if len(mobile) < 10:
         raise AppError(status_code=422, message="Invalid mobile number")
 
+    if await is_otp_locked(redis, mobile):
+        logger.warning(f"OTP login attempted while locked mobile={mobile}")
+        raise AppError(status_code=401, message="Account temporarily locked due to too many failed attempts. Please try again after 5 minutes.")
+
     user = await db.scalar(select(User).where(User.mobile == mobile))
     if user is None:
         raise AppError(status_code=404, message="User not registered")
@@ -134,10 +143,18 @@ async def verify_otp(
 
     if len(mobile) < 10:
         raise AppError(status_code=422, message="Invalid mobile number")
+        
+    if await is_otp_locked(redis, mobile):
+        logger.warning(f"OTP verification attempted while locked mobile={mobile}")
+        raise AppError(status_code=401, message="Account temporarily locked due to too many failed attempts. Please try again after 5 minutes.")
 
     if not await verify_otp_service(redis, mobile, payload.otp):
-        logger.warning(f"Invalid OTP attempt mobile={mobile}")  
+        logger.warning(f"Invalid OTP attempt mobile={mobile}")
+        await record_failed_otp_attempt(redis, mobile)
         raise AppError(status_code=401, message="Invalid or expired OTP")
+        
+    # On successful verify, clear any accumulated failed attempts
+    await clear_otp_lockout(redis, mobile)
 
     try:
         user = await db.scalar(select(User).where(User.mobile == mobile))
@@ -173,3 +190,52 @@ async def verify_otp(
     except Exception:
         logger.exception("OTP verification process failed") 
         raise
+
+@router.post(
+    "/logout",
+    response_model=dict,
+)
+async def logout(
+    current_user: User = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    redis: Redis | None = Depends(get_request_redis),
+):
+    if redis is None:
+        raise AppError(status_code=503, message="Redis unavailable")
+
+    try:
+        token = credentials.credentials
+        payload = decode_access_token(token)
+        jti = payload.get("jti")
+        exp = payload.get("exp")
+        
+        if jti and exp:
+            ttl = int(exp) - int(time.time())
+            if ttl > 0:
+                await redis.setex(f"blocklist:jti:{jti}", ttl, "true")
+        
+        return {"message": "Logged out successfully"}
+    except Exception as e:
+        logger.exception("Logout failed")
+        raise AppError(status_code=500, message="Logout failed")
+
+@router.post(
+    "/logout_all",
+    response_model=dict,
+)
+async def logout_all(
+    current_user: User = Depends(get_current_user),
+    redis: Redis | None = Depends(get_request_redis),
+):
+    if redis is None:
+        raise AppError(status_code=503, message="Redis unavailable")
+
+    try:
+        now_ts = time.time()
+        # Set max expiry same as JWT TTL to avoid keeping it forever
+        ttl = settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        await redis.setex(f"logout_all:user:{current_user.id}", ttl, str(now_ts))
+        return {"message": "Logged out from all devices"}
+    except Exception as e:
+        logger.exception("Logout all failed")
+        raise AppError(status_code=500, message="Logout all failed")

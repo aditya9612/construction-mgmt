@@ -52,4 +52,39 @@ def setup_logger():
     return logger
 
 
+def setup_audit_logger():
+    audit_logger = logging.getLogger("audit")
+    
+    # Avoid duplicating handlers if already initialized
+    if audit_logger.hasHandlers():
+        audit_logger.handlers.clear()
+        
+    audit_logger.setLevel(logging.INFO)
+    
+    # Ensure audit log directory exists
+    os.makedirs("logs/audit", exist_ok=True)
+    
+    # Simple JSON-like formatter for audit logs
+    formatter = logging.Formatter('%(message)s')
+    
+    file_handler = TimedRotatingFileHandler(
+        "logs/audit/audit.log",
+        when="midnight",
+        interval=1,
+        backupCount=30
+    )
+    file_handler.suffix = "%Y-%m-%d"
+    file_handler.setFormatter(formatter)
+    
+    # Re-use existing RequestIdFilter
+    file_handler.addFilter(RequestIdFilter())
+    
+    audit_logger.addHandler(file_handler)
+    
+    # Do not propagate audit logs to the root logger (prevents duplicate console output)
+    audit_logger.propagate = False
+    
+    return audit_logger
+
+
 logger = logging.getLogger("construction-mgmt")

@@ -16,6 +16,8 @@ class Settings(BaseSettings):
 
 
     SQL_ECHO: bool = False
+    SLOW_SQL_THRESHOLD: float = 0.5
+    GZIP_MINIMUM_SIZE: int = 1000
 
 
     JWT_SECRET: str = "supersecret"

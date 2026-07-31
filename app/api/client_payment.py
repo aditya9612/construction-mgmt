@@ -527,19 +527,31 @@ async def save_receipt(receipt: UploadFile | None, payment_no: str) -> str | Non
     if receipt is None:
         return None
     UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
-    filename = f"{payment_no}_{uuid.uuid4().hex}{Path(receipt.filename).suffix.lower()}"
-    filepath = UPLOAD_FOLDER / filename
     try:
-        with open(filepath, "wb") as buffer:
-            shutil.copyfileobj(receipt.file, buffer)
-        return str(filepath)
-    except Exception:
-        if filepath.exists():
-            filepath.unlink(missing_ok=True)
+        if receipt.content_type == "application/pdf":
+            from app.core.validators import validate_and_save_document
+            file_path_str = await validate_and_save_document(
+                file=receipt, upload_dir=str(UPLOAD_FOLDER), prefix=payment_no
+            )
+            return file_path_str
+        elif receipt.content_type.startswith("image/"):
+            from app.core.validators import validate_and_save_image
+            file_path_str = await validate_and_save_image(
+                file=receipt, upload_dir=str(UPLOAD_FOLDER), prefix=payment_no
+            )
+            return file_path_str
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unsupported receipt type. Please upload a PDF or an image."
+            )
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
         logger.exception("Unable to save receipt.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unable to save receipt.",
+            detail="Error saving receipt."
         )
     finally:
         await receipt.close()

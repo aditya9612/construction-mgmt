@@ -106,6 +106,7 @@ from app.middlewares.rate_limiter import default_rate_limiter_dependency
 
 # Utils
 from app.utils.helpers import NotFoundError
+from app.utils.qr import generate_qr
 
 EQUIPMENT_READ_ROLES = [
     r.value
@@ -4955,6 +4956,37 @@ async def list_transfer_history(
             "offset": offset,
         },
     }
+
+
+# ===================== QR CODE ====================================
+
+@router.get(
+    "/{equipment_id}/qr",
+    summary="Generate Equipment QR Code",
+    description="Stateless endpoint that generates an in-memory QR code PNG for the given equipment. No database writes occur.",
+    response_class=StreamingResponse,
+)
+async def generate_equipment_qr(
+    equipment_id: int,
+    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    # Verify equipment exists using standard helper
+    equipment = await get_active_equipment_or_404(db, equipment_id)
+    
+    # Generate QR in memory (payload: EQP:ID)
+    qr_buf = generate_qr(entity_type="EQP", entity_id=equipment.id)
+    
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="equipment_{equipment.id}.png"'
+    }
+    
+    return StreamingResponse(
+        qr_buf, 
+        media_type="image/png",
+        headers=headers
+    )
 
 
 # =====================get_equipment==============================

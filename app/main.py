@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 import asyncio
 import json
 from fastapi import WebSocket, WebSocketDisconnect
@@ -65,14 +66,16 @@ from app.api.notification import router as notification_router
 from app.api.rbac import router as rbac_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
-from app.core.db import AsyncSessionLocal
+from app.core.db import AsyncSessionLocal, async_engine
 from app.middlewares.rate_limiter import init_rate_limiter
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.utils.helpers import AppError
-from app.core.logger import setup_logger
+from app.core.logger import setup_logger, setup_audit_logger
 from fastapi.staticfiles import StaticFiles
 from app.core.request_context import set_request_id
 from app.core.logger import logger
+from app.middlewares.audit_logger import AuditLogMiddleware
+from app.middlewares.security_headers import SecurityHeadersMiddleware
 from fastapi import WebSocket, WebSocketDisconnect
 from app.core.websocket_manager import manager
 from app.core.redis_pubsub import RedisPubSub
@@ -84,6 +87,7 @@ SLOW_API_THRESHOLD = 500
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logger()
+    setup_audit_logger()
 
     app.state.redis = await create_redis_client(settings.REDIS_URL)
     try:
@@ -114,6 +118,9 @@ async def lifespan(app: FastAPI):
         redis = getattr(app.state, "redis", None)
         if redis is not None:
             await redis.close()
+            
+        logger.info("Disposing SQLAlchemy async engine...")
+        await async_engine.dispose()
 
 
 def create_app() -> FastAPI:
@@ -127,7 +134,7 @@ def create_app() -> FastAPI:
         "http://127.0.0.1:5173",
         "http://localhost:4200",
         "https://infrapilot.in",
-        "https://infra-pilot.netlify.app"
+        "https://infra-pilot.netlify.app",
         "https://infrapilot-testing.netlify.app",
     ]
 
@@ -138,6 +145,15 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Register Audit Logging Middleware as outermost wrapper possible (after CORS)
+    application.add_middleware(AuditLogMiddleware)
+    
+    # Register Security Headers Middleware
+    application.add_middleware(SecurityHeadersMiddleware)
+    
+    # Register GZip Middleware as the absolute outermost wrapper
+    application.add_middleware(GZipMiddleware, minimum_size=settings.GZIP_MINIMUM_SIZE)
 
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("uploads/profile", exist_ok=True)
@@ -250,6 +266,9 @@ def create_app() -> FastAPI:
     @application.get("/health", tags=["health"])
     async def health():
         return {"status": "ok"}
+
+    from app.api.health import router as advanced_health_router
+    application.include_router(advanced_health_router)
 
     api_router = APIRouter(dependencies=[default_rate_limiter_dependency()])
     from app.api.project import qc_router, safety_router, checklist_router
@@ -367,46 +386,55 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
     pubsub = redis.pubsub()
     await pubsub.subscribe(f"chat:{chat_id}", f"project:{chat_id}")
 
-    try:
-        # =========================
-        #  DB SESSION (ADDED)
-        # =========================
-        async with AsyncSessionLocal() as db:
+    async def redis_listener():
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
 
-            async for message in pubsub.listen():
+            data = json.loads(message["data"])
 
-                if message["type"] != "message":
-                    continue
-
-                data = json.loads(message["data"])
-
-                # =========================
-                #  MARK DELIVERED (ADDED)
-                # =========================
-                if data.get("type") == "message":
-                    msg_id = data.get("message_id")
-
-                    if msg_id:
+            if data.get("type") == "message":
+                msg_id = data.get("message_id")
+                if msg_id:
+                    async with AsyncSessionLocal() as db:
                         msg = await db.get(ChatMessage, msg_id)
-
                         if msg and msg.status == MessageStatus.SENT:
                             msg.status = MessageStatus.DELIVERED
                             await db.commit()
 
-                        #  broadcast delivered event (NEW)
-                        await redis.publish(
-                            f"chat:{chat_id}",
-                            json.dumps(
-                                {
-                                    "type": "delivered",
-                                    "chat_id": chat_id,
-                                    "message_id": msg_id,
-                                }
-                            ),
-                        )
+                    await redis.publish(
+                        f"chat:{chat_id}",
+                        json.dumps({
+                            "type": "delivered",
+                            "chat_id": chat_id,
+                            "message_id": msg_id
+                        })
+                    )
 
-                #  broadcast ALL event types
-                await manager.broadcast(chat_id, data)
+            await manager.broadcast(chat_id, data)
+
+    async def websocket_listener():
+        while True:
+            await websocket.receive_text()
+
+    redis_task = asyncio.create_task(redis_listener())
+    ws_task = asyncio.create_task(websocket_listener())
+
+    try:
+        done, pending = await asyncio.wait(
+            [redis_task, ws_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        
+        # Re-raise exceptions from completed tasks (like WebSocketDisconnect)
+        for task in done:
+            task.result()
 
     except WebSocketDisconnect:
         manager.disconnect(chat_id, websocket)

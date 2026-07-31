@@ -336,16 +336,71 @@ ALLOWED_DRAWING_EXTENSIONS = {
 }
 
 
-def validate_drawing_file(filename: str):
+async def validate_drawing_file(file: UploadFile):
+    content = await file.read()
+    MAX_FILE_SIZE = 50 * 1024 * 1024
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="Drawing file too large (max 50MB)")
+    await file.seek(0)
 
-    ext = os.path.splitext(filename)[1].lower()
-
+    ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_DRAWING_EXTENSIONS:
         raise HTTPException(
             status_code=400,
             detail="Unsupported drawing file type"
         )
+
+    allowed_mimes = {
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "application/acad",
+        "application/x-acad",
+        "image/vnd.dwg",
+        "image/x-dwg",
+        "image/vnd.dxf",
+        "application/dxf",
+        "application/octet-stream" # some clients send generic octet-stream for dwg/dxf
+    }
     
+    # We use a broad MIME check for CAD files since browsers/clients are often inconsistent with dwg/dxf MIME types
+    if file.content_type not in allowed_mimes and not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported drawing MIME type"
+        )
+
+async def validate_and_save_audio(
+    file: UploadFile,
+    upload_dir: str,
+    prefix: str,
+) -> str:
+    os.makedirs(upload_dir, exist_ok=True)
+    allowed_extensions = {".mp3", ".wav", ".m4a", ".webm", ".aac", ".ogg"}
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Only audio files allowed (mp3, wav, m4a, webm, aac, ogg).")
+
+    allowed_mimes = {
+        "audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a",
+        "audio/webm", "video/webm", "audio/aac", "audio/ogg", "application/ogg"
+    }
+    if file.content_type not in allowed_mimes and not file.content_type.startswith("audio/") and not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Invalid audio MIME type.")
+
+    content = await file.read()
+    if len(content) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio file too large (max 25MB).")
+    await file.seek(0)
+
+    filename = f"{prefix}_{uuid.uuid4().hex}{ext}"
+    file_path = f"{upload_dir}/{filename}"
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return file_path
+
 # ================= MATERIAL VALIDATORS =================
 
 

@@ -33,6 +33,7 @@ from app.models.approval import Approval
 from app.core.logger import logger
 import pandas as pd
 from app.utils.common import assert_project_access, generate_business_id
+from app.utils.qr import generate_qr
 from app.models.project import Project, ProjectMember
 from sqlalchemy.exc import IntegrityError
 from fastapi import File, UploadFile, Form
@@ -1961,7 +1962,33 @@ async def export_payroll_excel(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=payroll.xlsx"},
     )
+async def _get_active_labour_or_404(db: AsyncSession, labour_id: int):
+    obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
+    if not obj:
+        raise NotFoundError("Labour record not found")
+    return obj
 
+
+@router.get("/{labour_id}/qr", response_class=StreamingResponse)
+async def generate_labour_qr(
+    labour_id: int,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    labour = await _get_active_labour_or_404(db, labour_id)
+    
+    qr_buf = generate_qr(entity_type="LAB", entity_id=labour.id)
+    
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="labour_{labour.id}.png"'
+    }
+    
+    return StreamingResponse(
+        qr_buf, 
+        media_type="image/png",
+        headers=headers
+    )
 
 @router.get("/{labour_id}", response_model=s.LabourOut)
 async def get_labour(

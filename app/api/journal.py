@@ -167,26 +167,112 @@ async def export_adjustment_journals(db: AsyncSession = Depends(get_db_session))
     )
 
 @router.post("/adjustment/import")
-async def import_adjustment_journals(file: UploadFile = File(...)):
+async def import_adjustment_journals(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session)
+):
+    import csv
+    from datetime import date
+    from app.models.accountant import Account
+    
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+
     content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
     text = content.decode('utf-8')
     lines = text.splitlines()
     
-    total = max(0, len(lines) - 1)
     valid = 0
     errors = []
     
-    for i, line in enumerate(lines[1:], start=2):
-        if not line.strip(): continue
-        parts = line.split(',')
+    reader = csv.reader(lines)
+    try:
+        next(reader)
+    except StopIteration:
+        pass
+
+    journal_lines = []
+    total_debit = 0.0
+    total_credit = 0.0
+    entry_date = date.today()
+
+    for i, parts in enumerate(reader, start=2):
+        if not parts or not any(parts):
+            continue
         if len(parts) < 4:
             errors.append(f"Line {i}: Invalid format")
-        else:
-            valid += 1
+            continue
             
+        date_str = parts[0].strip()
+        account_id_str = parts[1].strip()
+        debit_str = parts[2].strip() or '0'
+        credit_str = parts[3].strip() or '0'
+
+        try:
+            row_date = date.fromisoformat(date_str)
+            if valid == 0:
+                entry_date = row_date
+        except ValueError:
+            errors.append(f"Line {i}: Invalid date format, expected YYYY-MM-DD")
+            continue
+
+        try:
+            account_id = int(account_id_str)
+        except ValueError:
+            errors.append(f"Line {i}: Invalid account ID '{account_id_str}'")
+            continue
+
+        try:
+            debit = float(debit_str)
+            credit = float(credit_str)
+        except ValueError:
+            errors.append(f"Line {i}: Invalid debit/credit amount")
+            continue
+
+        acc = await db.get(Account, account_id)
+        if not acc:
+            errors.append(f"Line {i}: Account ID {account_id} not found")
+            continue
+
+        journal_lines.append(JournalLine(
+            account_id=account_id,
+            debit=debit,
+            credit=credit
+        ))
+        total_debit += debit
+        total_credit += credit
+        valid += 1
+
+    if valid > 0 and len(errors) == 0:
+        if abs(total_debit - total_credit) > 0.01:
+            errors.append(f"Debit and Credit must match. Debits: {total_debit}, Credits: {total_credit}")
+        else:
+            je = JournalEntry(
+                entry_date=entry_date,
+                description="Imported Adjustment Journal",
+                entry_type="Adjustment",
+                created_by=current_user.id
+            )
+            db.add(je)
+            await db.flush()
+
+            for jl in journal_lines:
+                jl.entry_id = je.id
+                db.add(jl)
+
+            je.journal_number = f"ADJ-{je.id}"
+            await db.commit()
+    
+    if len(errors) > 0:
+        await db.rollback()
+        
     return {
-        "valid_records": valid,
-        "errors": errors
+        "valid_records": valid if len(errors) == 0 else 0,
+        "errors": errors,
+        "message": "Import successful" if len(errors) == 0 else "Import failed due to errors"
     }
 
 @router.get("/adjustment/{id}", response_model=JournalEntryExtendedOut)
