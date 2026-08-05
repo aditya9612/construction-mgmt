@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import date, datetime
+from decimal import ROUND_HALF_UP
 import json
 import mimetypes
 import pathlib, re, io, os, uuid
@@ -22,6 +23,7 @@ from app.core.enums import (
     TaskPriority,
     WorkActivityStatus,
 )
+from app.models.boq import BOQ
 from app.models.work_order import WorkOrder
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.core.validators import validate_drawing_file
@@ -87,7 +89,7 @@ from app.utils.common import (
     generate_business_id,
     assert_task_project,
 )
-from app.utils.qr import generate_qr,
+from app.utils.qr import generate_qr
 
 
 def compute_project_status(project):
@@ -962,15 +964,11 @@ class ProjectMembersService:
         )
         self._assert_member_mutation_role(current_user)
 
-        project = await self.projects_repo.get_project(
-            db, project_id=project_id
-        )
+        project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
 
-        user = await db.scalar(
-            select(User).where(User.id == user_id)
-        )
+        user = await db.scalar(select(User).where(User.id == user_id))
         if user is None:
             raise NotFoundError("User not found")
 
@@ -991,9 +989,7 @@ class ProjectMembersService:
             )
 
             # If the assigned user is Labour, create LabourProject mapping
-            labour = await db.scalar(
-                select(Labour).where(Labour.user_id == user_id)
-            )
+            labour = await db.scalar(select(Labour).where(Labour.user_id == user_id))
 
             if labour:
                 existing_labour_project = await db.scalar(
@@ -3923,6 +3919,7 @@ async def create_task(
 
     if audio_file:
         from app.core.validators import validate_and_save_audio
+
         audio_instruction_url = await validate_and_save_audio(
             file=audio_file, upload_dir=AUDIO_DIR, prefix="audio"
         )
@@ -3936,6 +3933,7 @@ async def create_task(
 
     if instruction_image:
         from app.core.validators import validate_and_save_image
+
         instruction_image_url = await validate_and_save_image(
             file=instruction_image, upload_dir=IMAGE_DIR, prefix="img"
         )
@@ -4032,6 +4030,7 @@ async def update_task(
 
     if audio_file:
         from app.core.validators import validate_and_save_audio
+
         audio_instruction_url = await validate_and_save_audio(
             file=audio_file, upload_dir=AUDIO_DIR, prefix="audio"
         )
@@ -4044,6 +4043,7 @@ async def update_task(
     instruction_image_url = None
     if instruction_image:
         from app.core.validators import validate_and_save_image
+
         instruction_image_url = await validate_and_save_image(
             file=instruction_image, upload_dir=IMAGE_DIR, prefix="img"
         )
@@ -5070,7 +5070,9 @@ async def export_dsr_excel(
     if not rows:
         raise NotFoundError("No DSR data found")
 
-    project_result = await db.execute(select(Project).where(Project.id == project_id))
+    project_result = await db.execute(
+        select(m.Project).where(m.Project.id == project_id)
+    )
     project = project_result.scalars().first()
     project_name = project.project_name if project else str(project_id)
 
@@ -5733,7 +5735,7 @@ async def create_activity_log(
     remarks=None,
 ):
 
-    log = ActivityHistory(
+    log = m.ActivityHistory(
         activity_id=activity_id,
         action=action,
         old_value=(
@@ -5808,7 +5810,7 @@ async def create_activity(
         # =====================================
 
         project = await db.get(
-            Project,
+            m.Project,
             data.project_id,
         )
 
@@ -5876,9 +5878,9 @@ async def create_activity(
         # DUPLICATE ACTIVITY CHECK
         # =====================================
 
-        duplicate_stmt = select(WorkActivity).where(
-            WorkActivity.project_id == data.project_id,
-            WorkActivity.boq_item_id == data.boq_item_id,
+        duplicate_stmt = select(m.WorkActivity).where(
+            m.WorkActivity.project_id == data.project_id,
+            m.WorkActivity.boq_item_id == data.boq_item_id,
         )
 
         duplicate_result = await db.execute(duplicate_stmt)
@@ -5936,9 +5938,9 @@ async def create_activity(
             # CHECK PROJECT ASSIGNMENT
             # =====================================
 
-            member_stmt = select(ProjectMember).where(
-                ProjectMember.project_id == data.project_id,
-                ProjectMember.user_id == data.engineer_id,
+            member_stmt = select(m.ProjectMember).where(
+                m.ProjectMember.project_id == data.project_id,
+                m.ProjectMember.user_id == data.engineer_id,
             )
 
             member_result = await db.execute(member_stmt)
@@ -5952,7 +5954,7 @@ async def create_activity(
                     detail="Engineer is not assigned to this project",
                 )
 
-        activity = WorkActivity(
+        activity = m.WorkActivity(
             project_id=data.project_id,
             boq_item_id=data.boq_item_id,
             work_order_id=data.work_order_id,
@@ -6099,7 +6101,7 @@ async def list_activities(
         # =====================================================
 
         project = await db.get(
-            Project,
+            m.Project,
             project_id,
         )
 
@@ -6120,7 +6122,9 @@ async def list_activities(
         # REALTIME STATUS REFRESH
         # =====================================================
 
-        refresh_stmt = select(WorkActivity).where(WorkActivity.project_id == project_id)
+        refresh_stmt = select(m.WorkActivity).where(
+            m.WorkActivity.project_id == project_id
+        )
 
         refresh_result = await db.execute(refresh_stmt)
 
@@ -6146,17 +6150,17 @@ async def list_activities(
         # BASE QUERY
         # =====================================================
 
-        stmt = select(WorkActivity).options(
-            selectinload(WorkActivity.project),
-            selectinload(WorkActivity.work_order),
-            selectinload(WorkActivity.boq_item),
-            selectinload(WorkActivity.engineer),
+        stmt = select(m.WorkActivity).options(
+            selectinload(m.WorkActivity.project),
+            selectinload(m.WorkActivity.work_order),
+            selectinload(m.WorkActivity.boq_item),
+            selectinload(m.WorkActivity.engineer),
         )
 
-        count_stmt = select(func.count()).select_from(WorkActivity)
+        count_stmt = select(func.count()).select_from(m.WorkActivity)
 
         filters = [
-            WorkActivity.project_id == project_id,
+            m.WorkActivity.project_id == project_id,
         ]
 
         # =====================================================
@@ -6184,7 +6188,7 @@ async def list_activities(
                     detail="Work order does not belong to this project",
                 )
 
-            filters.append(WorkActivity.work_order_id == work_order_id)
+            filters.append(m.WorkActivity.work_order_id == work_order_id)
 
         # =====================================================
         # ENGINEER FILTER
@@ -6211,7 +6215,7 @@ async def list_activities(
                     detail="Selected user is not a Site Engineer",
                 )
 
-            filters.append(WorkActivity.engineer_id == engineer_id)
+            filters.append(m.WorkActivity.engineer_id == engineer_id)
 
         # =====================================================
         # STATUS FILTER
@@ -6219,7 +6223,7 @@ async def list_activities(
 
         if status is not None:
 
-            filters.append(WorkActivity.status == status)
+            filters.append(m.WorkActivity.status == status)
 
         # =====================================================
         # SEARCH FILTER
@@ -6231,8 +6235,8 @@ async def list_activities(
 
             filters.append(
                 or_(
-                    WorkActivity.activity_name.ilike(f"%{search}%"),
-                    WorkActivity.discipline.ilike(f"%{search}%"),
+                    m.WorkActivity.activity_name.ilike(f"%{search}%"),
+                    m.WorkActivity.discipline.ilike(f"%{search}%"),
                 )
             )
 
@@ -6248,7 +6252,7 @@ async def list_activities(
         # ORDERING
         # =====================================================
 
-        stmt = stmt.order_by(WorkActivity.created_at.desc())
+        stmt = stmt.order_by(m.WorkActivity.created_at.desc())
 
         # =====================================================
         # PAGINATION
@@ -6349,13 +6353,13 @@ async def get_activity(
         # =====================================================
 
         stmt = (
-            select(WorkActivity)
-            .where(WorkActivity.id == activity_id)
+            select(m.WorkActivity)
+            .where(m.WorkActivity.id == activity_id)
             .options(
-                selectinload(WorkActivity.project),
-                selectinload(WorkActivity.work_order),
-                selectinload(WorkActivity.boq_item),
-                selectinload(WorkActivity.engineer),
+                selectinload(m.WorkActivity.project),
+                selectinload(m.WorkActivity.work_order),
+                selectinload(m.WorkActivity.boq_item),
+                selectinload(m.WorkActivity.engineer),
             )
         )
 
@@ -6451,11 +6455,11 @@ async def update_activity(
         # =====================================
 
         stmt = (
-            select(WorkActivity)
-            .where(WorkActivity.id == activity_id)
+            select(m.WorkActivity)
+            .where(m.WorkActivity.id == activity_id)
             .options(
-                selectinload(WorkActivity.project),
-                selectinload(WorkActivity.work_order),
+                selectinload(m.WorkActivity.project),
+                selectinload(m.WorkActivity.work_order),
             )
         )
 
@@ -6566,9 +6570,9 @@ async def update_activity(
                     detail="Engineer is inactive",
                 )
 
-            member_stmt = select(ProjectMember).where(
-                ProjectMember.project_id == activity.project_id,
-                ProjectMember.user_id == engineer.id,
+            member_stmt = select(m.ProjectMember).where(
+                m.ProjectMember.project_id == activity.project_id,
+                m.ProjectMember.user_id == engineer.id,
             )
 
             member_result = await db.execute(member_stmt)
@@ -6810,13 +6814,13 @@ async def delete_activity(
         # =====================================
 
         stmt = (
-            select(WorkActivity)
+            select(m.WorkActivity)
             .where(
-                WorkActivity.id == activity_id,
+                m.WorkActivity.id == activity_id,
             )
             .options(
-                selectinload(WorkActivity.progress_entries),
-                selectinload(WorkActivity.history_logs),
+                selectinload(m.WorkActivity.progress_entries),
+                selectinload(m.WorkActivity.history_logs),
             )
         )
 
@@ -6845,8 +6849,8 @@ async def delete_activity(
         # CHECK DAILY PROGRESS
         # =====================================
 
-        progress_stmt = select(DailyProgressEntry.id).where(
-            DailyProgressEntry.activity_id == activity.id,
+        progress_stmt = select(m.DailyProgressEntry.id).where(
+            m.DailyProgressEntry.activity_id == activity.id,
         )
 
         progress_result = await db.execute(progress_stmt)
@@ -6890,8 +6894,8 @@ async def delete_activity(
         # =====================================
 
         await db.execute(
-            delete(ActivityHistory).where(
-                ActivityHistory.activity_id == activity.id,
+            delete(m.ActivityHistory).where(
+                m.ActivityHistory.activity_id == activity.id,
             )
         )
 
@@ -6997,9 +7001,9 @@ async def add_daily_progress(
         # =====================================================
 
         stmt = (
-            select(WorkActivity)
+            select(m.WorkActivity)
             .where(
-                WorkActivity.id == data.activity_id,
+                m.WorkActivity.id == data.activity_id,
             )
             .with_for_update()
         )
@@ -7065,9 +7069,9 @@ async def add_daily_progress(
         # CHECK DUPLICATE ENTRY
         # =====================================================
 
-        duplicate_stmt = select(DailyProgressEntry).where(
-            DailyProgressEntry.activity_id == data.activity_id,
-            DailyProgressEntry.entry_date == data.entry_date,
+        duplicate_stmt = select(m.DailyProgressEntry).where(
+            m.DailyProgressEntry.activity_id == data.activity_id,
+            m.DailyProgressEntry.entry_date == data.entry_date,
         )
 
         duplicate_result = await db.execute(duplicate_stmt)
@@ -7154,7 +7158,7 @@ async def add_daily_progress(
         # CREATE DAILY PROGRESS ENTRY
         # =====================================================
 
-        progress_entry = DailyProgressEntry(
+        progress_entry = m.DailyProgressEntry(
             activity_id=activity.id,
             entry_date=data.entry_date,
             today_progress=today_progress,
@@ -7191,11 +7195,11 @@ async def add_daily_progress(
 
                 total_stmt = select(
                     func.coalesce(
-                        func.sum(WorkActivity.total_completed),
+                        func.sum(m.WorkActivity.total_completed),
                         0,
                     )
                 ).where(
-                    WorkActivity.work_order_id == activity.work_order_id,
+                    m.WorkActivity.work_order_id == activity.work_order_id,
                 )
 
                 total_result = await db.execute(total_stmt)
@@ -7354,7 +7358,7 @@ async def list_daily_entries(
         # VALIDATE PROJECT ACCESS
         # =====================================================
 
-        project = await db.get(Project, project_id)
+        project = await db.get(m.Project, project_id)
 
         if project is None:
             raise HTTPException(
@@ -7383,34 +7387,34 @@ async def list_daily_entries(
         # =====================================================
 
         stmt = (
-            select(DailyProgressEntry)
+            select(m.DailyProgressEntry)
             .join(
-                WorkActivity,
-                DailyProgressEntry.activity_id == WorkActivity.id,
+                m.WorkActivity,
+                m.DailyProgressEntry.activity_id == m.WorkActivity.id,
             )
             .options(
-                selectinload(DailyProgressEntry.activity).load_only(
-                    WorkActivity.id,
-                    WorkActivity.activity_name,
-                    WorkActivity.status,
-                    WorkActivity.engineer_id,
-                    WorkActivity.project_id,
-                    WorkActivity.work_order_id,
+                selectinload(m.DailyProgressEntry.activity).load_only(
+                    m.WorkActivity.id,
+                    m.WorkActivity.activity_name,
+                    m.WorkActivity.status,
+                    m.WorkActivity.engineer_id,
+                    m.WorkActivity.project_id,
+                    m.WorkActivity.work_order_id,
                 )
             )
         )
 
         count_stmt = (
             select(func.count())
-            .select_from(DailyProgressEntry)
+            .select_from(m.DailyProgressEntry)
             .join(
-                WorkActivity,
-                DailyProgressEntry.activity_id == WorkActivity.id,
+                m.WorkActivity,
+                m.DailyProgressEntry.activity_id == m.WorkActivity.id,
             )
         )
 
         filters = [
-            WorkActivity.project_id == project_id,
+            m.WorkActivity.project_id == project_id,
         ]
 
         # =====================================================
@@ -7420,7 +7424,7 @@ async def list_daily_entries(
         if activity_id is not None:
 
             activity = await db.get(
-                WorkActivity,
+                m.WorkActivity,
                 activity_id,
             )
 
@@ -7437,7 +7441,7 @@ async def list_daily_entries(
                 )
 
             filters.append(
-                DailyProgressEntry.activity_id == activity_id,
+                m.DailyProgressEntry.activity_id == activity_id,
             )
 
         # =====================================================
@@ -7446,7 +7450,7 @@ async def list_daily_entries(
 
         if work_order_id is not None:
             filters.append(
-                WorkActivity.work_order_id == work_order_id,
+                m.WorkActivity.work_order_id == work_order_id,
             )
 
         # =====================================================
@@ -7455,7 +7459,7 @@ async def list_daily_entries(
 
         if engineer_id is not None:
             filters.append(
-                WorkActivity.engineer_id == engineer_id,
+                m.WorkActivity.engineer_id == engineer_id,
             )
 
         # =====================================================
@@ -7464,20 +7468,20 @@ async def list_daily_entries(
 
         if from_date:
             filters.append(
-                DailyProgressEntry.entry_date >= from_date,
+                m.DailyProgressEntry.entry_date >= from_date,
             )
 
         if to_date:
             filters.append(
-                DailyProgressEntry.entry_date <= to_date,
+                m.DailyProgressEntry.entry_date <= to_date,
             )
 
         stmt = stmt.where(*filters)
         count_stmt = count_stmt.where(*filters)
 
         stmt = stmt.order_by(
-            DailyProgressEntry.entry_date.desc(),
-            DailyProgressEntry.id.desc(),
+            m.DailyProgressEntry.entry_date.desc(),
+            m.DailyProgressEntry.id.desc(),
         )
 
         stmt = stmt.offset(offset).limit(limit)
@@ -7558,11 +7562,11 @@ async def update_daily_entry(
         # =====================================================
 
         stmt = (
-            select(DailyProgressEntry)
+            select(m.DailyProgressEntry)
             .where(
-                DailyProgressEntry.id == id,
+                m.DailyProgressEntry.id == id,
             )
-            .options(selectinload(DailyProgressEntry.activity))
+            .options(selectinload(m.DailyProgressEntry.activity))
             .with_for_update()
         )
 
@@ -7591,9 +7595,9 @@ async def update_daily_entry(
         # =====================================================
 
         activity_result = await db.execute(
-            select(WorkActivity)
+            select(m.WorkActivity)
             .where(
-                WorkActivity.id == activity.id,
+                m.WorkActivity.id == activity.id,
             )
             .with_for_update()
         )
@@ -7656,10 +7660,10 @@ async def update_daily_entry(
             # DUPLICATE DATE CHECK
             # =================================================
 
-            duplicate_stmt = select(DailyProgressEntry).where(
-                DailyProgressEntry.activity_id == activity.id,
-                DailyProgressEntry.entry_date == data.entry_date,
-                DailyProgressEntry.id != entry.id,
+            duplicate_stmt = select(m.DailyProgressEntry).where(
+                m.DailyProgressEntry.activity_id == activity.id,
+                m.DailyProgressEntry.entry_date == data.entry_date,
+                m.DailyProgressEntry.id != entry.id,
             )
 
             duplicate_result = await db.execute(duplicate_stmt)
@@ -7792,11 +7796,11 @@ async def update_daily_entry(
 
                 total_stmt = select(
                     func.coalesce(
-                        func.sum(WorkActivity.total_completed),
+                        func.sum(m.WorkActivity.total_completed),
                         Decimal("0"),
                     )
                 ).where(
-                    WorkActivity.work_order_id == activity.work_order_id,
+                    m.WorkActivity.work_order_id == activity.work_order_id,
                 )
 
                 total_result = await db.execute(total_stmt)
@@ -7935,11 +7939,11 @@ async def delete_daily_entry(
         # =====================================================
 
         stmt = (
-            select(DailyProgressEntry)
+            select(m.DailyProgressEntry)
             .where(
-                DailyProgressEntry.id == id,
+                m.DailyProgressEntry.id == id,
             )
-            .options(selectinload(DailyProgressEntry.activity))
+            .options(selectinload(m.DailyProgressEntry.activity))
             .with_for_update()
         )
 
@@ -7968,9 +7972,9 @@ async def delete_daily_entry(
         # =====================================================
 
         activity_result = await db.execute(
-            select(WorkActivity)
+            select(m.WorkActivity)
             .where(
-                WorkActivity.id == activity.id,
+                m.WorkActivity.id == activity.id,
             )
             .with_for_update()
         )
@@ -8077,11 +8081,11 @@ async def delete_daily_entry(
 
                 total_stmt = select(
                     func.coalesce(
-                        func.sum(WorkActivity.total_completed),
+                        func.sum(m.WorkActivity.total_completed),
                         Decimal("0"),
                     )
                 ).where(
-                    WorkActivity.work_order_id == activity.work_order_id,
+                    m.WorkActivity.work_order_id == activity.work_order_id,
                 )
 
                 total_result = await db.execute(total_stmt)
@@ -8261,10 +8265,10 @@ async def get_work_order_progress_summary(
 
         activity_stmt = (
             select(
-                WorkActivity,
+                m.WorkActivity,
             )
             .where(
-                WorkActivity.work_order_id == work_order_id,
+                m.WorkActivity.work_order_id == work_order_id,
             )
             .with_for_update()
         )
@@ -8303,14 +8307,14 @@ async def get_work_order_progress_summary(
 
         summary_stmt = select(
             func.count(
-                WorkActivity.id,
+                m.WorkActivity.id,
             ).label(
                 "total_activities",
             ),
             func.sum(
                 case(
                     (
-                        WorkActivity.status == WorkActivityStatus.COMPLETED,
+                        m.WorkActivity.status == WorkActivityStatus.COMPLETED,
                         1,
                     ),
                     else_=0,
@@ -8321,7 +8325,7 @@ async def get_work_order_progress_summary(
             func.sum(
                 case(
                     (
-                        WorkActivity.status == WorkActivityStatus.ON_TRACK,
+                        m.WorkActivity.status == WorkActivityStatus.ON_TRACK,
                         1,
                     ),
                     else_=0,
@@ -8332,7 +8336,7 @@ async def get_work_order_progress_summary(
             func.sum(
                 case(
                     (
-                        WorkActivity.status == WorkActivityStatus.DELAY,
+                        m.WorkActivity.status == WorkActivityStatus.DELAY,
                         1,
                     ),
                     else_=0,
@@ -8343,7 +8347,7 @@ async def get_work_order_progress_summary(
             func.sum(
                 case(
                     (
-                        WorkActivity.status == WorkActivityStatus.NOT_STARTED,
+                        m.WorkActivity.status == WorkActivityStatus.NOT_STARTED,
                         1,
                     ),
                     else_=0,
@@ -8353,7 +8357,7 @@ async def get_work_order_progress_summary(
             ),
             func.coalesce(
                 func.sum(
-                    WorkActivity.planned_quantity,
+                    m.WorkActivity.planned_quantity,
                 ),
                 Decimal("0"),
             ).label(
@@ -8361,7 +8365,7 @@ async def get_work_order_progress_summary(
             ),
             func.coalesce(
                 func.sum(
-                    WorkActivity.total_completed,
+                    m.WorkActivity.total_completed,
                 ),
                 Decimal("0"),
             ).label(
@@ -8369,19 +8373,19 @@ async def get_work_order_progress_summary(
             ),
             func.coalesce(
                 func.sum(
-                    WorkActivity.remaining_quantity,
+                    m.WorkActivity.remaining_quantity,
                 ),
                 Decimal("0"),
             ).label(
                 "remaining_quantity",
             ),
             func.avg(
-                WorkActivity.completion_percentage,
+                m.WorkActivity.completion_percentage,
             ).label(
                 "average_progress",
             ),
         ).where(
-            WorkActivity.work_order_id == work_order_id,
+            m.WorkActivity.work_order_id == work_order_id,
         )
 
         summary_result = await db.execute(
@@ -8541,54 +8545,54 @@ async def today_progress(
     try:
 
         stmt = (
-            select(DailyProgressEntry)
+            select(m.DailyProgressEntry)
             .join(
-                WorkActivity,
-                WorkActivity.id == DailyProgressEntry.activity_id,
+                m.WorkActivity,
+                m.WorkActivity.id == m.DailyProgressEntry.activity_id,
             )
             .options(
-                selectinload(DailyProgressEntry.activity),
+                selectinload(m.DailyProgressEntry.activity),
             )
             .where(
-                DailyProgressEntry.entry_date == date.today(),
+                m.DailyProgressEntry.entry_date == date.today(),
             )
         )
 
         count_stmt = (
             select(func.count())
-            .select_from(DailyProgressEntry)
+            .select_from(m.DailyProgressEntry)
             .join(
-                WorkActivity,
-                WorkActivity.id == DailyProgressEntry.activity_id,
+                m.WorkActivity,
+                m.WorkActivity.id == m.DailyProgressEntry.activity_id,
             )
             .where(
-                DailyProgressEntry.entry_date == date.today(),
+                m.DailyProgressEntry.entry_date == date.today(),
             )
         )
 
         # Site Engineer -> only own entries
         if current_user.role == UserRole.SITE_ENGINEER:
             stmt = stmt.where(
-                WorkActivity.engineer_id == current_user.id,
+                m.WorkActivity.engineer_id == current_user.id,
             )
 
             count_stmt = count_stmt.where(
-                WorkActivity.engineer_id == current_user.id,
+                m.WorkActivity.engineer_id == current_user.id,
             )
 
         # Admin / PM / Others -> optional engineer filter
         elif engineer_id:
             stmt = stmt.where(
-                WorkActivity.engineer_id == engineer_id,
+                m.WorkActivity.engineer_id == engineer_id,
             )
 
             count_stmt = count_stmt.where(
-                WorkActivity.engineer_id == engineer_id,
+                m.WorkActivity.engineer_id == engineer_id,
             )
 
         stmt = (
             stmt.order_by(
-                DailyProgressEntry.created_at.desc(),
+                m.DailyProgressEntry.created_at.desc(),
             )
             .offset(offset)
             .limit(limit)
@@ -8665,14 +8669,14 @@ async def get_activity_progress_history(
         # =====================================================
 
         activity_stmt = (
-            select(WorkActivity)
+            select(m.WorkActivity)
             .where(
-                WorkActivity.id == activity_id,
+                m.WorkActivity.id == activity_id,
             )
             .options(
-                selectinload(WorkActivity.engineer),
-                selectinload(WorkActivity.work_order),
-                selectinload(WorkActivity.boq_item),
+                selectinload(m.WorkActivity.engineer),
+                selectinload(m.WorkActivity.work_order),
+                selectinload(m.WorkActivity.boq_item),
             )
         )
 
@@ -8704,19 +8708,19 @@ async def get_activity_progress_history(
         # =====================================================
 
         filters = [
-            DailyProgressEntry.activity_id == activity_id,
+            m.DailyProgressEntry.activity_id == activity_id,
         ]
 
         if from_date:
 
             filters.append(
-                DailyProgressEntry.entry_date >= from_date,
+                m.DailyProgressEntry.entry_date >= from_date,
             )
 
         if to_date:
 
             filters.append(
-                DailyProgressEntry.entry_date <= to_date,
+                m.DailyProgressEntry.entry_date <= to_date,
             )
 
         # =====================================================
@@ -8725,12 +8729,12 @@ async def get_activity_progress_history(
 
         history_stmt = (
             select(
-                DailyProgressEntry,
+                m.DailyProgressEntry,
             )
             .where(*filters)
             .order_by(
-                DailyProgressEntry.entry_date.asc(),
-                DailyProgressEntry.id.asc(),
+                m.DailyProgressEntry.entry_date.asc(),
+                m.DailyProgressEntry.id.asc(),
             )
         )
 
@@ -8739,7 +8743,7 @@ async def get_activity_progress_history(
                 func.count(),
             )
             .select_from(
-                DailyProgressEntry,
+                m.DailyProgressEntry,
             )
             .where(*filters)
         )
@@ -8898,7 +8902,7 @@ async def project_progress_summary(
         # =====================================================
 
         project = await db.get(
-            Project,
+            m.Project,
             project_id,
         )
 
@@ -8924,12 +8928,12 @@ async def project_progress_summary(
         # =====================================================
 
         summary_stmt = select(
-            func.count(WorkActivity.id).label("total_activities"),
+            func.count(m.WorkActivity.id).label("total_activities"),
             func.coalesce(
                 func.sum(
                     case(
                         (
-                            WorkActivity.status == WorkActivityStatus.COMPLETED,
+                            m.WorkActivity.status == WorkActivityStatus.COMPLETED,
                             1,
                         ),
                         else_=0,
@@ -8941,7 +8945,7 @@ async def project_progress_summary(
                 func.sum(
                     case(
                         (
-                            WorkActivity.status == WorkActivityStatus.ON_TRACK,
+                            m.WorkActivity.status == WorkActivityStatus.ON_TRACK,
                             1,
                         ),
                         else_=0,
@@ -8953,7 +8957,7 @@ async def project_progress_summary(
                 func.sum(
                     case(
                         (
-                            WorkActivity.status == WorkActivityStatus.DELAY,
+                            m.WorkActivity.status == WorkActivityStatus.DELAY,
                             1,
                         ),
                         else_=0,
@@ -8965,7 +8969,7 @@ async def project_progress_summary(
                 func.sum(
                     case(
                         (
-                            WorkActivity.status == WorkActivityStatus.NOT_STARTED,
+                            m.WorkActivity.status == WorkActivityStatus.NOT_STARTED,
                             1,
                         ),
                         else_=0,
@@ -8974,23 +8978,23 @@ async def project_progress_summary(
                 0,
             ).label("not_started_activities"),
             func.coalesce(
-                func.sum(WorkActivity.planned_quantity),
+                func.sum(m.WorkActivity.planned_quantity),
                 Decimal("0.00"),
             ).label("planned_quantity"),
             func.coalesce(
-                func.sum(WorkActivity.total_completed),
+                func.sum(m.WorkActivity.total_completed),
                 Decimal("0.00"),
             ).label("completed_quantity"),
             func.coalesce(
-                func.sum(WorkActivity.remaining_quantity),
+                func.sum(m.WorkActivity.remaining_quantity),
                 Decimal("0.00"),
             ).label("remaining_quantity"),
             func.coalesce(
-                func.avg(WorkActivity.completion_percentage),
+                func.avg(m.WorkActivity.completion_percentage),
                 Decimal("0.00"),
             ).label("average_progress"),
         ).where(
-            WorkActivity.project_id == project_id,
+            m.WorkActivity.project_id == project_id,
         )
 
         result = await db.execute(summary_stmt)
@@ -9136,7 +9140,7 @@ async def get_delayed_activities(
         # VALIDATE PROJECT
         # =====================================================
 
-        project = await db.get(Project, project_id)
+        project = await db.get(m.Project, project_id)
 
         if project is None:
             raise HTTPException(
@@ -9159,29 +9163,29 @@ async def get_delayed_activities(
         # =====================================================
 
         filters = [
-            WorkActivity.project_id == project_id,
+            m.WorkActivity.project_id == project_id,
             or_(
-                WorkActivity.status == WorkActivityStatus.DELAY,
+                m.WorkActivity.status == WorkActivityStatus.DELAY,
                 and_(
-                    WorkActivity.end_date < date.today(),
-                    WorkActivity.status != WorkActivityStatus.COMPLETED,
+                    m.WorkActivity.end_date < date.today(),
+                    m.WorkActivity.status != WorkActivityStatus.COMPLETED,
                 ),
             ),
         ]
 
         if engineer_id:
 
-            filters.append(WorkActivity.engineer_id == engineer_id)
+            filters.append(m.WorkActivity.engineer_id == engineer_id)
 
         if work_order_id:
 
-            filters.append(WorkActivity.work_order_id == work_order_id)
+            filters.append(m.WorkActivity.work_order_id == work_order_id)
 
         # =====================================================
         # TOTAL COUNT
         # =====================================================
 
-        count_stmt = select(func.count(WorkActivity.id)).where(*filters)
+        count_stmt = select(func.count(m.WorkActivity.id)).where(*filters)
 
         total_count = await db.scalar(count_stmt)
 
@@ -9190,15 +9194,15 @@ async def get_delayed_activities(
         # =====================================================
 
         stmt = (
-            select(WorkActivity)
+            select(m.WorkActivity)
             .where(*filters)
             .options(
-                selectinload(WorkActivity.engineer),
-                selectinload(WorkActivity.work_order),
+                selectinload(m.WorkActivity.engineer),
+                selectinload(m.WorkActivity.work_order),
             )
             .order_by(
-                WorkActivity.end_date.asc(),
-                WorkActivity.created_at.asc(),
+                m.WorkActivity.end_date.asc(),
+                m.WorkActivity.created_at.asc(),
             )
             .offset(offset)
             .limit(limit)
@@ -9353,7 +9357,7 @@ async def work_progress_pdf_report(
         # ==================================
 
         project_result = await db.execute(
-            select(Project).where(Project.id == project_id)
+            select(m.Project).where(m.Project.id == project_id)
         )
 
         project = project_result.scalars().first()
@@ -9381,9 +9385,9 @@ async def work_progress_pdf_report(
         # ==================================
 
         activity_result = await db.execute(
-            select(WorkActivity)
-            .where(WorkActivity.project_id == project_id)
-            .order_by(WorkActivity.created_at.desc())
+            select(m.WorkActivity)
+            .where(m.WorkActivity.project_id == project_id)
+            .order_by(m.WorkActivity.created_at.desc())
         )
 
         activities = activity_result.scalars().all()
@@ -9686,7 +9690,7 @@ async def work_progress_excel_report(
         # =====================================
 
         project_result = await db.execute(
-            select(Project).where(Project.id == project_id)
+            select(m.Project).where(m.Project.id == project_id)
         )
 
         project = project_result.scalars().first()
@@ -9727,9 +9731,9 @@ async def work_progress_excel_report(
         # =====================================
 
         result = await db.execute(
-            select(WorkActivity)
-            .where(WorkActivity.project_id == project_id)
-            .order_by(WorkActivity.created_at.desc())
+            select(m.WorkActivity)
+            .where(m.WorkActivity.project_id == project_id)
+            .order_by(m.WorkActivity.created_at.desc())
         )
 
         activities = result.scalars().all()
@@ -11144,19 +11148,16 @@ async def generate_project_qr(
         project_id=project_id,
         current_user=current_user,
     )
-    
+
     qr_buf = generate_qr(entity_type="PRJ", entity_id=out.id)
-    
+
     headers = {
         "Cache-Control": "no-store",
-        "Content-Disposition": f'inline; filename="project_{out.id}.png"'
+        "Content-Disposition": f'inline; filename="project_{out.id}.png"',
     }
-    
-    return StreamingResponse(
-        qr_buf, 
-        media_type="image/png",
-        headers=headers
-    )
+
+    return StreamingResponse(qr_buf, media_type="image/png", headers=headers)
+
 
 @router.get("/{project_id}", response_model=s.ProjectOut)
 async def get_project(
@@ -11232,7 +11233,8 @@ async def delete_project(
     return {"success": True, "message": f"Project_id {project_id} deleted successfully"}
 
 
-from app.schemas import gantt as s_gantt,
+from app.schemas import gantt as s_gantt
+
 
 @router.get("/{project_id}/gantt", response_model=s_gantt.GanttResponseSchema)
 async def get_project_gantt(
@@ -11255,36 +11257,50 @@ async def get_project_gantt(
     for mstone in obj.milestones:
         children = []
         for t in mstone.tasks:
-            children.append(s_gantt.GanttTaskSchema(
-                id=f"t_{t.id}",
-                name=t.title,
-                start_date=t.start_date,
-                end_date=t.end_date,
-                progress=t.completion_percentage or 0.0,
-                status=t.status.value if hasattr(t.status, "value") else str(t.status)
-            ))
-        
-        gantt_items.append(s_gantt.GanttMilestoneSchema(
-            id=f"m_{mstone.id}",
-            name=mstone.title,
-            start_date=mstone.start_date,
-            end_date=mstone.end_date,
-            progress=mstone.completion_percentage or 0.0,
-            status=mstone.status.value if hasattr(mstone.status, "value") else str(mstone.status),
-            children=children
-        ))
+            children.append(
+                s_gantt.GanttTaskSchema(
+                    id=f"t_{t.id}",
+                    name=t.title,
+                    start_date=t.start_date,
+                    end_date=t.end_date,
+                    progress=t.completion_percentage or 0.0,
+                    status=(
+                        t.status.value if hasattr(t.status, "value") else str(t.status)
+                    ),
+                )
+            )
+
+        gantt_items.append(
+            s_gantt.GanttMilestoneSchema(
+                id=f"m_{mstone.id}",
+                name=mstone.title,
+                start_date=mstone.start_date,
+                end_date=mstone.end_date,
+                progress=mstone.completion_percentage or 0.0,
+                status=(
+                    mstone.status.value
+                    if hasattr(mstone.status, "value")
+                    else str(mstone.status)
+                ),
+                children=children,
+            )
+        )
 
     unassigned_tasks = []
     for t in obj.tasks:
         if not t.milestone_id:
-            unassigned_tasks.append(s_gantt.GanttTaskSchema(
-                id=f"t_{t.id}",
-                name=t.title,
-                start_date=t.start_date,
-                end_date=t.end_date,
-                progress=t.completion_percentage or 0.0,
-                status=t.status.value if hasattr(t.status, "value") else str(t.status)
-            ))
+            unassigned_tasks.append(
+                s_gantt.GanttTaskSchema(
+                    id=f"t_{t.id}",
+                    name=t.title,
+                    start_date=t.start_date,
+                    end_date=t.end_date,
+                    progress=t.completion_percentage or 0.0,
+                    status=(
+                        t.status.value if hasattr(t.status, "value") else str(t.status)
+                    ),
+                )
+            )
 
     return s_gantt.GanttResponseSchema(
         project_id=obj.id,
