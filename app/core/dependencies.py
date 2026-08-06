@@ -63,7 +63,7 @@ async def get_current_user(
         user_id = payload.get("sub")
         if user_id is None:
             raise credentials_exception
-            
+
         jti = payload.get("jti")
         iat = payload.get("iat")
     except Exception:
@@ -81,14 +81,23 @@ async def get_current_user(
                 is_blocked = await redis.exists(f"blocklist:jti:{jti}")
                 if is_blocked:
                     logger.warning(f"Blocked token used jti={jti}")
-                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been logged out")
-            
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Token has been logged out",
+                    )
+
             if iat:
                 logout_all_ts = await redis.get(f"logout_all:user:{user_id}")
                 if logout_all_ts:
                     if float(iat) < float(logout_all_ts):
-                        logger.warning(f"Token issued before logout_all for user={user_id}")
-                        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="All sessions have been terminated")
+                        logger.warning(
+                            f"Token issued before logout_all for user={user_id}"
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="All sessions have been terminated",
+                        )
+
         except HTTPException:
             raise
         except Exception as e:
@@ -102,23 +111,32 @@ async def get_current_user(
     if redis:
         try:
             cached = await cache_get_json(redis, cache_key)
+
             if cached:
-                user = await db.scalar(select(User).where(User.id == int(user_id)))
+                user = await db.scalar(
+                    select(User)
+                    .options(selectinload(User.project_memberships))
+                    .where(User.id == int(user_id))
+                )
 
                 if user:
                     return user
+
         except Exception as e:
             logger.warning(f"Redis cache read failed: {e}")
 
-        # --------------------------------------------------
-        # Fallback to database
-        # --------------------------------------------------
+    # --------------------------------------------------
+    # Fallback to database (ALWAYS EXECUTES)
+    # --------------------------------------------------
+    user = await db.scalar(
+        select(User)
+        .options(selectinload(User.project_memberships))
+        .where(User.id == int(user_id))
+    )
 
-        user = await db.scalar(
-            select(User)
-            .options(selectinload(User.project_memberships))
-            .where(User.id == int(user_id))
-        )
+    if user is None:
+        logger.warning(f"User not found id={user_id}")
+        raise credentials_exception
 
     # --------------------------------------------------
     # Store in Redis for future requests
