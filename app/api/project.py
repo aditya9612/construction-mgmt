@@ -90,7 +90,7 @@ from app.utils.common import (
     assert_task_project,
 )
 from app.utils.qr import generate_qr
-
+from app.models.labour import LabourProject
 
 def compute_project_status(project):
     today = date.today()

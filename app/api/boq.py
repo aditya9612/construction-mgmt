@@ -1213,83 +1213,81 @@ async def create_version(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    async with db.begin():
+    base = await db.scalar(
+        select(BOQ).where(
+            BOQ.boq_group_id == group_id,
+            BOQ.is_latest == True,
+            BOQ.status != "Deleted",
+        )
+    )
 
-        base = await db.scalar(
-            select(BOQ).where(
-                BOQ.boq_group_id == group_id,
-                BOQ.is_latest == True,
-                BOQ.status != "Deleted",
-            )
+    if not base:
+        raise NotFoundError("BOQ not found")
+
+    if base.approval_status != "Approved":
+        raise InvalidStateError(
+            "Only approved BOQ versions can create a new version."
         )
 
-        if not base:
-            raise NotFoundError("BOQ not found")
+    group = await db.get(BOQGroup, base.boq_group_id)
 
-        if base.approval_status != "Approved":
-            raise InvalidStateError(
-                "Only approved BOQ versions can create a new version."
-            )
+    if not group:
+        raise NotFoundError("BOQ group not found")
 
-        group = await db.get(BOQGroup, base.boq_group_id)
+    new_version = group.current_version + 1
 
-        if not group:
-            raise NotFoundError("BOQ group not found")
+    group.current_version = new_version
+    group.name = base.item_name
 
-        new_version = group.current_version + 1
-
-        group.current_version = new_version
-        group.name = base.item_name
-
-        await db.execute(
-            update(BOQ)
-            .where(
-                BOQ.boq_group_id == base.boq_group_id,
-                BOQ.version_no == base.version_no,
-                BOQ.is_latest == True,
-            )
-            .values(is_latest=False)
+    await db.execute(
+        update(BOQ)
+        .where(
+            BOQ.boq_group_id == base.boq_group_id,
+            BOQ.version_no == base.version_no,
+            BOQ.is_latest == True,
         )
+        .values(is_latest=False)
+    )
 
-        rows = (
-            (
-                await db.execute(
-                    select(BOQ)
-                    .where(
-                        BOQ.boq_group_id == base.boq_group_id,
-                        BOQ.version_no == base.version_no,
-                        BOQ.status != "Deleted",
-                    )
-                    .order_by(BOQ.id.asc())
+    rows = (
+        (
+            await db.execute(
+                select(BOQ)
+                .where(
+                    BOQ.boq_group_id == base.boq_group_id,
+                    BOQ.version_no == base.version_no,
+                    BOQ.status != "Deleted",
                 )
+                .order_by(BOQ.id.asc())
             )
-            .scalars()
-            .all()
         )
+        .scalars()
+        .all()
+    )
 
-        for r in rows:
-            db.add(
-                BOQ(
-                    project_id=r.project_id,
-                    boq_group_id=base.boq_group_id,
-                    version_no=new_version,
-                    is_latest=True,
-                    item_name=r.item_name,
-                    category=r.category,
-                    description=r.description,
-                    quantity=r.quantity,
-                    unit=r.unit,
-                    unit_cost=r.unit_cost,
-                    total_cost=r.total_cost,
-                    actual_quantity=Decimal(0),
-                    actual_cost=Decimal(0),
-                    variance_cost=Decimal(0),
-                    status="Active",
-                    approval_status="Draft",
-                    activity_type_id=r.activity_type_id,
-                )
+    for r in rows:
+        db.add(
+            BOQ(
+                project_id=r.project_id,
+                boq_group_id=base.boq_group_id,
+                version_no=new_version,
+                is_latest=True,
+                item_name=r.item_name,
+                category=r.category,
+                description=r.description,
+                quantity=r.quantity,
+                unit=r.unit,
+                unit_cost=r.unit_cost,
+                total_cost=r.total_cost,
+                actual_quantity=Decimal(0),
+                actual_cost=Decimal(0),
+                variance_cost=Decimal(0),
+                status="Active",
+                approval_status="Draft",
+                activity_type_id=r.activity_type_id,
             )
-        await db.flush()
+        )
+    await db.flush()
 
     await bump_cache_version(redis, VERSION_KEY)
 
