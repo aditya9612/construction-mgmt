@@ -16,7 +16,7 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 import enum
 from sqlalchemy import Text
-from app.core.enums import AccountType
+from app.core.enums import AccountType, VendorBillStatus
 from app.models.base import Base
 
 
@@ -266,13 +266,23 @@ class VendorBill(Base):
     bill_number = Column(String(50), unique=True, nullable=False, index=True)
     bill_date = Column(Date, nullable=False)
     due_date = Column(Date, nullable=False)
+    grn_number = Column(String(100), nullable=True)
+    gross_amount = Column(DECIMAL(18, 2), nullable=True, default=0.0)
+    gst_percent = Column(DECIMAL(5, 2), default=0)
+    gst_amount = Column(DECIMAL(18, 2), default=0)
+    tds_percent = Column(DECIMAL(5, 2), default=0)
+    tds_amount = Column(DECIMAL(18, 2), default=0)
+    advance_paid = Column(DECIMAL(18, 2), default=0)
 
     total_amount = Column(DECIMAL(18, 2), nullable=False)
     amount_paid = Column(DECIMAL(18, 2), default=0)
 
-    status = Column(String(50), default="PENDING")  # PENDING, PARTIAL, PAID
+    vendor_invoice_url = Column(String(500), nullable=True)
+    po_copy_url = Column(String(500), nullable=True)
+    grn_copy_url = Column(String(500), nullable=True)
+    supporting_docs_url = Column(String(500), nullable=True)
 
-    # created_at = Column(DateTime, default=datetime.utcnow)
+    status = Column(String(50), default=VendorBillStatus.PENDING.value)  # PENDING, APPROVED, PARTIAL, PAID, REJECTED
 
     created_at = Column(
         DateTime(timezone=True),
@@ -286,6 +296,25 @@ class VendorBill(Base):
         onupdate=func.now(),
         nullable=False
     )
+
+    items = relationship("VendorBillItem", back_populates="vendor_bill", cascade="all, delete-orphan")
+
+
+class VendorBillItem(Base):
+    __tablename__ = "vendor_bill_items"
+
+    id = Column(Integer, primary_key=True)
+    vendor_bill_id = Column(Integer, ForeignKey("vendor_bills.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    material_name = Column(String(150), nullable=False)
+    category = Column(String(100), nullable=True)
+    quantity = Column(DECIMAL(18, 2), nullable=False)
+    unit = Column(String(50), nullable=False)
+    rate = Column(DECIMAL(18, 2), nullable=False)
+    total = Column(DECIMAL(18, 2), nullable=False)
+
+    vendor_bill = relationship("VendorBill", back_populates="items")
+
 
 
 # ===================== NEW CONSOLIDATED MODELS =====================

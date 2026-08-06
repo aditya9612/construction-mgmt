@@ -8,6 +8,14 @@ class InvoiceStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class VendorBillStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    PARTIAL = "PARTIAL"
+    PAID = "PAID"
+    REJECTED = "REJECTED"
+
+
 class AccountType(str, Enum):
     ASSET = "asset"
     LIABILITY = "liability"

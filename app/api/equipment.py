@@ -49,6 +49,7 @@ from app.core.dependencies import (
 )
 
 # Internal - DB / Models
+from app.core.db import AsyncSessionLocal
 from app.db.session import get_db_session
 from app.models.equipment import (
     Equipment,
@@ -58,8 +59,10 @@ from app.models.equipment import (
     EquipmentRental,
     EquipmentAuditLog,
 )
-from app.models.project import Project
+from app.core.logger import logger
+from app.models.project import Project, ProjectMember
 from app.models.user import User, UserRole
+from app.services.notification_service import create_notification
 
 # Internal - Enums
 from app.core.enums import EquipmentCondition, EquipmentStatus, PurchaseType
@@ -1186,6 +1189,26 @@ async def allocate_equipment(
 
     await db.commit()
 
+    try:
+        if allocated_ids:
+            async with AsyncSessionLocal() as notif_db:
+                members = await notif_db.scalars(
+                    select(ProjectMember.user_id).where(ProjectMember.project_id == payload.project_id)
+                )
+                member_ids = members.all()
+                for allocated_id in allocated_ids:
+                    for member_id in member_ids:
+                        await create_notification(
+                            db=notif_db,
+                            user_id=member_id,
+                            title="Equipment Assigned",
+                            message=f"Equipment {allocated_id} has been assigned to your project.",
+                            type="INFO"
+                        )
+                await notif_db.commit()
+    except Exception as e:
+        logger.error(f"Failed to create notification for equipment allocation: {e}")
+
     await bump_cache_version(
         redis,
         VERSION_KEY,
@@ -1293,6 +1316,26 @@ async def deallocate_equipment(
         deallocated_ids.append(obj.id)
 
     await db.commit()
+
+    try:
+        if deallocated_ids:
+            async with AsyncSessionLocal() as notif_db:
+                members = await notif_db.scalars(
+                    select(ProjectMember.user_id).where(ProjectMember.project_id == payload.project_id)
+                )
+                member_ids = members.all()
+                for deallocated_id in deallocated_ids:
+                    for member_id in member_ids:
+                        await create_notification(
+                            db=notif_db,
+                            user_id=member_id,
+                            title="Equipment Returned",
+                            message=f"Equipment {deallocated_id} has been returned from your project.",
+                            type="INFO"
+                        )
+                await notif_db.commit()
+    except Exception as e:
+        logger.error(f"Failed to create notification for equipment deallocation: {e}")
 
     await bump_cache_version(
         redis,
@@ -2408,6 +2451,19 @@ async def create_maintenance(
 
     await db.commit()
 
+    try:
+        async with AsyncSessionLocal() as notif_db:
+            await create_notification(
+                db=notif_db,
+                user_id=current_user.id,
+                title="Maintenance Scheduled",
+                message=f"Maintenance for equipment {equipment.equipment_code} has been scheduled.",
+                type="INFO"
+            )
+            await notif_db.commit()
+    except Exception as e:
+        logger.error(f"Failed to create notification for maintenance schedule: {e}")
+
     await bump_cache_version(
         redis,
         VERSION_KEY,
@@ -2703,6 +2759,19 @@ async def complete_maintenance(
     )
 
     await db.commit()
+
+    try:
+        async with AsyncSessionLocal() as notif_db:
+            await create_notification(
+                db=notif_db,
+                user_id=current_user.id,
+                title="Maintenance Completed",
+                message=f"Maintenance for equipment {equipment.equipment_code} is completed.",
+                type="SUCCESS"
+            )
+            await notif_db.commit()
+    except Exception as e:
+        logger.error(f"Failed to create notification for maintenance completion: {e}")
 
     await db.refresh(maintenance)
     await db.refresh(equipment)
@@ -5091,6 +5160,23 @@ async def update_equipment(
     )
 
     await db.commit()
+
+    try:
+        # Check if status changed to DAMAGED
+        if old_data.get("status") != obj.status and obj.status == EquipmentStatus.DAMAGED:
+            async with AsyncSessionLocal() as notif_db:
+                # Notify admin/pm
+                await create_notification(
+                    db=notif_db,
+                    user_id=current_user.id,
+                    title="Equipment Out of Service",
+                    message=f"Equipment {obj.equipment_code} has been marked as out of service/damaged.",
+                    type="ERROR"
+                )
+                await notif_db.commit()
+    except Exception as e:
+        logger.error(f"Failed to create notification for equipment damaged status: {e}")
+
     await db.refresh(obj)
 
     return EquipmentOut.model_validate(obj)

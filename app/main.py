@@ -57,6 +57,7 @@ from app.api.cad import router as cad_router
 from app.api.settings import router as settings_router
 from app.api.alert import router as alert_router
 from app.api.accountant import router as accountant_router
+from app.api.vendor_bills import router as vendor_bills_router
 from app.api.chat import router as chats_router
 from app.api.quotation import router as quotation_router
 from app.api.agreement import router as agreement_router
@@ -297,6 +298,7 @@ def create_app() -> FastAPI:
     api_router.include_router(owner_router)
     api_router.include_router(contractor_router)
     api_router.include_router(expense_router)
+    api_router.include_router(vendor_bills_router)
     api_router.include_router(invoice_router)
     api_router.include_router(final_measurement_router)
     api_router.include_router(dashboard_router)

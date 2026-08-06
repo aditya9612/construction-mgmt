@@ -340,3 +340,74 @@ class GSTReconciliationMismatch(BaseModel):
     portal_gst: float
     difference: float
     status: str
+
+# ============================
+#  VENDOR BILLS
+# ============================
+
+class VendorBillItemCreate(BaseModel):
+    material_name: str
+    category: Optional[str] = None
+    quantity: float
+    unit: str
+    rate: float
+    total: float
+
+class VendorBillItemOut(VendorBillItemCreate):
+    id: int
+    vendor_bill_id: int
+
+    class Config:
+        from_attributes = True
+
+class VendorBillCreate(BaseModel):
+    supplier_id: int
+    project_id: Optional[int] = None
+    purchase_order_id: Optional[int] = None
+    bill_number: str
+    bill_date: date
+    due_date: date
+    grn_number: Optional[str] = None
+
+    gross_amount: float = 0.0
+    gst_percent: float = 0.0
+    gst_amount: float = 0.0
+    tds_percent: float = 0.0
+    tds_amount: float = 0.0
+    advance_paid: float = 0.0
+    total_amount: float
+
+    vendor_invoice_url: Optional[str] = None
+    po_copy_url: Optional[str] = None
+    grn_copy_url: Optional[str] = None
+    supporting_docs_url: Optional[str] = None
+
+    items: List[VendorBillItemCreate] = []
+
+class VendorBillUpdate(BaseModel):
+    status: Optional[str] = None
+    amount_paid: Optional[float] = None
+    # Add other fields if editable later
+
+class VendorBillOut(VendorBillCreate):
+    id: int
+    status: str
+    amount_paid: float
+    supplier_name: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    items: List[VendorBillItemOut] = []
+
+    class Config:
+        from_attributes = True
+
+class VendorBillApprovalRequest(BaseModel):
+    status: str # "APPROVED" or "REJECTED"
+    notes: Optional[str] = None
+
+class VendorBillPaymentRequest(BaseModel):
+    amount: float
+    mode: PaymentMode
+    reference: Optional[str] = None
+    payment_date: Optional[date] = None
+

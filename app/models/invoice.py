@@ -111,6 +111,7 @@ class Transaction(Base):
     # Relations
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
+    journal_entry_id = Column(Integer, ForeignKey("journal_entries.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Type: receipt (incoming) / payment (outgoing)
     type = Column(String(20), nullable=False)
@@ -131,3 +132,4 @@ class Transaction(Base):
 
     # Relationship
     invoice = relationship("Invoice", back_populates="transactions")
+    journal_entry = relationship("JournalEntry", foreign_keys=[journal_entry_id])

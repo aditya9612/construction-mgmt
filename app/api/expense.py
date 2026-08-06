@@ -301,11 +301,36 @@ async def delete_expense(
         )
     )
 
-    if owner_txn:
-        await db.delete(owner_txn)
+    journal_entry = await db.scalar(
+        select(JournalEntry).where(
+            JournalEntry.journal_number == f"J-EXP-{obj.id}"
+        )
+    )
+
+    boq_id = obj.boq_item_id
 
     try:
+        if owner_txn:
+            await db.delete(owner_txn)
+            
+        if journal_entry:
+            await db.delete(journal_entry)
+
         await db.delete(obj)
+        await db.flush()
+
+        if boq_id:
+            total_actual = await db.scalar(
+                select(func.sum(Expense.amount)).where(
+                    Expense.boq_item_id == boq_id
+                )
+            )
+
+            boq = await db.get(BOQ, boq_id)
+            if boq:
+                boq.actual_cost = Decimal(total_actual or 0)
+                boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
+
         await db.commit()
     except Exception:
         await db.rollback()
