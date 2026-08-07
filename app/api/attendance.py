@@ -5,10 +5,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import desc, func, select
 from app.core.dependencies import get_current_user, require_roles
-from app.core.enums import AttendanceStatus
+from app.core.enums import (
+    AttendanceStatus,
+    OTPolicyType,
+    AccountType,
+)
 from app.db.session import get_db_session
 from app.models.user import User, UserAttendance, ActivityLog
-from app.models.project import Project
+from app.models.project import (
+    Project,
+    ProjectOTPolicy,
+    Task,
+)
 from app.schemas.user import (
     UserAttendanceOut,
     ProxyBulkCheckInForm,
@@ -23,10 +31,11 @@ from app.core.validators import (
 )
 from sqlalchemy.orm import selectinload
 from app.models.labour import Labour
-from app.models.project import ProjectOTPolicy
 from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
-from app.core.enums import OTPolicyType
+from app.models.boq import BOQ
+from app.models.accountant import Account, JournalEntry, JournalLine
+from app.utils.accounting import get_primary_cash_account
 
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
 logger = logging.getLogger(__name__)
@@ -300,11 +309,7 @@ async def check_out(
                         multiplier = policy.normal_day_multiplier or Decimal("1")
                         today = attendance.attendance_date.weekday()
 
-                        # TODO: Holiday Calendar integration
-                        # is_holiday = False  # Implementation needed
-                        # if is_holiday:
-                        #     multiplier = policy.holiday_multiplier or multiplier
-                        # elif today == 6:
+
                         if today == 6:
                             multiplier = policy.sunday_multiplier or multiplier
 
@@ -318,6 +323,12 @@ async def check_out(
 
             total_wage = total_wage.quantize(Decimal("0.01"))
 
+            resolved_boq_id = None
+            if attendance.task_id:
+                task_obj = await db.get(Task, attendance.task_id)
+                if task_obj and task_obj.boq_id:
+                    resolved_boq_id = task_obj.boq_id
+
             existing_expense = await db.scalar(
                 select(Expense).where(
                     Expense.project_id == attendance.project_id,
@@ -327,9 +338,13 @@ async def check_out(
                 )
             )
 
-            if existing_expense:
+            expense_id = None
+            old_boq_id = None
 
+            if existing_expense:
+                old_boq_id = existing_expense.boq_item_id
                 existing_expense.amount = total_wage
+                existing_expense.boq_item_id = resolved_boq_id
 
                 existing_transaction = await db.scalar(
                     select(OwnerTransaction).where(
@@ -340,6 +355,8 @@ async def check_out(
                 )
                 if existing_transaction:
                     existing_transaction.amount = total_wage
+
+                expense_id = existing_expense.id
 
             else:
 
@@ -352,11 +369,14 @@ async def check_out(
                     amount=total_wage,
                     expense_date=attendance.attendance_date,
                     payment_mode="auto",
+                    boq_item_id=resolved_boq_id,
                 )
 
                 db.add(expense)
 
                 await db.flush()
+                
+                expense_id = expense.id
 
                 project = await db.get(Project, attendance.project_id)
 
@@ -374,6 +394,53 @@ async def check_out(
                         )
                     )
 
+            await db.flush()
+
+            affected_boq_ids = {boq_id for boq_id in [old_boq_id, resolved_boq_id] if boq_id}
+            for boq_id in affected_boq_ids:
+                total_actual = await db.scalar(
+                    select(func.sum(Expense.amount)).where(Expense.boq_item_id == boq_id)
+                )
+                boq = await db.get(BOQ, boq_id)
+                if boq:
+                    boq.actual_cost = Decimal(total_actual or 0)
+                    boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
+
+            journal_number = f"J-EXP-{expense_id}"
+            existing_je = await db.scalar(select(JournalEntry).where(JournalEntry.journal_number == journal_number))
+
+            expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
+            if not expense_acc:
+                expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Direct Expense%')))
+            cash_acc = await get_primary_cash_account(db)
+
+            if expense_acc and cash_acc:
+                if not existing_je:
+                    je = JournalEntry(
+                        entry_type="Expense",
+                        journal_number=journal_number,
+                        entry_date=attendance.attendance_date,
+                        description=f"Labour wage - {labour.id} - {attendance.attendance_date}",
+                        status="Posted"
+                    )
+                    db.add(je)
+                    await db.flush()
+
+                    db.add(JournalLine(entry_id=je.id, account_id=expense_acc.id, debit=total_wage, credit=Decimal(0)))
+                    db.add(JournalLine(entry_id=je.id, account_id=cash_acc.id, debit=Decimal(0), credit=total_wage))
+                else:
+                    existing_je.entry_date = attendance.attendance_date
+                    lines = (await db.execute(select(JournalLine).where(JournalLine.entry_id == existing_je.id))).scalars().all()
+                    for line in lines:
+                        if line.account_id == expense_acc.id:
+                            line.debit = total_wage
+                            line.credit = Decimal(0)
+                        elif line.account_id == cash_acc.id:
+                            line.credit = total_wage
+                            line.debit = Decimal(0)
+            else:
+                logger.warning(f"Skipping JournalEntry for expense {expense_id}: required accounts missing")
+
     # Auto-approve attendance upon checkout
     attendance.is_approved = True
     attendance.approved_by_id = current_user.id
@@ -383,6 +450,12 @@ async def check_out(
 
     except Exception:
         await db.rollback()
+
+        logger.exception(
+            "Attendance checkout accounting failed. attendance_id=%s",
+            attendance.id,
+        )
+
         raise
 
     await db.refresh(attendance)
