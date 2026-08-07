@@ -237,6 +237,14 @@ class PayrollGenerate(BaseModel):
     year: int
 
 
+class PayrollLock(BaseModel):
+    payroll_ids: List[int]
+
+
+class PayrollUnlock(BaseModel):
+    payroll_ids: List[int]
+
+
 class PayrollPayment(BaseModel):
     labour_id: int
     project_id: int

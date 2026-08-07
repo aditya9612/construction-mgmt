@@ -864,11 +864,8 @@ async def pay_contractor(
         if contractor_acc:
             break
     if not contractor_acc:
-        # Fall back to any liability account
-        from app.core.enums import AccountType as AT
-        contractor_acc = await db.scalar(
-            select(Account.id).where(Account.type == AT.LIABILITY)
-        )
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Contractor liability account is not configured.")
 
     # Try multiple code patterns for bank account
     bank_acc = None
@@ -2389,7 +2386,10 @@ async def create_tds_deduction(
     if tds.status == "Posted":
         try:
             tds_acc = await resolve_tax_accounts(db, 'tds_payable')
-            vendor_acc = await db.scalar(select(Account).where(Account.name.ilike('%Vendor%')).limit(1))
+            vendor_acc = await db.scalar(select(Account).where(Account.code == "VENDOR_PAYABLE"))
+            if not vendor_acc:
+                from fastapi import HTTPException
+                raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
             
             if tds_acc and vendor_acc:
                 je = JournalEntry(
@@ -2573,7 +2573,10 @@ async def create_tds_deduction(
     if tds.status == "Posted":
         try:
             tds_acc = await resolve_tax_accounts(db, 'tds_payable')
-            vendor_acc = await db.scalar(select(Account).where(Account.name.ilike('%Vendor%')).limit(1))
+            vendor_acc = await db.scalar(select(Account).where(Account.code == "VENDOR_PAYABLE"))
+            if not vendor_acc:
+                from fastapi import HTTPException
+                raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
             
             if tds_acc and vendor_acc:
                 je = JournalEntry(

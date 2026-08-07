@@ -3191,6 +3191,7 @@ async def labour_dashboard(
         LabourPayroll.labour_id == labour.id,
         LabourPayroll.month == current_month,
         LabourPayroll.year == current_year,
+        LabourPayroll.status != PayrollStatus.DRAFT,
     )
     payroll_query = _scope_to_project(payroll_query, LabourPayroll.project_id, project)
 
@@ -3315,7 +3316,10 @@ async def get_labour_payments(
             "ot_intensive"
         ),
         func.sum(LabourPayroll.advance_adjusted).label("advance_adjusted"),
-    ).where(LabourPayroll.labour_id == labour.id)
+    ).where(
+        LabourPayroll.labour_id == labour.id,
+        LabourPayroll.status != PayrollStatus.DRAFT,
+    )
 
     metrics_stmt = apply_payroll_time_filter(metrics_stmt, time_filter, month, year)
 
@@ -3336,12 +3340,16 @@ async def get_labour_payments(
         select(LabourPayroll, Labour)
         .join(Labour, LabourPayroll.labour_id == Labour.id)
         .options(selectinload(Labour.labour_type))
-        .where(LabourPayroll.labour_id == labour.id)
+        .where(
+            LabourPayroll.labour_id == labour.id,
+            LabourPayroll.status != PayrollStatus.DRAFT,
+        )
     )
     records_stmt = apply_payroll_time_filter(records_stmt, time_filter, month, year)
 
     count_stmt = select(func.count(LabourPayroll.id)).where(
-        LabourPayroll.labour_id == labour.id
+        LabourPayroll.labour_id == labour.id,
+        LabourPayroll.status != PayrollStatus.DRAFT,
     )
     count_stmt = apply_payroll_time_filter(count_stmt, time_filter, month, year)
 
@@ -3468,7 +3476,10 @@ async def export_labour_payments(
         select(LabourPayroll, Labour)
         .join(Labour, LabourPayroll.labour_id == Labour.id)
         .options(selectinload(Labour.labour_type))
-        .where(LabourPayroll.labour_id == labour.id)
+        .where(
+            LabourPayroll.labour_id == labour.id,
+            LabourPayroll.status != PayrollStatus.DRAFT,
+        )
     )
     records_stmt = apply_payroll_time_filter(records_stmt, time_filter, month, year)
     records_stmt = records_stmt.order_by(desc(LabourPayroll.created_at))

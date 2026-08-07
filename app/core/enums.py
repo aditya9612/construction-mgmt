@@ -33,6 +33,8 @@ class PaymentMode(str, Enum):
 
 
 class PayrollStatus(str, Enum):
+    DRAFT = "Draft"
+    LOCKED = "Locked"
     PENDING = "Pending"
     PAID = "Paid"
     PARTIAL = "Partial"

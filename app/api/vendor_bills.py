@@ -202,7 +202,7 @@ async def pay_vendor_bill(
     
     vendor_acc = await db.scalar(select(Account.id).where(Account.code == "VENDOR_PAYABLE"))
     if not vendor_acc:
-        vendor_acc = await db.scalar(select(Account.id).where(Account.type == AT.LIABILITY))
+        raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
         
     bank_acc = await db.scalar(select(Account.id).where(Account.code == "BANK"))
     if not bank_acc:

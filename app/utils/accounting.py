@@ -54,8 +54,7 @@ async def get_primary_cash_account(db: AsyncSession) -> Account:
     """
     Resolves the primary cash account for the system.
     1. Checks CompanySettings.primary_cash_account_id
-    2. Falls back to Account.name.ilike('%cash%')
-    3. Raises ValueError if neither exists
+    2. Raises ValueError if missing
     """
     from app.models.settings import CompanySettings
     
@@ -66,12 +65,7 @@ async def get_primary_cash_account(db: AsyncSession) -> Account:
         if cash_acc:
             return cash_acc
 
-    # Fallback
-    cash_acc = await db.scalar(select(Account).where(Account.name.ilike("%cash%")).limit(1))
-    if cash_acc:
-        return cash_acc
-
-    raise ValueError("No cash account could be resolved in the system.")
+    raise ValueError("Primary Cash Account is not configured.")
 
 
 async def get_petty_cash_account(db: AsyncSession) -> Account:

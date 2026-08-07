@@ -409,37 +409,39 @@ async def check_out(
             journal_number = f"J-EXP-{expense_id}"
             existing_je = await db.scalar(select(JournalEntry).where(JournalEntry.journal_number == journal_number))
 
-            expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
+            expense_acc = await db.scalar(select(Account).where(Account.code == "LABOUR_EXPENSE"))
             if not expense_acc:
-                expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Direct Expense%')))
-            cash_acc = await get_primary_cash_account(db)
+                from fastapi import HTTPException
+                raise HTTPException(status_code=400, detail="LABOUR_EXPENSE account is not configured.")
 
-            if expense_acc and cash_acc:
-                if not existing_je:
-                    je = JournalEntry(
-                        entry_type="Expense",
-                        journal_number=journal_number,
-                        entry_date=attendance.attendance_date,
-                        description=f"Labour wage - {labour.id} - {attendance.attendance_date}",
-                        status="Posted"
-                    )
-                    db.add(je)
-                    await db.flush()
+            wages_payable_acc = await db.scalar(select(Account).where(Account.code == "WAGES_PAYABLE"))
+            if not wages_payable_acc:
+                from fastapi import HTTPException
+                raise HTTPException(status_code=400, detail="WAGES_PAYABLE account is not configured.")
 
-                    db.add(JournalLine(entry_id=je.id, account_id=expense_acc.id, debit=total_wage, credit=Decimal(0)))
-                    db.add(JournalLine(entry_id=je.id, account_id=cash_acc.id, debit=Decimal(0), credit=total_wage))
-                else:
-                    existing_je.entry_date = attendance.attendance_date
-                    lines = (await db.execute(select(JournalLine).where(JournalLine.entry_id == existing_je.id))).scalars().all()
-                    for line in lines:
-                        if line.account_id == expense_acc.id:
-                            line.debit = total_wage
-                            line.credit = Decimal(0)
-                        elif line.account_id == cash_acc.id:
-                            line.credit = total_wage
-                            line.debit = Decimal(0)
+            if not existing_je:
+                je = JournalEntry(
+                    entry_type="Expense",
+                    journal_number=journal_number,
+                    entry_date=attendance.attendance_date,
+                    description=f"Labour wage - {labour.id} - {attendance.attendance_date}",
+                    status="Posted"
+                )
+                db.add(je)
+                await db.flush()
+
+                db.add(JournalLine(entry_id=je.id, account_id=expense_acc.id, debit=total_wage, credit=Decimal(0)))
+                db.add(JournalLine(entry_id=je.id, account_id=wages_payable_acc.id, debit=Decimal(0), credit=total_wage))
             else:
-                logger.warning(f"Skipping JournalEntry for expense {expense_id}: required accounts missing")
+                existing_je.entry_date = attendance.attendance_date
+                lines = (await db.execute(select(JournalLine).where(JournalLine.entry_id == existing_je.id))).scalars().all()
+                for line in lines:
+                    if line.account_id == expense_acc.id:
+                        line.debit = total_wage
+                        line.credit = Decimal(0)
+                    elif line.account_id == wages_payable_acc.id:
+                        line.credit = total_wage
+                        line.debit = Decimal(0)
 
     # Auto-approve attendance upon checkout
     attendance.is_approved = True

@@ -271,3 +271,7 @@ class LabourPayroll(Base, TimestampMixin):
     )
 
     labour = relationship("Labour")
+
+    __table_args__ = (
+        UniqueConstraint("labour_id", "project_id", "month", "year", name="uq_labour_payroll"),
+    )

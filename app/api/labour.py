@@ -41,7 +41,7 @@ from app.utils.pagination import PaginationParams
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from app.models.invoice import Transaction
-from app.models.accountant import JournalEntry, JournalLine
+from app.models.accountant import JournalEntry, JournalLine, Account
 from app.models.project import ProjectOTPolicy
 
 
@@ -366,6 +366,7 @@ async def get_payroll_stats(
             LabourPayroll.project_id == project_id,
             LabourPayroll.month == month,
             LabourPayroll.year == year,
+            LabourPayroll.status != PayrollStatus.DRAFT,
         )
     )
     res = payroll_sum.first()
@@ -421,6 +422,7 @@ async def get_contractor_liability(
             LabourPayroll.project_id == project_id,
             LabourPayroll.month == month,
             LabourPayroll.year == year,
+            LabourPayroll.status != PayrollStatus.DRAFT,
         )
         .group_by(Labour.contractor_id, Contractor.name)
     )
@@ -1195,6 +1197,32 @@ async def generate_payroll(
 
             total_wage = data["total_wage"]
 
+            payroll = await db.scalar(
+                select(LabourPayroll).where(
+                    LabourPayroll.labour_id == labour_id,
+                    LabourPayroll.project_id == project_id,
+                    LabourPayroll.month == payload.month,
+                    LabourPayroll.year == payload.year,
+                ).with_for_update()
+            )
+
+            if payroll:
+                if payroll.status in (PayrollStatus.LOCKED, PayrollStatus.PARTIAL, PayrollStatus.PAID, PayrollStatus.PENDING):
+                    from fastapi import HTTPException
+                    raise HTTPException(status_code=400, detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}")
+
+                payroll.total_working_hours = data["working_hours"]
+                payroll.total_overtime_hours = data["overtime_hours"]
+                payroll.total_wage = total_wage
+                
+                payroll.remaining_amount = max(Decimal("0"), total_wage - payroll.paid_amount)
+                
+                payroll.status = PayrollStatus.DRAFT
+
+                await db.flush()
+                output.append(payroll)
+                continue
+
             advance = await db.scalar(
                 select(func.sum(Expense.amount)).where(
                     Expense.labour_id == labour_id,
@@ -1207,34 +1235,6 @@ async def generate_payroll(
 
             remaining_amount = max(Decimal("0"), total_wage - advance)
 
-            if remaining_amount == 0:
-                status = PayrollStatus.PAID
-            elif advance > 0:
-                status = PayrollStatus.PARTIAL
-            else:
-                status = PayrollStatus.PENDING
-
-            payroll = await db.scalar(
-                select(LabourPayroll).where(
-                    LabourPayroll.labour_id == labour_id,
-                    LabourPayroll.project_id == project_id,
-                    LabourPayroll.month == payload.month,
-                    LabourPayroll.year == payload.year,
-                )
-            )
-
-            if payroll:
-                payroll.total_working_hours = data["working_hours"]
-                payroll.total_overtime_hours = data["overtime_hours"]
-                payroll.total_wage = total_wage
-                payroll.paid_amount = advance
-                payroll.remaining_amount = remaining_amount
-                payroll.status = status
-
-                await db.flush()
-                output.append(payroll)
-                continue
-
             payroll = LabourPayroll(
                 labour_id=labour_id,
                 project_id=project_id,
@@ -1245,11 +1245,37 @@ async def generate_payroll(
                 total_wage=total_wage,
                 paid_amount=advance,
                 remaining_amount=remaining_amount,
-                status=status,
+                status=PayrollStatus.DRAFT,
             )
 
-            db.add(payroll)
-            await db.flush()
+            try:
+                async with db.begin_nested():
+                    db.add(payroll)
+                    await db.flush()
+            except IntegrityError:
+                payroll = await db.scalar(
+                    select(LabourPayroll).where(
+                        LabourPayroll.labour_id == labour_id,
+                        LabourPayroll.project_id == project_id,
+                        LabourPayroll.month == payload.month,
+                        LabourPayroll.year == payload.year,
+                    ).with_for_update()
+                )
+                if payroll:
+                    if payroll.status in (PayrollStatus.LOCKED, PayrollStatus.PARTIAL, PayrollStatus.PAID, PayrollStatus.PENDING):
+                        from fastapi import HTTPException
+                        raise HTTPException(status_code=400, detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}")
+
+                    payroll.total_working_hours = data["working_hours"]
+                    payroll.total_overtime_hours = data["overtime_hours"]
+                    payroll.total_wage = total_wage
+                    
+                    payroll.remaining_amount = max(Decimal("0"), total_wage - payroll.paid_amount)
+                    
+                    payroll.status = PayrollStatus.DRAFT
+
+                    await db.flush()
+            
             output.append(payroll)
 
         await r.bump_cache_version(redis, VERSION_KEY)
@@ -1262,6 +1288,130 @@ async def generate_payroll(
         logger.exception("Payroll generation failed")
         raise
 
+
+# =========================
+# PAYROLL LOCK
+# =========================
+@router.post("/payroll/lock", response_model=list[s.PayrollOut])
+async def lock_payroll(
+    payload: s.PayrollLock,
+    current_user: User = Depends(
+        d.require_roles(
+            [
+                UserRole.ADMIN.value,
+                UserRole.PROJECT_MANAGER.value,
+                UserRole.ACCOUNTANT.value,
+                UserRole.SITE_ENGINEER.value,
+            ]
+        )
+    ),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(d.get_request_redis),
+):
+    if not payload.payroll_ids:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    if len(payload.payroll_ids) != len(set(payload.payroll_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate IDs in payload")
+
+    try:
+        payrolls = await db.scalars(
+            select(LabourPayroll)
+            .where(LabourPayroll.id.in_(payload.payroll_ids))
+            .order_by(LabourPayroll.id)
+            .with_for_update()
+        )
+        payrolls = payrolls.all()
+
+        if len(payrolls) != len(payload.payroll_ids):
+            raise HTTPException(status_code=400, detail="One or more payroll records not found")
+
+        for p in payrolls:
+            if p.status != PayrollStatus.DRAFT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot lock Payroll {p.id}. Current Status: {p.status.value}. Only DRAFT payrolls can be locked."
+                )
+
+        for p in payrolls:
+            p.status = PayrollStatus.LOCKED
+
+        await db.flush()
+
+        await r.bump_cache_version(redis, VERSION_KEY)
+        await r.bump_cache_version(redis, "dashboard_version")
+
+        return payrolls
+
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception:
+        await db.rollback()
+        logger.exception("Payroll lock failed")
+        raise
+
+# =========================
+# PAYROLL UNLOCK
+# =========================
+@router.post("/payroll/unlock", response_model=list[s.PayrollOut])
+async def unlock_payroll(
+    payload: s.PayrollUnlock,
+    current_user: User = Depends(
+        d.require_roles(
+            [
+                UserRole.ADMIN.value,
+                UserRole.PROJECT_MANAGER.value,
+                UserRole.ACCOUNTANT.value,
+                UserRole.SITE_ENGINEER.value,
+            ]
+        )
+    ),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(d.get_request_redis),
+):
+    if not payload.payroll_ids:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    if len(payload.payroll_ids) != len(set(payload.payroll_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate IDs in payload")
+
+    try:
+        payrolls = await db.scalars(
+            select(LabourPayroll)
+            .where(LabourPayroll.id.in_(payload.payroll_ids))
+            .order_by(LabourPayroll.id)
+            .with_for_update()
+        )
+        payrolls = payrolls.all()
+
+        if len(payrolls) != len(payload.payroll_ids):
+            raise HTTPException(status_code=400, detail="One or more payroll records not found")
+
+        for p in payrolls:
+            if p.status != PayrollStatus.LOCKED or p.paid_amount > 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot unlock Payroll {p.id}. Current Status: {p.status.value}. Paid Amount: {p.paid_amount}. Only LOCKED payrolls with zero paid_amount can be unlocked."
+                )
+
+        for p in payrolls:
+            p.status = PayrollStatus.DRAFT
+
+        await db.flush()
+
+        await r.bump_cache_version(redis, VERSION_KEY)
+        await r.bump_cache_version(redis, "dashboard_version")
+
+        return payrolls
+
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception:
+        await db.rollback()
+        logger.exception("Payroll unlock failed")
+        raise
 
 # =========================
 # PAYROLL PAYMENT
@@ -1286,11 +1436,20 @@ async def pay_salary(
             LabourPayroll.project_id == payload.project_id,
             LabourPayroll.month == payload.month,
             LabourPayroll.year == payload.year,
-        )
+        ).with_for_update()
     )
 
     if not payroll:
         raise NotFoundError("Payroll not found")
+
+    if payload.amount <= 0:
+        raise ValidationError("Payment amount must be greater than zero")
+
+    if payroll.status == PayrollStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Cannot pay DRAFT payroll. Please lock it first.")
+
+    if payroll.status == PayrollStatus.PAID:
+        raise HTTPException(status_code=400, detail="Payroll is already PAID in full.")
 
     if payload.amount > payroll.remaining_amount:
         raise ValidationError("Amount exceeds remaining salary")
@@ -1330,8 +1489,10 @@ async def pay_salary(
     db.add(entry)
     await db.flush()  # get entry.id
 
-    #  replace with real IDs later
-    EXPENSE_ACCOUNT_ID = 1  # Salary Expense
+    wages_payable_acc = await db.scalar(select(Account).where(Account.code == "WAGES_PAYABLE"))
+    if not wages_payable_acc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="WAGES_PAYABLE account is not configured.")
 
     from app.utils.accounting import get_primary_cash_account
 
@@ -1347,7 +1508,7 @@ async def pay_salary(
     db.add(
         JournalLine(
             entry_id=entry.id,
-            account_id=EXPENSE_ACCOUNT_ID,
+            account_id=wages_payable_acc.id,
             debit=payload.amount,
             credit=0,
         )
@@ -2199,6 +2360,7 @@ async def get_fiscal_summary(
             LabourPayroll.project_id == project_id,
             LabourPayroll.month == month,
             LabourPayroll.year == year,
+            LabourPayroll.status != PayrollStatus.DRAFT,
         )
     )
     res = payroll_sum.first()
@@ -2262,6 +2424,7 @@ async def get_payroll_momentum(
         )
         .where(
             LabourPayroll.project_id == project_id,
+            LabourPayroll.status != PayrollStatus.DRAFT,
             or_(
                 LabourPayroll.year > period_start.year,
                 and_(
