@@ -119,36 +119,33 @@ async def resolve_tax_accounts(db: AsyncSession, account_type_name: str) -> Acco
     
     if account_type_name == 'tds_payable':
         if settings and getattr(settings, 'tds_payable_account_id', None):
-            return await db.get(Account, settings.tds_payable_account_id)
-        # Fallback to search
-        acc = await db.scalar(select(Account).where(Account.name.ilike('%TDS%'), Account.type == AccountType.LIABILITY.value))
-        if acc: return acc
-        raise ValueError("TDS Payable account not configured or found.")
+            acc = await db.get(Account, settings.tds_payable_account_id)
+            if acc: return acc
+        raise ValueError("TDS Payable account not configured.")
         
     elif account_type_name == 'input_gst':
-        # Usually an asset or liability depending on net
-        acc = await db.scalar(select(Account).where(Account.name.ilike('%Input GST%')))
+        acc = await db.scalar(select(Account).where(Account.code == 'INPUT_GST'))
         if acc: return acc
-        raise ValueError("Input GST account not configured or found.")
+        raise ValueError("Input GST account not configured.")
         
     elif account_type_name == 'output_gst':
-        acc = await db.scalar(select(Account).where(Account.name.ilike('%Output GST%')))
+        acc = await db.scalar(select(Account).where(Account.code == 'OUTPUT_GST'))
         if acc: return acc
-        raise ValueError("Output GST account not configured or found.")
+        raise ValueError("Output GST account not configured.")
 
     raise ValueError(f"Unknown tax account type request: {account_type_name}")
 
 
 async def get_accounts_receivable(db: AsyncSession) -> Account:
     from app.core.enums import AccountType
-    acc = await db.scalar(select(Account).where(Account.name.ilike('%Receivable%'), Account.type == AccountType.ASSET.value))
+    acc = await db.scalar(select(Account).where(Account.code == 'ACCOUNTS_RECEIVABLE'))
     if not acc:
-        raise ValueError("Accounts Receivable account not configured or found.")
+        raise ValueError("Accounts Receivable account not configured.")
     return acc
 
 async def get_revenue_account(db: AsyncSession) -> Account:
     from app.core.enums import AccountType
-    acc = await db.scalar(select(Account).where(Account.name.ilike('%Revenue%'), Account.type == AccountType.INCOME.value))
+    acc = await db.scalar(select(Account).where(Account.code == 'SALES_REVENUE'))
     if not acc:
-        raise ValueError("Revenue account not configured or found.")
+        raise ValueError("Revenue account not configured.")
     return acc

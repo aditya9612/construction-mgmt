@@ -1,6 +1,9 @@
 from typing import Optional
 from datetime import date
-from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Header
+from sqlalchemy.exc import IntegrityError
+import hashlib
+import json
 from sqlalchemy import or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import OwnerReferenceType, OwnerTransactionType
@@ -58,6 +61,7 @@ async def create_expense(
     payload: ExpenseCreate,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     logger.info(
         f"Creating expense project_id={payload.project_id} amount={payload.amount}"
@@ -81,11 +85,33 @@ async def create_expense(
         if boq:
             data["boq_item_id"] = boq.id
 
+    request_hash = None
+    if idempotency_key:
+        payload_dict = payload.model_dump(mode="json")
+        payload_str = json.dumps(payload_dict, sort_keys=True)
+        request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+        data["idempotency_key"] = idempotency_key
+        data["request_hash"] = request_hash
+
     obj = Expense(**data)
     db.add(obj)
 
     try:
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            existing_expense = await db.scalar(
+                select(Expense).where(Expense.idempotency_key == idempotency_key)
+            )
+            if existing_expense:
+                if existing_expense.request_hash != request_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Idempotency-Key already used with a different request payload."
+                    )
+                return ExpenseOut.model_validate(existing_expense)
+            raise
 
         if obj.boq_item_id:
             total_actual = await db.scalar(
@@ -115,10 +141,9 @@ async def create_expense(
         # DR GST Input Account (if GST exists) -> assuming no gst field for now on Expense, UI says "GST"
         # CR Bank/Cash/Vendor Payable
         # We will dynamically find Expense account or fallback
-        from app.core.enums import AccountType
-        expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
+        expense_acc = await db.scalar(select(Account).where(Account.code == 'GENERAL_EXPENSE'))
         if not expense_acc:
-            expense_acc = await db.scalar(select(Account).where(Account.name.ilike('%Direct Expense%')))
+            raise HTTPException(status_code=400, detail="GENERAL_EXPENSE account is not configured.")
         
         cash_acc = await get_primary_cash_account(db)
 
@@ -219,20 +244,41 @@ async def update_expense(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
 ):
+    import time
     logger.info(f"Updating expense id={id}")
 
-    obj = await db.get(Expense, id)
+    # LOCK EXPENSE
+    obj = await db.scalar(select(Expense).where(Expense.id == id).with_for_update())
 
     if not obj:
         logger.warning(f"Expense not found id={id}")
         raise NotFoundError("Expense not found")
 
+    if obj.source_type == "attendance_auto":
+        raise HTTPException(
+            status_code=403,
+            detail="Cannot modify attendance-generated expenses directly. Please use the Attendance/Payroll modules."
+        )
+
+    # Capture original state to determine if accounting impact occurred
+    old_amount = obj.amount
+    old_date = obj.expense_date
+    old_category = obj.category
+    old_mode = obj.payment_mode
     old_boq_id = obj.boq_item_id
 
+    # Update metadata
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
     new_boq_id = obj.boq_item_id
+
+    accounting_changed = (
+        old_amount != obj.amount or
+        old_date != obj.expense_date or
+        old_category != obj.category or
+        old_mode != obj.payment_mode
+    )
 
     owner_txn = await db.scalar(
         select(OwnerTransaction).where(
@@ -242,28 +288,88 @@ async def update_expense(
     )
 
     if owner_txn:
-
         owner_txn.amount = obj.amount
-
         owner_txn.description = obj.description
 
     try:
+        if accounting_changed:
+            # 1. Identify CURRENT active JournalEntry
+            current_journal = await db.scalar(
+                select(JournalEntry)
+                .where(JournalEntry.journal_number.startswith(f"J-EXP-{obj.id}"))
+                .order_by(JournalEntry.id.desc())
+            )
+            if not current_journal:
+                raise HTTPException(status_code=500, detail="Original accounting journal not found")
+            if "-REV-" in current_journal.journal_number:
+                raise HTTPException(status_code=400, detail="Cannot edit an already reversed or deleted expense")
+
+            current_lines = (await db.execute(
+                select(JournalLine).where(JournalLine.entry_id == current_journal.id)
+            )).scalars().all()
+
+            timestamp = int(time.time() * 1000)
+
+            # 2. Create Reversal Journal
+            rev_je = JournalEntry(
+                entry_type="Expense",
+                journal_number=f"J-EXP-{obj.id}-REV-{timestamp}",
+                entry_date=current_journal.entry_date,  # MUST use original date
+                description=f"Reversal of {current_journal.journal_number}",
+                status="Posted"
+            )
+            db.add(rev_je)
+            await db.flush()
+
+            rev_debit_sum = Decimal(0)
+            rev_credit_sum = Decimal(0)
+
+            for line in current_lines:
+                db.add(JournalLine(
+                    entry_id=rev_je.id,
+                    account_id=line.account_id,
+                    debit=line.credit,   # swapped
+                    credit=line.debit,   # swapped
+                ))
+                rev_debit_sum += line.credit
+                rev_credit_sum += line.debit
+
+            if rev_debit_sum != rev_credit_sum:
+                raise HTTPException(status_code=500, detail="Reversal journal unbalanced")
+
+            # 3. Create Corrected Journal
+            expense_acc = await db.scalar(select(Account).where(Account.code == 'GENERAL_EXPENSE'))
+            if not expense_acc:
+                raise HTTPException(status_code=400, detail="GENERAL_EXPENSE account is not configured.")
+            cash_acc = await get_primary_cash_account(db)
+
+            if expense_acc and cash_acc:
+                new_je = JournalEntry(
+                    entry_type="Expense",
+                    journal_number=f"J-EXP-{obj.id}-V-{timestamp}",
+                    entry_date=obj.expense_date, # NEW date
+                    description=obj.description or f"Expense {obj.id} (Corrected)",
+                    status="Posted"
+                )
+                db.add(new_je)
+                await db.flush()
+
+                db.add(JournalLine(entry_id=new_je.id, account_id=expense_acc.id, debit=obj.amount, credit=Decimal(0)))
+                db.add(JournalLine(entry_id=new_je.id, account_id=cash_acc.id, debit=Decimal(0), credit=obj.amount))
+                
+                # Validation is implicit since we use obj.amount for both debit and credit.
+
         await db.flush()
 
         affected_boq_ids = {boq_id for boq_id in [old_boq_id, new_boq_id] if boq_id}
 
         for boq_id in affected_boq_ids:
-
             total_actual = await db.scalar(
                 select(func.sum(Expense.amount)).where(Expense.boq_item_id == boq_id)
             )
-
             boq = await db.get(BOQ, boq_id)
-
             if boq:
-
                 boq.actual_cost = Decimal(total_actual or 0)
-
                 boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
 
         await db.commit()
@@ -288,33 +394,78 @@ async def delete_expense(
 ):
     logger.info(f"Deleting expense id={id}")
 
-    obj = await db.get(Expense, id)
-
-    if not obj:
-        logger.warning(f"Expense not found id={id}")
-        raise NotFoundError("Expense not found")
-
-    owner_txn = await db.scalar(
-        select(OwnerTransaction).where(
-            OwnerTransaction.reference_type == OwnerReferenceType.EXPENSE.value,
-            OwnerTransaction.reference_id == obj.id,
-        )
-    )
-
-    journal_entry = await db.scalar(
-        select(JournalEntry).where(
-            JournalEntry.journal_number == f"J-EXP-{obj.id}"
-        )
-    )
-
-    boq_id = obj.boq_item_id
-
     try:
+        # 1. Lock Expense
+        obj = await db.scalar(
+            select(Expense).where(Expense.id == id).with_for_update()
+        )
+
+        if not obj:
+            logger.warning(f"Expense not found id={id}")
+            raise NotFoundError("Expense not found")
+
+        # 2. Attendance Protection
+        if obj.source_type == "attendance_auto":
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot modify attendance-generated expenses directly. Please use the Attendance/Payroll modules."
+            )
+
+        # 3. Find Current Active Journal
+        active_journal = await db.scalar(
+            select(JournalEntry)
+            .where(JournalEntry.journal_number.startswith(f"J-EXP-{obj.id}"))
+            .order_by(JournalEntry.id.desc())
+            .limit(1)
+        )
+
+        # 4 & 5. Create Final Delete Reversal and lines if active journal exists and isn't DEL
+        if active_journal and not active_journal.journal_number.endswith("-DEL"):
+            final_rev_journal_num = f"J-EXP-{obj.id}-DEL"
+            
+            final_rev_je = JournalEntry(
+                journal_number=final_rev_journal_num,
+                entry_date=active_journal.entry_date,
+                entry_type='Auto',
+                description=f"Delete Reversal - Expense {obj.id}",
+                status="Posted"
+            )
+            db.add(final_rev_je)
+            await db.flush()
+
+            active_lines = await db.scalars(
+                select(JournalLine).where(JournalLine.entry_id == active_journal.id)
+            )
+
+            rev_debit_sum = Decimal(0)
+            rev_credit_sum = Decimal(0)
+
+            for line in active_lines:
+                db.add(JournalLine(
+                    entry_id=final_rev_je.id,
+                    account_id=line.account_id,
+                    debit=line.credit,
+                    credit=line.debit,
+                ))
+                rev_debit_sum += (line.credit or Decimal(0))
+                rev_credit_sum += (line.debit or Decimal(0))
+
+            # 6. Balance Validation
+            if rev_debit_sum != rev_credit_sum:
+                raise HTTPException(status_code=500, detail="Reversal journal unbalanced")
+
+        # 7. OwnerTransaction
+        owner_txn = await db.scalar(
+            select(OwnerTransaction).where(
+                OwnerTransaction.reference_type == OwnerReferenceType.EXPENSE.value,
+                OwnerTransaction.reference_id == obj.id,
+            )
+        )
         if owner_txn:
             await db.delete(owner_txn)
-            
-        if journal_entry:
-            await db.delete(journal_entry)
+
+        # 8 & 9. BOQ handling and Delete Expense
+        boq_id = obj.boq_item_id
 
         await db.delete(obj)
         await db.flush()
@@ -331,7 +482,15 @@ async def delete_expense(
                 boq.actual_cost = Decimal(total_actual or 0)
                 boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
 
+        # 10. Commit transaction
         await db.commit()
+
+    except HTTPException:
+        await db.rollback()
+        raise
+    except NotFoundError:
+        await db.rollback()
+        raise
     except Exception:
         await db.rollback()
         logger.exception(f"Expense delete failed id={id}")

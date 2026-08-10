@@ -411,12 +411,10 @@ async def check_out(
 
             expense_acc = await db.scalar(select(Account).where(Account.code == "LABOUR_EXPENSE"))
             if not expense_acc:
-                from fastapi import HTTPException
                 raise HTTPException(status_code=400, detail="LABOUR_EXPENSE account is not configured.")
 
             wages_payable_acc = await db.scalar(select(Account).where(Account.code == "WAGES_PAYABLE"))
             if not wages_payable_acc:
-                from fastapi import HTTPException
                 raise HTTPException(status_code=400, detail="WAGES_PAYABLE account is not configured.")
 
             if not existing_je:

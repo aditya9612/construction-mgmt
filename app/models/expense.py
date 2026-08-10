@@ -54,3 +54,15 @@ class Expense(Base, TimestampMixin):
         nullable=True,
         index=True
     )
+
+    idempotency_key: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        unique=True,
+        index=True
+    )
+
+    request_hash: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True
+    )
