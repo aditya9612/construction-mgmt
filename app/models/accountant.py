@@ -283,6 +283,7 @@ class VendorBill(Base):
     supporting_docs_url = Column(String(500), nullable=True)
 
     status = Column(String(50), default=VendorBillStatus.PENDING.value)  # PENDING, APPROVED, PARTIAL, PAID, REJECTED
+    accrued_journal_id = Column(Integer, ForeignKey("journal_entries.id", ondelete="RESTRICT"), nullable=True)
 
     created_at = Column(
         DateTime(timezone=True),
@@ -390,3 +391,42 @@ class TDSDeduction(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+class PaymentVoucher(Base):
+    __tablename__ = "payment_vouchers"
+    id = Column(Integer, primary_key=True)
+    payment_voucher_number = Column(String(50), unique=True, nullable=False, index=True)
+    payment_date = Column(DateTime(timezone=True), nullable=False)
+    party_type = Column(String(50), nullable=False) # Vendor, Contractor
+    supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
+    contractor_id = Column(Integer, ForeignKey("contractors.id"), nullable=True)
+    vendor_bill_id = Column(Integer, ForeignKey("vendor_bills.id"), nullable=True)
+    
+    base_amount = Column(DECIMAL(18, 2), nullable=False, default=0)
+    gst_amount = Column(DECIMAL(18, 2), nullable=False, default=0)
+    gross_amount = Column(DECIMAL(18, 2), nullable=False, default=0)
+    tds_amount = Column(DECIMAL(18, 2), nullable=False, default=0)
+    retention_amount = Column(DECIMAL(18, 2), nullable=False, default=0)
+    net_payable_amount = Column(DECIMAL(18, 2), nullable=False, default=0)
+    
+    payment_method = Column(String(50), nullable=False)
+    bank_account_id = Column(Integer, ForeignKey("bank_accounts.id"), nullable=False)
+    reference_no = Column(String(100), nullable=True)
+    status = Column(String(50), default="PENDING") # PENDING, PAID, CANCELLED
+    journal_entry_id = Column(Integer, ForeignKey("journal_entries.id", ondelete="RESTRICT"), nullable=True)
+    
+    created_by = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    
+    vendor_bill = relationship("VendorBill")
+    journal_entry = relationship("JournalEntry")

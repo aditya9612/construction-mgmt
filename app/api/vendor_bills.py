@@ -142,7 +142,15 @@ async def approve_vendor_bill(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES))
 ):
-    bill = await db.get(VendorBill, id)
+    from sqlalchemy.orm import with_for_update
+    from app.models.accountant import Account, JournalEntry, JournalLine
+    from datetime import date
+    from decimal import Decimal
+    
+    # Lock for update
+    result = await db.execute(select(VendorBill).where(VendorBill.id == id).with_for_update())
+    bill = result.scalar_one_or_none()
+    
     if not bill:
         raise HTTPException(status_code=404, detail="Vendor Bill not found")
         
@@ -152,6 +160,50 @@ async def approve_vendor_bill(
     if payload.status not in [VendorBillStatus.APPROVED.value, VendorBillStatus.REJECTED.value]:
         raise HTTPException(status_code=400, detail="Invalid status. Must be APPROVED or REJECTED.")
         
+    if payload.status == VendorBillStatus.APPROVED.value and not bill.accrued_journal_id:
+        # Create Accrual Journal
+        # Dr Expense, Dr INPUT_GST, Cr VENDOR_PAYABLE
+        vendor_acc = await db.scalar(select(Account).where(Account.code == "VENDOR_PAYABLE"))
+        expense_acc = await db.scalar(select(Account).where(Account.code == "EXPENSE")) 
+        gst_acc = await db.scalar(select(Account).where(Account.code == "INPUT_GST"))
+        
+        if not vendor_acc:
+             raise HTTPException(status_code=400, detail="VENDOR_PAYABLE account is not configured.")
+        if not expense_acc:
+             raise HTTPException(status_code=400, detail="EXPENSE account is not configured.")
+        
+        base_amount = Decimal(str(bill.total_amount - (bill.gst_amount or 0)))
+        gst_amount = Decimal(str(bill.gst_amount or 0))
+        gross_amount = Decimal(str(bill.total_amount))
+        
+        je = JournalEntry(
+            description=f"Accrual for Vendor Bill {bill.bill_number}",
+            entry_date=date.today(),
+            entry_type="Auto",
+            status="Posted",
+            created_by=current_user.id
+        )
+        db.add(je)
+        await db.flush()
+        
+        lines = []
+        # Dr Expense
+        lines.append(JournalLine(entry_id=je.id, account_id=expense_acc.id, debit=base_amount, credit=Decimal(0)))
+        
+        # Dr GST
+        if gst_amount > 0 and gst_acc:
+            lines.append(JournalLine(entry_id=je.id, account_id=gst_acc.id, debit=gst_amount, credit=Decimal(0)))
+        elif gst_amount > 0 and not gst_acc:
+            raise HTTPException(status_code=400, detail="INPUT_GST account is not configured but bill has GST.")
+            
+        # Cr Payable
+        lines.append(JournalLine(entry_id=je.id, account_id=vendor_acc.id, debit=Decimal(0), credit=gross_amount))
+        
+        db.add_all(lines)
+        await db.flush()
+        
+        bill.accrued_journal_id = je.id
+
     bill.status = payload.status
 
     await db.commit()
@@ -188,6 +240,9 @@ async def pay_vendor_bill(
         
     if bill.status not in [VendorBillStatus.APPROVED.value, VendorBillStatus.PARTIAL.value, VendorBillStatus.PAID.value]:
         raise HTTPException(status_code=400, detail="Bill must be approved before payment")
+        
+    if bill.accrued_journal_id is not None:
+        raise HTTPException(status_code=400, detail="This bill uses accrual accounting. Please use the Payment Voucher module to settle it.")
         
     if payload.amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid payment amount")
