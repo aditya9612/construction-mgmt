@@ -8,8 +8,8 @@ from app.schemas.accountant import OfferCreate, OfferOut
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract
-from app.core.enums import AccountType, PaymentMode
-from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine, BankTransaction, FundTransfer, GSTReturn, BankAccount, TDSDeduction, VendorBill
+from app.core.enums import AccountType, PaymentMode, PettyCashTransactionType
+from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine, BankTransaction, FundTransfer, GSTReturn, BankAccount, TDSDeduction, VendorBill, PettyCashTransaction
 from app.schemas.accountant import (
     AccountCreate,
     AccountOut,
@@ -25,7 +25,8 @@ from app.schemas.accountant import (
     GSTReturnCreate, GSTReturnOut,
     BankAccountCreate, BankAccountUpdate, BankAccountOut, BankLedgerLine, ReconciliationDashboardOut,
     TDSDeductionCreate, TDSDeductionOut, GSTRegisterItem, GSTDashboardOut, GSTReconciliationMismatch,
-    GSTReturnStatus, GSTRecentFiling, GSTImportResult
+    GSTReturnStatus, GSTRecentFiling, GSTImportResult,
+    PettyCashTransactionCreate, PettyCashTransactionOut, PettyCashLedgerLine
 )
 from app.db.session import get_db_session
 from app.models.billing import RABill
@@ -1395,7 +1396,103 @@ async def import_cash_book(file: UploadFile = File(...)):
     }
 
 
-@router.get("/petty-cash/ledger", response_model=list[BankLedgerLine])
+@router.post("/petty-cash/transactions", response_model=PettyCashTransactionOut)
+async def create_petty_cash_transaction(
+    payload: PettyCashTransactionCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+):
+    from app.utils.accounting import get_petty_cash_account
+    from app.utils.common import generate_business_id
+
+    if payload.amount <= Decimal('0'):
+        raise ValidationError("Amount must be greater than 0")
+
+    try:
+        cash_acc = await get_petty_cash_account(db)
+    except ValueError:
+        raise ValidationError("Petty cash account not configured")
+
+    # Validate based on type
+    if payload.type == PettyCashTransactionType.CASH_OUT:
+        if not payload.category_id:
+            raise ValidationError("Category ID is required for CASH_OUT")
+        if payload.category_id == cash_acc.id:
+            raise ValidationError("Category cannot be the Petty Cash account")
+        category_acc = await db.get(Account, payload.category_id)
+        if not category_acc or category_acc.type != AccountType.EXPENSE:
+            raise ValidationError("Category must be a valid Expense account")
+
+    elif payload.type == PettyCashTransactionType.CASH_IN:
+        if not payload.source_account_id:
+            raise ValidationError("Source Account ID is required for CASH_IN")
+        if payload.source_account_id == cash_acc.id:
+            raise ValidationError("Source account cannot be the Petty Cash account")
+        source_acc = await db.get(Account, payload.source_account_id)
+        # Assuming source should be Asset (Bank) or Liability based on existing system. 
+        # But wait, BankAccount might enforce ASSET. We will allow ASSET.
+        if not source_acc or source_acc.type != AccountType.ASSET:
+            raise ValidationError("Source account must be a valid Asset/Bank account")
+
+    # Validate approved_by user if provided
+    if payload.approved_by:
+        approver = await db.get(User, payload.approved_by)
+        if not approver:
+            raise ValidationError("Approved by user does not exist")
+
+    voucher_no = await generate_business_id(db, PettyCashTransaction, "voucher_no", "PC")
+
+    try:
+        # Accounting logic
+        je = JournalEntry(
+            description=payload.remarks or f"Petty Cash {payload.type.value}",
+            status="Posted",
+            entry_type="PettyCash",
+            entry_date=payload.transaction_date,
+            created_by=current_user.id
+        )
+        db.add(je)
+        await db.flush()
+
+        lines = []
+        if payload.type == PettyCashTransactionType.CASH_OUT:
+            # Dr Expense, Cr Petty Cash
+            lines.append(JournalLine(entry_id=je.id, account_id=payload.category_id, debit=payload.amount, credit=Decimal('0.0')))
+            lines.append(JournalLine(entry_id=je.id, account_id=cash_acc.id, debit=Decimal('0.0'), credit=payload.amount))
+        else:
+            # Dr Petty Cash, Cr Source
+            lines.append(JournalLine(entry_id=je.id, account_id=cash_acc.id, debit=payload.amount, credit=Decimal('0.0')))
+            lines.append(JournalLine(entry_id=je.id, account_id=payload.source_account_id, debit=Decimal('0.0'), credit=payload.amount))
+
+        db.add_all(lines)
+        await db.flush()
+
+        # Business record
+        obj = PettyCashTransaction(
+            voucher_no=voucher_no,
+            type=payload.type.value,
+            transaction_date=payload.transaction_date,
+            category_id=payload.category_id if payload.type == PettyCashTransactionType.CASH_OUT else None,
+            source_account_id=payload.source_account_id if payload.type == PettyCashTransactionType.CASH_IN else None,
+            amount=payload.amount,
+            paid_to_received_from=payload.paid_to_received_from,
+            approved_by=payload.approved_by,
+            remarks=payload.remarks,
+            journal_entry_id=je.id,
+            created_by=current_user.id
+        )
+        db.add(obj)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Transaction failed: {str(e)}")
+
+    await db.refresh(obj)
+    
+    return PettyCashTransactionOut.from_orm(obj)
+
+
+@router.get("/petty-cash/ledger", response_model=list[PettyCashLedgerLine])
 async def get_petty_cash_ledger(
     skip: int = 0,
     limit: int = 1000,
@@ -1404,12 +1501,50 @@ async def get_petty_cash_ledger(
 ):
     from app.utils.accounting import get_petty_cash_account
     from fastapi import HTTPException
+    from app.models.accountant import JournalLine, JournalEntry, PettyCashTransaction
     try:
         cash_acc = await get_petty_cash_account(db)
     except ValueError:
         raise HTTPException(status_code=400, detail="Petty cash account not configured")
         
-    return await _build_ledger(db, cash_acc.id)
+    query = (
+        select(JournalLine, JournalEntry, PettyCashTransaction, Account)
+        .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
+        .outerjoin(PettyCashTransaction, PettyCashTransaction.journal_entry_id == JournalEntry.id)
+        .outerjoin(Account, PettyCashTransaction.category_id == Account.id)
+        .where(JournalLine.account_id == cash_acc.id)
+        .where(JournalEntry.status == "Posted")
+        .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.asc())
+    )
+    
+    results = await db.execute(query)
+    
+    ledger = []
+    running_balance = Decimal('0.0')
+    
+    for line, entry, pc_txn, category_acc in results:
+        running_balance += (line.debit - line.credit)
+        
+        voucher = pc_txn.voucher_no if pc_txn else f"JV-{entry.id}"
+        remarks = pc_txn.remarks if pc_txn else entry.description
+        category = category_acc.name if category_acc else None
+        paid_to = pc_txn.paid_to_received_from if pc_txn else None
+        
+        ledger.append(PettyCashLedgerLine(
+            date=entry.entry_date or entry.created_at.date(),
+            voucher_no=voucher,
+            description=remarks,
+            debit=float(line.debit),
+            credit=float(line.credit),
+            category=category,
+            remarks=remarks,
+            paid_to=paid_to,
+            cash_in=line.debit,
+            cash_out=line.credit,
+            balance=float(running_balance)
+        ))
+        
+    return ledger
 
 async def _build_consolidated_bank_ledger(db: AsyncSession) -> list[dict]:
     # Gets consolidated ledger across ALL bank accounts

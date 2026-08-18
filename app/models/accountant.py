@@ -427,6 +427,37 @@ class PaymentVoucher(Base):
         onupdate=func.now(),
         nullable=False,
     )
-    
+
     vendor_bill = relationship("VendorBill")
     journal_entry = relationship("JournalEntry")
+
+class PettyCashTransaction(Base):
+    __tablename__ = "petty_cash_transactions"
+
+    id = Column(Integer, primary_key=True)
+    voucher_no = Column(String(50), unique=True, nullable=False, index=True)
+    type = Column(String(50), nullable=False)
+    transaction_date = Column(Date, nullable=False)
+    
+    category_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    source_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    
+    amount = Column(DECIMAL(18, 2), nullable=False)
+    paid_to_received_from = Column(String(150), nullable=True)
+    approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    remarks = Column(String(255), nullable=True)
+    
+    journal_entry_id = Column(Integer, ForeignKey("journal_entries.id", ondelete="RESTRICT"), nullable=True)
+    
+    created_by = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

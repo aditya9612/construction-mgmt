@@ -5,7 +5,7 @@ from typing import Optional, List
 from decimal import Decimal
 
 from pydantic import BaseModel, Field, field_validator
-from app.core.enums import PaymentMode
+from app.core.enums import PaymentMode, PettyCashTransactionType
 from app.core.validators import validate_ifsc
 
 
@@ -161,6 +161,39 @@ class BankLedgerLine(BaseModel):
     description: Optional[str] = None
     debit: float = 0.0
     credit: float = 0.0
+    balance: float = 0.0
+
+
+class PettyCashTransactionCreate(BaseModel):
+    type: PettyCashTransactionType
+    transaction_date: date
+    category_id: Optional[int] = None
+    source_account_id: Optional[int] = None
+    amount: Decimal
+    paid_to_received_from: Optional[str] = None
+    approved_by: Optional[int] = None
+    remarks: Optional[str] = None
+
+
+class PettyCashTransactionOut(PettyCashTransactionCreate):
+    id: int
+    voucher_no: str
+
+    class Config:
+        from_attributes = True
+
+
+class PettyCashLedgerLine(BaseModel):
+    date: date
+    voucher_no: Optional[str] = None
+    description: Optional[str] = None
+    debit: float = 0.0
+    credit: float = 0.0
+    category: Optional[str] = None
+    remarks: Optional[str] = None
+    paid_to: Optional[str] = None
+    cash_in: Decimal = Decimal('0.0')
+    cash_out: Decimal = Decimal('0.0')
     balance: float = 0.0
 
 
