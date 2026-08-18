@@ -22,7 +22,7 @@ from app.schemas.accountant import (
     ReceiptCreate,
     BankTransactionCreate, BankTransactionOut,
     FundTransferCreate, FundTransferOut,
-    GSTReturnCreate, GSTReturnOut,
+    GSTReturnCreate, GSTReturnOut, GSTReturnUpdate,
     BankAccountCreate, BankAccountUpdate, BankAccountOut, BankLedgerLine, ReconciliationDashboardOut,
     TDSDeductionCreate, TDSDeductionOut, TDSDeductionUpdate, GSTRegisterItem, GSTDashboardOut, GSTReconciliationMismatch,
     GSTReturnStatus, GSTRecentFiling, GSTImportResult,
@@ -2504,6 +2504,7 @@ async def list_gst_returns(
     result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
     return result.all()
 
+
 @router.get("/tds/deductions", response_model=list[TDSDeductionOut])
 async def list_tds_deductions(
     skip: int = 0,
@@ -2939,6 +2940,62 @@ async def reconcile_gst(
                     ))
                     
     return mismatches
+
+@router.get("/gst/returns/{id}", response_model=GSTReturnOut)
+async def get_gst_return(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    gstr = await db.get(GSTReturn, id)
+    if not gstr:
+        raise HTTPException(status_code=404, detail="GST Return not found")
+    return gstr
+
+@router.patch("/gst/returns/{id}", response_model=GSTReturnOut)
+async def update_gst_return(
+    id: int,
+    payload: GSTReturnUpdate,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    gstr = await db.get(GSTReturn, id)
+    if not gstr:
+        raise HTTPException(status_code=404, detail="GST Return not found")
+        
+    if gstr.status == "Filed":
+        raise HTTPException(status_code=400, detail="Filed GST Return cannot be modified.")
+        
+    if getattr(payload, 'status', None) == "Filed" and gstr.status != "Filed":
+        raise HTTPException(status_code=400, detail="GST Return cannot be marked as Filed through update. Use the GST filing workflow.")
+
+    update_data = payload.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(gstr, key, value)
+        
+    await db.commit()
+    await db.refresh(gstr)
+    return gstr
+
+@router.delete("/gst/returns/{id}", status_code=204)
+async def delete_gst_return(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    gstr = await db.get(GSTReturn, id)
+    if not gstr:
+        raise HTTPException(status_code=404, detail="GST Return not found")
+        
+    if gstr.status == "Filed":
+        raise HTTPException(status_code=400, detail="Filed GST Return cannot be deleted.")
+        
+    await db.delete(gstr)
+    await db.commit()
+    return None
 
 @router.get("/gst/export")
 async def export_gst(

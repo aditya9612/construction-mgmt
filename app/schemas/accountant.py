@@ -293,6 +293,16 @@ class GSTReturnCreate(BaseModel):
     status: str = "Draft"
     filing_date: Optional[date] = None
 
+class GSTReturnUpdate(BaseModel):
+    filing_period: Optional[str] = None
+    return_type: Optional[str] = None
+    taxable_value: Optional[float] = None
+    gst_liability: Optional[float] = None
+    itc_available: Optional[float] = None
+    net_gst_payable: Optional[float] = None
+    status: Optional[str] = None
+    filing_date: Optional[date] = None
+
 class GSTReturnOut(GSTReturnCreate):
     id: int
     created_at: datetime
