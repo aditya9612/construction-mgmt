@@ -24,7 +24,7 @@ from app.schemas.accountant import (
     FundTransferCreate, FundTransferOut,
     GSTReturnCreate, GSTReturnOut,
     BankAccountCreate, BankAccountUpdate, BankAccountOut, BankLedgerLine, ReconciliationDashboardOut,
-    TDSDeductionCreate, TDSDeductionOut, GSTRegisterItem, GSTDashboardOut, GSTReconciliationMismatch,
+    TDSDeductionCreate, TDSDeductionOut, TDSDeductionUpdate, GSTRegisterItem, GSTDashboardOut, GSTReconciliationMismatch,
     GSTReturnStatus, GSTRecentFiling, GSTImportResult,
     PettyCashTransactionCreate, PettyCashTransactionOut, PettyCashLedgerLine
 )
@@ -2504,14 +2504,41 @@ async def list_gst_returns(
     result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
     return result.all()
 
+@router.get("/tds/deductions", response_model=list[TDSDeductionOut])
+async def list_tds_deductions(
+    skip: int = 0,
+    limit: int = 100,
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    result = await db.scalars(
+        select(TDSDeduction)
+        .order_by(TDSDeduction.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    return result.all()
+
 @router.post("/tds/deductions", response_model=TDSDeductionOut)
 async def create_tds_deduction(
     payload: TDSDeductionCreate,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from app.utils.accounting import resolve_tax_accounts, auto_post_journal
+    from fastapi import HTTPException
+    from app.utils.accounting import resolve_tax_accounts
     
+    # Duplicate checking
+    if getattr(payload, 'vendor_bill_id', None) is not None:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == payload.vendor_bill_id))
+        if existing:
+            raise HTTPException(status_code=400, detail="TDS Deduction already exists for this Vendor Bill.")
+            
+    if getattr(payload, 'ra_bill_id', None) is not None:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.ra_bill_id == payload.ra_bill_id))
+        if existing:
+            raise HTTPException(status_code=400, detail="TDS Deduction already exists for this RA Bill.")
+
     tds = TDSDeduction(**payload.model_dump())
     tds.created_by = current_user.id
     
@@ -2521,9 +2548,11 @@ async def create_tds_deduction(
     if tds.status == "Posted":
         try:
             tds_acc = await resolve_tax_accounts(db, 'tds_payable')
+            if not tds_acc:
+                raise HTTPException(status_code=400, detail="TDS payable account is not configured.")
+                
             vendor_acc = await db.scalar(select(Account).where(Account.code == "VENDOR_PAYABLE"))
             if not vendor_acc:
-                from fastapi import HTTPException
                 raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
             
             if tds_acc and vendor_acc:
@@ -2541,12 +2570,108 @@ async def create_tds_deduction(
                 jl_debit = JournalLine(entry_id=je.id, account_id=vendor_acc.id, debit=tds.tds_amount, credit=0.0)
                 jl_credit = JournalLine(entry_id=je.id, account_id=tds_acc.id, debit=0.0, credit=tds.tds_amount)
                 db.add_all([jl_debit, jl_credit])
-        except ValueError:
-            pass # Or handle
+        except Exception as e:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Database commit failed: {str(e)}")
+
     await db.refresh(tds)
     return tds
+
+@router.get("/tds/deductions/{id}", response_model=TDSDeductionOut)
+async def get_tds_deduction(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    tds = await db.get(TDSDeduction, id)
+    if not tds:
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+    return tds
+
+@router.patch("/tds/deductions/{id}", response_model=TDSDeductionOut)
+async def update_tds_deduction(
+    id: int,
+    payload: TDSDeductionUpdate,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    
+    tds = await db.get(TDSDeduction, id)
+    if not tds:
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+        
+    is_posted = tds.status == "Posted"
+    is_payment_service = tds.status == "PENDING" and tds.vendor_bill_id is not None
+    
+    if is_posted or is_payment_service:
+        # Prevent accounting-sensitive updates
+        sensitive_fields = ['payment_amount', 'tds_rate', 'tds_amount', 'vendor_bill_id', 'ra_bill_id', 'status']
+        payload_data = payload.model_dump(exclude_unset=True)
+        for field in sensitive_fields:
+            if field in payload_data and payload_data[field] != getattr(tds, field):
+                raise HTTPException(status_code=400, detail=f"Cannot modify accounting-sensitive field '{field}' on a POSTED or PaymentService-generated record.")
+                
+    if getattr(payload, 'status', None) == "Posted" and tds.status != "Posted":
+        raise HTTPException(status_code=400, detail="Cannot change TDS status to Posted through update. Use the TDS posting workflow.")
+        
+    # Duplicate checking if changing bill ids
+    if getattr(payload, 'vendor_bill_id', None) is not None and payload.vendor_bill_id != tds.vendor_bill_id:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == payload.vendor_bill_id, TDSDeduction.id != id))
+        if existing:
+            raise HTTPException(status_code=400, detail="TDS Deduction already exists for this Vendor Bill.")
+            
+    if getattr(payload, 'ra_bill_id', None) is not None and payload.ra_bill_id != tds.ra_bill_id:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.ra_bill_id == payload.ra_bill_id, TDSDeduction.id != id))
+        if existing:
+            raise HTTPException(status_code=400, detail="TDS Deduction already exists for this RA Bill.")
+
+    try:
+        update_data = payload.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(tds, key, value)
+            
+        await db.commit()
+        await db.refresh(tds)
+        return tds
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Update failed: {str(e)}")
+
+
+@router.delete("/tds/deductions/{id}", status_code=204)
+async def delete_tds_deduction(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    
+    tds = await db.get(TDSDeduction, id)
+    if not tds:
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+        
+    is_posted = tds.status == "Posted"
+    is_payment_service = tds.status == "PENDING" and tds.vendor_bill_id is not None
+    
+    if is_posted or is_payment_service:
+        raise HTTPException(status_code=400, detail="Cannot delete a POSTED or PaymentService-generated TDS record. Please use a reversal mechanism if applicable.")
+        
+    try:
+        await db.delete(tds)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Deletion failed: {str(e)}")
+        
+
 
 @router.get("/gst/invoice-register", response_model=list[GSTRegisterItem])
 async def gst_invoice_register(
@@ -2691,49 +2816,7 @@ async def list_gst_returns(
     result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
     return result.all()
 
-@router.post("/tds/deductions", response_model=TDSDeductionOut)
-async def create_tds_deduction(
-    payload: TDSDeductionCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    from app.utils.accounting import resolve_tax_accounts, auto_post_journal
-    
-    tds = TDSDeduction(**payload.model_dump())
-    tds.created_by = current_user.id
-    
-    db.add(tds)
-    
-    # Process Auto Journal if posted directly
-    if tds.status == "Posted":
-        try:
-            tds_acc = await resolve_tax_accounts(db, 'tds_payable')
-            vendor_acc = await db.scalar(select(Account).where(Account.code == "VENDOR_PAYABLE"))
-            if not vendor_acc:
-                from fastapi import HTTPException
-                raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
-            
-            if tds_acc and vendor_acc:
-                je = JournalEntry(
-                    entry_date=date.today(),
-                    description=f"TDS Deduction for {tds.party_name}",
-                    entry_type="Auto",
-                    status="Posted",
-                    created_by=current_user.id
-                )
-                db.add(je)
-                await db.flush()
-                
-                # Debit Vendor, Credit TDS
-                jl_debit = JournalLine(entry_id=je.id, account_id=vendor_acc.id, debit=tds.tds_amount, credit=0.0)
-                jl_credit = JournalLine(entry_id=je.id, account_id=tds_acc.id, debit=0.0, credit=tds.tds_amount)
-                db.add_all([jl_debit, jl_credit])
-        except ValueError:
-            pass # Or handle
 
-    await db.commit()
-    await db.refresh(tds)
-    return tds
 
 @router.get("/gst/invoice-register", response_model=list[GSTRegisterItem])
 async def gst_invoice_register(

@@ -313,6 +313,20 @@ class TDSDeductionCreate(BaseModel):
     vendor_bill_id: Optional[int] = None
     ra_bill_id: Optional[int] = None
 
+
+class TDSDeductionUpdate(BaseModel):
+    party_name: Optional[str] = None
+    pan_number: Optional[str] = None
+    invoice_number: Optional[str] = None
+    payment_amount: Optional[float] = None
+    tds_section: Optional[str] = None
+    tds_rate: Optional[float] = None
+    tds_amount: Optional[float] = None
+    deposit_date: Optional[date] = None
+    status: Optional[str] = None
+    vendor_bill_id: Optional[int] = None
+    ra_bill_id: Optional[int] = None
+
 class TDSDeductionOut(TDSDeductionCreate):
     id: int
     created_by: Optional[int] = None
