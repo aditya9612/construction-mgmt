@@ -275,6 +275,13 @@ class VendorBill(Base):
     advance_paid = Column(DECIMAL(18, 2), default=0)
 
     total_amount = Column(DECIMAL(18, 2), nullable=False)
+
+    # NEW GST INVOICE FIELDS
+    party_gstin = Column(String(20), nullable=True)
+    cgst = Column(DECIMAL(18, 2), nullable=True, default=0.0)
+    sgst = Column(DECIMAL(18, 2), nullable=True, default=0.0)
+    igst = Column(DECIMAL(18, 2), nullable=True, default=0.0)
+    gst_document_url = Column(String(500), nullable=True)
     amount_paid = Column(DECIMAL(18, 2), default=0)
 
     vendor_invoice_url = Column(String(500), nullable=True)

@@ -2685,13 +2685,20 @@ async def gst_invoice_register(
     invoices = await db.scalars(select(Invoice))
     for inv in invoices:
         items.append(GSTRegisterItem(
-            date=inv.created_at.date(), # assuming created_at as date for now
-            invoice_no=str(inv.id),
+            date=inv.invoice_date or inv.created_at.date(),
+            invoice_no=inv.invoice_number or str(inv.id),
             type='SALES',
-            party_name='Customer', # Would join customer/project
+            party_name='Customer',
+            gstin=inv.party_gstin,
             taxable_amount=float(inv.amount),
             gst_amount=float(inv.gst_amount),
-            invoice_total=float(inv.total_amount)
+            invoice_total=float(inv.total_amount),
+            cgst=float(inv.cgst or 0.0),
+            sgst=float(inv.sgst or 0.0),
+            igst=float(inv.igst or 0.0),
+            invoice_copy_url=inv.invoice_copy_url,
+            gst_document_url=inv.gst_document_url,
+            attachments=inv.invoice_copy_url
         ))
         
     vendor_bills = await db.scalars(select(VendorBill))
@@ -2830,13 +2837,20 @@ async def gst_invoice_register(
     invoices = await db.scalars(select(Invoice))
     for inv in invoices:
         items.append(GSTRegisterItem(
-            date=inv.created_at.date(), # assuming created_at as date for now
-            invoice_no=str(inv.id),
+            date=inv.invoice_date or inv.created_at.date(),
+            invoice_no=inv.invoice_number or str(inv.id),
             type='SALES',
-            party_name='Customer', # Would join customer/project
+            party_name='Customer',
+            gstin=inv.party_gstin,
             taxable_amount=float(inv.amount),
             gst_amount=float(inv.gst_amount),
-            invoice_total=float(inv.total_amount)
+            invoice_total=float(inv.total_amount),
+            cgst=float(inv.cgst or 0.0),
+            sgst=float(inv.sgst or 0.0),
+            igst=float(inv.igst or 0.0),
+            invoice_copy_url=inv.invoice_copy_url,
+            gst_document_url=inv.gst_document_url,
+            attachments=inv.invoice_copy_url
         ))
         
     vendor_bills = await db.scalars(select(VendorBill))
@@ -3018,11 +3032,11 @@ async def export_gst(
     
     for inv in invoices:
         writer.writerow([
-            str(inv.id),
-            inv.created_at.date().isoformat(),
+            inv.invoice_number or str(inv.id),
+            (inv.invoice_date or inv.created_at.date()).isoformat(),
             'SALES',
             'Customer', # Simplified
-            '',
+            inv.party_gstin or '',
             float(inv.amount),
             float(inv.gst_amount),
             float(inv.total_amount),
@@ -3035,9 +3049,9 @@ async def export_gst(
             vb.bill_date.isoformat() if vb.bill_date else '',
             'PURCHASE',
             'Vendor', # Simplified
-            '',
-            float(vb.total_amount),
-            0.0, # Simplified
+            vb.party_gstin or '',
+            float(vb.gross_amount or 0.0),
+            float(vb.gst_amount or 0.0),
             float(vb.total_amount),
             vb.status
         ])

@@ -1,5 +1,6 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional
+from decimal import Decimal
 from datetime import date, datetime
 from app.core.enums import (
     InvoiceStatus,
@@ -60,6 +61,15 @@ class InvoiceOut(BaseModel):
 
     status: InvoiceStatus
     description: Optional[str]
+
+    invoice_number: Optional[str] = None
+    invoice_date: Optional[date] = None
+    party_gstin: Optional[str] = None
+    cgst: Optional[float] = None
+    sgst: Optional[float] = None
+    igst: Optional[float] = None
+    invoice_copy_url: Optional[str] = None
+    gst_document_url: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -132,6 +142,36 @@ class CreateInvoice(BaseModel):
     tax_percent: Decimal = Field(default=0)
 
     description: Optional[str] = None
+
+    invoice_number: Optional[str] = None
+    invoice_date: Optional[date] = None
+    party_gstin: Optional[str] = None
+    cgst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    sgst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    igst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    invoice_copy_url: Optional[str] = None
+    gst_document_url: Optional[str] = None
+
+    @model_validator(mode='after')
+    def validate_gst_split(self) -> 'CreateInvoice':
+        cgst = self.cgst or Decimal('0.0')
+        sgst = self.sgst or Decimal('0.0')
+        igst = self.igst or Decimal('0.0')
+
+        if cgst < 0 or sgst < 0 or igst < 0:
+            raise ValueError('GST components cannot be negative')
+
+        if igst > 0 and (cgst > 0 or sgst > 0):
+            raise ValueError('IGST cannot be combined with CGST/SGST')
+
+        total_split = cgst + sgst + igst
+        if total_split > 0:
+            amt = self.amount or Decimal('0.0')
+            pct = self.gst_percent or Decimal('0.0')
+            expected_gst = round((amt * pct) / Decimal('100.0'), 2)
+            if round(total_split, 2) != expected_gst:
+                raise ValueError(f'Total GST split {total_split} must reconcile exactly with calculated GST amount {expected_gst}')
+        return self
 
 
 class InvoiceList(BaseModel):

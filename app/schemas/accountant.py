@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List
 from decimal import Decimal
 
@@ -357,6 +357,12 @@ class GSTRegisterItem(BaseModel):
     invoice_total: float
     attachments: Optional[str] = None
 
+    cgst: Optional[float] = 0.0
+    sgst: Optional[float] = 0.0
+    igst: Optional[float] = 0.0
+    invoice_copy_url: Optional[str] = None
+    gst_document_url: Optional[str] = None
+
 class MonthlyTrend(BaseModel):
     month: str
     input: float
@@ -438,6 +444,28 @@ class VendorBillCreate(BaseModel):
     po_copy_url: Optional[str] = None
     grn_copy_url: Optional[str] = None
     supporting_docs_url: Optional[str] = None
+
+    party_gstin: Optional[str] = None
+    cgst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    sgst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    igst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    gst_document_url: Optional[str] = None
+
+    @model_validator(mode='after')
+    def validate_gst_split(self) -> 'VendorBillCreate':
+        c = self.cgst or Decimal('0.0')
+        s = self.sgst or Decimal('0.0')
+        i = self.igst or Decimal('0.0')
+        if c < Decimal('0.0') or s < Decimal('0.0') or i < Decimal('0.0'):
+            raise ValueError('GST components cannot be negative')
+        if i > Decimal('0.0') and (c > Decimal('0.0') or s > Decimal('0.0')):
+            raise ValueError('IGST cannot be combined with CGST/SGST')
+        t = c + s + i
+        if t > Decimal('0.0'):
+            gst_amt = Decimal(str(self.gst_amount or 0.0))
+            if round(t, 2) != round(gst_amt, 2):
+                raise ValueError(f'Total GST split {t} must reconcile exactly with gst_amount {gst_amt}')
+        return self
 
     items: List[VendorBillItemCreate] = []
 

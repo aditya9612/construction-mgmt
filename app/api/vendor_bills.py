@@ -59,7 +59,12 @@ async def create_vendor_bill(
         grn_copy_url=payload.grn_copy_url,
         supporting_docs_url=payload.supporting_docs_url,
         status=VendorBillStatus.PENDING.value,
-        amount_paid=0.0
+        amount_paid=0.0,
+        party_gstin=payload.party_gstin,
+        cgst=payload.cgst,
+        sgst=payload.sgst,
+        igst=payload.igst,
+        gst_document_url=payload.gst_document_url
     )
     
     db.add(bill)
