@@ -317,3 +317,8 @@ class PurchaseType(str, Enum):
     USED = "USED"
     RENT = "RENT"
     SPARE_PART = "SPARE_PART"
+
+class WagePeriodType(str, Enum):
+    DAILY = 'Daily'
+    WEEKLY = 'Weekly'
+    MONTHLY = 'Monthly'

@@ -280,7 +280,8 @@ async def list_labour(
 
 
 from sqlalchemy.orm import selectinload
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, exists, and_
+from app.models.labour import LabourWageRecord
 
 
 @router.get("/payroll", response_model=list[s.PayrollDetailsOut])
@@ -1144,6 +1145,14 @@ async def generate_payroll(
                 UserAttendance.project_id == payload.project_id,
                 extract("month", UserAttendance.attendance_date) == payload.month,
                 extract("year", UserAttendance.attendance_date) == payload.year,
+                ~exists().where(
+                    and_(
+                        LabourWageRecord.labour_id == Labour.id,
+                        LabourWageRecord.project_id == payload.project_id,
+                        LabourWageRecord.start_date <= UserAttendance.attendance_date,
+                        LabourWageRecord.end_date >= UserAttendance.attendance_date,
+                    )
+                )
             )
         )
 
