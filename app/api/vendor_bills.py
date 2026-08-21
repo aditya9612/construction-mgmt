@@ -110,7 +110,8 @@ async def list_vendor_bills(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES))
 ):
-    query = select(VendorBill, Supplier.name.label("supplier_name")).outerjoin(Supplier, Supplier.id == VendorBill.supplier_id)
+    from sqlalchemy.orm import selectinload
+    query = select(VendorBill, Supplier.supplier_name.label("supplier_name")).outerjoin(Supplier, Supplier.id == VendorBill.supplier_id).options(selectinload(VendorBill.items))
     if status:
         query = query.where(VendorBill.status == status)
     

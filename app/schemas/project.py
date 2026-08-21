@@ -149,8 +149,7 @@ class ProjectOut(BaseSchema):
 
     @field_validator("business_id")
     def validate_business_id(cls, v):
-        if not v.startswith("PRJ"):
-            raise ValueError("Invalid project ID format")
+        # Allow legacy business_id formats (e.g. '1') without failing serialization
         return v
 
     class Config:

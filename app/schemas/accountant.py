@@ -483,6 +483,10 @@ class VendorBillOut(VendorBillCreate):
     updated_at: datetime
     items: List[VendorBillItemOut] = []
 
+    @field_validator("gross_amount", "gst_percent", "gst_amount", "tds_percent", "tds_amount", "advance_paid", mode="before")
+    def coerce_null_to_zero(cls, v):
+        return 0.0 if v is None else v
+
     class Config:
         from_attributes = True
 
