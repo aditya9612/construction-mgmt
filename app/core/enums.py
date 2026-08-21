@@ -58,6 +58,11 @@ class SkillType(str, Enum):
 
 class TransactionType(str, Enum):
     PURCHASE = "PURCHASE"
+    USAGE = "USAGE"
+    ADJUSTMENT = "ADJUSTMENT"
+    TRANSFER_IN = "TRANSFER_IN"
+    TRANSFER_OUT = "TRANSFER_OUT"
+    RETURN = "RETURN"
 
 
 class PettyCashTransactionType(str, Enum):
