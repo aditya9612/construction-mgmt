@@ -20,7 +20,7 @@ from app.models.user import User, UserRole
 from app.core.enums import DocumentStatus
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.document import DocumentCreate, DocumentOut, DocumentUpdate, DocumentStats
-from app.utils.helpers import NotFoundError
+from app.utils.helpers import NotFoundError, ValidationError
 
 DOCUMENT_WRITE_ROLES = [r.value for r in [
     UserRole.ADMIN,
@@ -57,12 +57,19 @@ async def get_document_stats(
     """
     Returns statistics for the document repository.
     """
-    total_size = await db.scalar(select(func.sum(Document.file_size))) or 0
+    total_size = await db.scalar(select(func.coalesce(func.sum(Document.file_size), 0)).where(Document.is_folder == False, Document.is_deleted == False))
     pending_count = await db.scalar(
-        select(func.count(Document.id)).where(Document.status == DocumentStatus.UNDER_REVIEW)
+        select(func.count(Document.id)).where(
+            Document.status.in_([DocumentStatus.PENDING, DocumentStatus.UNDER_REVIEW]),
+            Document.is_folder == False,
+            Document.is_deleted == False,
+        )
     )
     total_docs = await db.scalar(
-        select(func.count(Document.id)).where(Document.is_folder == False)
+        select(func.count(Document.id)).where(
+            Document.is_folder == False,
+            Document.is_deleted == False,
+        )
     )
 
     return DocumentStats(
