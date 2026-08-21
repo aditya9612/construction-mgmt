@@ -1815,6 +1815,10 @@ async def project_transactions(
     ):
         raise HTTPException(403, "Access denied")
 
+    project = await db.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
     query = (
         select(MaterialTransaction, Material.material_name, Supplier.supplier_name)
         .join(Material, Material.id == MaterialTransaction.material_id)

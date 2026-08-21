@@ -1978,7 +1978,7 @@ async def export_attendance_excel(
                 "Task ID": att.task_id,
                 "Check-In Location": att.check_in_address,
                 "Check-Out Location": att.check_out_address,
-                "Status": att.status.value,
+                "Status": att.status,
             }
         )
 
@@ -2633,6 +2633,7 @@ async def create_wage_record(
     if not labour:
         raise NotFoundError("Labour not found")
 
+    target_account_id = payload.bank_account_id
     if payload.payment_mode.lower() == "bank":
         if not payload.bank_account_id:
             raise HTTPException(status_code=400, detail="bank_account_id is required for Bank Transfer")
@@ -2640,6 +2641,7 @@ async def create_wage_record(
         bank_acc = await db.scalar(select(BankAccount).where(BankAccount.id == payload.bank_account_id))
         if not bank_acc:
             raise NotFoundError("Bank account not found")
+        target_account_id = bank_acc.account_id
 
     from sqlalchemy.exc import DBAPIError
     try:
@@ -2684,7 +2686,7 @@ async def create_wage_record(
                 gross_wage=total_wage,
                 net_wage=total_wage,
                 payment_mode=payload.payment_mode,
-                bank_account_id=payload.bank_account_id,
+                bank_account_id=target_account_id,
                 status="PENDING",
                 created_by=current_user.id
             )
