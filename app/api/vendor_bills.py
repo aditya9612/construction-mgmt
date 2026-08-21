@@ -388,9 +388,39 @@ async def reverse_vendor_payment(
         )
 
     # ----------------------------------------
+    # TDS Validation
+    # ----------------------------------------
+    from app.models.accountant import TDSDeduction
+    tds_check = await db.scalar(
+        select(TDSDeduction)
+        .where(
+            TDSDeduction.vendor_bill_id == bill.id,
+            TDSDeduction.status != "PENDING"
+        )
+    )
+    if tds_check:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reverse: TDS has already been processed or remitted."
+        )
+
+    # ----------------------------------------
+    # Duplicate Reversal Protection
+    # ----------------------------------------
+    existing_reversal = await db.scalar(
+        select(Transaction).where(Transaction.reference == f"REV-{txn.id}")
+    )
+    if existing_reversal:
+        raise HTTPException(
+            status_code=400,
+            detail="Transaction has already been reversed."
+        )
+
+    # ----------------------------------------
     # Validate Journal Entry
     # ----------------------------------------
-    entry = await db.get(JournalEntry, txn.journal_entry_id)
+    from sqlalchemy.orm import selectinload
+    entry = await db.get(JournalEntry, txn.journal_entry_id, options=[selectinload(JournalEntry.lines)])
     if not entry:
         logger.error(
             "JournalEntry not found during vendor payment reversal. "
@@ -424,12 +454,40 @@ async def reverse_vendor_payment(
         else:
             bill.status = VendorBillStatus.PARTIAL.value
 
-        # Delete payment transaction
-        await db.delete(txn)
+        # Create reversal JournalEntry
+        rev_je = JournalEntry(
+            description=f"Reversal of Payment for Vendor Bill {bill.bill_number}",
+            entry_date=date.today(),
+            entry_type="Reversal",
+            status="Posted",
+            created_by=current_user.id
+        )
+        db.add(rev_je)
+        await db.flush()
 
-        # JournalLines are removed automatically
-        # through cascade="all, delete-orphan"
-        await db.delete(entry)
+        # Swap debits and credits
+        rev_lines = []
+        for line in entry.lines:
+            rev_lines.append(JournalLine(
+                entry_id=rev_je.id,
+                account_id=line.account_id,
+                debit=line.credit,
+                credit=line.debit
+            ))
+        db.add_all(rev_lines)
+
+        # Create reversal Transaction
+        rev_tx = Transaction(
+            project_id=txn.project_id,
+            type="payment",
+            amount=-txn.amount,
+            mode=txn.mode,
+            reference=f"REV-{txn.id}",
+            linked_to=txn.linked_to,
+            journal_entry_id=rev_je.id,
+            created_by=current_user.id
+        )
+        db.add(rev_tx)
 
         await db.commit()
         await db.refresh(bill)

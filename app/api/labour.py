@@ -2641,53 +2641,63 @@ async def create_wage_record(
         if not bank_acc:
             raise NotFoundError("Bank account not found")
 
-    async with db.begin_nested():
-        overlapping = await db.scalar(
-            select(LabourWageRecord).where(
-                LabourWageRecord.labour_id == payload.labour_id,
-                LabourWageRecord.project_id == payload.project_id,
-                LabourWageRecord.start_date <= payload.end_date,
-                LabourWageRecord.end_date >= payload.start_date
-            ).with_for_update()
-        )
-        if overlapping:
-            raise HTTPException(status_code=409, detail="Wage period overlaps with an existing wage record")
-
-        attendance_rows = (await db.execute(
-            select(LabourAttendance).where(
-                LabourAttendance.labour_id == payload.labour_id,
-                LabourAttendance.project_id == payload.project_id,
-                LabourAttendance.attendance_date >= payload.start_date,
-                LabourAttendance.attendance_date <= payload.end_date
+    from sqlalchemy.exc import DBAPIError
+    try:
+        async with db.begin_nested():
+            overlapping = await db.scalar(
+                select(LabourWageRecord).where(
+                    LabourWageRecord.labour_id == payload.labour_id,
+                    LabourWageRecord.project_id == payload.project_id,
+                    LabourWageRecord.start_date <= payload.end_date,
+                    LabourWageRecord.end_date >= payload.start_date
+                ).with_for_update()
             )
-        )).scalars().all()
+            if overlapping:
+                raise HTTPException(status_code=409, detail="Wage period overlaps with an existing wage record")
 
-        hourly_rate = (labour.effective_daily_wage or Decimal("0")) / Decimal("8")
-        total_wage = Decimal("0")
+            attendance_rows = (await db.execute(
+                select(LabourAttendance).where(
+                    LabourAttendance.labour_id == payload.labour_id,
+                    LabourAttendance.project_id == payload.project_id,
+                    LabourAttendance.attendance_date >= payload.start_date,
+                    LabourAttendance.attendance_date <= payload.end_date
+                )
+            )).scalars().all()
 
-        for att in attendance_rows:
-            if att.status == AttendanceStatus.ABSENT:
-                continue
-            elif att.status == AttendanceStatus.HALF_DAY:
-                total_wage += (hourly_rate * Decimal("4")) + (Decimal(str(att.overtime_rate or 0)) * Decimal(str(att.overtime_hours or 0)))
-            else:
-                total_wage += (hourly_rate * Decimal(str(att.working_hours or 0))) + (Decimal(str(att.overtime_rate or 0)) * Decimal(str(att.overtime_hours or 0)))
+            hourly_rate = (labour.effective_daily_wage or Decimal("0")) / Decimal("8")
+            total_wage = Decimal("0")
 
-        wage_record = LabourWageRecord(
-            labour_id=payload.labour_id,
-            project_id=payload.project_id,
-            period_type=payload.period_type.value,
-            start_date=payload.start_date,
-            end_date=payload.end_date,
-            gross_wage=total_wage,
-            net_wage=total_wage,
-            payment_mode=payload.payment_mode,
-            bank_account_id=payload.bank_account_id,
-            status="PENDING",
-            created_by=current_user.id
-        )
-        db.add(wage_record)
-        await db.flush()
+            for att in attendance_rows:
+                if att.status == AttendanceStatus.ABSENT:
+                    continue
+                elif att.status == AttendanceStatus.HALF_DAY:
+                    total_wage += (hourly_rate * Decimal("4")) + (Decimal(str(att.overtime_rate or 0)) * Decimal(str(att.overtime_hours or 0)))
+                else:
+                    total_wage += (hourly_rate * Decimal(str(att.working_hours or 0))) + (Decimal(str(att.overtime_rate or 0)) * Decimal(str(att.overtime_hours or 0)))
+
+            wage_record = LabourWageRecord(
+                labour_id=payload.labour_id,
+                project_id=payload.project_id,
+                period_type=payload.period_type.value,
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                gross_wage=total_wage,
+                net_wage=total_wage,
+                payment_mode=payload.payment_mode,
+                bank_account_id=payload.bank_account_id,
+                status="PENDING",
+                created_by=current_user.id
+            )
+            db.add(wage_record)
+            await db.flush()
+    except DBAPIError as e:
+        if e.orig and hasattr(e.orig, "args") and len(e.orig.args) > 0 and e.orig.args[0] == 1213:
+            logger.warning(f"Deadlock detected during wage generation for labour {payload.labour_id}")
+            raise HTTPException(
+                status_code=409,
+                detail="A wage record for this labour and period is already being created or exists. Please retry."
+            )
+        raise
 
     return wage_record
 
