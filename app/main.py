@@ -57,12 +57,14 @@ from app.api.cad import router as cad_router
 from app.api.settings import router as settings_router
 from app.api.alert import router as alert_router
 from app.api.accountant import router as accountant_router
+from app.api.vendor_bills import router as vendor_bills_router
 from app.api.chat import router as chats_router
 from app.api.quotation import router as quotation_router
 from app.api.agreement import router as agreement_router
 from app.api.project_visualization import router as visualization_router
 from app.api.attendance import router as attendance_router
 from app.api.notification import router as notification_router
+from app.api.payments import router as payments_router
 # from app.api.rbac import router as rbac_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
@@ -133,6 +135,7 @@ def create_app() -> FastAPI:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:4200",
+        "http://localhost:8081",
         "https://infrapilot.in",
         "https://infra-pilot.netlify.app",
         "https://infrapilot-testing.netlify.app",
@@ -297,6 +300,7 @@ def create_app() -> FastAPI:
     api_router.include_router(owner_router)
     api_router.include_router(contractor_router)
     api_router.include_router(expense_router)
+    api_router.include_router(vendor_bills_router)
     api_router.include_router(invoice_router)
     api_router.include_router(final_measurement_router)
     api_router.include_router(dashboard_router)
@@ -319,6 +323,7 @@ def create_app() -> FastAPI:
     api_router.include_router(payroll_router)
     api_router.include_router(journal_router)
     api_router.include_router(work_update_router)
+    api_router.include_router(payments_router)
 
     application.include_router(api_router, prefix="/api/v1")
 

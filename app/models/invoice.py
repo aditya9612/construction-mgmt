@@ -5,6 +5,7 @@ from sqlalchemy import (
     String,
     ForeignKey,
     DECIMAL,
+    Date,
     DateTime,
     Enum,
     JSON,
@@ -71,6 +72,16 @@ class Invoice(Base):
 
     total_amount = Column(DECIMAL(18, 2), nullable=False)
 
+    # NEW GST INVOICE FIELDS
+    invoice_number = Column(String(50), nullable=True, index=True)
+    invoice_date = Column(Date, nullable=True)
+    party_gstin = Column(String(20), nullable=True)
+    cgst = Column(DECIMAL(18, 2), nullable=True, default=0.0)
+    sgst = Column(DECIMAL(18, 2), nullable=True, default=0.0)
+    igst = Column(DECIMAL(18, 2), nullable=True, default=0.0)
+    invoice_copy_url = Column(String(500), nullable=True)
+    gst_document_url = Column(String(500), nullable=True)
+
     #  PAYMENT TRACKING (CRITICAL)
     paid_amount = Column(DECIMAL(18, 2), default=0)
     pending_amount = Column(DECIMAL(18, 2), nullable=False)
@@ -111,6 +122,7 @@ class Transaction(Base):
     # Relations
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
+    journal_entry_id = Column(Integer, ForeignKey("journal_entries.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Type: receipt (incoming) / payment (outgoing)
     type = Column(String(20), nullable=False)
@@ -131,3 +143,4 @@ class Transaction(Base):
 
     # Relationship
     invoice = relationship("Invoice", back_populates="transactions")
+    journal_entry = relationship("JournalEntry", foreign_keys=[journal_entry_id])

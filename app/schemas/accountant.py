@@ -1,11 +1,11 @@
 from datetime import date, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List
 from decimal import Decimal
 
 from pydantic import BaseModel, Field, field_validator
-from app.core.enums import PaymentMode
+from app.core.enums import PaymentMode, PettyCashTransactionType
 from app.core.validators import validate_ifsc
 
 
@@ -164,6 +164,39 @@ class BankLedgerLine(BaseModel):
     balance: float = 0.0
 
 
+class PettyCashTransactionCreate(BaseModel):
+    type: PettyCashTransactionType
+    transaction_date: date
+    category_id: Optional[int] = None
+    source_account_id: Optional[int] = None
+    amount: Decimal
+    paid_to_received_from: Optional[str] = None
+    approved_by: Optional[int] = None
+    remarks: Optional[str] = None
+
+
+class PettyCashTransactionOut(PettyCashTransactionCreate):
+    id: int
+    voucher_no: str
+
+    class Config:
+        from_attributes = True
+
+
+class PettyCashLedgerLine(BaseModel):
+    date: date
+    voucher_no: Optional[str] = None
+    description: Optional[str] = None
+    debit: float = 0.0
+    credit: float = 0.0
+    category: Optional[str] = None
+    remarks: Optional[str] = None
+    paid_to: Optional[str] = None
+    cash_in: Decimal = Decimal('0.0')
+    cash_out: Decimal = Decimal('0.0')
+    balance: float = 0.0
+
+
 # ============================
 #  JOURNAL
 # ============================
@@ -260,6 +293,16 @@ class GSTReturnCreate(BaseModel):
     status: str = "Draft"
     filing_date: Optional[date] = None
 
+class GSTReturnUpdate(BaseModel):
+    filing_period: Optional[str] = None
+    return_type: Optional[str] = None
+    taxable_value: Optional[float] = None
+    gst_liability: Optional[float] = None
+    itc_available: Optional[float] = None
+    net_gst_payable: Optional[float] = None
+    status: Optional[str] = None
+    filing_date: Optional[date] = None
+
 class GSTReturnOut(GSTReturnCreate):
     id: int
     created_at: datetime
@@ -277,6 +320,20 @@ class TDSDeductionCreate(BaseModel):
     tds_amount: float
     deposit_date: Optional[date] = None
     status: str = "Pending"
+    vendor_bill_id: Optional[int] = None
+    ra_bill_id: Optional[int] = None
+
+
+class TDSDeductionUpdate(BaseModel):
+    party_name: Optional[str] = None
+    pan_number: Optional[str] = None
+    invoice_number: Optional[str] = None
+    payment_amount: Optional[float] = None
+    tds_section: Optional[str] = None
+    tds_rate: Optional[float] = None
+    tds_amount: Optional[float] = None
+    deposit_date: Optional[date] = None
+    status: Optional[str] = None
     vendor_bill_id: Optional[int] = None
     ra_bill_id: Optional[int] = None
 
@@ -299,6 +356,12 @@ class GSTRegisterItem(BaseModel):
     gst_amount: float
     invoice_total: float
     attachments: Optional[str] = None
+
+    cgst: Optional[float] = 0.0
+    sgst: Optional[float] = 0.0
+    igst: Optional[float] = 0.0
+    invoice_copy_url: Optional[str] = None
+    gst_document_url: Optional[str] = None
 
 class MonthlyTrend(BaseModel):
     month: str
@@ -340,3 +403,115 @@ class GSTReconciliationMismatch(BaseModel):
     portal_gst: float
     difference: float
     status: str
+
+# ============================
+#  VENDOR BILLS
+# ============================
+
+class VendorBillItemCreate(BaseModel):
+    material_name: str
+    category: Optional[str] = None
+    quantity: float
+    unit: str
+    rate: float
+    total: float
+
+class VendorBillItemOut(VendorBillItemCreate):
+    id: int
+    vendor_bill_id: int
+
+    class Config:
+        from_attributes = True
+
+class VendorBillCreate(BaseModel):
+    supplier_id: int
+    project_id: Optional[int] = None
+    purchase_order_id: Optional[int] = None
+    bill_number: str
+    bill_date: date
+    due_date: date
+    grn_number: Optional[str] = None
+
+    gross_amount: float = 0.0
+    gst_percent: float = 0.0
+    gst_amount: float = 0.0
+    tds_percent: float = 0.0
+    tds_amount: float = 0.0
+    advance_paid: float = 0.0
+    total_amount: float
+
+    vendor_invoice_url: Optional[str] = None
+    po_copy_url: Optional[str] = None
+    grn_copy_url: Optional[str] = None
+    supporting_docs_url: Optional[str] = None
+
+    party_gstin: Optional[str] = None
+    cgst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    sgst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    igst: Optional[Decimal] = Field(default=Decimal('0.0'))
+    gst_document_url: Optional[str] = None
+
+    @model_validator(mode='after')
+    def validate_gst_split(self) -> 'VendorBillCreate':
+        c = self.cgst or Decimal('0.0')
+        s = self.sgst or Decimal('0.0')
+        i = self.igst or Decimal('0.0')
+        if c < Decimal('0.0') or s < Decimal('0.0') or i < Decimal('0.0'):
+            raise ValueError('GST components cannot be negative')
+        if i > Decimal('0.0') and (c > Decimal('0.0') or s > Decimal('0.0')):
+            raise ValueError('IGST cannot be combined with CGST/SGST')
+        t = c + s + i
+        if t > Decimal('0.0'):
+            gst_amt = Decimal(str(self.gst_amount or 0.0))
+            if round(t, 2) != round(gst_amt, 2):
+                raise ValueError(f'Total GST split {t} must reconcile exactly with gst_amount {gst_amt}')
+        return self
+
+    items: List[VendorBillItemCreate] = []
+
+class VendorBillUpdate(BaseModel):
+    status: Optional[str] = None
+    amount_paid: Optional[float] = None
+    # Add other fields if editable later
+
+class VendorBillOut(VendorBillCreate):
+    id: int
+    status: str
+    amount_paid: float
+    supplier_name: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    items: List[VendorBillItemOut] = []
+
+    @field_validator("gross_amount", "gst_percent", "gst_amount", "tds_percent", "tds_amount", "advance_paid", mode="before")
+    def coerce_null_to_zero(cls, v):
+        return 0.0 if v is None else v
+
+    class Config:
+        from_attributes = True
+
+class VendorBillApprovalRequest(BaseModel):
+    status: str # "APPROVED" or "REJECTED"
+    notes: Optional[str] = None
+
+class VendorBillPaymentRequest(BaseModel):
+    amount: float
+    mode: PaymentMode
+    reference: Optional[str] = None
+    payment_date: Optional[date] = None
+
+
+class FixedAssetOut(BaseModel):
+    id: int
+    name: str
+    purchase_value: Decimal
+    purchase_date: Optional[date] = None
+    depreciation_rate: Optional[Decimal] = None
+    current_value: Decimal
+    project_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+    project_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True

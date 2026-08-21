@@ -5,13 +5,14 @@ from decimal import Decimal, InvalidOperation
 import uuid
 import os
 from sqlalchemy.exc import IntegrityError
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from reportlab.platypus import SimpleDocTemplate, Table
 from openpyxl import Workbook
 from app.models.boq import BOQ
 from app.models.user import User, UserRole, ActivityLog
+from app.utils.boq_calc import recalculate_boq_actuals
 from app.schemas.material import (
     InventoryAdjustResponse,
     MaterialReportResponse,
@@ -2378,6 +2379,71 @@ async def update_transfer_status(
 # ================= USAGE =================
 
 
+async def _build_material_out_from_id(db, material_id: int):
+    obj = await db.scalar(
+        select(Material)
+        .options(
+            selectinload(Material.supplier),
+            selectinload(Material.unit),
+            selectinload(Material.material_master),
+        )
+        .where(Material.id == material_id)
+    )
+    if not obj:
+        raise HTTPException(404, "Material not found")
+
+    supplier = obj.supplier
+    unit = obj.unit
+    master = obj.material_master
+
+    total_amount = float(obj.total_amount or 0)
+    payment_given = float(obj.payment_given or 0)
+
+    payment_pending = max(
+        0,
+        total_amount - payment_given,
+    )
+
+    extra_paid = max(
+        0,
+        payment_given - total_amount,
+    )
+
+    if (obj.remaining_stock or 0) <= 0:
+        alert_type = "OUT_OF_STOCK"
+    elif (obj.remaining_stock or 0) <= (obj.minimum_stock_level or 0):
+        alert_type = "LOW_STOCK"
+    else:
+        alert_type = "IN_STOCK"
+
+    return MaterialOut(
+        id=obj.id,
+        material_code=obj.material_code,
+        project_id=obj.project_id,
+        material_master_id=obj.material_master_id,
+        material_master_name=master.name if master else None,
+        material_master_brand=master.brand if master else None,
+        material_master_specification=master.specification if master else None,
+        material_master_hsn_code=master.hsn_code if master else None,
+        material_name=obj.material_name.strip().title() if obj.material_name else "",
+        category=obj.category,
+        unit_id=obj.unit_id,
+        unit_name=unit.name if unit else "",
+        supplier_id=obj.supplier_id,
+        supplier_name=supplier.supplier_name if supplier else None,
+        purchase_rate=float(obj.purchase_rate or 0),
+        rate_type=obj.rate_type,
+        quantity_purchased=float(obj.quantity_purchased or 0),
+        quantity_used=float(obj.quantity_used or 0),
+        remaining_stock=float(obj.remaining_stock or 0),
+        total_amount=round(total_amount, 2),
+        payment_given=round(payment_given, 2),
+        payment_pending=round(payment_pending, 2),
+        extra_paid=round(extra_paid, 2),
+        minimum_stock_level=float(obj.minimum_stock_level or 0),
+        alert_type=alert_type,
+    )
+
 @router.post("/{material_id}/usage", response_model=MaterialOut)
 async def usage(
     material_id: int,
@@ -2385,7 +2451,28 @@ async def usage(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+
+    import json
+    import hashlib
+
+    request_hash = None
+    if idempotency_key:
+        payload_dict = data.model_dump(mode="json")
+        payload_dict["material_id"] = material_id
+        payload_str = json.dumps(payload_dict, sort_keys=True)
+        request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+        existing = await db.scalar(
+            select(MaterialTransaction)
+            .where(MaterialTransaction.idempotency_key == idempotency_key)
+        )
+        if existing:
+            if existing.request_hash != request_hash:
+                raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+            return await _build_material_out_from_id(db, existing.material_id)
+
 
     obj = await db.scalar(
         select(Material)
@@ -2437,9 +2524,10 @@ async def usage(
 
     if data.boq_item_id:
 
-        boq = await db.get(
-            BOQ,
-            data.boq_item_id,
+        boq = await db.scalar(
+            select(BOQ)
+            .where(BOQ.id == data.boq_item_id)
+            .with_for_update()
         )
 
         if not boq:
@@ -2467,6 +2555,8 @@ async def usage(
 
         transaction = MaterialTransaction(
             material_id=obj.id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
             boq_item_id=data.boq_item_id,
             type=DBTransactionType.USAGE,
             quantity=-qty,
@@ -2521,11 +2611,11 @@ async def usage(
 
         if boq:
 
-            boq.actual_quantity = (boq.actual_quantity or Decimal("0")) + qty
-
-            boq.actual_cost = (boq.actual_cost or Decimal("0")) + used_value
-
-            boq.variance_cost = (boq.total_cost or Decimal("0")) - boq.actual_cost
+            # Replace inline mutations with centralized recalculation
+            # Note: We don't need to lock the BOQ again since it's already locked above.
+            # But recalculate_boq_actuals takes `lock=True` by default, which is fine (reentrant).
+            await db.flush()
+            await recalculate_boq_actuals(db, boq.id)
 
         # =====================================
         # RECALCULATE MATERIAL
@@ -2548,6 +2638,19 @@ async def usage(
             .where(Material.id == material_id)
         )
 
+
+    except IntegrityError:
+        await db.rollback()
+        if idempotency_key:
+            existing = await db.scalar(
+                select(MaterialTransaction)
+                .where(MaterialTransaction.idempotency_key == idempotency_key)
+            )
+            if existing:
+                if existing.request_hash != request_hash:
+                    raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                return await _build_material_out_from_id(db, existing.material_id)
+        raise
     except Exception:
         await db.rollback()
         raise
@@ -2646,8 +2749,29 @@ async def purchase(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     import uuid
+
+    import json
+    import hashlib
+
+    request_hash = None
+    if idempotency_key:
+        payload_dict = data.model_dump(mode="json")
+        payload_dict["material_id"] = material_id
+        payload_str = json.dumps(payload_dict, sort_keys=True)
+        request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+        existing = await db.scalar(
+            select(MaterialTransaction)
+            .where(MaterialTransaction.idempotency_key == idempotency_key)
+        )
+        if existing:
+            if existing.request_hash != request_hash:
+                raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+            return await _build_material_out_from_id(db, existing.material_id)
+
     from decimal import Decimal, ROUND_HALF_UP
 
     try:
@@ -2737,9 +2861,7 @@ async def purchase(
                     detail="BOQ item is deleted",
                 )
 
-            boq.actual_cost = (boq.actual_cost or Decimal("0")) + total
-
-            boq.variance_cost = boq.total_cost - boq.actual_cost
+            # Removed BOQ actual_cost mutation per Phase 1C rules
 
         reference = f"PUR-{uuid.uuid4().hex[:8]}"
 
@@ -2750,6 +2872,8 @@ async def purchase(
         db.add(
             MaterialTransaction(
                 material_id=obj.id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
                 boq_item_id=data.boq_item_id,
                 type=DBTransactionType.PURCHASE,
                 quantity=qty,
@@ -2828,6 +2952,19 @@ async def purchase(
 
         obj = result.scalar_one()
 
+
+    except IntegrityError:
+        await db.rollback()
+        if idempotency_key:
+            existing = await db.scalar(
+                select(MaterialTransaction)
+                .where(MaterialTransaction.idempotency_key == idempotency_key)
+            )
+            if existing:
+                if existing.request_hash != request_hash:
+                    raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                return await _build_material_out_from_id(db, existing.material_id)
+        raise
     except Exception:
         await db.rollback()
         raise
@@ -2902,7 +3039,39 @@ async def adjust_inventory(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     redis=Depends(get_request_redis),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+
+    import json
+    import hashlib
+
+    request_hash = None
+    if idempotency_key:
+        payload_dict = payload.model_dump(mode="json")
+        payload_dict["material_id"] = payload.material_id
+        payload_str = json.dumps(payload_dict, sort_keys=True)
+        request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+        existing = await db.scalar(
+            select(MaterialTransaction)
+            .where(MaterialTransaction.idempotency_key == idempotency_key)
+        )
+        if existing:
+            if existing.request_hash != request_hash:
+                raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+            adj_mat = await db.scalar(select(Material).where(Material.id == existing.material_id))
+            return InventoryAdjustResponse(
+                material_id=adj_mat.id,
+                material_name=adj_mat.material_name,
+                old_stock=float(adj_mat.remaining_stock - existing.quantity),
+                new_stock=float(adj_mat.remaining_stock),
+                difference=float(existing.quantity),
+                avg_rate=float(existing.rate),
+                reason=existing.remarks.split('|')[-1].strip() if existing.remarks else "Idempotent response",
+                reference_id=existing.reference_id,
+                message="Inventory adjusted successfully"
+            )
+
 
     material_id = payload.material_id
 
@@ -3026,6 +3195,8 @@ async def adjust_inventory(
         db.add(
             MaterialTransaction(
                 material_id=material.id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
                 type=DBTransactionType.ADJUSTMENT,
                 quantity=diff,
                 rate=avg_rate,
@@ -3063,6 +3234,30 @@ async def adjust_inventory(
         await db.rollback()
         raise
 
+
+    except IntegrityError:
+        await db.rollback()
+        if idempotency_key:
+            existing = await db.scalar(
+                select(MaterialTransaction)
+                .where(MaterialTransaction.idempotency_key == idempotency_key)
+            )
+            if existing:
+                if existing.request_hash != request_hash:
+                    raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                adj_mat = await db.scalar(select(Material).where(Material.id == existing.material_id))
+            return InventoryAdjustResponse(
+                material_id=adj_mat.id,
+                material_name=adj_mat.material_name,
+                old_stock=float(adj_mat.remaining_stock - existing.quantity),
+                new_stock=float(adj_mat.remaining_stock),
+                difference=float(existing.quantity),
+                avg_rate=float(existing.rate),
+                reason=existing.remarks.split('|')[-1].strip() if existing.remarks else "Idempotent response",
+                reference_id=existing.reference_id,
+                message="Inventory adjusted successfully"
+            )
+        raise
     except Exception:
         await db.rollback()
         raise
@@ -3074,6 +3269,8 @@ async def adjust_inventory(
 
     return InventoryAdjustResponse(
         material_id=material.id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
         material_name=material.material_name,
         old_stock=float(old_stock),
         new_stock=float(material.remaining_stock),
@@ -4248,8 +4445,29 @@ async def create_material(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     redis=Depends(get_request_redis),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     from decimal import Decimal
+
+    import json
+    import hashlib
+
+    request_hash = None
+    if idempotency_key:
+        payload_dict = payload.model_dump(mode="json")
+
+        payload_str = json.dumps(payload_dict, sort_keys=True)
+        request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+        existing = await db.scalar(
+            select(MaterialTransaction)
+            .where(MaterialTransaction.idempotency_key == idempotency_key)
+        )
+        if existing:
+            if existing.request_hash != request_hash:
+                raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+            return await _build_material_out_from_id(db, existing.material_id)
+
     import uuid
 
     data = payload.model_dump()
@@ -4400,6 +4618,8 @@ async def create_material(
 
             transaction = MaterialTransaction(
                 material_id=obj.id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
                 type=DBTransactionType.PURCHASE,
                 quantity=qty,
                 rate=rate,
@@ -4434,12 +4654,26 @@ async def create_material(
         await db.rollback()
         raise
 
-    except IntegrityError:
+
+    except IntegrityError as e:
         await db.rollback()
+
+        if idempotency_key:
+            existing = await db.scalar(
+                select(MaterialTransaction)
+                .where(MaterialTransaction.idempotency_key == idempotency_key)
+            )
+            if existing:
+                if existing.request_hash != request_hash:
+                    raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                return await _build_material_out_from_id(db, existing.material_id)
+
+        # If it wasn't the idempotency key, it might be the material unique constraint
         raise HTTPException(
             status_code=400,
-            detail="Material already exists",
+            detail="Material already exists or integrity constraint violated"
         )
+
 
     except Exception:
         await db.rollback()
@@ -4652,16 +4886,16 @@ async def generate_material_qr(
     db: AsyncSession = Depends(get_db_session),
 ):
     material = await _get_active_material_or_404(db, material_id)
-    
+
     qr_buf = generate_qr(entity_type="MAT", entity_id=material.id)
-    
+
     headers = {
         "Cache-Control": "no-store",
         "Content-Disposition": f'inline; filename="material_{material.id}.png"'
     }
-    
+
     return StreamingResponse(
-        qr_buf, 
+        qr_buf,
         media_type="image/png",
         headers=headers
     )

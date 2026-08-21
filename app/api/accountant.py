@@ -1,3 +1,6 @@
+from app.utils.pagination import PaginationParams
+from app.schemas.base import PaginatedResponse, PaginationMeta
+from app.schemas.accountant import FixedAssetOut
 from decimal import Decimal
 from datetime import date, datetime
 from typing import Optional
@@ -8,8 +11,8 @@ from app.schemas.accountant import OfferCreate, OfferOut
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract
-from app.core.enums import AccountType, PaymentMode
-from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine, BankTransaction, FundTransfer, GSTReturn, BankAccount, TDSDeduction, VendorBill
+from app.core.enums import AccountType, PaymentMode, PettyCashTransactionType
+from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine, BankTransaction, FundTransfer, GSTReturn, BankAccount, TDSDeduction, VendorBill, PettyCashTransaction
 from app.schemas.accountant import (
     AccountCreate,
     AccountOut,
@@ -22,10 +25,11 @@ from app.schemas.accountant import (
     ReceiptCreate,
     BankTransactionCreate, BankTransactionOut,
     FundTransferCreate, FundTransferOut,
-    GSTReturnCreate, GSTReturnOut,
+    GSTReturnCreate, GSTReturnOut, GSTReturnUpdate,
     BankAccountCreate, BankAccountUpdate, BankAccountOut, BankLedgerLine, ReconciliationDashboardOut,
-    TDSDeductionCreate, TDSDeductionOut, GSTRegisterItem, GSTDashboardOut, GSTReconciliationMismatch,
-    GSTReturnStatus, GSTRecentFiling, GSTImportResult
+    TDSDeductionCreate, TDSDeductionOut, TDSDeductionUpdate, GSTRegisterItem, GSTDashboardOut, GSTReconciliationMismatch,
+    GSTReturnStatus, GSTRecentFiling, GSTImportResult,
+    PettyCashTransactionCreate, PettyCashTransactionOut, PettyCashLedgerLine
 )
 from app.db.session import get_db_session
 from app.models.billing import RABill
@@ -864,11 +868,8 @@ async def pay_contractor(
         if contractor_acc:
             break
     if not contractor_acc:
-        # Fall back to any liability account
-        from app.core.enums import AccountType as AT
-        contractor_acc = await db.scalar(
-            select(Account.id).where(Account.type == AT.LIABILITY)
-        )
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Contractor liability account is not configured.")
 
     # Try multiple code patterns for bank account
     bank_acc = None
@@ -1398,7 +1399,103 @@ async def import_cash_book(file: UploadFile = File(...)):
     }
 
 
-@router.get("/petty-cash/ledger", response_model=list[BankLedgerLine])
+@router.post("/petty-cash/transactions", response_model=PettyCashTransactionOut)
+async def create_petty_cash_transaction(
+    payload: PettyCashTransactionCreate,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+):
+    from app.utils.accounting import get_petty_cash_account
+    from app.utils.common import generate_business_id
+
+    if payload.amount <= Decimal('0'):
+        raise ValidationError("Amount must be greater than 0")
+
+    try:
+        cash_acc = await get_petty_cash_account(db)
+    except ValueError:
+        raise ValidationError("Petty cash account not configured")
+
+    # Validate based on type
+    if payload.type == PettyCashTransactionType.CASH_OUT:
+        if not payload.category_id:
+            raise ValidationError("Category ID is required for CASH_OUT")
+        if payload.category_id == cash_acc.id:
+            raise ValidationError("Category cannot be the Petty Cash account")
+        category_acc = await db.get(Account, payload.category_id)
+        if not category_acc or category_acc.type != AccountType.EXPENSE:
+            raise ValidationError("Category must be a valid Expense account")
+
+    elif payload.type == PettyCashTransactionType.CASH_IN:
+        if not payload.source_account_id:
+            raise ValidationError("Source Account ID is required for CASH_IN")
+        if payload.source_account_id == cash_acc.id:
+            raise ValidationError("Source account cannot be the Petty Cash account")
+        source_acc = await db.get(Account, payload.source_account_id)
+        # Assuming source should be Asset (Bank) or Liability based on existing system. 
+        # But wait, BankAccount might enforce ASSET. We will allow ASSET.
+        if not source_acc or source_acc.type != AccountType.ASSET:
+            raise ValidationError("Source account must be a valid Asset/Bank account")
+
+    # Validate approved_by user if provided
+    if payload.approved_by:
+        approver = await db.get(User, payload.approved_by)
+        if not approver:
+            raise ValidationError("Approved by user does not exist")
+
+    voucher_no = await generate_business_id(db, PettyCashTransaction, "voucher_no", "PC")
+
+    try:
+        # Accounting logic
+        je = JournalEntry(
+            description=payload.remarks or f"Petty Cash {payload.type.value}",
+            status="Posted",
+            entry_type="PettyCash",
+            entry_date=payload.transaction_date,
+            created_by=current_user.id
+        )
+        db.add(je)
+        await db.flush()
+
+        lines = []
+        if payload.type == PettyCashTransactionType.CASH_OUT:
+            # Dr Expense, Cr Petty Cash
+            lines.append(JournalLine(entry_id=je.id, account_id=payload.category_id, debit=payload.amount, credit=Decimal('0.0')))
+            lines.append(JournalLine(entry_id=je.id, account_id=cash_acc.id, debit=Decimal('0.0'), credit=payload.amount))
+        else:
+            # Dr Petty Cash, Cr Source
+            lines.append(JournalLine(entry_id=je.id, account_id=cash_acc.id, debit=payload.amount, credit=Decimal('0.0')))
+            lines.append(JournalLine(entry_id=je.id, account_id=payload.source_account_id, debit=Decimal('0.0'), credit=payload.amount))
+
+        db.add_all(lines)
+        await db.flush()
+
+        # Business record
+        obj = PettyCashTransaction(
+            voucher_no=voucher_no,
+            type=payload.type.value,
+            transaction_date=payload.transaction_date,
+            category_id=payload.category_id if payload.type == PettyCashTransactionType.CASH_OUT else None,
+            source_account_id=payload.source_account_id if payload.type == PettyCashTransactionType.CASH_IN else None,
+            amount=payload.amount,
+            paid_to_received_from=payload.paid_to_received_from,
+            approved_by=payload.approved_by,
+            remarks=payload.remarks,
+            journal_entry_id=je.id,
+            created_by=current_user.id
+        )
+        db.add(obj)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Transaction failed: {str(e)}")
+
+    await db.refresh(obj)
+    
+    return PettyCashTransactionOut.from_orm(obj)
+
+
+@router.get("/petty-cash/ledger", response_model=list[PettyCashLedgerLine])
 async def get_petty_cash_ledger(
     skip: int = 0,
     limit: int = 1000,
@@ -1407,12 +1504,50 @@ async def get_petty_cash_ledger(
 ):
     from app.utils.accounting import get_petty_cash_account
     from fastapi import HTTPException
+    from app.models.accountant import JournalLine, JournalEntry, PettyCashTransaction
     try:
         cash_acc = await get_petty_cash_account(db)
     except ValueError:
         raise HTTPException(status_code=400, detail="Petty cash account not configured")
         
-    return await _build_ledger(db, cash_acc.id)
+    query = (
+        select(JournalLine, JournalEntry, PettyCashTransaction, Account)
+        .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
+        .outerjoin(PettyCashTransaction, PettyCashTransaction.journal_entry_id == JournalEntry.id)
+        .outerjoin(Account, PettyCashTransaction.category_id == Account.id)
+        .where(JournalLine.account_id == cash_acc.id)
+        .where(JournalEntry.status == "Posted")
+        .order_by(JournalEntry.entry_date.asc(), JournalEntry.created_at.asc())
+    )
+    
+    results = await db.execute(query)
+    
+    ledger = []
+    running_balance = Decimal('0.0')
+    
+    for line, entry, pc_txn, category_acc in results:
+        running_balance += (line.debit - line.credit)
+        
+        voucher = pc_txn.voucher_no if pc_txn else f"JV-{entry.id}"
+        remarks = pc_txn.remarks if pc_txn else entry.description
+        category = category_acc.name if category_acc else None
+        paid_to = pc_txn.paid_to_received_from if pc_txn else None
+        
+        ledger.append(PettyCashLedgerLine(
+            date=entry.entry_date or entry.created_at.date(),
+            voucher_no=voucher,
+            description=remarks,
+            debit=float(line.debit),
+            credit=float(line.credit),
+            category=category,
+            remarks=remarks,
+            paid_to=paid_to,
+            cash_in=line.debit,
+            cash_out=line.credit,
+            balance=float(running_balance)
+        ))
+        
+    return ledger
 
 async def _build_consolidated_bank_ledger(db: AsyncSession) -> list[dict]:
     # Gets consolidated ledger across ALL bank accounts
@@ -1540,12 +1675,44 @@ async def create_journal_entry(
     return {"message": "Journal entry created"}
 
 
-@router.get("/journal")
+from typing import Optional
+from sqlalchemy import func
+from app.schemas.journal import JournalEntryExtendedOut
+
+@router.get("/journal", response_model=list[JournalEntryExtendedOut])
 async def list_journal(
+    status: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    return (await db.execute(select(JournalEntry).order_by(JournalEntry.created_at.desc()))).scalars().all()
+    from app.models.approval import Approval
+    
+    query = (
+        select(
+            JournalEntry,
+            func.sum(JournalLine.debit).label("amount"),
+            Approval.id.label("approval_id")
+        )
+        .outerjoin(JournalLine, JournalEntry.id == JournalLine.entry_id)
+        .outerjoin(Approval, (Approval.entity_type == "journal_entry") & (Approval.entity_id == JournalEntry.id) & (Approval.status == "Pending"))
+        .group_by(JournalEntry.id, Approval.id)
+        .order_by(JournalEntry.created_at.desc())
+    )
+    
+    if status:
+        query = query.where(JournalEntry.status == status)
+        
+    rows = (await db.execute(query)).all()
+    
+    items = []
+    for row in rows:
+        je = row.JournalEntry
+        je_dict = je.__dict__.copy()
+        je_dict["amount"] = row.amount
+        je_dict["approval_id"] = row.approval_id
+        items.append(JournalEntryExtendedOut.model_validate(je_dict))
+        
+    return items
 
 
 @router.get("/gst/summary", response_model=GSTDashboardOut)
@@ -1682,6 +1849,72 @@ async def bank_summary(
         "today_withdrawal": today_withdrawal,
     }
 
+
+
+@router.get("/assets", response_model=PaginatedResponse[FixedAssetOut])
+async def list_assets(
+    project_id: Optional[int] = None,
+    purchase_date: Optional[date] = None,
+    pagination: PaginationParams = Depends(),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+):
+    from app.models.project import Project
+    
+    pagination = pagination.normalized()
+    
+    query = (
+        select(FixedAsset, Project.project_name)
+        .outerjoin(Project, FixedAsset.project_id == Project.id)
+        .order_by(FixedAsset.id.desc())
+    )
+    
+    if project_id:
+        query = query.where(FixedAsset.project_id == project_id)
+    if purchase_date:
+        query = query.where(FixedAsset.purchase_date == purchase_date)
+        
+    query = query.offset(pagination.offset).limit(pagination.limit)
+    rows = (await db.execute(query)).all()
+    
+    count_query = select(func.count()).select_from(FixedAsset)
+    if project_id:
+        count_query = count_query.where(FixedAsset.project_id == project_id)
+    if purchase_date:
+        count_query = count_query.where(FixedAsset.purchase_date == purchase_date)
+    total = await db.scalar(count_query)
+    
+    items = []
+    for row in rows:
+        fa = row.FixedAsset
+        fa_dict = fa.__dict__.copy()
+        fa_dict["project_name"] = row.project_name
+        items.append(FixedAssetOut.model_validate(fa_dict))
+        
+    return PaginatedResponse(items=items, meta=PaginationMeta(total=int(total or 0), limit=pagination.limit, offset=pagination.offset))
+
+@router.get("/assets/{id}", response_model=FixedAssetOut)
+async def get_asset(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+):
+    from app.models.project import Project
+    
+    query = (
+        select(FixedAsset, Project.project_name)
+        .outerjoin(Project, FixedAsset.project_id == Project.id)
+        .where(FixedAsset.id == id)
+    )
+    row = (await db.execute(query)).first()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+        
+    fa = row.FixedAsset
+    fa_dict = fa.__dict__.copy()
+    fa_dict["project_name"] = row.project_name
+    return FixedAssetOut.model_validate(fa_dict)
 
 @router.post("/assets")
 async def create_asset(
@@ -2372,14 +2605,42 @@ async def list_gst_returns(
     result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
     return result.all()
 
+
+@router.get("/tds/deductions", response_model=list[TDSDeductionOut])
+async def list_tds_deductions(
+    skip: int = 0,
+    limit: int = 100,
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    result = await db.scalars(
+        select(TDSDeduction)
+        .order_by(TDSDeduction.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    return result.all()
+
 @router.post("/tds/deductions", response_model=TDSDeductionOut)
 async def create_tds_deduction(
     payload: TDSDeductionCreate,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from app.utils.accounting import resolve_tax_accounts, auto_post_journal
+    from fastapi import HTTPException
+    from app.utils.accounting import resolve_tax_accounts
     
+    # Duplicate checking
+    if getattr(payload, 'vendor_bill_id', None) is not None:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == payload.vendor_bill_id))
+        if existing:
+            raise HTTPException(status_code=400, detail="TDS Deduction already exists for this Vendor Bill.")
+            
+    if getattr(payload, 'ra_bill_id', None) is not None:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.ra_bill_id == payload.ra_bill_id))
+        if existing:
+            raise HTTPException(status_code=400, detail="TDS Deduction already exists for this RA Bill.")
+
     tds = TDSDeduction(**payload.model_dump())
     tds.created_by = current_user.id
     
@@ -2389,7 +2650,12 @@ async def create_tds_deduction(
     if tds.status == "Posted":
         try:
             tds_acc = await resolve_tax_accounts(db, 'tds_payable')
-            vendor_acc = await db.scalar(select(Account).where(Account.name.ilike('%Vendor%')).limit(1))
+            if not tds_acc:
+                raise HTTPException(status_code=400, detail="TDS payable account is not configured.")
+                
+            vendor_acc = await db.scalar(select(Account).where(Account.code == "VENDOR_PAYABLE"))
+            if not vendor_acc:
+                raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
             
             if tds_acc and vendor_acc:
                 je = JournalEntry(
@@ -2406,12 +2672,108 @@ async def create_tds_deduction(
                 jl_debit = JournalLine(entry_id=je.id, account_id=vendor_acc.id, debit=tds.tds_amount, credit=0.0)
                 jl_credit = JournalLine(entry_id=je.id, account_id=tds_acc.id, debit=0.0, credit=tds.tds_amount)
                 db.add_all([jl_debit, jl_credit])
-        except ValueError:
-            pass # Or handle
+        except Exception as e:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Database commit failed: {str(e)}")
+
     await db.refresh(tds)
     return tds
+
+@router.get("/tds/deductions/{id}", response_model=TDSDeductionOut)
+async def get_tds_deduction(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    tds = await db.get(TDSDeduction, id)
+    if not tds:
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+    return tds
+
+@router.patch("/tds/deductions/{id}", response_model=TDSDeductionOut)
+async def update_tds_deduction(
+    id: int,
+    payload: TDSDeductionUpdate,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    
+    tds = await db.get(TDSDeduction, id)
+    if not tds:
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+        
+    is_posted = tds.status == "Posted"
+    is_payment_service = tds.status == "PENDING" and tds.vendor_bill_id is not None
+    
+    if is_posted or is_payment_service:
+        # Prevent accounting-sensitive updates
+        sensitive_fields = ['payment_amount', 'tds_rate', 'tds_amount', 'vendor_bill_id', 'ra_bill_id', 'status']
+        payload_data = payload.model_dump(exclude_unset=True)
+        for field in sensitive_fields:
+            if field in payload_data and payload_data[field] != getattr(tds, field):
+                raise HTTPException(status_code=400, detail=f"Cannot modify accounting-sensitive field '{field}' on a POSTED or PaymentService-generated record.")
+                
+    if getattr(payload, 'status', None) == "Posted" and tds.status != "Posted":
+        raise HTTPException(status_code=400, detail="Cannot change TDS status to Posted through update. Use the TDS posting workflow.")
+        
+    # Duplicate checking if changing bill ids
+    if getattr(payload, 'vendor_bill_id', None) is not None and payload.vendor_bill_id != tds.vendor_bill_id:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == payload.vendor_bill_id, TDSDeduction.id != id))
+        if existing:
+            raise HTTPException(status_code=400, detail="TDS Deduction already exists for this Vendor Bill.")
+            
+    if getattr(payload, 'ra_bill_id', None) is not None and payload.ra_bill_id != tds.ra_bill_id:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.ra_bill_id == payload.ra_bill_id, TDSDeduction.id != id))
+        if existing:
+            raise HTTPException(status_code=400, detail="TDS Deduction already exists for this RA Bill.")
+
+    try:
+        update_data = payload.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(tds, key, value)
+            
+        await db.commit()
+        await db.refresh(tds)
+        return tds
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Update failed: {str(e)}")
+
+
+@router.delete("/tds/deductions/{id}", status_code=204)
+async def delete_tds_deduction(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    
+    tds = await db.get(TDSDeduction, id)
+    if not tds:
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+        
+    is_posted = tds.status == "Posted"
+    is_payment_service = tds.status == "PENDING" and tds.vendor_bill_id is not None
+    
+    if is_posted or is_payment_service:
+        raise HTTPException(status_code=400, detail="Cannot delete a POSTED or PaymentService-generated TDS record. Please use a reversal mechanism if applicable.")
+        
+    try:
+        await db.delete(tds)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Deletion failed: {str(e)}")
+        
+
 
 @router.get("/gst/invoice-register", response_model=list[GSTRegisterItem])
 async def gst_invoice_register(
@@ -2424,13 +2786,20 @@ async def gst_invoice_register(
     invoices = await db.scalars(select(Invoice))
     for inv in invoices:
         items.append(GSTRegisterItem(
-            date=inv.created_at.date(), # assuming created_at as date for now
-            invoice_no=str(inv.id),
+            date=inv.invoice_date or inv.created_at.date(),
+            invoice_no=inv.invoice_number or str(inv.id),
             type='SALES',
-            party_name='Customer', # Would join customer/project
+            party_name='Customer',
+            gstin=inv.party_gstin,
             taxable_amount=float(inv.amount),
             gst_amount=float(inv.gst_amount),
-            invoice_total=float(inv.total_amount)
+            invoice_total=float(inv.total_amount),
+            cgst=float(inv.cgst or 0.0),
+            sgst=float(inv.sgst or 0.0),
+            igst=float(inv.igst or 0.0),
+            invoice_copy_url=inv.invoice_copy_url,
+            gst_document_url=inv.gst_document_url,
+            attachments=inv.invoice_copy_url
         ))
         
     vendor_bills = await db.scalars(select(VendorBill))
@@ -2556,46 +2925,7 @@ async def list_gst_returns(
     result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
     return result.all()
 
-@router.post("/tds/deductions", response_model=TDSDeductionOut)
-async def create_tds_deduction(
-    payload: TDSDeductionCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    from app.utils.accounting import resolve_tax_accounts, auto_post_journal
-    
-    tds = TDSDeduction(**payload.model_dump())
-    tds.created_by = current_user.id
-    
-    db.add(tds)
-    
-    # Process Auto Journal if posted directly
-    if tds.status == "Posted":
-        try:
-            tds_acc = await resolve_tax_accounts(db, 'tds_payable')
-            vendor_acc = await db.scalar(select(Account).where(Account.name.ilike('%Vendor%')).limit(1))
-            
-            if tds_acc and vendor_acc:
-                je = JournalEntry(
-                    entry_date=date.today(),
-                    description=f"TDS Deduction for {tds.party_name}",
-                    entry_type="Auto",
-                    status="Posted",
-                    created_by=current_user.id
-                )
-                db.add(je)
-                await db.flush()
-                
-                # Debit Vendor, Credit TDS
-                jl_debit = JournalLine(entry_id=je.id, account_id=vendor_acc.id, debit=tds.tds_amount, credit=0.0)
-                jl_credit = JournalLine(entry_id=je.id, account_id=tds_acc.id, debit=0.0, credit=tds.tds_amount)
-                db.add_all([jl_debit, jl_credit])
-        except ValueError:
-            pass # Or handle
 
-    await db.commit()
-    await db.refresh(tds)
-    return tds
 
 @router.get("/gst/invoice-register", response_model=list[GSTRegisterItem])
 async def gst_invoice_register(
@@ -2608,13 +2938,20 @@ async def gst_invoice_register(
     invoices = await db.scalars(select(Invoice))
     for inv in invoices:
         items.append(GSTRegisterItem(
-            date=inv.created_at.date(), # assuming created_at as date for now
-            invoice_no=str(inv.id),
+            date=inv.invoice_date or inv.created_at.date(),
+            invoice_no=inv.invoice_number or str(inv.id),
             type='SALES',
-            party_name='Customer', # Would join customer/project
+            party_name='Customer',
+            gstin=inv.party_gstin,
             taxable_amount=float(inv.amount),
             gst_amount=float(inv.gst_amount),
-            invoice_total=float(inv.total_amount)
+            invoice_total=float(inv.total_amount),
+            cgst=float(inv.cgst or 0.0),
+            sgst=float(inv.sgst or 0.0),
+            igst=float(inv.igst or 0.0),
+            invoice_copy_url=inv.invoice_copy_url,
+            gst_document_url=inv.gst_document_url,
+            attachments=inv.invoice_copy_url
         ))
         
     vendor_bills = await db.scalars(select(VendorBill))
@@ -2719,6 +3056,62 @@ async def reconcile_gst(
                     
     return mismatches
 
+@router.get("/gst/returns/{id}", response_model=GSTReturnOut)
+async def get_gst_return(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    gstr = await db.get(GSTReturn, id)
+    if not gstr:
+        raise HTTPException(status_code=404, detail="GST Return not found")
+    return gstr
+
+@router.patch("/gst/returns/{id}", response_model=GSTReturnOut)
+async def update_gst_return(
+    id: int,
+    payload: GSTReturnUpdate,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    gstr = await db.get(GSTReturn, id)
+    if not gstr:
+        raise HTTPException(status_code=404, detail="GST Return not found")
+        
+    if gstr.status == "Filed":
+        raise HTTPException(status_code=400, detail="Filed GST Return cannot be modified.")
+        
+    if getattr(payload, 'status', None) == "Filed" and gstr.status != "Filed":
+        raise HTTPException(status_code=400, detail="GST Return cannot be marked as Filed through update. Use the GST filing workflow.")
+
+    update_data = payload.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(gstr, key, value)
+        
+    await db.commit()
+    await db.refresh(gstr)
+    return gstr
+
+@router.delete("/gst/returns/{id}", status_code=204)
+async def delete_gst_return(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    from fastapi import HTTPException
+    gstr = await db.get(GSTReturn, id)
+    if not gstr:
+        raise HTTPException(status_code=404, detail="GST Return not found")
+        
+    if gstr.status == "Filed":
+        raise HTTPException(status_code=400, detail="Filed GST Return cannot be deleted.")
+        
+    await db.delete(gstr)
+    await db.commit()
+    return None
+
 @router.get("/gst/export")
 async def export_gst(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
@@ -2740,11 +3133,11 @@ async def export_gst(
     
     for inv in invoices:
         writer.writerow([
-            str(inv.id),
-            inv.created_at.date().isoformat(),
+            inv.invoice_number or str(inv.id),
+            (inv.invoice_date or inv.created_at.date()).isoformat(),
             'SALES',
             'Customer', # Simplified
-            '',
+            inv.party_gstin or '',
             float(inv.amount),
             float(inv.gst_amount),
             float(inv.total_amount),
@@ -2757,9 +3150,9 @@ async def export_gst(
             vb.bill_date.isoformat() if vb.bill_date else '',
             'PURCHASE',
             'Vendor', # Simplified
-            '',
-            float(vb.total_amount),
-            0.0, # Simplified
+            vb.party_gstin or '',
+            float(vb.gross_amount or 0.0),
+            float(vb.gst_amount or 0.0),
             float(vb.total_amount),
             vb.status
         ])

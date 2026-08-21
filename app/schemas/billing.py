@@ -92,6 +92,9 @@ class RABillOut(BaseModel):
     bill_date: date
     status: str
 
+    project_name: Optional[str] = None
+    contractor_name: Optional[str] = None
+    approval_id: Optional[int] = None
     progress_percent: Optional[float] = None
     total_billed_quantity: Optional[float] = None
     remaining_quantity: Optional[float] = None

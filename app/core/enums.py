@@ -8,6 +8,14 @@ class InvoiceStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class VendorBillStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    PARTIAL = "PARTIAL"
+    PAID = "PAID"
+    REJECTED = "REJECTED"
+
+
 class AccountType(str, Enum):
     ASSET = "asset"
     LIABILITY = "liability"
@@ -25,6 +33,8 @@ class PaymentMode(str, Enum):
 
 
 class PayrollStatus(str, Enum):
+    DRAFT = "Draft"
+    LOCKED = "Locked"
     PENDING = "Pending"
     PAID = "Paid"
     PARTIAL = "Partial"
@@ -48,6 +58,11 @@ class SkillType(str, Enum):
 
 class TransactionType(str, Enum):
     PURCHASE = "PURCHASE"
+
+
+class PettyCashTransactionType(str, Enum):
+    CASH_IN = "CASH_IN"
+    CASH_OUT = "CASH_OUT"
     USAGE = "USAGE"
     TRANSFER_IN = "TRANSFER_IN"
     TRANSFER_OUT = "TRANSFER_OUT"
@@ -302,3 +317,8 @@ class PurchaseType(str, Enum):
     USED = "USED"
     RENT = "RENT"
     SPARE_PART = "SPARE_PART"
+
+class WagePeriodType(str, Enum):
+    DAILY = 'Daily'
+    WEEKLY = 'Weekly'
+    MONTHLY = 'Monthly'

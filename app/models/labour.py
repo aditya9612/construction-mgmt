@@ -271,3 +271,37 @@ class LabourPayroll(Base, TimestampMixin):
     )
 
     labour = relationship("Labour")
+
+    __table_args__ = (
+        UniqueConstraint("labour_id", "project_id", "month", "year", name="uq_labour_payroll"),
+    )
+
+# ======================
+# WAGE RECORD (NEW)
+# ======================
+class LabourWageRecord(Base, TimestampMixin):
+    __tablename__ = "labour_wage_record"
+
+    id = Column(Integer, primary_key=True)
+
+    labour_id = Column(Integer, ForeignKey("labour.id"), nullable=False, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+
+    period_type = Column(String(50), nullable=False) # DAILY, WEEKLY, MONTHLY
+    
+    start_date = Column(Date, nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+
+    gross_wage = Column(DECIMAL(18, 2), default=0)
+    net_wage = Column(DECIMAL(18, 2), default=0)
+
+    payment_mode = Column(String(50), nullable=True)
+    bank_account_id = Column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True)
+
+    status = Column(String(50), default="PENDING")
+
+    created_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    labour = relationship("Labour")
+    project = relationship("Project")
+    bank_account = relationship("Account")

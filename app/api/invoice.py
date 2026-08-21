@@ -186,6 +186,14 @@ async def create_invoice(
         pending_amount=total_amount,
         status=InvoiceStatus.PENDING,
         description=payload.description,
+        invoice_number=payload.invoice_number,
+        invoice_date=payload.invoice_date,
+        party_gstin=payload.party_gstin,
+        cgst=payload.cgst,
+        sgst=payload.sgst,
+        igst=payload.igst,
+        invoice_copy_url=payload.invoice_copy_url,
+        gst_document_url=payload.gst_document_url,
     )
 
     try:

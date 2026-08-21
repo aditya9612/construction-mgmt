@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import List, Optional, Union
@@ -10,7 +11,6 @@ from pydantic import (
     Field,
     computed_field,
     field_validator,
-    json,
     model_validator,
 )
 from typing_extensions import Annotated
@@ -149,8 +149,7 @@ class ProjectOut(BaseSchema):
 
     @field_validator("business_id")
     def validate_business_id(cls, v):
-        if not v.startswith("PRJ"):
-            raise ValueError("Invalid project ID format")
+        # Allow legacy business_id formats (e.g. '1') without failing serialization
         return v
 
     class Config:
@@ -1388,9 +1387,11 @@ class ActivityProgressSummary(BaseSchema):
     boq_item_id: int
 
 
-class ActivityProgressHistoryItem(BaseSchema):
+class WorkProgressHistoryItem(BaseSchema):
 
     id: int
+    activity_id: int
+    activity_name: str
     entry_date: date
     today_progress: Decimal
     running_total: Decimal
@@ -1407,11 +1408,10 @@ class PaginationResponse(BaseSchema):
     page_count: int
 
 
-class ActivityProgressHistoryResponse(BaseSchema):
+class WorkProgressHistoryResponse(BaseSchema):
 
     message: str
-    activity: ActivityProgressSummary
-    history: list[ActivityProgressHistoryItem]
+    history: list[WorkProgressHistoryItem]
     pagination: PaginationResponse
 
 

@@ -73,6 +73,13 @@ class Document(Base, TimestampMixin):
         default=False,
     )
 
+    # Soft delete flag
+    is_deleted: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+
     # IMPORTANT: changed from "documents.id" to "document_management.id"
     parent_id: Mapped[Optional[int]] = mapped_column(
         Integer,

@@ -19,13 +19,15 @@ from app.core.validators import validate_and_save_image
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.contractor import Contractor
-from app.models.labour import Labour, LabourPayroll, LabourProject
+from app.models.labour import Labour, LabourAttendance, LabourPayroll, LabourProject
 from app.models.master_data import LabourType
 from app.models.user import UserAttendance
 from app.schemas.user import UserAttendanceOut
 from app.models.user import User, UserRole
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import labour as s
+from app.schemas import payroll as payroll_s
+from app.core.enums import WagePeriodType
 from app.utils.helpers import NotFoundError, PermissionDeniedError, ValidationError
 from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
@@ -41,7 +43,7 @@ from app.utils.pagination import PaginationParams
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from app.models.invoice import Transaction
-from app.models.accountant import JournalEntry, JournalLine
+from app.models.accountant import JournalEntry, JournalLine, Account
 from app.models.project import ProjectOTPolicy
 
 
@@ -280,7 +282,8 @@ async def list_labour(
 
 
 from sqlalchemy.orm import selectinload
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, exists, and_
+from app.models.labour import LabourWageRecord
 
 
 @router.get("/payroll", response_model=list[s.PayrollDetailsOut])
@@ -366,6 +369,7 @@ async def get_payroll_stats(
             LabourPayroll.project_id == project_id,
             LabourPayroll.month == month,
             LabourPayroll.year == year,
+            LabourPayroll.status != PayrollStatus.DRAFT,
         )
     )
     res = payroll_sum.first()
@@ -421,6 +425,7 @@ async def get_contractor_liability(
             LabourPayroll.project_id == project_id,
             LabourPayroll.month == month,
             LabourPayroll.year == year,
+            LabourPayroll.status != PayrollStatus.DRAFT,
         )
         .group_by(Labour.contractor_id, Contractor.name)
     )
@@ -1142,6 +1147,14 @@ async def generate_payroll(
                 UserAttendance.project_id == payload.project_id,
                 extract("month", UserAttendance.attendance_date) == payload.month,
                 extract("year", UserAttendance.attendance_date) == payload.year,
+                ~exists().where(
+                    and_(
+                        LabourWageRecord.labour_id == Labour.id,
+                        LabourWageRecord.project_id == payload.project_id,
+                        LabourWageRecord.start_date <= UserAttendance.attendance_date,
+                        LabourWageRecord.end_date >= UserAttendance.attendance_date,
+                    )
+                )
             )
         )
 
@@ -1195,6 +1208,32 @@ async def generate_payroll(
 
             total_wage = data["total_wage"]
 
+            payroll = await db.scalar(
+                select(LabourPayroll).where(
+                    LabourPayroll.labour_id == labour_id,
+                    LabourPayroll.project_id == project_id,
+                    LabourPayroll.month == payload.month,
+                    LabourPayroll.year == payload.year,
+                ).with_for_update()
+            )
+
+            if payroll:
+                if payroll.status in (PayrollStatus.LOCKED, PayrollStatus.PARTIAL, PayrollStatus.PAID, PayrollStatus.PENDING):
+                    from fastapi import HTTPException
+                    raise HTTPException(status_code=400, detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}")
+
+                payroll.total_working_hours = data["working_hours"]
+                payroll.total_overtime_hours = data["overtime_hours"]
+                payroll.total_wage = total_wage
+                
+                payroll.remaining_amount = max(Decimal("0"), total_wage - payroll.paid_amount)
+                
+                payroll.status = PayrollStatus.DRAFT
+
+                await db.flush()
+                output.append(payroll)
+                continue
+
             advance = await db.scalar(
                 select(func.sum(Expense.amount)).where(
                     Expense.labour_id == labour_id,
@@ -1207,34 +1246,6 @@ async def generate_payroll(
 
             remaining_amount = max(Decimal("0"), total_wage - advance)
 
-            if remaining_amount == 0:
-                status = PayrollStatus.PAID
-            elif advance > 0:
-                status = PayrollStatus.PARTIAL
-            else:
-                status = PayrollStatus.PENDING
-
-            payroll = await db.scalar(
-                select(LabourPayroll).where(
-                    LabourPayroll.labour_id == labour_id,
-                    LabourPayroll.project_id == project_id,
-                    LabourPayroll.month == payload.month,
-                    LabourPayroll.year == payload.year,
-                )
-            )
-
-            if payroll:
-                payroll.total_working_hours = data["working_hours"]
-                payroll.total_overtime_hours = data["overtime_hours"]
-                payroll.total_wage = total_wage
-                payroll.paid_amount = advance
-                payroll.remaining_amount = remaining_amount
-                payroll.status = status
-
-                await db.flush()
-                output.append(payroll)
-                continue
-
             payroll = LabourPayroll(
                 labour_id=labour_id,
                 project_id=project_id,
@@ -1245,11 +1256,37 @@ async def generate_payroll(
                 total_wage=total_wage,
                 paid_amount=advance,
                 remaining_amount=remaining_amount,
-                status=status,
+                status=PayrollStatus.DRAFT,
             )
 
-            db.add(payroll)
-            await db.flush()
+            try:
+                async with db.begin_nested():
+                    db.add(payroll)
+                    await db.flush()
+            except IntegrityError:
+                payroll = await db.scalar(
+                    select(LabourPayroll).where(
+                        LabourPayroll.labour_id == labour_id,
+                        LabourPayroll.project_id == project_id,
+                        LabourPayroll.month == payload.month,
+                        LabourPayroll.year == payload.year,
+                    ).with_for_update()
+                )
+                if payroll:
+                    if payroll.status in (PayrollStatus.LOCKED, PayrollStatus.PARTIAL, PayrollStatus.PAID, PayrollStatus.PENDING):
+                        from fastapi import HTTPException
+                        raise HTTPException(status_code=400, detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}")
+
+                    payroll.total_working_hours = data["working_hours"]
+                    payroll.total_overtime_hours = data["overtime_hours"]
+                    payroll.total_wage = total_wage
+                    
+                    payroll.remaining_amount = max(Decimal("0"), total_wage - payroll.paid_amount)
+                    
+                    payroll.status = PayrollStatus.DRAFT
+
+                    await db.flush()
+            
             output.append(payroll)
 
         await r.bump_cache_version(redis, VERSION_KEY)
@@ -1262,6 +1299,130 @@ async def generate_payroll(
         logger.exception("Payroll generation failed")
         raise
 
+
+# =========================
+# PAYROLL LOCK
+# =========================
+@router.post("/payroll/lock", response_model=list[s.PayrollOut])
+async def lock_payroll(
+    payload: s.PayrollLock,
+    current_user: User = Depends(
+        d.require_roles(
+            [
+                UserRole.ADMIN.value,
+                UserRole.PROJECT_MANAGER.value,
+                UserRole.ACCOUNTANT.value,
+                UserRole.SITE_ENGINEER.value,
+            ]
+        )
+    ),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(d.get_request_redis),
+):
+    if not payload.payroll_ids:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    if len(payload.payroll_ids) != len(set(payload.payroll_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate IDs in payload")
+
+    try:
+        payrolls = await db.scalars(
+            select(LabourPayroll)
+            .where(LabourPayroll.id.in_(payload.payroll_ids))
+            .order_by(LabourPayroll.id)
+            .with_for_update()
+        )
+        payrolls = payrolls.all()
+
+        if len(payrolls) != len(payload.payroll_ids):
+            raise HTTPException(status_code=400, detail="One or more payroll records not found")
+
+        for p in payrolls:
+            if p.status != PayrollStatus.DRAFT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot lock Payroll {p.id}. Current Status: {p.status.value}. Only DRAFT payrolls can be locked."
+                )
+
+        for p in payrolls:
+            p.status = PayrollStatus.LOCKED
+
+        await db.flush()
+
+        await r.bump_cache_version(redis, VERSION_KEY)
+        await r.bump_cache_version(redis, "dashboard_version")
+
+        return payrolls
+
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception:
+        await db.rollback()
+        logger.exception("Payroll lock failed")
+        raise
+
+# =========================
+# PAYROLL UNLOCK
+# =========================
+@router.post("/payroll/unlock", response_model=list[s.PayrollOut])
+async def unlock_payroll(
+    payload: s.PayrollUnlock,
+    current_user: User = Depends(
+        d.require_roles(
+            [
+                UserRole.ADMIN.value,
+                UserRole.PROJECT_MANAGER.value,
+                UserRole.ACCOUNTANT.value,
+                UserRole.SITE_ENGINEER.value,
+            ]
+        )
+    ),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(d.get_request_redis),
+):
+    if not payload.payroll_ids:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    if len(payload.payroll_ids) != len(set(payload.payroll_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate IDs in payload")
+
+    try:
+        payrolls = await db.scalars(
+            select(LabourPayroll)
+            .where(LabourPayroll.id.in_(payload.payroll_ids))
+            .order_by(LabourPayroll.id)
+            .with_for_update()
+        )
+        payrolls = payrolls.all()
+
+        if len(payrolls) != len(payload.payroll_ids):
+            raise HTTPException(status_code=400, detail="One or more payroll records not found")
+
+        for p in payrolls:
+            if p.status != PayrollStatus.LOCKED or p.paid_amount > 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot unlock Payroll {p.id}. Current Status: {p.status.value}. Paid Amount: {p.paid_amount}. Only LOCKED payrolls with zero paid_amount can be unlocked."
+                )
+
+        for p in payrolls:
+            p.status = PayrollStatus.DRAFT
+
+        await db.flush()
+
+        await r.bump_cache_version(redis, VERSION_KEY)
+        await r.bump_cache_version(redis, "dashboard_version")
+
+        return payrolls
+
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception:
+        await db.rollback()
+        logger.exception("Payroll unlock failed")
+        raise
 
 # =========================
 # PAYROLL PAYMENT
@@ -1286,11 +1447,20 @@ async def pay_salary(
             LabourPayroll.project_id == payload.project_id,
             LabourPayroll.month == payload.month,
             LabourPayroll.year == payload.year,
-        )
+        ).with_for_update()
     )
 
     if not payroll:
         raise NotFoundError("Payroll not found")
+
+    if payload.amount <= 0:
+        raise ValidationError("Payment amount must be greater than zero")
+
+    if payroll.status == PayrollStatus.DRAFT:
+        raise HTTPException(status_code=400, detail="Cannot pay DRAFT payroll. Please lock it first.")
+
+    if payroll.status == PayrollStatus.PAID:
+        raise HTTPException(status_code=400, detail="Payroll is already PAID in full.")
 
     if payload.amount > payroll.remaining_amount:
         raise ValidationError("Amount exceeds remaining salary")
@@ -1330,8 +1500,10 @@ async def pay_salary(
     db.add(entry)
     await db.flush()  # get entry.id
 
-    #  replace with real IDs later
-    EXPENSE_ACCOUNT_ID = 1  # Salary Expense
+    wages_payable_acc = await db.scalar(select(Account).where(Account.code == "WAGES_PAYABLE"))
+    if not wages_payable_acc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="WAGES_PAYABLE account is not configured.")
 
     from app.utils.accounting import get_primary_cash_account
 
@@ -1347,7 +1519,7 @@ async def pay_salary(
     db.add(
         JournalLine(
             entry_id=entry.id,
-            account_id=EXPENSE_ACCOUNT_ID,
+            account_id=wages_payable_acc.id,
             debit=payload.amount,
             credit=0,
         )
@@ -2199,6 +2371,7 @@ async def get_fiscal_summary(
             LabourPayroll.project_id == project_id,
             LabourPayroll.month == month,
             LabourPayroll.year == year,
+            LabourPayroll.status != PayrollStatus.DRAFT,
         )
     )
     res = payroll_sum.first()
@@ -2262,6 +2435,7 @@ async def get_payroll_momentum(
         )
         .where(
             LabourPayroll.project_id == project_id,
+            LabourPayroll.status != PayrollStatus.DRAFT,
             or_(
                 LabourPayroll.year > period_start.year,
                 and_(
@@ -2446,3 +2620,244 @@ async def get_aggregate_report(
         )
         for row in rows
     ]
+
+@router.post("/wages", response_model=payroll_s.LabourWageOut)
+async def create_wage_record(
+    payload: payroll_s.LabourWageGenerateRequest,
+    current_user: User = Depends(d.require_roles([UserRole.ADMIN.value, UserRole.PROJECT_MANAGER.value, UserRole.ACCOUNTANT.value])),
+    db: AsyncSession = Depends(get_db_session)
+):
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+
+    labour = await db.get(Labour, payload.labour_id)
+    if not labour:
+        raise NotFoundError("Labour not found")
+
+    if payload.payment_mode.lower() == "bank":
+        if not payload.bank_account_id:
+            raise HTTPException(status_code=400, detail="bank_account_id is required for Bank Transfer")
+        from app.models.accountant import BankAccount
+        bank_acc = await db.scalar(select(BankAccount).where(BankAccount.id == payload.bank_account_id))
+        if not bank_acc:
+            raise NotFoundError("Bank account not found")
+
+    from sqlalchemy.exc import DBAPIError
+    try:
+        async with db.begin_nested():
+            overlapping = await db.scalar(
+                select(LabourWageRecord).where(
+                    LabourWageRecord.labour_id == payload.labour_id,
+                    LabourWageRecord.project_id == payload.project_id,
+                    LabourWageRecord.start_date <= payload.end_date,
+                    LabourWageRecord.end_date >= payload.start_date
+                ).with_for_update()
+            )
+            if overlapping:
+                raise HTTPException(status_code=409, detail="Wage period overlaps with an existing wage record")
+
+            attendance_rows = (await db.execute(
+                select(LabourAttendance).where(
+                    LabourAttendance.labour_id == payload.labour_id,
+                    LabourAttendance.project_id == payload.project_id,
+                    LabourAttendance.attendance_date >= payload.start_date,
+                    LabourAttendance.attendance_date <= payload.end_date
+                )
+            )).scalars().all()
+
+            hourly_rate = (labour.effective_daily_wage or Decimal("0")) / Decimal("8")
+            total_wage = Decimal("0")
+
+            for att in attendance_rows:
+                if att.status == AttendanceStatus.ABSENT:
+                    continue
+                elif att.status == AttendanceStatus.HALF_DAY:
+                    total_wage += (hourly_rate * Decimal("4")) + (Decimal(str(att.overtime_rate or 0)) * Decimal(str(att.overtime_hours or 0)))
+                else:
+                    total_wage += (hourly_rate * Decimal(str(att.working_hours or 0))) + (Decimal(str(att.overtime_rate or 0)) * Decimal(str(att.overtime_hours or 0)))
+
+            wage_record = LabourWageRecord(
+                labour_id=payload.labour_id,
+                project_id=payload.project_id,
+                period_type=payload.period_type.value,
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                gross_wage=total_wage,
+                net_wage=total_wage,
+                payment_mode=payload.payment_mode,
+                bank_account_id=payload.bank_account_id,
+                status="PENDING",
+                created_by=current_user.id
+            )
+            db.add(wage_record)
+            await db.flush()
+    except DBAPIError as e:
+        if e.orig and hasattr(e.orig, "args") and len(e.orig.args) > 0 and e.orig.args[0] == 1213:
+            logger.warning(f"Deadlock detected during wage generation for labour {payload.labour_id}")
+            raise HTTPException(
+                status_code=409,
+                detail="A wage record for this labour and period is already being created or exists. Please retry."
+            )
+        raise
+
+    return wage_record
+
+@router.get("/wages", response_model=PaginatedResponse[payroll_s.LabourWageRegisterOut])
+async def list_wages(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    period_type: Optional[str] = None,
+    status: Optional[str] = None,
+    labour_id: Optional[int] = None,
+    project_id: Optional[int] = None,
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    query = select(LabourWageRecord, Labour).join(Labour, Labour.id == LabourWageRecord.labour_id).options(selectinload(Labour.labour_type))
+    count_query = select(func.count(LabourWageRecord.id)).join(Labour, Labour.id == LabourWageRecord.labour_id)
+
+    if project_id:
+        query = query.where(LabourWageRecord.project_id == project_id)
+        count_query = count_query.where(LabourWageRecord.project_id == project_id)
+
+    if labour_id:
+        query = query.where(LabourWageRecord.labour_id == labour_id)
+        count_query = count_query.where(LabourWageRecord.labour_id == labour_id)
+
+    if period_type:
+        query = query.where(LabourWageRecord.period_type == period_type)
+        count_query = count_query.where(LabourWageRecord.period_type == period_type)
+
+    if status:
+        query = query.where(LabourWageRecord.status == status)
+        count_query = count_query.where(LabourWageRecord.status == status)
+
+    if start_date and end_date:
+        query = query.where(and_(LabourWageRecord.start_date <= end_date, LabourWageRecord.end_date >= start_date))
+        count_query = count_query.where(and_(LabourWageRecord.start_date <= end_date, LabourWageRecord.end_date >= start_date))
+
+    query = query.order_by(LabourWageRecord.id.desc()).limit(limit).offset(offset)
+
+    total = await db.scalar(count_query)
+    rows = await db.execute(query)
+
+    items = []
+    for wage, labour in rows:
+        items.append({
+            "id": wage.id,
+            "labour_name": labour.labour_name,
+            "labour_type": labour.labour_type.name if labour.labour_type else None,
+            "period": f"{wage.start_date} to {wage.end_date}",
+            "gross_wage": wage.gross_wage,
+            "net_wage": wage.net_wage,
+            "status": wage.status
+        })
+
+    return PaginatedResponse(
+        items=items,
+        meta=PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
+    )
+
+@router.post("/wages/{id}/pay")
+async def pay_wage_record(
+    id: int,
+    current_user: User = Depends(d.require_roles([UserRole.ADMIN.value, UserRole.PROJECT_MANAGER.value, UserRole.ACCOUNTANT.value])),
+    db: AsyncSession = Depends(get_db_session)
+):
+    wage_record = await db.scalar(
+        select(LabourWageRecord).where(LabourWageRecord.id == id).with_for_update()
+    )
+    if not wage_record:
+        raise NotFoundError("Wage record not found")
+
+    await assert_project_access(db, project_id=wage_record.project_id, current_user=current_user)
+
+    if wage_record.status == "PAID":
+        raise HTTPException(status_code=409, detail="Wage record is already PAID")
+
+    amount = wage_record.net_wage
+
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Payment amount must be greater than zero")
+
+    wage_record.status = "PAID"
+    await db.flush()
+
+    txn = Transaction(
+        project_id=wage_record.project_id,
+        invoice_id=None,
+        type="payment",
+        amount=amount,
+        mode=wage_record.payment_mode or "cash",
+        reference=f"wage_record:{wage_record.id}",
+        created_by=current_user.id,
+    )
+    db.add(txn)
+
+    entry = JournalEntry(description="Salary Payment")
+    db.add(entry)
+    await db.flush()
+
+    wages_payable_acc = await db.scalar(select(Account).where(Account.code == "WAGES_PAYABLE"))
+    if not wages_payable_acc:
+        raise HTTPException(status_code=400, detail="WAGES_PAYABLE account is not configured.")
+
+    if wage_record.payment_mode and wage_record.payment_mode.lower() == "bank":
+        if not wage_record.bank_account_id:
+            raise HTTPException(status_code=400, detail="bank_account_id is required for Bank Transfer")
+        from app.models.accountant import BankAccount
+        bank_acc = await db.scalar(select(BankAccount).where(BankAccount.id == wage_record.bank_account_id))
+        if not bank_acc:
+            raise NotFoundError("Bank account not found")
+        credit_account_id = bank_acc.account_id
+    else:
+        from app.utils.accounting import get_primary_cash_account
+        try:
+            cash_acc = await get_primary_cash_account(db)
+            credit_account_id = cash_acc.id
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Primary Cash Account not configured")
+
+    db.add(JournalLine(entry_id=entry.id, account_id=wages_payable_acc.id, debit=amount, credit=0))
+    db.add(JournalLine(entry_id=entry.id, account_id=credit_account_id, debit=0, credit=amount))
+
+    return {"message": "Wage paid successfully"}
+
+@router.get("/wages/stats", response_model=payroll_s.LabourWageStatsOut)
+async def get_wage_stats(
+    project_id: int = Query(...),
+    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    pending = await db.scalar(
+        select(func.sum(LabourWageRecord.net_wage))
+        .where(LabourWageRecord.project_id == project_id, LabourWageRecord.status == "PENDING")
+    ) or Decimal("0")
+
+    paid = await db.scalar(
+        select(func.sum(LabourWageRecord.net_wage))
+        .where(LabourWageRecord.project_id == project_id, LabourWageRecord.status == "PAID")
+    ) or Decimal("0")
+
+    advance = await db.scalar(
+        select(func.sum(Expense.amount))
+        .where(Expense.project_id == project_id, Expense.category == "Labour Advance")
+    ) or Decimal("0")
+
+    contractor = await db.scalar(
+        select(func.sum(Expense.amount))
+        .where(Expense.project_id == project_id, Expense.category == "Contractor")
+    ) or Decimal("0")
+
+    return {
+        "pending_payroll": pending,
+        "paid_payroll": paid,
+        "advance_given": advance,
+        "contractor_payment": contractor
+    }

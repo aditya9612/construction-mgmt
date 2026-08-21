@@ -20,6 +20,8 @@ class JournalEntryOut(BaseModel):
     amount: Decimal
     created_at: datetime
     lines: List[JournalLineOut] = []
+    amount: Optional[Decimal] = None
+    approval_id: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -64,6 +66,8 @@ class JournalEntryExtendedOut(BaseModel):
     created_by: Optional[int] = None
     created_at: datetime
     lines: List[JournalLineOut] = []
+    amount: Optional[Decimal] = None
+    approval_id: Optional[int] = None
 
     class Config:
         from_attributes = True

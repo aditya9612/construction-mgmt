@@ -18,9 +18,7 @@ from app.models.invoice import Invoice
 from app.models.labour import Labour, LabourAttendance, LabourPayroll
 from app.schemas.payroll import (
     StaffSalaryProcessRequest,
-    StaffSalaryRegisterOut,
-    LabourWageGenerateRequest,
-    ContractorPayRequest
+    StaffSalaryRegisterOut
 )
 from app.utils.accounting import get_payroll_account, get_primary_cash_account
 
@@ -34,7 +32,7 @@ def get_allowed_staff_roles():
         UserRole.ACCOUNTANT.value
     ]
 
-@router.get("/summary")
+@router.get("/summary", deprecated=True)
 async def payroll_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user)
@@ -68,7 +66,7 @@ async def payroll_summary(
         "contractor_payment": contractor_payment
     }
 
-@router.get("/payslip/export")
+@router.get("/payslip/export", deprecated=True)
 async def export_payslips(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user)
@@ -198,7 +196,7 @@ async def get_staff_history(
 
 # ================= LABOUR PAYROLL =================
 
-@router.get("/labour/wages")
+@router.get("/labour/wages", deprecated=True)
 async def get_labour_wages(
     start_date: date,
     end_date: date,
@@ -234,67 +232,11 @@ async def get_labour_wages(
         })
     return results
 
-@router.post("/labour/pay")
-async def pay_labour_wages(
-    payload: LabourWageGenerateRequest,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user)
-):
-    if current_user.role not in [UserRole.ADMIN.value, UserRole.ACCOUNTANT.value]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-        
-    labour = await db.get(Labour, payload.labour_id)
-    if not labour:
-        raise HTTPException(status_code=404, detail="Labour not found")
-        
-    try:
-        wages_acc = await get_payroll_account(db, "wages_account_id")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Payroll account mapping not configured")
-        
-    if payload.payment_mode == "cash":
-        try:
-            pay_acc = await get_primary_cash_account(db)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Primary cash account not configured")
-    else:
-        if not payload.bank_account_id:
-            raise HTTPException(status_code=400, detail="Bank account required for bank payment")
-        bank = await db.get(BankAccount, payload.bank_account_id)
-        if not bank:
-            raise HTTPException(status_code=404, detail="Bank account not found")
-        pay_acc = await db.get(Account, bank.account_id)
 
-    amount = 500.00 # Placeholder for calculated wage
-
-    txn = Transaction(
-        project_id=payload.project_id,
-        type="payment",
-        amount=amount,
-        mode=payload.payment_mode,
-        reference=f"wages:{payload.start_date}_to_{payload.end_date}",
-        linked_to=f"LABOUR-WAGE:{payload.labour_id}:{payload.start_date}",
-        created_by=current_user.id
-    )
-    db.add(txn)
-    
-    je = JournalEntry(
-        description=f"Labour Wages {payload.start_date}",
-        entry_date=payload.start_date,
-        created_by=current_user.id
-    )
-    db.add(je)
-    await db.flush()
-    
-    db.add(JournalLine(entry_id=je.id, account_id=wages_acc.id, debit=amount, credit=0))
-    db.add(JournalLine(entry_id=je.id, account_id=pay_acc.id, debit=0, credit=amount))
-    
-    await db.commit()
-    return {"message": "Labour wages processed successfully"}
 
 # ================= CONTRACTOR PAYROLL =================
 
-@router.get("/contractor/bills")
+@router.get("/contractor/bills", deprecated=True)
 async def get_contractor_bills(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user)
@@ -352,7 +294,7 @@ async def export_staff_payroll(
             
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=staff_salary.csv"})
 
-@router.get("/contractor/export")
+@router.get("/contractor/export", deprecated=True)
 async def export_contractor_payroll(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user)
@@ -381,7 +323,7 @@ async def export_contractor_payroll(
         
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=contractor_payments.csv"})
 
-@router.get("/register/export")
+@router.get("/register/export", deprecated=True)
 async def export_payroll_register(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user)
@@ -440,75 +382,11 @@ async def export_payroll_register(
         writer.writerow([name, p_type, period, gross, deduct, net, status, p_date])
         
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=payroll_register.csv"})
-@router.post("/contractor/pay")
-async def pay_contractor_bill(
-    payload: ContractorPayRequest,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user)
-):
-    if current_user.role not in [UserRole.ADMIN.value, UserRole.ACCOUNTANT.value]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-        
-    rabill = await db.get(RABill, payload.rabill_id)
-    if not rabill:
-        raise HTTPException(status_code=404, detail="RA Bill not found")
-        
-    invoice_stmt = select(Invoice).where(Invoice.reference_id == rabill.id, Invoice.source_type == "contractor")
-    invoice = await db.scalar(invoice_stmt)
-    
-    try:
-        contractor_acc = await get_payroll_account(db, "contractor_expense_account_id")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Payroll account mapping not configured")
-        
-    if payload.payment_mode == "cash":
-        try:
-            pay_acc = await get_primary_cash_account(db)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Primary cash account not configured")
-    else:
-        bank = await db.get(BankAccount, payload.bank_account_id)
-        pay_acc = await db.get(Account, bank.account_id)
-        
-    # Update deductions on RABill without modifying gross amount
-    rabill.deductions = payload.total_deductions
-    rabill.status = "Paid"
-    
-    if invoice:
-        invoice.paid_amount = (invoice.paid_amount or 0) + payload.paid_amount
-        invoice.pending_amount = max(0, invoice.total_amount - invoice.paid_amount)
-        if invoice.pending_amount <= 0:
-            invoice.status = "Paid"
 
-    txn = Transaction(
-        project_id=rabill.project_id,
-        invoice_id=invoice.id if invoice else None,
-        type="payment",
-        amount=payload.paid_amount,
-        mode=payload.payment_mode,
-        reference=f"rabill:{rabill.bill_number}",
-        linked_to=f"CONTRACTOR-PAY:{payload.rabill_id}",
-        created_by=current_user.id
-    )
-    db.add(txn)
-    
-    je = JournalEntry(
-        description=f"Contractor Payment RA Bill {rabill.bill_number}",
-        entry_date=date.today(),
-        created_by=current_user.id
-    )
-    db.add(je)
-    await db.flush()
-    
-    db.add(JournalLine(entry_id=je.id, account_id=contractor_acc.id, debit=payload.paid_amount, credit=0))
-    db.add(JournalLine(entry_id=je.id, account_id=pay_acc.id, debit=0, credit=payload.paid_amount))
-    
-    await db.commit()
-    return {"message": "Contractor payment successful"}
 
 # ================= PAYROLL REGISTER =================
 
-@router.get("/register")
+@router.get("/register", deprecated=True)
 async def get_payroll_register(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user)

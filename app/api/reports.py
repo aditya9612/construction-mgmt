@@ -711,6 +711,151 @@ async def export_audit_excel(
     )
 
 
+
+# =====================================================================
+# PROCUREMENT EFFICIENCY REPORT
+# =====================================================================
+@router.get("/procurement-efficiency")
+async def procurement_efficiency_report(
+    project_id: int = Query(..., description="Project ID (required)"),
+    supplier_id: Optional[int] = Query(None, description="Filter by supplier ID"),
+    status: Optional[str] = Query(None, description="VendorBill status filter"),
+    payment_status: Optional[str] = Query(None, description="PAID|PARTIAL|UNPAID"),
+    date_from: Optional[date] = Query(None, description="Start date filter"),
+    date_to: Optional[date] = Query(None, description="End date filter"),
+    search: Optional[str] = Query(None, description="Search term for bill number or supplier name"),
+    format: str = Query("json", description="Response format: json|pdf|csv"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Generate Procurement Efficiency Report.
+
+    The underlying aggregation is performed in ReportService. The endpoint
+    supports three response formats, all sharing the same data.
+    """
+    filters: Dict[str, Any] = {
+        "project_id": project_id,
+        "supplier_id": supplier_id,
+        "status": status,
+        "payment_status": payment_status,
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
+        "search": search,
+    }
+    filters = {k: v for k, v in filters.items() if v is not None}
+    from app.services.report_service import ReportService
+    try:
+        report_dto = await ReportService.get_procurement_efficiency_report(db, filters)
+    except Exception as e:
+        if str(e) == "Report data missing":
+            raise HTTPException(status_code=404, detail="Project not found")
+        raise
+    if format.lower() == "json":
+        return report_dto
+    if format.lower() == "pdf":
+        b = PdfReportBuilder("Procurement Efficiency Report")
+        b.add_info_table([
+            (
+                "Project", report_dto.summary.project_name,
+                "Budget", str(report_dto.summary.budget_amount)
+            ),
+            (
+                "Total Spend", str(report_dto.summary.total_spend),
+                "Budget Utilisation", report_dto.summary.budget_vs_actual
+            ),
+        ])
+        b.add_section_table(
+            "Totals",
+            ["Metric", "Amount"],
+            [
+                ["Total Spend", str(report_dto.procurement.total_spend)],
+                ["Total Paid", str(report_dto.procurement.total_paid)],
+                ["Total Pending", str(report_dto.procurement.total_pending)],
+                ["Materials Qty", str(report_dto.procurement.materials_procured.total_quantity)],
+                ["Materials Value", str(report_dto.procurement.materials_procured.total_value)],
+            ]
+        )
+        supplier_headers = ["Supplier", "Bills", "Spend", "Paid", "Pending", "Avg Days"]
+        supplier_rows = [
+            [
+                s.supplier_name,
+                str(s.bill_count),
+                str(s.total_spend),
+                str(s.paid_amount),
+                str(s.pending_amount),
+                str(s.avg_payment_days),
+            ]
+            for s in report_dto.suppliers
+        ]
+        b.add_section_table("Supplier Performance", supplier_headers, supplier_rows)
+        po = report_dto.purchase_orders
+        b.add_section_table(
+            "Outstanding Purchase Orders",
+            ["Count", "Value"],
+            [[str(po.outstanding_count), str(po.outstanding_value)]],
+        )
+        stream = b.build()
+        return StreamingResponse(
+            stream,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=procurement_efficiency.pdf"},
+        )
+    if format.lower() == "csv":
+        from app.utils.csv_report_builder import CsvReportBuilder
+        csv_builder = CsvReportBuilder(
+            filename="procurement_efficiency.csv",
+            headers=["Project Summary", "", "", "", "", "", ""]
+        )
+        csv_builder.add_row(["Project ID", str(report_dto.summary.project_id)])
+        csv_builder.add_row(["Project Name", report_dto.summary.project_name])
+        csv_builder.add_row(["Budget Amount", str(report_dto.summary.budget_amount)])
+        csv_builder.add_row(["Total Spend", str(report_dto.summary.total_spend)])
+        csv_builder.add_row(["Budget Vs Actual", report_dto.summary.budget_vs_actual])
+        csv_builder.add_row([])
+        csv_builder.add_row(["Procurement Totals", "", "", "", "", "", ""])
+        csv_builder.add_row(["Total Spend", str(report_dto.procurement.total_spend)])
+        csv_builder.add_row(["Total Paid", str(report_dto.procurement.total_paid)])
+        csv_builder.add_row(["Total Pending", str(report_dto.procurement.total_pending)])
+        csv_builder.add_row(["Materials Qty", str(report_dto.procurement.materials_procured.total_quantity)])
+        csv_builder.add_row(["Materials Value", str(report_dto.procurement.materials_procured.total_value)])
+        csv_builder.add_row([])
+        csv_builder.add_row(["Outstanding Purchase Orders", "", "", "", "", "", ""])
+        csv_builder.add_row(["Count", str(report_dto.purchase_orders.outstanding_count)])
+        csv_builder.add_row(["Value", str(report_dto.purchase_orders.outstanding_value)])
+        csv_builder.add_row([])
+        csv_builder.add_row(["Supplier Performance", "", "", "", "", "", ""])
+        csv_builder.add_row([
+            "Supplier ID",
+            "Supplier Name",
+            "Bill Count",
+            "Total Spend",
+            "Paid Amount",
+            "Pending Amount",
+            "Avg Payment Days",
+        ])
+        for s in report_dto.suppliers:
+            csv_builder.add_row([
+                s.supplier_id,
+                s.supplier_name,
+                s.bill_count,
+                str(s.total_spend),
+                str(s.paid_amount),
+                str(s.pending_amount),
+                s.avg_payment_days,
+            ])
+        csv_builder.add_row([])
+        csv_builder.add_row(["Filters Applied", "", "", "", "", "", ""])
+        f = report_dto.filters_applied
+        csv_builder.add_row(["Project ID", str(f.project_id)])
+        if f.supplier_id: csv_builder.add_row(["Supplier ID", str(f.supplier_id)])
+        if f.status: csv_builder.add_row(["Status", f.status])
+        if f.date_from: csv_builder.add_row(["Date From", f.date_from])
+        if f.date_to: csv_builder.add_row(["Date To", f.date_to])
+        if f.search: csv_builder.add_row(["Search", f.search])
+        if f.payment_status: csv_builder.add_row(["Payment Status", f.payment_status])
+        return csv_builder.build()
+    raise HTTPException(status_code=400, detail="Invalid format. Supported: json, pdf, csv")
+
 @router.get("/audit/pdf")
 async def export_audit_pdf(
     start_date: Optional[date] = Query(None, description="Start date"),
