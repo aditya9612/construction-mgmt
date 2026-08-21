@@ -8637,11 +8637,12 @@ async def today_progress(
 
 
 @work_progress_router.get(
-    "/activities/{activity_id}/progress-history",
-    response_model=s.ActivityProgressHistoryResponse,
+    "/progress-history",
+    response_model=s.WorkProgressHistoryResponse,
 )
-async def get_activity_progress_history(
-    activity_id: int = Path(..., gt=0),
+async def get_work_progress_history(
+    activity_id: int | None = Query(default=None, gt=0),
+    project_id: int | None = Query(default=None, gt=0),
     from_date: date | None = Query(default=None),
     to_date: date | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
@@ -8665,63 +8666,57 @@ async def get_activity_progress_history(
             )
 
         # =====================================================
-        # FETCH ACTIVITY
+        # VALIDATE PARAMS
         # =====================================================
 
-        activity_stmt = (
-            select(m.WorkActivity)
-            .where(
-                m.WorkActivity.id == activity_id,
-            )
-            .options(
-                selectinload(m.WorkActivity.engineer),
-                selectinload(m.WorkActivity.work_order),
-                selectinload(m.WorkActivity.boq_item),
-            )
-        )
-
-        activity_result = await db.execute(
-            activity_stmt,
-        )
-
-        activity = activity_result.scalar_one_or_none()
-
-        if activity is None:
+        if not activity_id and not project_id:
 
             raise HTTPException(
-                status_code=404,
-                detail="Work activity not found",
+                status_code=400,
+                detail="Must provide either activity_id or project_id",
             )
 
         # =====================================================
         # PROJECT ACCESS
         # =====================================================
 
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=activity.project_id,
-        )
+        target_project_id = project_id
+
+        if activity_id and not target_project_id:
+            activity_stmt = select(m.WorkActivity).where(m.WorkActivity.id == activity_id)
+            activity_result = await db.execute(activity_stmt)
+            activity = activity_result.scalar_one_or_none()
+            if not activity:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Work activity not found",
+                )
+            target_project_id = activity.project_id
+
+        if target_project_id:
+            await assert_project_access(
+                db=db,
+                current_user=current_user,
+                project_id=target_project_id,
+            )
 
         # =====================================================
         # BUILD FILTERS
         # =====================================================
 
-        filters = [
-            m.DailyProgressEntry.activity_id == activity_id,
-        ]
+        filters = []
+
+        if activity_id:
+            filters.append(m.DailyProgressEntry.activity_id == activity_id)
+
+        if project_id:
+            filters.append(m.WorkActivity.project_id == project_id)
 
         if from_date:
-
-            filters.append(
-                m.DailyProgressEntry.entry_date >= from_date,
-            )
+            filters.append(m.DailyProgressEntry.entry_date >= from_date)
 
         if to_date:
-
-            filters.append(
-                m.DailyProgressEntry.entry_date <= to_date,
-            )
+            filters.append(m.DailyProgressEntry.entry_date <= to_date)
 
         # =====================================================
         # BASE QUERY
@@ -8730,21 +8725,21 @@ async def get_activity_progress_history(
         history_stmt = (
             select(
                 m.DailyProgressEntry,
+                m.WorkActivity,
             )
+            .join(m.WorkActivity, m.DailyProgressEntry.activity_id == m.WorkActivity.id)
             .where(*filters)
             .order_by(
+                m.WorkActivity.id.asc(),
                 m.DailyProgressEntry.entry_date.asc(),
                 m.DailyProgressEntry.id.asc(),
             )
         )
 
         count_stmt = (
-            select(
-                func.count(),
-            )
-            .select_from(
-                m.DailyProgressEntry,
-            )
+            select(func.count())
+            .select_from(m.DailyProgressEntry)
+            .join(m.WorkActivity, m.DailyProgressEntry.activity_id == m.WorkActivity.id)
             .where(*filters)
         )
 
@@ -8762,7 +8757,7 @@ async def get_activity_progress_history(
             history_stmt,
         )
 
-        progress_entries = history_result.scalars().all()
+        progress_entries = history_result.all()
 
         total_result = await db.execute(
             count_stmt,
@@ -8774,28 +8769,32 @@ async def get_activity_progress_history(
         # RUNNING TOTAL
         # =====================================================
 
-        running_total = Decimal("0.00")
-
+        running_totals = {}
         history_items = []
 
-        for progress in progress_entries:
+        for progress, activity in progress_entries:
+            
+            if activity.id not in running_totals:
+                running_totals[activity.id] = Decimal("0.00")
 
             today_progress = Decimal(str(progress.today_progress or 0))
 
-            running_total += today_progress
+            running_totals[activity.id] += today_progress
 
-            remaining_quantity = Decimal(str(activity.planned_quantity)) - running_total
+            remaining_quantity = Decimal(str(activity.planned_quantity)) - running_totals[activity.id]
 
             if remaining_quantity < Decimal("0"):
 
                 remaining_quantity = Decimal("0.00")
 
             history_items.append(
-                s.ActivityProgressHistoryItem(
+                s.WorkProgressHistoryItem(
                     id=progress.id,
+                    activity_id=activity.id,
+                    activity_name=activity.activity_name,
                     entry_date=progress.entry_date,
                     today_progress=progress.today_progress,
-                    running_total=running_total.quantize(
+                    running_total=running_totals[activity.id].quantize(
                         Decimal("0.01"),
                         rounding=ROUND_HALF_UP,
                     ),
@@ -8821,33 +8820,10 @@ async def get_activity_progress_history(
 
         # =====================================================
         # RESPONSE
-        #
-        # NOTE: this now works correctly because
-        # ActivityProgressSummary, ActivityProgressHistoryItem, and
-        # PaginationResponse are all defined in schemas.py and
-        # ActivityProgressHistoryResponse has been rewritten to
-        # match this exact shape. Previously all three referenced
-        # classes did not exist anywhere in the schema module.
         # =====================================================
 
-        return s.ActivityProgressHistoryResponse(
-            message="Activity progress history fetched successfully",
-            activity=s.ActivityProgressSummary(
-                id=activity.id,
-                activity_name=activity.activity_name,
-                discipline=activity.discipline,
-                planned_quantity=activity.planned_quantity,
-                completed_quantity=activity.total_completed,
-                remaining_quantity=activity.remaining_quantity,
-                completion_percentage=activity.completion_percentage,
-                status=activity.status,
-                unit=activity.unit,
-                start_date=activity.start_date,
-                end_date=activity.end_date,
-                engineer_id=activity.engineer_id,
-                work_order_id=activity.work_order_id,
-                boq_item_id=activity.boq_item_id,
-            ),
+        return s.WorkProgressHistoryResponse(
+            message="Work progress history fetched successfully",
             history=history_items,
             pagination=pagination,
         )

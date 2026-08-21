@@ -1388,9 +1388,11 @@ class ActivityProgressSummary(BaseSchema):
     boq_item_id: int
 
 
-class ActivityProgressHistoryItem(BaseSchema):
+class WorkProgressHistoryItem(BaseSchema):
 
     id: int
+    activity_id: int
+    activity_name: str
     entry_date: date
     today_progress: Decimal
     running_total: Decimal
@@ -1407,11 +1409,10 @@ class PaginationResponse(BaseSchema):
     page_count: int
 
 
-class ActivityProgressHistoryResponse(BaseSchema):
+class WorkProgressHistoryResponse(BaseSchema):
 
     message: str
-    activity: ActivityProgressSummary
-    history: list[ActivityProgressHistoryItem]
+    history: list[WorkProgressHistoryItem]
     pagination: PaginationResponse
 
 
