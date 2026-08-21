@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import List, Optional, Union
@@ -10,7 +11,6 @@ from pydantic import (
     Field,
     computed_field,
     field_validator,
-    json,
     model_validator,
 )
 from typing_extensions import Annotated
