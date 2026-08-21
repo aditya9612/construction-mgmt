@@ -538,10 +538,10 @@ async def boq_comparison(
         variance_percentage = (variance / boq_amount * 100) if boq_amount > 0 else 0
 
         res.append(BOQComparisonRow(
-            boq_item=item.item_desc or item.category,
+            boq_item=item.item_name or item.category,
             unit=item.unit or "Nos",
             boq_qty=float(item.quantity or 0),
-            boq_rate=float(item.rate or 0),
+            boq_rate=float(item.unit_cost or 0),
             boq_amount=boq_amount,
             actual_amount=actual_amount,
             variance=variance,

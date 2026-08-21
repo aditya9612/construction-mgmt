@@ -4,7 +4,7 @@ from openpyxl import Workbook
 from fastapi.responses import FileResponse
 import tempfile
 import csv
-from fastapi import APIRouter, Depends, Query, UploadFile, File
+from fastapi import APIRouter, Depends, Query, UploadFile, File, HTTPException
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle

@@ -46,7 +46,7 @@ async def create_approval(
 
     await db.flush()
 
-    if payload.entity_type == "boq":
+    if payload.entity_type.lower() == "boq":
         from app.models.boq import BOQ
 
         boq = await db.get(BOQ, payload.entity_id)
@@ -141,7 +141,7 @@ async def approve(
         if journal:
             journal.status = "Posted"
 
-    elif obj.entity_type == "boq":
+    elif obj.entity_type.lower() == "boq":
         from app.models.boq import BOQ
 
         boq = await db.get(BOQ, obj.entity_id)
@@ -236,7 +236,7 @@ async def reject(
         if journal:
             journal.status = "Rejected"
 
-    elif obj.entity_type == "boq":
+    elif obj.entity_type.lower() == "boq":
         from app.models.boq import BOQ
 
         boq = await db.get(BOQ, obj.entity_id)
