@@ -242,6 +242,16 @@ class EquipmentUsage(Base, TimestampMixin):
         String(500),
     )
 
+    rental_rate_at_usage: Mapped[Optional[Decimal]] = mapped_column(
+        DECIMAL(10, 2),
+        nullable=True,
+    )
+
+    cost: Mapped[Optional[Decimal]] = mapped_column(
+        DECIMAL(12, 2),
+        nullable=True,
+    )
+
 
 class EquipmentMaintenance(Base, TimestampMixin):
     __tablename__ = "equipment_maintenance"

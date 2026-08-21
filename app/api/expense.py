@@ -12,9 +12,9 @@ from app.models.expense import Expense
 from app.models.project import Project
 from app.models.owner import OwnerTransaction
 from app.schemas.expense import (
-    ExpenseCreate, ExpenseUpdate, ExpenseOut, ExpenseDashboardOut, 
-    ExpenseTrendOut, ExpenseCategorySummaryOut, ProjectAllocationsOut, 
-    ProjectAllocationCard, ProjectAllocationRecent, ExpenseLedgerRow, 
+    ExpenseCreate, ExpenseUpdate, ExpenseOut, ExpenseDashboardOut,
+    ExpenseTrendOut, ExpenseCategorySummaryOut, ProjectAllocationsOut,
+    ProjectAllocationCard, ProjectAllocationRecent, ExpenseLedgerRow,
     BOQComparisonRow
 )
 from app.models.accountant import JournalEntry, JournalLine, Account
@@ -26,11 +26,8 @@ from app.models.boq import BOQ
 from sqlalchemy import select, func
 from decimal import Decimal
 
-from app.models.boq import BOQ
-from sqlalchemy import select, func
-from decimal import Decimal
-
 from app.models.user import User, UserRole
+from app.utils.boq_calc import recalculate_boq_actuals
 from app.core.dependencies import require_roles
 
 EXPENSE_READ_ROLES = [
@@ -114,16 +111,7 @@ async def create_expense(
             raise
 
         if obj.boq_item_id:
-            total_actual = await db.scalar(
-                select(func.sum(Expense.amount)).where(
-                    Expense.boq_item_id == obj.boq_item_id
-                )
-            )
-
-            boq = await db.get(BOQ, obj.boq_item_id)
-            if boq:
-                boq.actual_cost = Decimal(total_actual or 0)
-                boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
+            await recalculate_boq_actuals(db, obj.boq_item_id, lock=True)
 
         owner_transaction = OwnerTransaction(
             owner_id=project.owner_id,
@@ -144,7 +132,7 @@ async def create_expense(
         expense_acc = await db.scalar(select(Account).where(Account.code == 'GENERAL_EXPENSE'))
         if not expense_acc:
             raise HTTPException(status_code=400, detail="GENERAL_EXPENSE account is not configured.")
-        
+
         cash_acc = await get_primary_cash_account(db)
 
         if expense_acc and cash_acc:
@@ -204,7 +192,7 @@ async def list_expenses(
     current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
 ):
     query = select(Expense)
-    
+
     if category:
         query = query.where(Expense.category == category)
     if project_id:
@@ -215,11 +203,11 @@ async def list_expenses(
         query = query.where(Expense.expense_date <= to_date)
     if search:
         query = query.where(Expense.description.ilike(f"%{search}%"))
-    
+
     offset = (page - 1) * limit
     result = await db.execute(query.order_by(Expense.created_at.desc()).offset(offset).limit(limit))
     rows = result.scalars().all()
-    
+
     return [ExpenseOut.model_validate(r) for r in rows]
 
 
@@ -356,7 +344,7 @@ async def update_expense(
 
                 db.add(JournalLine(entry_id=new_je.id, account_id=expense_acc.id, debit=obj.amount, credit=Decimal(0)))
                 db.add(JournalLine(entry_id=new_je.id, account_id=cash_acc.id, debit=Decimal(0), credit=obj.amount))
-                
+
                 # Validation is implicit since we use obj.amount for both debit and credit.
 
         await db.flush()
@@ -364,13 +352,7 @@ async def update_expense(
         affected_boq_ids = {boq_id for boq_id in [old_boq_id, new_boq_id] if boq_id}
 
         for boq_id in affected_boq_ids:
-            total_actual = await db.scalar(
-                select(func.sum(Expense.amount)).where(Expense.boq_item_id == boq_id)
-            )
-            boq = await db.get(BOQ, boq_id)
-            if boq:
-                boq.actual_cost = Decimal(total_actual or 0)
-                boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
+            await recalculate_boq_actuals(db, boq_id, lock=True)
 
         await db.commit()
 
@@ -422,7 +404,7 @@ async def delete_expense(
         # 4 & 5. Create Final Delete Reversal and lines if active journal exists and isn't DEL
         if active_journal and not active_journal.journal_number.endswith("-DEL"):
             final_rev_journal_num = f"J-EXP-{obj.id}-DEL"
-            
+
             final_rev_je = JournalEntry(
                 journal_number=final_rev_journal_num,
                 entry_date=active_journal.entry_date,
@@ -471,16 +453,7 @@ async def delete_expense(
         await db.flush()
 
         if boq_id:
-            total_actual = await db.scalar(
-                select(func.sum(Expense.amount)).where(
-                    Expense.boq_item_id == boq_id
-                )
-            )
-
-            boq = await db.get(BOQ, boq_id)
-            if boq:
-                boq.actual_cost = Decimal(total_actual or 0)
-                boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
+            await recalculate_boq_actuals(db, boq_id, lock=True)
 
         # 10. Commit transaction
         await db.commit()
@@ -600,14 +573,14 @@ async def get_dashboard(
 
     # For simple estimation, consider all currently assigned project expenses
     project_expense = total_expense  # in a real app might exclude HQ expenses
-    
+
     # Direct vs Indirect
     direct_expense = total_expense * 0.8  # dummy fallback if category lacks distinction
     indirect_expense = total_expense * 0.2
 
     # Trend (Last 6 months)
     trend = []
-    
+
     # Category Summary
     cat_res = await db.execute(
         select(Expense.category, func.sum(Expense.amount))
@@ -654,7 +627,7 @@ async def get_project_allocations(
             other_expense=float(amt) * 0.1,
             total_allocated=float(amt)
         ))
-        
+
     recent = []
     expenses = (await db.execute(select(Expense).join(Project).order_by(Expense.created_at.desc()).limit(10))).scalars().all()
     for e in expenses:
@@ -688,7 +661,7 @@ async def get_expense_ledger(
         .where(JournalLine.account_id.in_(expense_accs), JournalEntry.status == "Posted")
         .order_by(JournalEntry.entry_date.asc())
     )
-    
+
     rows = []
     running_balance = 0.0
     for je, jl in res.all():

@@ -5,6 +5,7 @@ import io
 import json
 from zipfile import Path
 from app.models.boq import BOQ
+from app.utils.boq_calc import recalculate_boq_actuals
 
 # FastAPI
 from fastapi import (
@@ -1720,8 +1721,23 @@ async def restore_equipment(
 
     return EquipmentOut.model_validate(obj)
 
-    # ========================= CREATE USAGE===========================
 
+
+
+# ========================= CREATE USAGE===========================
+
+@router.post(
+    "/{equipment_id}/usage",
+    response_model=EquipmentUsageOut,
+)
+async def create_usage(
+    equipment_id: int,
+    payload: EquipmentUsageCreate,
+    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    request: Request = None,
+):
     equipment = await get_active_equipment_or_404(
         db,
         equipment_id,
@@ -1836,8 +1852,15 @@ async def restore_equipment(
 
     # ================= CREATE USAGE =================
 
+    # ================= SNAPSHOT HISTORICAL COST =================
+
+    rental_rate_at_usage = equipment.rental_cost or Decimal("0")
+    cost = payload.working_hours * rental_rate_at_usage
+
     obj = EquipmentUsage(
         equipment_id=equipment_id,
+        rental_rate_at_usage=rental_rate_at_usage,
+        cost=cost,
         **payload.model_dump(),
     )
 
@@ -1857,15 +1880,11 @@ async def restore_equipment(
 
     # ================= BOQ ACTUAL COST UPDATE =================
 
-    usage_cost = Decimal("0")
-
-    if boq_item:
-
-        usage_cost = payload.working_hours * (equipment.rental_cost or Decimal("0"))
-
-        boq_item.actual_cost = (boq_item.actual_cost or Decimal("0")) + usage_cost
+    usage_cost = cost
 
     await db.flush()
+    if boq_item:
+        await recalculate_boq_actuals(db, boq_item.id)
 
     # ================= AUDIT LOG =================
 
@@ -2036,6 +2055,12 @@ async def update_usage(
         usage.equipment_id,
     )
 
+    if usage.cost is None or usage.rental_rate_at_usage is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot edit legacy usage lacking cost snapshots.",
+        )
+
     # ================= OLD VALUES =================
 
     old_usage_hours = usage.working_hours or Decimal("0")
@@ -2094,64 +2119,31 @@ async def update_usage(
 
     # ================= BOQ COST RECALCULATION =================
 
-    rental_rate = equipment.rental_cost or Decimal("0")
+    rental_rate = usage.rental_rate_at_usage
 
-    old_usage_cost = old_usage_hours * rental_rate
+    old_usage_cost = usage.cost
     new_usage_cost = (usage.working_hours or Decimal("0")) * rental_rate
+
+    usage.cost = new_usage_cost
 
     new_boq_item_id = usage.boq_item_id
 
-    # ================= BOQ CHANGED =================
+    # ================= BOQ SYNC =================
+
+    await db.flush()
 
     if old_boq_item_id != new_boq_item_id:
-
         if old_boq_item_id:
-
-            old_boq = await db.get(
-                BOQ,
-                old_boq_item_id,
-            )
-
-            if old_boq:
-                old_boq.actual_cost = max(
-                    Decimal("0"),
-                    (old_boq.actual_cost or Decimal("0")) - old_usage_cost,
-                )
-
+            await recalculate_boq_actuals(db, old_boq_item_id)
         if new_boq_item_id:
-
-            new_boq = await db.get(
-                BOQ,
-                new_boq_item_id,
-            )
-
+            new_boq = await db.get(BOQ, new_boq_item_id)
             if not new_boq:
-                raise HTTPException(
-                    status_code=404,
-                    detail="BOQ item not found",
-                )
-
+                raise HTTPException(status_code=404, detail="BOQ item not found")
             if equipment.project_id != new_boq.project_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="BOQ item does not belong to equipment project",
-                )
-
-            new_boq.actual_cost = (new_boq.actual_cost or Decimal("0")) + new_usage_cost
-
-    # ================= SAME BOQ =================
-
+                raise HTTPException(status_code=400, detail="BOQ item does not belong to equipment project")
+            await recalculate_boq_actuals(db, new_boq_item_id)
     elif new_boq_item_id:
-
-        boq_item = await db.get(
-            BOQ,
-            new_boq_item_id,
-        )
-
-        if boq_item:
-            boq_item.actual_cost = (
-                (boq_item.actual_cost or Decimal("0")) - old_usage_cost + new_usage_cost
-            )
+        await recalculate_boq_actuals(db, new_boq_item_id)
 
     # ================= AUDIT LOG =================
 
@@ -2188,14 +2180,6 @@ async def update_usage(
     return EquipmentUsageOut.model_validate(usage)
 
 
-# ========================= DELETE USAGE===========================
-
-
-@router.delete(
-    "/usage/{usage_id}",
-    response_model=DeleteUsageResponse,
-    status_code=status.HTTP_200_OK,
-)
 async def delete_usage(
     usage_id: int,
     current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
@@ -2219,25 +2203,25 @@ async def delete_usage(
         usage.equipment_id,
     )
 
+    if usage.cost is None or usage.rental_rate_at_usage is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete legacy usage lacking cost snapshots.",
+        )
+
     # ================= BOQ COST ROLLBACK =================
 
-    usage_cost = Decimal("0")
+    usage_cost = usage.cost
+
+    boq_item_id_to_recalc = None
 
     if usage.boq_item_id:
-
         boq_item = await db.get(
             BOQ,
             usage.boq_item_id,
         )
-
         if boq_item:
-
-            usage_cost = usage.working_hours * (equipment.rental_cost or Decimal("0"))
-
-            boq_item.actual_cost = max(
-                Decimal("0"),
-                (boq_item.actual_cost or Decimal("0")) - usage_cost,
-            )
+            boq_item_id_to_recalc = boq_item.id
 
     # ================= EQUIPMENT TOTALS UPDATE =================
 
@@ -2276,6 +2260,10 @@ async def delete_usage(
     # ================= DELETE USAGE =================
 
     await db.delete(usage)
+    await db.flush()
+
+    if boq_item_id_to_recalc:
+        await recalculate_boq_actuals(db, boq_item_id_to_recalc)
 
     await db.commit()
 
@@ -2412,8 +2400,8 @@ async def create_maintenance(
     maintenance_cost = Decimal(str(payload.cost or 0))
 
     if boq_item and maintenance_cost > 0:
-
-        boq_item.actual_cost = (boq_item.actual_cost or Decimal("0")) + maintenance_cost
+        await db.flush()
+        await recalculate_boq_actuals(db, boq_item.id)
 
     # ================= STATUS RECALCULATION =================
 
@@ -2584,38 +2572,18 @@ async def update_maintenance(
                 old_boq_id,
             )
 
-            if old_boq:
-                old_boq.actual_cost = max(
-                    Decimal("0"),
-                    (old_boq.actual_cost or Decimal("0")) - old_cost,
-                )
+            await db.flush()
+            await recalculate_boq_actuals(db, old_boq_id)
 
         if new_boq_id:
-
-            new_boq = await db.get(
-                BOQ,
-                new_boq_id,
-            )
-
+            new_boq = await db.get(BOQ, new_boq_id)
             if not new_boq:
-                raise HTTPException(
-                    status_code=404,
-                    detail="BOQ item not found",
-                )
-
-            new_boq.actual_cost = (new_boq.actual_cost or Decimal("0")) + new_cost
+                raise HTTPException(status_code=404, detail="BOQ item not found")
+            await recalculate_boq_actuals(db, new_boq_id)
 
     elif new_boq_id:
-
-        boq_item = await db.get(
-            BOQ,
-            new_boq_id,
-        )
-
-        if boq_item:
-            boq_item.actual_cost = (
-                (boq_item.actual_cost or Decimal("0")) - old_cost + new_cost
-            )
+        await db.flush()
+        await recalculate_boq_actuals(db, new_boq_id)
 
     # ================= STATUS RECALCULATION =================
 
@@ -2837,12 +2805,8 @@ async def delete_maintenance(
         )
 
         if boq_item:
-
-            boq_item.actual_cost = max(
-                Decimal("0"),
-                (boq_item.actual_cost or Decimal("0"))
-                - (maintenance.cost or Decimal("0")),
-            )
+            await db.flush()
+            await recalculate_boq_actuals(db, boq_item.id)
 
     # ================= AUDIT LOG =================
 
@@ -3185,9 +3149,8 @@ async def create_rental(
                 detail="BOQ item does not belong to project",
             )
 
-        boq_item.actual_cost = (
-            boq_item.actual_cost or Decimal("0")
-        ) + payload.rental_cost
+        await db.flush()
+        await recalculate_boq_actuals(db, boq_item.id)
 
     old_status = equipment.status
 
@@ -3554,18 +3517,13 @@ async def update_rental(
             old_boq_item_id,
         )
 
-        if old_boq:
-            old_boq.actual_cost = max(
-                Decimal("0"),
-                (old_boq.actual_cost or Decimal("0")) - old_rental_cost,
-            )
+        await db.flush()
+        await recalculate_boq_actuals(db, old_boq_id)
 
     if rental.boq_item_id:
-
-        new_boq = await db.get(
-            BOQ,
-            rental.boq_item_id,
-        )
+        new_boq = await db.get(BOQ, rental.boq_item_id)
+        if new_boq:
+            await recalculate_boq_actuals(db, rental.boq_item_id)
 
         if not new_boq:
             raise HTTPException(
@@ -3581,7 +3539,6 @@ async def update_rental(
                 detail="BOQ item does not belong to project",
             )
 
-        new_boq.actual_cost = (new_boq.actual_cost or Decimal("0")) + rental.rental_cost
 
     # ================= STATUS =================
 
@@ -3704,12 +3661,8 @@ async def delete_rental(
         )
 
         if boq_item:
-
-            boq_item.actual_cost = max(
-                Decimal("0"),
-                (boq_item.actual_cost or Decimal("0"))
-                - (rental.rental_cost or Decimal("0")),
-            )
+            await db.flush()
+            await recalculate_boq_actuals(db, boq_item.id)
 
     # ================= DELETE RENTAL =================
 
@@ -4175,12 +4128,8 @@ async def create_purchase(
         # ================= BOQ UPDATE =================
 
         if boq_item:
-
-            boq_item.actual_cost = (boq_item.actual_cost or Decimal("0")) + total_amount
-
-            boq_item.variance_cost = (
-                boq_item.total_cost or Decimal("0")
-            ) - boq_item.actual_cost
+            await db.flush()
+            await recalculate_boq_actuals(db, boq_item.id)
 
         # ================= AUDIT LOG =================
 
@@ -4506,74 +4455,19 @@ async def update_purchase(
     # (total_cost - actual_cost) was never recalculated here, unlike
     # create_purchase. Now both stay consistent on update too.
 
+    await db.flush()
     if old_boq_item_id != new_boq_item_id:
-
-        # Rollback old BOQ
         if old_boq_item_id:
-
-            old_boq = await db.get(
-                BOQ,
-                old_boq_item_id,
-            )
-
-            if old_boq:
-
-                old_boq.actual_cost = max(
-                    Decimal("0"),
-                    (old_boq.actual_cost or Decimal("0")) - old_total_amount,
-                )
-                old_boq.variance_cost = (
-                    old_boq.total_cost or Decimal("0")
-                ) - old_boq.actual_cost
-
-        # Add amount to new BOQ
+            await recalculate_boq_actuals(db, old_boq_item_id)
         if new_boq_item_id:
-
-            new_boq = await db.get(
-                BOQ,
-                new_boq_item_id,
-            )
-
+            new_boq = await db.get(BOQ, new_boq_item_id)
             if not new_boq:
-                raise HTTPException(
-                    status_code=404,
-                    detail="BOQ item not found",
-                )
-
+                raise HTTPException(status_code=404, detail="BOQ item not found")
             if purchase.project_id and new_boq.project_id != purchase.project_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="BOQ item does not belong to project",
-                )
-
-            new_boq.actual_cost = (
-                new_boq.actual_cost or Decimal("0")
-            ) + new_total_amount
-            new_boq.variance_cost = (
-                new_boq.total_cost or Decimal("0")
-            ) - new_boq.actual_cost
-
-    # Same BOQ -> adjust amount difference only
+                raise HTTPException(status_code=400, detail="BOQ item does not belong to project")
+            await recalculate_boq_actuals(db, new_boq_item_id)
     elif new_boq_item_id:
-
-        boq_item = await db.get(
-            BOQ,
-            new_boq_item_id,
-        )
-
-        if boq_item:
-
-            boq_item.actual_cost = max(
-                Decimal("0"),
-                (
-                    (boq_item.actual_cost or Decimal("0"))
-                    - old_total_amount
-                    + new_total_amount
-                ),
-            )
-            boq_item.variance_cost = (
-                boq_item.total_cost or Decimal("0")
-            ) - boq_item.actual_cost
+        await recalculate_boq_actuals(db, new_boq_item_id)
 
     # ================= EQUIPMENT =================
 
@@ -4658,16 +4552,8 @@ async def delete_purchase(
     try:
         # ================= BOQ ROLLBACK (single execution) =================
         if purchase.boq_item_id:
-            boq_item = await db.get(BOQ, purchase.boq_item_id)
-            if boq_item:
-                boq_item.actual_cost = max(
-                    Decimal("0"),
-                    (boq_item.actual_cost or Decimal("0"))
-                    - (purchase.total_amount or Decimal("0")),
-                )
-                boq_item.variance_cost = (
-                    boq_item.total_cost or Decimal("0")
-                ) - boq_item.actual_cost
+            await db.flush()
+            await recalculate_boq_actuals(db, purchase.boq_item_id)
 
         # ================= AUDIT LOG (single execution) =================
         await create_audit_log(
@@ -5042,17 +4928,17 @@ async def generate_equipment_qr(
 ):
     # Verify equipment exists using standard helper
     equipment = await get_active_equipment_or_404(db, equipment_id)
-    
+
     # Generate QR in memory (payload: EQP:ID)
     qr_buf = generate_qr(entity_type="EQP", entity_id=equipment.id)
-    
+
     headers = {
         "Cache-Control": "no-store",
         "Content-Disposition": f'inline; filename="equipment_{equipment.id}.png"'
     }
-    
+
     return StreamingResponse(
-        qr_buf, 
+        qr_buf,
         media_type="image/png",
         headers=headers
     )

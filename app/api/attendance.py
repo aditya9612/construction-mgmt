@@ -35,6 +35,7 @@ from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
 from app.models.boq import BOQ
 from app.models.accountant import Account, JournalEntry, JournalLine
+from app.utils.boq_calc import recalculate_boq_actuals
 from app.utils.accounting import get_primary_cash_account
 
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
@@ -375,7 +376,7 @@ async def check_out(
                 db.add(expense)
 
                 await db.flush()
-                
+
                 expense_id = expense.id
 
                 project = await db.get(Project, attendance.project_id)
@@ -398,13 +399,7 @@ async def check_out(
 
             affected_boq_ids = {boq_id for boq_id in [old_boq_id, resolved_boq_id] if boq_id}
             for boq_id in affected_boq_ids:
-                total_actual = await db.scalar(
-                    select(func.sum(Expense.amount)).where(Expense.boq_item_id == boq_id)
-                )
-                boq = await db.get(BOQ, boq_id)
-                if boq:
-                    boq.actual_cost = Decimal(total_actual or 0)
-                    boq.variance_cost = Decimal(boq.total_cost or 0) - boq.actual_cost
+                await recalculate_boq_actuals(db, boq_id, lock=True)
 
             journal_number = f"J-EXP-{expense_id}"
             existing_je = await db.scalar(select(JournalEntry).where(JournalEntry.journal_number == journal_number))

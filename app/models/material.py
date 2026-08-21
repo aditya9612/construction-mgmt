@@ -6,6 +6,7 @@ from sqlalchemy import Column, Integer
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Date,
     ForeignKey,
     Index,
     String,
@@ -307,6 +308,24 @@ class MaterialTransaction(Base, TimestampMixin):
     reference_id: Mapped[Optional[str]] = mapped_column(String(100))
     remarks: Mapped[Optional[str]] = mapped_column(String(255))
 
+    journal_entry_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("journal_entries.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    idempotency_key: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, unique=True, index=True
+    )
+
+    request_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+
+    transaction_date = mapped_column(
+        Date, nullable=False, server_default=func.current_date()
+    )
+
     __table_args__ = (
         Index("idx_tx_material", "material_id"),
         Index("idx_tx_project", "project_id"),
@@ -443,6 +462,10 @@ class MaterialLedger(Base, TimestampMixin):
 
     reference_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     remarks: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    transaction_date = mapped_column(
+        Date, nullable=False, server_default=func.current_date()
+    )
 
     __table_args__ = (
         Index("idx_ledger_material", "material_id"),
