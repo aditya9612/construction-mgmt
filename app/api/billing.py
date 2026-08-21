@@ -1,3 +1,4 @@
+from typing import Optional
 from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, func
@@ -255,28 +256,47 @@ async def create_ra_bill(
 # ======================
 @router.get("", response_model=PaginatedResponse[RABillOut])
 async def list_ra_bills(
+    status: Optional[str] = None,
     pagination: PaginationParams = Depends(),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(BILLING_READ_ROLES)),
 ):
     from app.models.work_order import WorkOrder
+    from app.models.project import Project
+    from app.models.contractor import Contractor
+    from app.models.approval import Approval
 
     pagination = pagination.normalized()
 
-    total = await db.scalar(select(func.count()).select_from(RABill))
-
     query = (
-        select(RABill)
+        select(
+            RABill,
+            Project.project_name,
+            Contractor.name.label("contractor_name"),
+            Approval.id.label("approval_id")
+        )
+        .outerjoin(Project, RABill.project_id == Project.id)
+        .outerjoin(Contractor, RABill.contractor_id == Contractor.id)
+        .outerjoin(Approval, (Approval.entity_type == "bill") & (Approval.entity_id == RABill.id) & (Approval.status == "Pending"))
         .order_by(RABill.id.desc())
         .offset(pagination.offset)
         .limit(pagination.limit)
     )
 
-    rows = (await db.execute(query)).scalars().all()
+    if status:
+        query = query.where(RABill.status == status)
+
+    rows = (await db.execute(query)).all()
+    
+    total = await db.scalar(select(func.count()).select_from(RABill))
 
     items = []
 
-    for r in rows:
+    for row in rows:
+        r = row.RABill
+        project_name = row.project_name
+        contractor_name = row.contractor_name
+        approval_id = row.approval_id
         progress = None
         total_billed_qty = None
         remaining_qty = None
@@ -306,6 +326,9 @@ async def list_ra_bills(
             RABillOut.model_validate(
                 {
                     **r.__dict__,
+                    "project_name": project_name,
+                    "contractor_name": contractor_name,
+                    "approval_id": approval_id,
                     "progress_percent": round(progress, 2) if progress else None,
                     "total_billed_quantity": total_billed_qty,
                     "remaining_quantity": remaining_qty,

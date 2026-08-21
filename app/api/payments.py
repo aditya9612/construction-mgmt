@@ -30,13 +30,52 @@ async def create_payment_voucher(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+from typing import Optional
+
 @router.get("", response_model=list[PaymentVoucherOut])
 async def list_payment_vouchers(
+    status: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES))
 ):
-    result = await db.scalars(select(PaymentVoucher).order_by(PaymentVoucher.created_at.desc()))
-    return result.all()
+    from app.models.accountant import VendorBill
+    from app.models.project import Project
+    from app.models.material import Supplier
+    from app.models.contractor import Contractor
+    from sqlalchemy.orm import aliased
+    from sqlalchemy import case
+    
+    query = (
+        select(
+            PaymentVoucher,
+            Project.project_name,
+            case(
+                (PaymentVoucher.party_type == "Supplier", Supplier.supplier_name),
+                (PaymentVoucher.party_type == "Contractor", Contractor.name),
+                else_=None
+            ).label("party_name")
+        )
+        .outerjoin(VendorBill, PaymentVoucher.vendor_bill_id == VendorBill.id)
+        .outerjoin(Project, VendorBill.project_id == Project.id)
+        .outerjoin(Supplier, (PaymentVoucher.party_type == "Supplier") & (PaymentVoucher.supplier_id == Supplier.id))
+        .outerjoin(Contractor, (PaymentVoucher.party_type == "Contractor") & (PaymentVoucher.contractor_id == Contractor.id))
+        .order_by(PaymentVoucher.created_at.desc())
+    )
+    
+    if status:
+        query = query.where(PaymentVoucher.status == status)
+        
+    rows = (await db.execute(query)).all()
+    
+    items = []
+    for row in rows:
+        pv = row.PaymentVoucher
+        pv_dict = pv.__dict__.copy()
+        pv_dict["project_name"] = row.project_name
+        pv_dict["party_name"] = row.party_name
+        items.append(PaymentVoucherOut.model_validate(pv_dict))
+        
+    return items
 
 @router.post("/{id}/mark-paid", response_model=PaymentVoucherOut)
 async def mark_voucher_paid(

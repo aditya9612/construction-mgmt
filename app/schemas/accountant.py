@@ -496,3 +496,18 @@ class VendorBillPaymentRequest(BaseModel):
     reference: Optional[str] = None
     payment_date: Optional[date] = None
 
+
+class FixedAssetOut(BaseModel):
+    id: int
+    name: str
+    purchase_value: Decimal
+    purchase_date: Optional[date] = None
+    depreciation_rate: Optional[Decimal] = None
+    current_value: Decimal
+    project_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+    project_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True

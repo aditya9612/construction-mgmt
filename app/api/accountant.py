@@ -1,3 +1,6 @@
+from app.utils.pagination import PaginationParams
+from app.schemas.base import PaginatedResponse, PaginationMeta
+from app.schemas.accountant import FixedAssetOut
 from decimal import Decimal
 from datetime import date, datetime
 from typing import Optional
@@ -1672,12 +1675,44 @@ async def create_journal_entry(
     return {"message": "Journal entry created"}
 
 
-@router.get("/journal")
+from typing import Optional
+from sqlalchemy import func
+from app.schemas.journal import JournalEntryExtendedOut
+
+@router.get("/journal", response_model=list[JournalEntryExtendedOut])
 async def list_journal(
+    status: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    return (await db.execute(select(JournalEntry).order_by(JournalEntry.created_at.desc()))).scalars().all()
+    from app.models.approval import Approval
+    
+    query = (
+        select(
+            JournalEntry,
+            func.sum(JournalLine.debit).label("amount"),
+            Approval.id.label("approval_id")
+        )
+        .outerjoin(JournalLine, JournalEntry.id == JournalLine.entry_id)
+        .outerjoin(Approval, (Approval.entity_type == "journal_entry") & (Approval.entity_id == JournalEntry.id) & (Approval.status == "Pending"))
+        .group_by(JournalEntry.id, Approval.id)
+        .order_by(JournalEntry.created_at.desc())
+    )
+    
+    if status:
+        query = query.where(JournalEntry.status == status)
+        
+    rows = (await db.execute(query)).all()
+    
+    items = []
+    for row in rows:
+        je = row.JournalEntry
+        je_dict = je.__dict__.copy()
+        je_dict["amount"] = row.amount
+        je_dict["approval_id"] = row.approval_id
+        items.append(JournalEntryExtendedOut.model_validate(je_dict))
+        
+    return items
 
 
 @router.get("/gst/summary", response_model=GSTDashboardOut)
@@ -1814,6 +1849,72 @@ async def bank_summary(
         "today_withdrawal": today_withdrawal,
     }
 
+
+
+@router.get("/assets", response_model=PaginatedResponse[FixedAssetOut])
+async def list_assets(
+    project_id: Optional[int] = None,
+    purchase_date: Optional[date] = None,
+    pagination: PaginationParams = Depends(),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+):
+    from app.models.project import Project
+    
+    pagination = pagination.normalized()
+    
+    query = (
+        select(FixedAsset, Project.project_name)
+        .outerjoin(Project, FixedAsset.project_id == Project.id)
+        .order_by(FixedAsset.id.desc())
+    )
+    
+    if project_id:
+        query = query.where(FixedAsset.project_id == project_id)
+    if purchase_date:
+        query = query.where(FixedAsset.purchase_date == purchase_date)
+        
+    query = query.offset(pagination.offset).limit(pagination.limit)
+    rows = (await db.execute(query)).all()
+    
+    count_query = select(func.count()).select_from(FixedAsset)
+    if project_id:
+        count_query = count_query.where(FixedAsset.project_id == project_id)
+    if purchase_date:
+        count_query = count_query.where(FixedAsset.purchase_date == purchase_date)
+    total = await db.scalar(count_query)
+    
+    items = []
+    for row in rows:
+        fa = row.FixedAsset
+        fa_dict = fa.__dict__.copy()
+        fa_dict["project_name"] = row.project_name
+        items.append(FixedAssetOut.model_validate(fa_dict))
+        
+    return PaginatedResponse(items=items, meta=PaginationMeta(total=int(total or 0), limit=pagination.limit, offset=pagination.offset))
+
+@router.get("/assets/{id}", response_model=FixedAssetOut)
+async def get_asset(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+):
+    from app.models.project import Project
+    
+    query = (
+        select(FixedAsset, Project.project_name)
+        .outerjoin(Project, FixedAsset.project_id == Project.id)
+        .where(FixedAsset.id == id)
+    )
+    row = (await db.execute(query)).first()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+        
+    fa = row.FixedAsset
+    fa_dict = fa.__dict__.copy()
+    fa_dict["project_name"] = row.project_name
+    return FixedAssetOut.model_validate(fa_dict)
 
 @router.post("/assets")
 async def create_asset(

@@ -35,5 +35,7 @@ class PaymentVoucherOut(PaymentVoucherBase):
     created_by: Optional[int] = None
     created_at: datetime
     updated_at: datetime
+    project_name: Optional[str] = None
+    party_name: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
