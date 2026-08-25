@@ -19,6 +19,7 @@ class Owner(Base):
     __tablename__ = "owners"
 
     id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="RESTRICT"), index=True, nullable=True)
 
     owner_code = Column(String(20), unique=True, nullable=False, index=True)
 

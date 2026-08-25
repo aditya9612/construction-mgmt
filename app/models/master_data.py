@@ -22,6 +22,7 @@ class Unit(Base):
     __tablename__ = "units"
 
     id = Column(Integer, primary_key=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="RESTRICT"), nullable=True, index=True)
 
     name = Column(String(100), unique=True, nullable=False)
 
@@ -42,6 +43,7 @@ class LabourType(Base):
     __tablename__ = "labour_types"
 
     id = Column(Integer, primary_key=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="RESTRICT"), nullable=True, index=True)
 
     name = Column(String(100), unique=True, nullable=False)
 
@@ -70,6 +72,7 @@ class ActivityType(Base):
     __tablename__ = "activity_types"
 
     id = Column(Integer, primary_key=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="RESTRICT"), nullable=True, index=True)
 
     name = Column(String(100), unique=True, nullable=False)
 
@@ -93,6 +96,7 @@ class MaterialMaster(Base):
     __tablename__ = "material_master"
 
     id = Column(Integer, primary_key=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=True)
 
     name = Column(String(150), nullable=False)
 

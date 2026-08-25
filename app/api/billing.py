@@ -278,6 +278,7 @@ async def list_ra_bills(
         .outerjoin(Project, RABill.project_id == Project.id)
         .outerjoin(Contractor, RABill.contractor_id == Contractor.id)
         .outerjoin(Approval, (Approval.entity_type == "bill") & (Approval.entity_id == RABill.id) & (Approval.status == "Pending"))
+        .where(Project.company_id == current_user.company_id)
         .order_by(RABill.id.desc())
         .offset(pagination.offset)
         .limit(pagination.limit)
@@ -288,7 +289,12 @@ async def list_ra_bills(
 
     rows = (await db.execute(query)).all()
     
-    total = await db.scalar(select(func.count()).select_from(RABill))
+    total = await db.scalar(
+        select(func.count())
+        .select_from(RABill)
+        .join(Project, RABill.project_id == Project.id)
+        .where(Project.company_id == current_user.company_id)
+    )
 
     items = []
 
@@ -535,6 +541,8 @@ async def submit_bill(
     if not obj:
         raise NotFoundError("Bill not found")
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     if obj.status != "Draft":
         raise ValidationError("Only draft bills can be submitted")
 
@@ -554,6 +562,8 @@ async def approve_bill(
     obj = await db.get(RABill, id)
     if not obj:
         raise NotFoundError("Bill not found")
+
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
 
     if obj.status != "Submitted":
         raise ValidationError("Bill must be submitted first")
@@ -646,6 +656,8 @@ async def pay_bill(
     obj = await db.get(RABill, id)
     if not obj:
         raise NotFoundError("Bill not found")
+
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
 
     if obj.status != "Approved":
         raise ValidationError("Only approved bills can be paid")

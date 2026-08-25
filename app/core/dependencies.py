@@ -12,6 +12,7 @@ from app.db.session import get_db_session
 from app.models.user import User, UserRole
 from app.core.request_context import set_current_user_id
 from app.models.rbac import Permission, RolePermission
+from app.models.company import Company
 
 security = HTTPBearer()
 
@@ -174,6 +175,35 @@ async def get_current_active_user(
     #  SET USER ID IN CONTEXT
     set_current_user_id(current_user.id)
 
+    return current_user
+
+
+async def get_current_tenant(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session)
+) -> Company:
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not belong to any company."
+        )
+    company = await db.scalar(select(Company).where(Company.id == current_user.company_id))
+    if not company or not company.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Company is inactive or not found."
+        )
+    return company
+
+
+async def require_super_admin(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    if not current_user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super Admin privileges required."
+        )
     return current_user
 
 

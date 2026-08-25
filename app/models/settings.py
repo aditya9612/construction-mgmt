@@ -1,5 +1,6 @@
 from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, JSON, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import Optional
 
 from app.models.base import Base, TimestampMixin
 
@@ -39,6 +40,12 @@ class CompanySettings(Base, TimestampMixin):
     __tablename__ = "company_settings"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+
+    company_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("companies.id", ondelete="CASCADE"), unique=True, nullable=True, index=True
+    )
+    
+    company = relationship("Company", back_populates="settings")
 
     company_name: Mapped[str | None] = mapped_column(String(255))
 

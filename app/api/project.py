@@ -643,6 +643,7 @@ class ProjectsService:
                 data["business_id"] = await generate_business_id(
                     db, m.Project, "business_id", "PRJ"
                 )
+                data["company_id"] = current_user.company_id
 
                 obj = await self.projects_repo.create_project(db, data)
 
@@ -722,6 +723,8 @@ class ProjectsService:
                 .join(m.ProjectMember, m.ProjectMember.project_id == m.Project.id)
                 .where(m.ProjectMember.user_id == current_user.id)
             )
+
+        base_query = base_query.where(m.Project.company_id == current_user.company_id)
 
         if search:
             base_query = base_query.where(

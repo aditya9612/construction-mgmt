@@ -175,6 +175,7 @@ async def create_labour(
             data["user_id"] = user.id
 
             obj = Labour(**data)
+            obj.company_id = current_user.company_id
             db.add(obj)
             await db.flush()
             await db.refresh(
@@ -232,9 +233,9 @@ async def list_labour(
             selectinload(Labour.contractor),
             selectinload(Labour.labour_type),
         )
-    ).distinct()
+    ).where(Labour.company_id == current_user.company_id).distinct()
 
-    count_query = select(func.count(func.distinct(Labour.id))).select_from(Labour)
+    count_query = select(func.count(func.distinct(Labour.id))).select_from(Labour).where(Labour.company_id == current_user.company_id)
 
     #  Subquery instead of JOIN
     if project_id:
@@ -472,7 +473,7 @@ async def update_labour(
 ):
     obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Labour record not found")
 
     #  FIX: get ALL mappings
@@ -614,7 +615,7 @@ async def delete_labour(
 ):
     obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Labour record not found")
 
     #  FIX: multi-project validation

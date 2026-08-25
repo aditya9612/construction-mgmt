@@ -65,6 +65,7 @@ from app.api.project_visualization import router as visualization_router
 from app.api.attendance import router as attendance_router
 from app.api.notification import router as notification_router
 from app.api.payments import router as payments_router
+from app.api.superadmin import router as superadmin_router
 # from app.api.rbac import router as rbac_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
@@ -324,6 +325,7 @@ def create_app() -> FastAPI:
     api_router.include_router(journal_router)
     api_router.include_router(work_update_router)
     api_router.include_router(payments_router)
+    api_router.include_router(superadmin_router)
 
     application.include_router(api_router, prefix="/api/v1")
 

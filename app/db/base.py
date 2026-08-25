@@ -22,6 +22,7 @@ from app.models.material import PurchaseOrder  # noqa: F401
 from app.models.material import MaterialTransfer  # noqa: F401
 
 from app.models.project import Project  # noqa: F401
+from app.models.company import Company  # noqa: F401
 from app.models.user import User # noqa: F401
 from app.models.owner import Owner
 from app.models.contractor import Contractor
@@ -45,7 +46,7 @@ from app.models.master_data import Unit
 from app.models.master_data import LabourType
 from app.models.master_data import ActivityType
 from app.models.master_data import MaterialMaster
-from app.models.settings import UserSettings
+from app.models.settings import UserSettings, CompanySettings
 from app.models.chat import ChatSession, ChatMember, ChatMessage, MessageRead, MessageReaction
 from app.models.quotation import QuotationItem, QuotationMaster, QuotationStatus
 from app.models.project_visualization import ProjectVisualization

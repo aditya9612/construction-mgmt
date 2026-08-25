@@ -44,6 +44,10 @@ class QuotationMaster(Base):
 
     quotation_no: Mapped[str] = mapped_column(String(50), unique=True, index=True)
 
+    company_id: Mapped[int | None] = mapped_column(
+        ForeignKey("companies.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+
     # ================= CLIENT =================
 
     client_user_id: Mapped[int | None] = mapped_column(

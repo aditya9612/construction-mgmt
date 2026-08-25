@@ -27,7 +27,18 @@ async def get_current_user_optional(
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-        return await get_current_active_user(request=request, db=db)
+        from fastapi.security.utils import get_authorization_scheme_param
+        from fastapi.security import HTTPAuthorizationCredentials
+        from app.core.dependencies import get_current_user
+
+        authorization = request.headers.get("Authorization")
+        scheme, credentials = get_authorization_scheme_param(authorization)
+        if not (authorization and scheme.lower() == "bearer"):
+            return None
+
+        creds = HTTPAuthorizationCredentials(scheme=scheme, credentials=credentials)
+        user = await get_current_user(request=request, credentials=creds, db=db)
+        return await get_current_active_user(current_user=user)
     except Exception:
         return None
 
@@ -129,9 +140,10 @@ async def create_user(
 
     try:
         # ------------------------
-        # ACTOR (AUDIT SUPPORT)
+        # ACTOR & TENANT (AUDIT SUPPORT & ISOLATION)
         # ------------------------
         creator_id = current_user.id if current_user else None
+        company_id = current_user.company_id if current_user else None
 
         # ------------------------
         # IMAGE
@@ -186,6 +198,7 @@ async def create_user(
                 designation=payload.designation,
                 joining_date=payload.joining_date,
                 created_by=creator_id,
+                company_id=company_id,
             )
 
         # ------------------------
@@ -225,6 +238,7 @@ async def create_user(
                 designation=payload.designation,
                 joining_date=payload.joining_date,
                 created_by=creator_id,
+                company_id=company_id,
             )
 
         # ------------------------
@@ -320,9 +334,9 @@ async def list_users(
     if cached is not None:
         return PaginatedResponse[UserOut].model_validate(cached)
 
-    query = select(User).where(User.is_deleted == False)
+    query = select(User).where(User.is_deleted == False, User.company_id == current_user.company_id)
     count_query = select(func.count()).select_from(User).where(
-        User.is_deleted == False
+        User.is_deleted == False, User.company_id == current_user.company_id
     )
 
     if search:
@@ -522,7 +536,11 @@ async def get_user(
     db: AsyncSession = Depends(get_db_session),
 ):
     user = await db.scalar(
-        select(User).where(User.id == user_id, User.is_deleted == False)
+        select(User).where(
+            User.id == user_id, 
+            User.is_deleted == False,
+            User.company_id == current_user.company_id
+        )
     )
 
     if user is None:
@@ -543,7 +561,11 @@ async def update_user(
     logger.info(f"Updating user id={user_id}")
 
     user = await db.scalar(
-        select(User).where(User.id == user_id, User.is_deleted == False)
+        select(User).where(
+            User.id == user_id, 
+            User.is_deleted == False,
+            User.company_id == current_user.company_id
+        )
     )
     if user is None:
         raise NotFoundError("User not found")
@@ -575,7 +597,7 @@ async def update_user(
             data["mobile"] = mobile_val
 
             existing = await db.scalar(
-                select(User).where(and_(User.mobile == mobile_val, User.id != user_id))
+                select(User).where(and_(User.mobile == mobile_val, User.id != user_id, User.company_id == current_user.company_id))
             )
             if existing:
                 raise ConflictError("Mobile already registered")
@@ -589,7 +611,7 @@ async def update_user(
 
             existing = await db.scalar(
                 select(User).where(
-                    and_(User.email == data["email"], User.id != user_id)
+                    and_(User.email == data["email"], User.id != user_id, User.company_id == current_user.company_id)
                 )
             )
             if existing:
@@ -669,7 +691,11 @@ async def delete_user(
     logger.info(f"Deleting user id={user_id}")
 
     user = await db.scalar(
-        select(User).where(User.id == user_id, User.is_deleted == False)
+        select(User).where(
+            User.id == user_id, 
+            User.is_deleted == False,
+            User.company_id == current_user.company_id
+        )
     )
 
     if user is None:

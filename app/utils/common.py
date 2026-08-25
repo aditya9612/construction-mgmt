@@ -17,19 +17,25 @@ async def assert_project_access(
     current_user: User,
 ):
     if current_user.role == UserRole.ADMIN.value:
+        # Check tenant access
+        project = await db.get(m.Project, project_id)
+        if not project or project.company_id != current_user.company_id:
+            raise PermissionDeniedError("Project belongs to another company")
         return
 
     exists = await db.scalar(
         select(func.count())
         .select_from(m.ProjectMember)
+        .join(m.Project, m.Project.id == m.ProjectMember.project_id)
         .where(
             m.ProjectMember.project_id == project_id,
             m.ProjectMember.user_id == current_user.id,
+            m.Project.company_id == current_user.company_id
         )
     )
 
     if not exists:
-        raise PermissionDeniedError("User is not part of this project")
+        raise PermissionDeniedError("User is not part of this project or company")
 
 
 async def assert_task_project(db: AsyncSession, task_id: int | None, project_id: int):
@@ -52,6 +58,11 @@ async def validate_contractor_access(
     """
     Ensure user has access to contractor via project mapping
     """
+
+    from app.models.contractor import Contractor
+    contractor = await db.get(Contractor, contractor_id)
+    if not contractor or contractor.company_id != current_user.company_id:
+        raise PermissionDeniedError("Access denied")
 
     result = await db.execute(
         select(ContractorProject.project_id).where(
