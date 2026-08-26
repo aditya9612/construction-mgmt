@@ -28,6 +28,7 @@ from app.schemas.superadmin import (
     SubscriptionUpdate,
     EntitlementOut,
     AuditLogOut,
+    BillingWebhookEventOut,
 )
 from app.schemas.user import UserOut
 from app.utils.helpers import AppError, NotFoundError, ConflictError
@@ -965,15 +966,110 @@ class SuperAdminService:
 
         return await self.get_company_subscription(db, company_id)
 
-    async def get_company_entitlements(
-        self, db: AsyncSession, company_id: int
-    ) -> EntitlementOut:
+    async def get_company_entitlements(self, db: AsyncSession, company_id: int) -> EntitlementOut:
+        company = await db.get(Company, company_id)
+        if not company:
+            raise NotFoundError("Company not found")
+        
+        data = await self.entitlement_service.get_company_entitlements(db, company_id)
+        return EntitlementOut(**data)
+
+    async def list_company_invoices(
+        self, db: AsyncSession, company_id: int, limit: int = 20, offset: int = 0
+    ) -> PaginatedResponse[Dict[str, Any]]:
         company = await db.get(Company, company_id)
         if not company:
             raise NotFoundError("Company not found")
 
-        data = await self.entitlement_service.get_company_entitlements(db, company_id)
-        return EntitlementOut(**data)
+        from app.models.subscription import SubscriptionInvoice
+        
+        query = (
+            select(SubscriptionInvoice)
+            .where(SubscriptionInvoice.company_id == company_id)
+            .order_by(SubscriptionInvoice.created_at.desc())
+        )
+        count_query = select(func.count()).select_from(SubscriptionInvoice).where(SubscriptionInvoice.company_id == company_id)
+        
+        total = await db.scalar(count_query) or 0
+        rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
+        
+        items = [
+            {
+                "id": inv.id,
+                "company_id": inv.company_id,
+                "subscription_id": inv.subscription_id,
+                "invoice_number": inv.invoice_number,
+                "status": inv.status,
+                "subtotal": float(inv.subtotal),
+                "tax_amount": float(inv.tax_amount),
+                "total_amount": float(inv.total_amount),
+                "currency": inv.currency,
+                "issued_at": inv.issued_at,
+                "due_at": inv.due_at,
+                "paid_at": inv.paid_at,
+                "created_at": inv.created_at,
+            }
+            for inv in rows
+        ]
+        
+        from app.schemas.base import PaginationMeta
+        meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
+        return PaginatedResponse(items=items, meta=meta)
+
+    async def reconcile_company_billing(
+        self, db: AsyncSession, company_id: int, current_user: User
+    ) -> Dict[str, Any]:
+        company = await db.get(Company, company_id)
+        if not company:
+            raise NotFoundError("Company not found")
+
+        from app.core.config import settings
+        from app.services.billing.mock_provider import MockPaymentProvider
+        from app.services.billing.razorpay_provider import RazorpayPaymentProvider
+        from app.services.billing.reconciliation_service import BillingReconciliationService
+
+        if settings.PAYMENT_PROVIDER == "razorpay":
+            if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
+                raise AppError(status_code=503, message="Razorpay credentials not configured")
+            provider = RazorpayPaymentProvider()
+        else:
+            provider = MockPaymentProvider()
+
+        recon_service = BillingReconciliationService(provider)
+        return await recon_service.reconcile_tenant(db, company_id, current_user)
+
+    async def list_company_billing_events(
+        self, db: AsyncSession, company_id: int, limit: int = 20, offset: int = 0
+    ) -> PaginatedResponse[BillingWebhookEventOut]:
+        company = await db.get(Company, company_id)
+        if not company:
+            raise NotFoundError("Company not found")
+
+        from app.models.subscription import BillingWebhookEvent
+        query = select(BillingWebhookEvent).where(BillingWebhookEvent.company_id == company_id).order_by(BillingWebhookEvent.id.desc())
+        count_query = select(func.count()).select_from(BillingWebhookEvent).where(BillingWebhookEvent.company_id == company_id)
+
+        total = await db.scalar(count_query) or 0
+        rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
+
+        items = [
+            BillingWebhookEventOut(
+                id=evt.id,
+                company_id=evt.company_id,
+                provider=evt.provider,
+                event_id=evt.event_id,
+                event_type=evt.event_type,
+                status=evt.status,
+                payload_reference=evt.payload_reference,
+                processed_at=evt.processed_at,
+                created_at=evt.created_at,
+            )
+            for evt in rows
+        ]
+
+        from app.schemas.base import PaginationMeta
+        meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
+        return PaginatedResponse[BillingWebhookEventOut](items=items, meta=meta)
 
     # =========================================================================
     # 6. PLATFORM AUDIT LOGS

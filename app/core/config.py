@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_PHONE_NUMBER: str = ""
+    
+    PAYMENT_PROVIDER: str = "mock"  # mock | razorpay
+    RAZORPAY_KEY_ID: str = ""
+    RAZORPAY_KEY_SECRET: str = ""
+    RAZORPAY_WEBHOOK_SECRET: str = ""
+
+    # ================= PLATFORM SAAS UPI =================
+    SUPER_ADMIN_UPI_ID: str = "9960106127@ybl"
+    SUPER_ADMIN_PAYEE_NAME: str = "InfraPilot"
 
     # ================= EMAIL (SMTP) =================
     # SMTP_HOST: str = "smtp.gmail.com"

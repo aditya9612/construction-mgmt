@@ -327,6 +327,8 @@ def create_app() -> FastAPI:
     api_router.include_router(payments_router)
     api_router.include_router(superadmin_router)
 
+    from app.api.saas_billing import router as saas_billing_router
+    api_router.include_router(saas_billing_router)
     application.include_router(api_router, prefix="/api/v1")
 
     return application

@@ -158,6 +158,22 @@ class SubscriptionUpdate(BaseSchema):
     auto_renew: Optional[bool] = None
 
 
+class SubscriptionInvoiceOut(BaseSchema):
+    id: int
+    company_id: int
+    subscription_id: int
+    invoice_number: str
+    status: str
+    subtotal: float
+    tax_amount: float
+    total_amount: float
+    currency: str
+    issued_at: Optional[datetime] = None
+    due_at: Optional[datetime] = None
+    paid_at: Optional[datetime] = None
+    created_at: datetime
+
+
 class EntitlementOut(BaseSchema):
     plan_id: Optional[int] = None
     plan_name: str
@@ -176,3 +192,31 @@ class EntitlementOut(BaseSchema):
     equipment: bool = True
     ai_features: bool = False
     features: Dict[str, Any] = Field(default_factory=dict)
+
+
+class BillingReconciliationOut(BaseSchema):
+    company_id: int
+    subscription_id: Optional[int] = None
+    local_status: Optional[str] = None
+    provider_name: str
+    provider_subscription_id: Optional[str] = None
+    provider_status: Optional[str] = None
+    is_matched: bool
+    has_drift: bool
+    drift_type: str
+    details: Optional[str] = None
+    reconciled_at: datetime
+
+
+class BillingWebhookEventOut(BaseSchema):
+    id: int
+    company_id: Optional[int] = None
+    provider: str
+    event_id: str
+    event_type: str
+    status: str
+    payload_reference: Optional[str] = None
+    processed_at: Optional[datetime] = None
+    created_at: datetime
+
+

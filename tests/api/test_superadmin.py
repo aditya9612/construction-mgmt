@@ -65,6 +65,8 @@ def test_unauthenticated_requests_denied():
     assert client.post("/api/v1/superadmin/companies", json={"name": "Test", "subdomain": "test-t1"}).status_code == 401
     assert client.get("/api/v1/superadmin/plans").status_code == 401
     assert client.get("/api/v1/superadmin/audit-logs").status_code == 401
+    assert client.get("/api/v1/superadmin/companies/1/billing/reconciliation").status_code == 401
+    assert client.get("/api/v1/superadmin/companies/1/billing-events").status_code == 401
 
 
 def test_normal_user_denied_superadmin_api():
@@ -74,6 +76,8 @@ def test_normal_user_denied_superadmin_api():
     assert client.post("/api/v1/superadmin/companies", json={"name": "Test", "subdomain": "test-t1"}).status_code == 403
     assert client.get("/api/v1/superadmin/plans").status_code == 403
     assert client.get("/api/v1/superadmin/audit-logs").status_code == 403
+    assert client.get("/api/v1/superadmin/companies/1/billing/reconciliation").status_code == 403
+    assert client.get("/api/v1/superadmin/companies/1/billing-events").status_code == 403
     clear_overrides()
 
 
@@ -84,6 +88,8 @@ def test_tenant_admin_denied_superadmin_api():
     assert client.post("/api/v1/superadmin/companies", json={"name": "Test", "subdomain": "test-t1"}).status_code == 403
     assert client.get("/api/v1/superadmin/plans").status_code == 403
     assert client.get("/api/v1/superadmin/audit-logs").status_code == 403
+    assert client.get("/api/v1/superadmin/companies/1/billing/reconciliation").status_code == 403
+    assert client.get("/api/v1/superadmin/companies/1/billing-events").status_code == 403
     clear_overrides()
 
 
@@ -255,3 +261,61 @@ def test_superadmin_platform_audit_logs():
     assert comp_audit_resp.status_code in (200, 404)
 
     clear_overrides()
+
+
+def test_superadmin_list_tenant_invoices():
+    override_user(super_admin_user)
+    
+    # We assume company 1 exists from previous tests or mock
+    resp = client.get(f"/api/v1/superadmin/companies/1/invoices")
+    assert resp.status_code in (200, 404)
+    if resp.status_code == 200:
+        data = resp.json()
+        assert "items" in data
+        assert "meta" in data
+        
+    clear_overrides()
+
+
+def test_superadmin_reconciliation_endpoint():
+    override_user(super_admin_user)
+    
+    resp = client.get("/api/v1/superadmin/companies/1/billing/reconciliation")
+    assert resp.status_code in (200, 404)
+    if resp.status_code == 200:
+        data = resp.json()
+        assert "company_id" in data
+        assert "is_matched" in data
+        assert "has_drift" in data
+        assert "drift_type" in data
+        assert "provider_name" in data
+        assert "reconciled_at" in data
+
+    clear_overrides()
+
+
+def test_superadmin_list_billing_events():
+    override_user(super_admin_user)
+    
+    resp = client.get("/api/v1/superadmin/companies/1/billing-events")
+    assert resp.status_code in (200, 404)
+    if resp.status_code == 200:
+        data = resp.json()
+        assert "items" in data
+        assert "meta" in data
+        for item in data["items"]:
+            assert "company_id" in item
+            assert "provider" in item
+            assert "event_id" in item
+            assert "event_type" in item
+            assert "status" in item
+            assert "created_at" in item
+            # Verify no raw payload or secrets leaked
+            assert "raw" not in item
+            assert "payload_summary" not in item
+            assert "secret" not in item
+            assert "signature" not in item
+
+    clear_overrides()
+
+

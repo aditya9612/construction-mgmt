@@ -97,6 +97,9 @@ class BillingWebhookEvent(Base, TimestampMixin):
     __tablename__ = "billing_webhook_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    company_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     provider: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # razorpay, stripe, etc.
     event_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
@@ -108,6 +111,48 @@ class BillingWebhookEvent(Base, TimestampMixin):
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
+    company = relationship("Company", backref="billing_webhook_events")
+
     __table_args__ = (
         UniqueConstraint("provider", "event_id", name="uq_provider_event_id"),
     )
+
+
+class ManualPaymentTransaction(Base, TimestampMixin):
+    __tablename__ = "manual_payment_transactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    company_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("companies.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    subscription_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    plan_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("plans.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    invoice_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscription_invoices.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    amount: Mapped[Decimal] = mapped_column(DECIMAL(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="INR")
+    payment_method: Mapped[str] = mapped_column(String(50), nullable=False, default="UPI")
+    transaction_reference: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    utr_reference: Mapped[Optional[str]] = mapped_column(String(100), unique=True, index=True, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="pending", index=True
+    )  # pending, verified, rejected
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    verified_by: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    company = relationship("Company", backref="manual_payment_transactions")
+    subscription = relationship("Subscription", backref="manual_payment_transactions")
+    plan = relationship("Plan", backref="manual_payment_transactions")
+    invoice = relationship("SubscriptionInvoice", backref="manual_payment_transactions")
+    verifier = relationship("User", foreign_keys=[verified_by], backref="verified_manual_payments")
+
+

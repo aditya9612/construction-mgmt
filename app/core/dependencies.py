@@ -207,6 +207,23 @@ async def require_super_admin(
     return current_user
 
 
+async def require_tenant_admin(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    if not current_user.company_id or current_user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant Admin privileges required.",
+        )
+    if current_user.role != UserRole.ADMIN.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant Admin privileges required.",
+        )
+    return current_user
+
+
+
 # def require_roles(allowed_roles: Iterable[UserRole]) -> Callable[[User], User]:
 #     allowed: List[UserRole] = list(allowed_roles)
 

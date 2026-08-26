@@ -22,6 +22,9 @@ from app.schemas.superadmin import (
     SubscriptionUpdate,
     EntitlementOut,
     AuditLogOut,
+    SubscriptionInvoiceOut,
+    BillingReconciliationOut,
+    BillingWebhookEventOut,
 )
 from app.schemas.user import UserOut
 from app.schemas.base import PaginatedResponse
@@ -353,6 +356,39 @@ async def get_company_entitlements(
     service: SuperAdminService = Depends(get_superadmin_service),
 ):
     return await service.get_company_entitlements(db, company_id)
+
+
+@router.get("/companies/{company_id}/invoices", response_model=PaginatedResponse[SubscriptionInvoiceOut])
+async def list_company_invoices(
+    company_id: int = Path(..., ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db_session),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.list_company_invoices(db, company_id, limit, offset)
+
+
+@router.get("/companies/{company_id}/billing/reconciliation", response_model=BillingReconciliationOut)
+async def reconcile_company_billing(
+    company_id: int = Path(..., ge=1),
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db_session),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.reconcile_company_billing(db, company_id, current_user)
+
+
+@router.get("/companies/{company_id}/billing-events", response_model=PaginatedResponse[BillingWebhookEventOut])
+async def list_company_billing_events(
+    company_id: int = Path(..., ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db_session),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.list_company_billing_events(db, company_id, limit, offset)
+
 
 
 # =============================================================================

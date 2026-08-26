@@ -64,6 +64,8 @@ async def test_tenant_isolation_db_level():
             from app.services.superadmin import SuperAdminService
             from app.schemas.superadmin import CompanyCreate, CompanyAdminCreate
             service = SuperAdminService()
+            import uuid
+            uid = uuid.uuid4().hex[:6]
 
             # Pre-cleanup in case of previous failure
             await db.execute(text("DELETE FROM activity_logs WHERE performed_by IN (999)"))
@@ -71,16 +73,21 @@ async def test_tenant_isolation_db_level():
             await db.execute(text("DELETE FROM users WHERE email IN ('admin-a-new@test.com', 'admin-inv-new@test.com', 'admin-inv2-new@test.com')"))
             await db.execute(text("DELETE FROM company_settings WHERE company_id IN (SELECT id FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new'))"))
             await db.execute(text("DELETE FROM projects WHERE company_id IN (SELECT id FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new'))"))
+            await db.execute(text("DELETE FROM subscription_invoices WHERE company_id IN (SELECT id FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new'))"))
+            await db.execute(text("DELETE FROM subscriptions WHERE company_id IN (SELECT id FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new'))"))
             await db.execute(text("DELETE FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new')"))
             await db.execute(text("DELETE FROM users WHERE id = 999"))
             await db.commit()
 
             # Insert real super admin to satisfy FK constraint
-            await db.execute(text("INSERT IGNORE INTO users (id, email, hashed_password, full_name, mobile, role, is_active, is_deleted, is_super_admin, created_at, updated_at) VALUES (999, 'super@test.com', 'pass', 'Super', '9999999999', 'Admin', 1, 0, 1, NOW(), NOW())"))
+            import random
+            r_mobile = f"99{random.randint(10000000, 99999999)}"
+            r_email = f"super-{uid}@test.com"
+            await db.execute(text(f"INSERT IGNORE INTO users (id, email, hashed_password, full_name, mobile, role, is_active, is_deleted, is_super_admin, created_at, updated_at) VALUES (999, '{r_email}', 'pass', 'Super', '{r_mobile}', 'Admin', 1, 0, 1, NOW(), NOW())"))
             await db.commit()
 
             # Create Company A
-            comp_a = await service.create_company(db, super_admin, CompanyCreate(name="Test A New", subdomain="test-a-123-new"))
+            comp_a = await service.create_company(db, super_admin, CompanyCreate(name="Test A New", subdomain=f"test-a-{uid}"))
             
             # Create Admin for A
             admin_a = await service.create_company_admin(db, comp_a.id, super_admin, CompanyAdminCreate(
@@ -94,7 +101,7 @@ async def test_tenant_isolation_db_level():
             assert getattr(admin_a_db.role, "value", admin_a_db.role) == "Admin"
 
             # Create Company B
-            comp_b = await service.create_company(db, super_admin, CompanyCreate(name="Test B New", subdomain="test-b-123-new"))
+            comp_b = await service.create_company(db, super_admin, CompanyCreate(name="Test B New", subdomain=f"test-b-{uid}"))
 
             # Test invalid company ID
             with pytest.raises(Exception):
@@ -130,6 +137,8 @@ async def test_tenant_isolation_db_level():
                 await db.execute(text("DELETE FROM users WHERE email IN ('admin-a-new@test.com', 'admin-inv-new@test.com', 'admin-inv2-new@test.com')"))
                 await db.execute(text("DELETE FROM company_settings WHERE company_id IN (SELECT id FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new'))"))
                 await db.execute(text("DELETE FROM projects WHERE company_id IN (SELECT id FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new'))"))
+                await db.execute(text("DELETE FROM subscription_invoices WHERE company_id IN (SELECT id FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new'))"))
+                await db.execute(text("DELETE FROM subscriptions WHERE company_id IN (SELECT id FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new'))"))
                 await db.execute(text("DELETE FROM companies WHERE subdomain IN ('test-a-123-new', 'test-b-123-new')"))
                 await db.execute(text("DELETE FROM users WHERE id = 999"))
                 await db.commit()
