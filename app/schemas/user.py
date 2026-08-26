@@ -142,6 +142,8 @@ class UserOut(BaseSchema):
     department: Optional[str]
     joining_date: Optional[date]
     is_active: bool
+    company_id: Optional[int] = None
+    is_super_admin: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -161,6 +163,8 @@ class UserOut(BaseSchema):
                 "department": getattr(data, "department", None),
                 "joining_date": getattr(data, "joining_date", None),
                 "is_active": data.is_active,
+                "company_id": getattr(data, "company_id", None),
+                "is_super_admin": getattr(data, "is_super_admin", False),
             }
         return data
 

@@ -112,7 +112,7 @@ router = APIRouter(
 async def create_user(
     payload: UserCreatePayload = Depends(),
     profile_image: UploadFile = File(None),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
     """Create a user with any role. Provide either email+password or mobile_number."""
@@ -135,6 +135,11 @@ async def create_user(
                 422,
                 "Use /labour API to create labour users"
             )
+        if role == UserRole.ADMIN.value:
+            raise AppError(
+                403,
+                "Cannot create Admin users via this endpoint. Super Admins must use /superadmin/companies/{id}/admin"
+            )
     except ValueError:
         raise AppError(422, f"Invalid role. Use one of: {ROLES}")
 
@@ -142,8 +147,18 @@ async def create_user(
         # ------------------------
         # ACTOR & TENANT (AUDIT SUPPORT & ISOLATION)
         # ------------------------
-        creator_id = current_user.id if current_user else None
-        company_id = current_user.company_id if current_user else None
+        if current_user.company_id is None:
+            raise AppError(403, "User does not belong to any company.")
+            
+        creator_id = current_user.id
+        company_id = current_user.company_id
+
+        # ------------------------
+        # SAAS ENTITLEMENT: USER LIMIT & SUBSCRIPTION ENFORCEMENT
+        # ------------------------
+        from app.services.entitlement import get_entitlement_service
+        entitlement_service = get_entitlement_service()
+        await entitlement_service.assert_can_create_user(db, company_id)
 
         # ------------------------
         # IMAGE

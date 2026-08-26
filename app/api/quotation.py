@@ -1633,6 +1633,7 @@ async def create_quotation(
         return await get_quotation_or_404(
             quotation.id,
             db,
+            current_user,
         )
 
     # =====================================================
@@ -2646,6 +2647,7 @@ async def update_labour_item(
     quotation = await get_quotation_or_404(
         labour_item.quotation_id,
         db,
+        current_user,
     )
 
     # =====================================================
@@ -2724,6 +2726,7 @@ async def update_labour_item(
     return await get_quotation_or_404(
         quotation.id,
         db,
+        current_user,
     )
 
 # =========================================================

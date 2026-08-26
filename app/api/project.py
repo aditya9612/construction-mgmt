@@ -78,6 +78,7 @@ from app.utils.helpers import (
     AppError,
     BadRequestError,
     DataIntegrityError,
+    ForbiddenError,
     NotFoundError,
     ConflictError,
     PermissionDeniedError,
@@ -627,6 +628,14 @@ class ProjectsService:
         self, db: AsyncSession, current_user: User, payload: s.ProjectCreate
     ) -> s.ProjectOut:
         self._assert_project_mutation_role(current_user)
+        if not current_user.company_id and not current_user.is_super_admin:
+            raise ForbiddenError("User does not belong to any tenant company.")
+
+        if current_user.company_id:
+            from app.services.entitlement import get_entitlement_service
+            entitlement_service = get_entitlement_service()
+            await entitlement_service.assert_can_create_project(db, current_user.company_id)
+
         data = payload.model_dump(exclude_unset=True)
         if "status" not in data:
             data["status"] = s.ProjectStatus.PLANNED
@@ -638,7 +647,7 @@ class ProjectsService:
             if payload.end_date < payload.start_date:
                 raise ValidationError("end_date cannot be before start_date")
 
-        for _ in range(3):
+        for attempt in range(3):
             try:
                 data["business_id"] = await generate_business_id(
                     db, m.Project, "business_id", "PRJ"
@@ -657,19 +666,38 @@ class ProjectsService:
                     )
                 )
                 await db.flush()
-
                 break
 
             except IntegrityError as e:
                 await db.rollback()
-
-                # Optional: if name conflict (keep your logic)
                 if "project_name" in str(e.orig):
                     raise ConflictError("Project with this name already exists")
-
                 continue
+            except Exception as exc:
+                await db.rollback()
+                logger.warning(f"Project creation retry attempt {attempt} failed: {exc}")
+                import uuid
+                data["business_id"] = f"PRJ-{uuid.uuid4().hex[:6].upper()}"
+                try:
+                    data["company_id"] = current_user.company_id
+                    obj = await self.projects_repo.create_project(db, data)
+                    db.add(
+                        ActivityLog(
+                            action="CREATE_PROJECT",
+                            entity="project",
+                            entity_id=obj.id,
+                            performed_by=current_user.id,
+                            details={"message": f"Project '{obj.project_name}' created"},
+                        )
+                    )
+                    await db.flush()
+                    break
+                except Exception as inner_exc:
+                    await db.rollback()
+                    logger.warning(f"Fallback project creation failed: {inner_exc}")
+                    continue
         else:
-            raise Exception("Failed to generate unique project ID")
+            raise AppError(status_code=400, message="Could not create project due to conflicting data.")
 
         completion_map = await self._compute_completion_percentage_by_project_ids(
             db, [obj.id]
@@ -1109,6 +1137,7 @@ class MilestonesService:
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
 
         data = payload.model_dump(exclude_unset=True)
 
@@ -1134,6 +1163,7 @@ class MilestonesService:
     async def list_milestones(
         self,
         db: AsyncSession,
+        current_user: User,
         *,
         project_id: int,
         pagination: PaginationParams,
@@ -1142,6 +1172,7 @@ class MilestonesService:
         project = await self.projects_repo.get_project(db, project_id=project_id)
         if project is None:
             raise NotFoundError("Project not found")
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
 
         rows, total = await self.milestones_repo.list_milestones(
             db,
@@ -1162,13 +1193,14 @@ class MilestonesService:
         )
 
     async def get_milestone(
-        self, db: AsyncSession, *, project_id: int, milestone_id: int
+        self, db: AsyncSession, current_user: User, *, project_id: int, milestone_id: int
     ) -> s.MilestoneOut:
         obj = await self.milestones_repo.get_milestone(
             db, project_id=project_id, milestone_id=milestone_id
         )
         if obj is None:
             raise NotFoundError("Milestone not found")
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
         return serialize_milestone(obj)
 
     async def update_milestone(
@@ -1186,6 +1218,7 @@ class MilestonesService:
         )
         if obj is None:
             raise NotFoundError("Milestone not found")
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
 
         data = payload.model_dump(exclude_unset=True)
         if "title" in data and data["title"] is None:
@@ -1236,6 +1269,7 @@ class MilestonesService:
         )
         if obj is None:
             raise NotFoundError("Milestone not found")
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
         try:
             await self.milestones_repo.delete_milestone(db, obj=obj)
         except Exception:
@@ -2196,13 +2230,21 @@ class AlertsService:
     ):
         today = date.today()
 
+        if current_user.company_id is None:
+            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=pagination.limit, offset=pagination.offset))
+
         if current_user.role in (
             UserRole.ADMIN.value,
             UserRole.PROJECT_MANAGER.value,
         ):
-            base_query = select(m.Task).where(
-                m.Task.end_date < today,
-                m.Task.status != s.TaskStatus.COMPLETED,
+            base_query = (
+                select(m.Task)
+                .join(m.Project, m.Task.project_id == m.Project.id)
+                .where(
+                    m.Task.end_date < today,
+                    m.Task.status != s.TaskStatus.COMPLETED,
+                    m.Project.company_id == current_user.company_id
+                )
             )
         else:
             base_query = (
@@ -3809,6 +3851,7 @@ async def list_milestones(
 ):
     return await service.list_milestones(
         db,
+        current_user=current_user,
         project_id=project_id,
         pagination=pagination,
     )
@@ -3825,7 +3868,7 @@ async def get_milestone(
     service: MilestonesService = Depends(get_milestones_service),
 ):
     return await service.get_milestone(
-        db, project_id=project_id, milestone_id=milestone_id
+        db, current_user=current_user, project_id=project_id, milestone_id=milestone_id
     )
 
 
@@ -4203,6 +4246,7 @@ async def create_task_request(
     current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
     request = form.to_schema()
+    await assert_project_access(db, project_id=request.project_id, current_user=current_user)
 
     attachment_url = None
 
@@ -4233,7 +4277,9 @@ async def get_task_requests(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
-    query = select(m.TaskRequest).where(m.TaskRequest.is_deleted == False)
+    if current_user.company_id is None:
+        return []
+    query = select(m.TaskRequest).join(m.Project, m.TaskRequest.project_id == m.Project.id).where(m.TaskRequest.is_deleted == False, m.Project.company_id == current_user.company_id)
     if project_id:
         query = query.where(m.TaskRequest.project_id == project_id)
     if status:
@@ -4262,7 +4308,9 @@ async def list_task_requests(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
 ):
-    query = select(m.TaskRequest).where(m.TaskRequest.is_deleted == False)
+    if current_user.company_id is None:
+        return s.PaginatedResponse(items=[], meta=s.PaginationMeta(page=page, page_size=page_size, total=0, total_pages=0))
+    query = select(m.TaskRequest).join(m.Project, m.TaskRequest.project_id == m.Project.id).where(m.TaskRequest.is_deleted == False, m.Project.company_id == current_user.company_id)
 
     # Filters
     if project_id:
@@ -4318,6 +4366,7 @@ async def update_task_request(
 
     if not db_obj:
         raise HTTPException(status_code=404, detail="Task request not found")
+    await assert_project_access(db, project_id=db_obj.project_id, current_user=current_user)
 
     update_data = request.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -4343,6 +4392,8 @@ async def delete_task_request(
 
     if not db_obj:
         raise HTTPException(status_code=404, detail="Task request not found")
+
+    await assert_project_access(db, project_id=db_obj.project_id, current_user=current_user)
 
     # Soft delete
     db_obj.is_deleted = True
@@ -4850,6 +4901,7 @@ async def get_dsr_map_points(
     current_user: User = Depends(require_roles(DSR_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     result = await db.execute(
         select(
             m.DailySiteReport.latitude,
@@ -4975,6 +5027,7 @@ async def delete_dsr(
     if not obj:
         logger.warning(f"DSR not found id={id}")
         raise NotFoundError("DSR not found")
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
 
     try:
         await db.delete(obj)
@@ -5001,6 +5054,7 @@ async def get_dsr_photos(
     dsr = await db.get(m.DailySiteReport, dsr_id)
     if not dsr:
         raise NotFoundError("DSR not found")
+    await assert_project_access(db, project_id=dsr.project_id, current_user=current_user)
 
     result = await db.execute(select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == dsr_id))
     rows = result.scalars().all()
@@ -5018,6 +5072,9 @@ async def delete_dsr_photo(
 
     if not obj:
         raise NotFoundError("Photo not found")
+    dsr = await db.get(m.DailySiteReport, obj.dsr_id)
+    if dsr:
+        await assert_project_access(db, project_id=dsr.project_id, current_user=current_user)
 
     try:
         await db.delete(obj)
@@ -5369,12 +5426,14 @@ async def list_issues(
     current_user: User = Depends(require_roles(READ_ROLES)),
 ):
     pagination = pagination.normalized()
+    if current_user.company_id is None:
+        return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=pagination.limit, offset=pagination.offset))
 
     if current_user.role in (
         UserRole.ADMIN.value,
         UserRole.PROJECT_MANAGER.value,
     ):
-        base_query = select(m.Issue)
+        base_query = select(m.Issue).join(m.Project, m.Issue.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
     else:
         subquery = select(m.ProjectMember.project_id).where(
             m.ProjectMember.user_id == current_user.id
@@ -5602,6 +5661,7 @@ async def delete_issue(
         logger.warning(f"Issue not found id={id}")
         raise NotFoundError("Issue not found")
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
     if current_user.role not in (
         UserRole.ADMIN.value,
         UserRole.PROJECT_MANAGER.value,
@@ -5641,6 +5701,7 @@ async def issues_by_project(
     current_user: User = Depends(require_roles(READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     pagination = pagination.normalized()
 
     total = await db.scalar(
@@ -5679,6 +5740,7 @@ async def issue_analytics(
 ):
     if start_date and end_date and end_date < start_date:
         raise BadRequestError("end_date cannot be before start_date")
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     base_query = select(m.DailySiteReport).where(
         m.DailySiteReport.project_id == project_id

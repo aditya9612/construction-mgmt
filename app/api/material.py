@@ -135,6 +135,8 @@ from app.schemas.material import (
 )
 
 from app.core.logger import logger
+from app.utils.common import assert_project_access
+from app.utils.helpers import PermissionDeniedError
 
 MATERIAL_READ_ROLES = [
     r.value
@@ -1006,6 +1008,7 @@ async def material_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     from decimal import Decimal
     from fastapi import HTTPException
 
@@ -1093,7 +1096,7 @@ async def list_suppliers(
         (
             await db.execute(
                 select(Supplier)
-                .where(Supplier.is_deleted == False)
+                .where(Supplier.is_deleted == False, Supplier.company_id == current_user.company_id)
                 .order_by(Supplier.id.desc())
                 .offset(skip)
                 .limit(limit)
@@ -1114,6 +1117,9 @@ async def generate_supplier_qr(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _s = await db.get(Supplier, supplier_id)
+    if not _s or _s.company_id != current_user.company_id:
+        raise NotFoundError("Supplier not found")
     supplier = await db.get(Supplier, supplier_id)
 
     if not supplier or supplier.is_deleted:
@@ -1141,6 +1147,9 @@ async def get_supplier(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _s = await db.get(Supplier, supplier_id)
+    if not _s or _s.company_id != current_user.company_id:
+        raise NotFoundError("Supplier not found")
     supplier = await db.get(Supplier, supplier_id)
 
     if not supplier or supplier.is_deleted:
@@ -1230,6 +1239,7 @@ async def create_supplier(
         existing = await db.scalar(
             select(Supplier).where(
                 Supplier.is_deleted.is_(False),
+                Supplier.company_id == current_user.company_id,
                 or_(*conditions),
             )
         )
@@ -1247,6 +1257,7 @@ async def create_supplier(
         phone_email=phone_email,
         gst_number=gst_number,
         address=address,
+        company_id=current_user.company_id,
     )
 
     try:
@@ -1274,6 +1285,9 @@ async def update_supplier(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _s = await db.get(Supplier, supplier_id)
+    if not _s or _s.company_id != current_user.company_id:
+        raise NotFoundError("Supplier not found")
     import re
 
     supplier = await db.get(Supplier, supplier_id)
@@ -1418,6 +1432,9 @@ async def delete_supplier(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
 ):
+    _s = await db.get(Supplier, id)
+    if not _s or _s.company_id != current_user.company_id:
+        raise NotFoundError("Supplier not found")
     obj = await db.get(Supplier, id)
 
     if not obj or obj.is_deleted:
@@ -1460,6 +1477,10 @@ async def get_supplier_materials(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
 
@@ -1516,6 +1537,7 @@ async def get_material_alerts(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     query = (
         select(
             Material,
@@ -1586,6 +1608,7 @@ async def create_po(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
 ):
 
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     if payload.quantity <= 0 or payload.rate <= 0:
         raise HTTPException(400, "Quantity and rate must be greater than 0")
 
@@ -1647,6 +1670,10 @@ async def get_po(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
 
+    _po = await db.get(PurchaseOrder, id)
+    if not _po:
+        raise NotFoundError("PO not found")
+    await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
     po = await db.get(PurchaseOrder, id)
 
     if not po or po.is_deleted:
@@ -1671,6 +1698,7 @@ async def list_po(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     limit = min(max(limit, 1), 100)
 
     if (
@@ -1710,6 +1738,10 @@ async def update_po(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _po = await db.get(PurchaseOrder, id)
+    if not _po:
+        raise NotFoundError("PO not found")
+    await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
     obj = await db.get(PurchaseOrder, id)
 
     if not obj or obj.is_deleted:
@@ -1767,6 +1799,10 @@ async def delete_po(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
 ):
 
+    _po = await db.get(PurchaseOrder, id)
+    if not _po:
+        raise NotFoundError("PO not found")
+    await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
     obj = await db.get(PurchaseOrder, id)
 
     if not obj or obj.is_deleted:
@@ -1808,6 +1844,7 @@ async def project_transactions(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
     if current_user.role != UserRole.ADMIN.value and project_id not in (
@@ -1858,6 +1895,10 @@ async def get_material_transactions(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
 
@@ -1920,6 +1961,8 @@ async def create_transfer(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     redis=Depends(get_request_redis),
 ):
+    await assert_project_access(db, project_id=payload.from_project_id, current_user=current_user)
+    await assert_project_access(db, project_id=payload.to_project_id, current_user=current_user)
     try:
 
         if payload.quantity <= 0:
@@ -2192,6 +2235,7 @@ async def list_transfers(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     skip = max(skip, 0)
     limit = min(max(limit, 1), 100)
 
@@ -2275,6 +2319,11 @@ async def get_transfer(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
 
+    _tr = await db.get(MaterialTransfer, id)
+    if not _tr:
+        raise NotFoundError("Transfer not found")
+    await assert_project_access(db, project_id=_tr.from_project_id, current_user=current_user)
+    await assert_project_access(db, project_id=_tr.to_project_id, current_user=current_user)
     FromProject = aliased(Project)
     ToProject = aliased(Project)
 
@@ -2320,6 +2369,11 @@ async def update_transfer_status(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _tr = await db.get(MaterialTransfer, id)
+    if not _tr:
+        raise NotFoundError("Transfer not found")
+    await assert_project_access(db, project_id=_tr.from_project_id, current_user=current_user)
+    await assert_project_access(db, project_id=_tr.to_project_id, current_user=current_user)
     status = status.upper().strip()
 
     if status not in VALID_STATUS:
@@ -2458,6 +2512,10 @@ async def usage(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
 
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     import json
     import hashlib
 
@@ -2755,6 +2813,10 @@ async def purchase(
     redis=Depends(get_request_redis),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     import uuid
 
     import json
@@ -3046,6 +3108,7 @@ async def adjust_inventory(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
 
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     import json
     import hashlib
 
@@ -3364,6 +3427,7 @@ async def get_inventory_valuation(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     query = select(
         Material.quantity_purchased,
         Material.remaining_stock,
@@ -3405,6 +3469,7 @@ async def get_project_inventory(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     result = await db.execute(
         select(
             Material.id,
@@ -3457,6 +3522,10 @@ async def logs(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     limit = min(max(limit, 1), 100)
 
     if (
@@ -3535,6 +3604,10 @@ async def material_report(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
 
@@ -4292,6 +4365,10 @@ async def export_pdf(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     try:
         if current_user.role != UserRole.ADMIN.value and project_id not in (
             current_user.allowed_projects or []
@@ -4356,6 +4433,10 @@ async def export_excel(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     try:
         if current_user.role != UserRole.ADMIN.value and project_id not in (
             current_user.allowed_projects or []
@@ -4407,6 +4488,10 @@ async def price_history(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     result = await db.execute(
         select(MaterialTransaction.rate, MaterialTransaction.created_at)
         .where(
@@ -4451,6 +4536,7 @@ async def create_material(
     redis=Depends(get_request_redis),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     from decimal import Decimal
 
     import json
@@ -4795,6 +4881,7 @@ async def download_procurement_report_pdf(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     if (
         current_user.role != UserRole.ADMIN.value
         and current_user.allowed_projects
@@ -4889,6 +4976,10 @@ async def generate_material_qr(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     material = await _get_active_material_or_404(db, material_id)
 
     qr_buf = generate_qr(entity_type="MAT", entity_id=material.id)
@@ -4911,6 +5002,10 @@ async def get_material(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     result = await db.execute(
         select(
             Material,
@@ -4967,6 +5062,10 @@ async def update_material(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     obj = await db.scalar(
         select(Material)
         .where(
@@ -5224,6 +5323,10 @@ async def delete_material(
     redis=Depends(get_request_redis),
 ):
 
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     obj = await db.scalar(
         select(Material).where(
             Material.id == material_id,
@@ -5279,6 +5382,7 @@ async def get_ai_material_recommendation(
     redis=Depends(get_request_redis),
 ):
 
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     version = await get_cache_version(redis, VERSION_KEY)
     cache_key = (
         f"cache:materials:ai_rec:{version}:{payload.project_id}:{payload.target_days}"

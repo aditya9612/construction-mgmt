@@ -13,3 +13,6 @@ class Company(Base, TimestampMixin):
     users = relationship("User", back_populates="company")
     projects = relationship("Project", back_populates="company")
     settings = relationship("CompanySettings", back_populates="company", uselist=False)
+    subscription = relationship("Subscription", back_populates="company", uselist=False)
+    subscription_invoices = relationship("SubscriptionInvoice", back_populates="company", cascade="all, delete-orphan")
+

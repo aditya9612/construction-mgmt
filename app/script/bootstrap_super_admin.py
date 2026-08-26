@@ -7,7 +7,8 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from app.db.session import async_session_maker
+from app.core.db import AsyncSessionLocal as async_session_maker
+import app.main  # Ensures all models are loaded via FastAPI router definitions
 from app.models.user import User, UserRole
 from app.core.security import get_password_hash
 from sqlalchemy import select
@@ -39,7 +40,7 @@ async def bootstrap_super_admin():
             email=email,
             full_name=full_name,
             mobile=mobile,
-            password=get_password_hash(password),
+            hashed_password=get_password_hash(password),
             role=UserRole.ADMIN.value,  # They technically have Admin role but is_super_admin defines their actual global power
             is_active=True,
             is_super_admin=True,

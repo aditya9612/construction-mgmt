@@ -23,6 +23,7 @@ from app.models.material import MaterialTransfer  # noqa: F401
 
 from app.models.project import Project  # noqa: F401
 from app.models.company import Company  # noqa: F401
+from app.models.subscription import Plan, Subscription, SubscriptionInvoice, BillingWebhookEvent  # noqa: F401
 from app.models.user import User # noqa: F401
 from app.models.owner import Owner
 from app.models.contractor import Contractor
