@@ -4,6 +4,7 @@ from decimal import Decimal
 from fastapi.testclient import TestClient
 from app.main import app
 from app.core.dependencies import get_current_active_user, get_db_session, require_tenant_admin
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.user import User, ActivityLog, UserRole
 from app.models.subscription import Plan, Subscription, SubscriptionInvoice, ManualPaymentTransaction
 from app.core.config import settings

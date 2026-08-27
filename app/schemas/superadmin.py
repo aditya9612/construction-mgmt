@@ -81,7 +81,7 @@ class CompanyAdminCreate(BaseSchema):
 class TenantUserOut(BaseSchema):
     id: int
     email: str
-    full_name: str
+    full_name: Optional[str] = None
     mobile: Optional[str] = None
     role: str
     is_active: bool

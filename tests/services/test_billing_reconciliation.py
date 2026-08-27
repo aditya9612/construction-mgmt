@@ -289,8 +289,8 @@ def test_superadmin_platform_reconciliation_api():
 
     client = TestClient(app)
 
-    super_user = User(id=1025, email="super@platform.com", is_super_admin=True, role=UserRole.ADMIN.value, company_id=None)
-    tenant_user = User(id=2001, email="admin@tenant.com", is_super_admin=False, role=UserRole.ADMIN.value, company_id=1)
+    super_user = User(id=1, email="superadmin12@gmail.com", is_super_admin=True, role=UserRole.ADMIN.value, company_id=None)
+    tenant_user = User(id=2, email="admin@shreeganeshinfra.com", is_super_admin=False, role=UserRole.ADMIN.value, company_id=1)
 
     # 1. Unauthenticated -> 401
     app.dependency_overrides.clear()

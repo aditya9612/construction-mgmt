@@ -105,7 +105,7 @@ def build_infapilot_invoice(invoice_data):
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
     qr_buffer = io.BytesIO()
-    img.save(qr_buffer, format="PNG")
+    img.save(qr_buffer)
     qr_buffer.seek(0)
     qr_img = Image(qr_buffer, width=1*inch, height=1*inch)
     

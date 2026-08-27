@@ -5,7 +5,8 @@ import qrcode
 from decimal import Decimal
 from datetime import datetime
 from urllib.parse import quote_plus
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response
+from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
@@ -256,6 +257,130 @@ async def generate_subscription_upi_qr(
         qr_code_base64=qr_b64,
         status="pending",
     )
+
+
+@router.get("/upi/qr-image", responses={200: {"content": {"image/png": {}}}})
+async def get_subscription_upi_qr_image(
+    plan_id: int,
+    current_user: User = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Returns the dynamic UPI QR Code directly as a PNG image stream.
+    Allows viewing/scanning the QR code directly in Swagger UI or browser.
+    """
+    # 1. Authoritative active plan
+    result = await db.execute(select(Plan).where(Plan.id == plan_id, Plan.is_active == True))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Active plan not found")
+
+    # 2. Authoritative tenant subscription
+    sub_res = await db.execute(select(Subscription).where(Subscription.company_id == current_user.company_id))
+    subscription = sub_res.scalar_one_or_none()
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Tenant subscription not found")
+
+    txn_ref = f"TXN-UPI-{current_user.company_id}-{int(datetime.utcnow().timestamp())}-{uuid.uuid4().hex[:6].upper()}"
+
+    upi_uri = (
+        f"upi://pay?"
+        f"pa={settings.SUPER_ADMIN_UPI_ID}"
+        f"&pn={quote_plus(settings.SUPER_ADMIN_PAYEE_NAME)}"
+        f"&am={plan.price:.2f}"
+        f"&cu={plan.currency}"
+        f"&tr={txn_ref}"
+        f"&tn={quote_plus(f'InfraPilot SaaS - {plan.name}')}"
+    )
+
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(upi_uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffered = io.BytesIO()
+    img.save(buffered)
+
+    return Response(content=buffered.getvalue(), media_type="image/png")
+
+
+@router.get("/upi/checkout-preview", response_class=HTMLResponse)
+async def get_subscription_upi_checkout_preview(
+    plan_id: int,
+    current_user: User = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Renders an interactive HTML Checkout Preview with live scannable QR Code.
+    """
+    result = await db.execute(select(Plan).where(Plan.id == plan_id, Plan.is_active == True))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Active plan not found")
+
+    sub_res = await db.execute(select(Subscription).where(Subscription.company_id == current_user.company_id))
+    subscription = sub_res.scalar_one_or_none()
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Tenant subscription not found")
+
+    txn_ref = f"TXN-UPI-{current_user.company_id}-{int(datetime.utcnow().timestamp())}-{uuid.uuid4().hex[:6].upper()}"
+
+    upi_uri = (
+        f"upi://pay?"
+        f"pa={settings.SUPER_ADMIN_UPI_ID}"
+        f"&pn={quote_plus(settings.SUPER_ADMIN_PAYEE_NAME)}"
+        f"&am={plan.price:.2f}"
+        f"&cu={plan.currency}"
+        f"&tr={txn_ref}"
+        f"&tn={quote_plus(f'InfraPilot SaaS - {plan.name}')}"
+    )
+
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(upi_uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffered = io.BytesIO()
+    img.save(buffered)
+    qr_b64 = f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>InfraPilot UPI Checkout</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+        .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 32px; max-width: 420px; width: 100%; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5); text-align: center; }}
+        .badge {{ background: #065f46; color: #34d399; font-weight: bold; padding: 4px 12px; border-radius: 9999px; font-size: 12px; display: inline-block; margin-bottom: 12px; }}
+        h2 {{ margin: 0 0 8px 0; font-size: 22px; }}
+        .price {{ font-size: 32px; font-weight: bold; color: #38bdf8; margin: 12px 0; }}
+        .qr-container {{ background: white; padding: 12px; border-radius: 12px; display: inline-block; margin: 16px 0; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }}
+        .qr-img {{ width: 220px; height: 220px; display: block; }}
+        .payee {{ font-size: 13px; color: #94a3b8; margin-bottom: 8px; }}
+        .ref {{ font-size: 11px; font-family: monospace; color: #64748b; margin-bottom: 16px; word-break: break-all; }}
+        .instructions {{ font-size: 13px; color: #cbd5e1; line-height: 1.5; background: #0f172a; border-radius: 8px; padding: 12px; margin-bottom: 16px; text-align: left; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <span class="badge">LIVE QR SCANNER</span>
+        <h2>InfraPilot SaaS Upgrade</h2>
+        <p style="color: #94a3b8; margin: 0;">Plan: <strong style="color: #fff;">{plan.name}</strong></p>
+        <div class="price">₹{plan.price:,.2f}</div>
+        <div class="payee">Pay to: <strong>{settings.SUPER_ADMIN_PAYEE_NAME}</strong> ({settings.SUPER_ADMIN_UPI_ID})</div>
+        <div class="qr-container">
+            <img src="{qr_b64}" alt="UPI QR Code" class="qr-img">
+        </div>
+        <div class="ref">Txn Ref: {txn_ref}</div>
+        <div class="instructions">
+            <strong>Payment Steps:</strong><br>
+            1. Scan QR with GPay, PhonePe, or Paytm.<br>
+            2. Amount <strong>₹{plan.price:,.2f}</strong> is auto-locked.<br>
+            3. Enter bank 12-digit UTR in InfraPilot console.
+        </div>
+    </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @router.post("/upi/submit", response_model=UPISubmitResponse)

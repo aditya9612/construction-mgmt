@@ -1,4 +1,5 @@
 import pytest
+import uuid
 from fastapi.testclient import TestClient
 from app.main import app
 from app.core.dependencies import get_current_user, get_current_active_user, require_super_admin
@@ -10,8 +11,8 @@ client = TestClient(app)
 
 # Mock users for authorization boundary testing
 super_admin_user = User(
-    id=1025,
-    email="superadmin21@gmail.com",
+    id=1,
+    email="superadmin12@gmail.com",
     full_name="Platform Super Admin",
     role=UserRole.ADMIN.value,
     is_active=True,
@@ -116,7 +117,7 @@ def test_superadmin_company_management_lifecycle():
     override_user(super_admin_user)
 
     # 1. Create company
-    subdomain = "test-saas-comp-01"
+    subdomain = f"test-comp-{uuid.uuid4().hex[:6]}"
     create_payload = {
         "name": "Acme Builders Inc",
         "subdomain": subdomain,
@@ -178,7 +179,7 @@ def test_superadmin_plan_management():
     override_user(super_admin_user)
 
     # 1. Create plan
-    plan_code = "enterprise-v1"
+    plan_code = f"ent_{uuid.uuid4().hex[:6]}"
     plan_payload = {
         "name": "Enterprise Plus",
         "code": plan_code,
