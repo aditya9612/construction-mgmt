@@ -208,7 +208,17 @@ class BillingReconciliationOut(BaseSchema):
     reconciled_at: datetime
 
 
+class PlatformBillingReconciliationOut(BaseSchema):
+    total_reconciled: int
+    total_matched: int
+    total_drifted: int
+    total_unavailable: int
+    results: List[BillingReconciliationOut]
+    reconciled_at: datetime
+
+
 class BillingWebhookEventOut(BaseSchema):
+
     id: int
     company_id: Optional[int] = None
     provider: str
@@ -218,5 +228,30 @@ class BillingWebhookEventOut(BaseSchema):
     payload_reference: Optional[str] = None
     processed_at: Optional[datetime] = None
     created_at: datetime
+
+
+class ManualPaymentTransactionOut(BaseSchema):
+    id: int
+    company_id: int
+    company_name: Optional[str] = None
+    subscription_id: int
+    plan_id: int
+    plan_name: Optional[str] = None
+    invoice_id: Optional[int] = None
+    amount: float
+    currency: str
+    payment_method: str
+    transaction_reference: str
+    utr_reference: Optional[str] = None
+    status: str
+    rejection_reason: Optional[str] = None
+    verified_by: Optional[int] = None
+    verified_at: Optional[datetime] = None
+    submitted_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class ManualPaymentRejectRequest(BaseSchema):
+    rejection_reason: constr(min_length=3, max_length=500)  # type: ignore
 
 

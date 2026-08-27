@@ -220,3 +220,99 @@ class BillingReconciliationService:
             await db.commit()
 
         return result
+
+    async def reconcile_all_tenants(
+        self,
+        db: AsyncSession,
+        batch_size: int = 50,
+        current_user: Optional[User] = None,
+        stop_event: Optional[object] = None,
+    ) -> Dict[str, Any]:
+        """
+        Reconciles all company subscriptions against the payment provider in batches.
+        Read-only, non-destructive drift detection across the platform.
+        """
+        offset = 0
+        total_reconciled = 0
+        total_matched = 0
+        total_drifted = 0
+        total_unavailable = 0
+        results = []
+
+        while True:
+            if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                logger.info("Billing reconciliation aborted early by stop_event.")
+                break
+
+            stmt = (
+                select(Company.id)
+                .order_by(Company.id.asc())
+                .limit(batch_size)
+                .offset(offset)
+            )
+            company_ids = (await db.execute(stmt)).scalars().all()
+            if not company_ids:
+                break
+
+            for company_id in company_ids:
+                if stop_event is not None and getattr(stop_event, "is_set", lambda: False)():
+                    logger.info("Billing reconciliation batch loop aborted early by stop_event.")
+                    break
+                try:
+                    res = await self.reconcile_tenant(db, company_id, current_user=None)
+                    results.append(res)
+                    total_reconciled += 1
+                    if res["is_matched"]:
+                        total_matched += 1
+                    else:
+                        total_drifted += 1
+                    if res.get("drift_type") == "provider_unavailable":
+                        total_unavailable += 1
+                except Exception as e:
+                    logger.warning(f"Error reconciling company {company_id}: {str(e)}")
+                    total_reconciled += 1
+                    total_drifted += 1
+                    total_unavailable += 1
+                    results.append({
+                        "company_id": company_id,
+                        "subscription_id": None,
+                        "local_status": None,
+                        "provider_name": self.provider.provider_name,
+                        "provider_subscription_id": None,
+                        "provider_status": None,
+                        "is_matched": False,
+                        "has_drift": True,
+                        "drift_type": "provider_unavailable",
+                        "details": f"Reconciliation exception: {str(e)}",
+                        "reconciled_at": datetime.utcnow(),
+                    })
+
+            offset += batch_size
+
+        summary = {
+            "total_reconciled": total_reconciled,
+            "total_matched": total_matched,
+            "total_drifted": total_drifted,
+            "total_unavailable": total_unavailable,
+            "results": results,
+            "reconciled_at": datetime.utcnow(),
+        }
+
+        if current_user:
+            log = ActivityLog(
+                action="PLATFORM_BILLING_RECONCILIATION_PERFORMED",
+                entity="Platform",
+                entity_id=None,
+                performed_by=current_user.id,
+                details={
+                    "total_reconciled": total_reconciled,
+                    "total_matched": total_matched,
+                    "total_drifted": total_drifted,
+                    "total_unavailable": total_unavailable,
+                    "provider": self.provider.provider_name,
+                },
+            )
+            db.add(log)
+            await db.commit()
+
+        return summary

@@ -179,8 +179,10 @@ class CompanySettingsUpdate(BaseModel):
 class CompanySettingsOut(BaseModel):
 
     id: int
+    company_id: Optional[int] = None
 
     company_name: Optional[str]
+
 
     company_logo: Optional[str]
 

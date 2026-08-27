@@ -28,11 +28,11 @@ async def test_razorpay_create_customer(razorpay_provider):
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.return_value = mock_response
-        
+
         customer_id = await razorpay_provider.create_customer(
             company_id=1, company_name="Test Company", user_email="test@test.com"
         )
-        
+
         assert customer_id == "cust_123"
         mock_post.assert_called_once()
         args, kwargs = mock_post.call_args
@@ -47,7 +47,7 @@ async def test_razorpay_create_checkout_session(razorpay_provider):
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.return_value = mock_response
-        
+
         url = await razorpay_provider.create_checkout_session(
             company_id=1,
             plan_id=1,
@@ -57,7 +57,7 @@ async def test_razorpay_create_checkout_session(razorpay_provider):
             success_url="http://success",
             cancel_url="http://cancel"
         )
-        
+
         assert url == "https://rzp.io/i/test"
         mock_post.assert_called_once()
         args, kwargs = mock_post.call_args
@@ -68,13 +68,13 @@ async def test_razorpay_create_checkout_session(razorpay_provider):
 def test_razorpay_verify_webhook_signature(razorpay_provider):
     payload = b'{"event":"payment.captured"}'
     secret = "test_webhook_secret"
-    
+
     valid_signature = hmac.new(
         key=secret.encode("utf-8"),
         msg=payload,
         digestmod=hashlib.sha256
     ).hexdigest()
-    
+
     assert razorpay_provider.verify_webhook_signature(payload, valid_signature) is True
     assert razorpay_provider.verify_webhook_signature(payload, "invalid") is False
 
@@ -91,12 +91,12 @@ def test_razorpay_normalize_webhook_event(razorpay_provider):
             }
         }
     }
-    
+
     normalized = razorpay_provider.normalize_webhook_event(raw_event)
     assert normalized["type"] == "invoice.payment_succeeded"
     assert normalized["data"]["object"]["customer"] == "cust_123"
     assert normalized["id"] == "rzp_evt_plink_123"
-    
+
     raw_event_failed = {
         "event": "payment.failed",
         "payload": {
@@ -108,7 +108,7 @@ def test_razorpay_normalize_webhook_event(razorpay_provider):
             }
         }
     }
-    
+
     normalized_failed = razorpay_provider.normalize_webhook_event(raw_event_failed)
     assert normalized_failed["type"] == "invoice.payment_failed"
     assert normalized_failed["data"]["object"]["customer"] == "cust_456"
@@ -158,18 +158,46 @@ def test_razorpay_normalize_refund_event(razorpay_provider):
 async def test_razorpay_missing_credentials():
     settings.RAZORPAY_KEY_ID = ""
     provider = RazorpayPaymentProvider()
-    
+
     with pytest.raises(HTTPException) as exc:
         await provider.create_customer(1, "Test", "test@test.com")
-    
+
     assert exc.value.status_code == 500
 
 
 async def test_razorpay_http_error(razorpay_provider):
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.side_effect = httpx.RequestError("Network error", request=MagicMock())
-        
+
         with pytest.raises(HTTPException) as exc:
             await razorpay_provider.create_customer(1, "Test", "test@test.com")
-            
+
         assert exc.value.status_code == 502
+
+
+async def test_razorpay_get_subscription_status_retry_on_500(razorpay_provider):
+    """Verify get_subscription_status retries on HTTP 500 until max_retries."""
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_get.return_value = mock_resp
+
+        with pytest.raises(HTTPException) as exc:
+            await razorpay_provider.get_subscription_status("sub_test_500", max_retries=1)
+
+        assert exc.value.status_code == 502
+        assert mock_get.call_count == 2  # 1 initial + 1 retry
+
+
+async def test_razorpay_get_subscription_status_no_retry_on_404(razorpay_provider):
+    """Verify get_subscription_status does NOT retry on HTTP 404 client error."""
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_get.return_value = mock_resp
+
+        with pytest.raises(HTTPException) as exc:
+            await razorpay_provider.get_subscription_status("sub_test_404", max_retries=2)
+
+        assert exc.value.status_code == 502
+        assert mock_get.call_count == 1  # No retry for 4xx

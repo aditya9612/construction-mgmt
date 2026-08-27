@@ -102,8 +102,14 @@ class MockEntitlementService:
 async def override_get_db():
     yield MockAsyncSession()
 
-app.dependency_overrides[get_db_session] = override_get_db
-app.dependency_overrides[get_entitlement_service] = lambda: MockEntitlementService()
+@pytest.fixture(autouse=True)
+def setup_overrides():
+    app.dependency_overrides[get_db_session] = override_get_db
+    app.dependency_overrides[get_entitlement_service] = lambda: MockEntitlementService()
+    yield
+    app.dependency_overrides.clear()
+
+
 
 def test_tenant_billing_summary():
     app.dependency_overrides[get_current_active_user] = lambda: tenant_admin

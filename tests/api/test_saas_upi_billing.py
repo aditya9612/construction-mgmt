@@ -295,15 +295,15 @@ def test_utr_submission_invalid_format():
     app.dependency_overrides.clear()
 
 
-def test_phase_5_9b_superadmin_verification_endpoints_not_present():
-    """Verify Phase 5.9B Super Admin verification endpoints do NOT exist in Phase 5.9A."""
-    app.dependency_overrides[get_current_active_user] = lambda: super_admin_user
+def test_phase_5_9b_superadmin_verification_endpoints_require_superadmin():
+    """Verify Phase 5.9B Super Admin verification endpoints are protected from Tenant Admin / Normal User."""
+    app.dependency_overrides[get_current_active_user] = lambda: tenant_a_admin
     res1 = client.post("/api/v1/superadmin/manual-payments/1/verify")
-    assert res1.status_code in [404, 405]
+    assert res1.status_code == 403
 
-    res2 = client.post("/api/v1/superadmin/manual-payments/1/reject")
-    assert res2.status_code in [404, 405]
+    res2 = client.post("/api/v1/superadmin/manual-payments/1/reject", json={"rejection_reason": "Invalid payment"})
+    assert res2.status_code == 403
 
     res3 = client.get("/api/v1/superadmin/manual-payments")
-    assert res3.status_code in [404, 405]
+    assert res3.status_code == 403
     app.dependency_overrides.clear()

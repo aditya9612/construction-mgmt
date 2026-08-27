@@ -1,9 +1,11 @@
 import hmac
 import hashlib
 import logging
+import asyncio
 import httpx
 from typing import Dict, Any
 from fastapi import HTTPException
+
 
 from app.core.config import settings
 from app.services.billing.provider_base import PaymentProviderInterface
@@ -116,17 +118,52 @@ class RazorpayPaymentProvider(PaymentProviderInterface):
                 logger.error(f"Razorpay network error creating checkout: {str(e)}")
                 raise HTTPException(status_code=502, detail="Payment gateway network error")
 
-    async def get_subscription_status(self, provider_subscription_id: str) -> Dict[str, Any]:
+    async def get_subscription_status(
+        self, provider_subscription_id: str, max_retries: int = 2
+    ) -> Dict[str, Any]:
         """
-        Fetch subscription details from Razorpay.
+        Fetch subscription details from Razorpay with bounded exponential backoff for transient failures.
+        Non-transient errors (HTTP 4xx) are NOT retried.
         """
-        async with self._get_client() as client:
-            try:
-                response = await client.get(f"/subscriptions/{provider_subscription_id}")
-                response.raise_for_status()
-                return response.json()
-            except httpx.HTTPError:
-                raise HTTPException(status_code=502, detail="Error fetching subscription status")
+        attempts = 0
+        backoff = 0.1
+
+        while True:
+            attempts += 1
+            async with self._get_client() as client:
+                try:
+                    response = await client.get(f"/subscriptions/{provider_subscription_id}")
+                    if response.status_code >= 500:
+                        if attempts <= max_retries:
+                            logger.warning(
+                                f"Razorpay returned {response.status_code} for {provider_subscription_id}. Retrying in {backoff}s (attempt {attempts}/{max_retries})."
+                            )
+                            await asyncio.sleep(backoff)
+                            backoff *= 2
+                            continue
+                        raise HTTPException(status_code=502, detail=f"Razorpay server error: HTTP {response.status_code}")
+                    elif response.status_code >= 400:
+                        # 4xx client errors (404, 400, 401) should NOT be retried
+                        raise HTTPException(status_code=502, detail=f"Error fetching subscription status: HTTP {response.status_code}")
+
+                    response.raise_for_status()
+                    return response.json()
+                except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
+                    if attempts <= max_retries:
+                        logger.warning(
+                            f"Razorpay network error for {provider_subscription_id}: {e}. Retrying in {backoff}s (attempt {attempts}/{max_retries})."
+                        )
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    raise HTTPException(status_code=502, detail=f"Razorpay connection error: {str(e)}")
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code >= 500 and attempts <= max_retries:
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    raise HTTPException(status_code=502, detail=f"Error fetching subscription status: {e.response.status_code}")
+
 
     async def cancel_subscription(self, provider_subscription_id: str) -> bool:
         """

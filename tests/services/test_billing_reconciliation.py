@@ -1,6 +1,8 @@
 import pytest
 import uuid
+import asyncio
 from sqlalchemy import select
+
 
 from app.db.session import AsyncSessionLocal
 import app.db.base
@@ -205,3 +207,112 @@ async def test_reconciliation_no_secrets_in_result_or_audit():
             assert log is not None
             assert "secret" not in str(log.details)
             assert "token" not in str(log.details)
+
+
+async def test_multi_tenant_batch_reconciliation():
+    """Verify batch processing across all companies without in-memory overflow."""
+    async with AsyncSessionLocal() as db:
+        provider = MockPaymentProvider()
+        # Seed 3 companies: 1 matched, 1 drifted, 1 trial
+        sub_id_1 = f"sub_matched_{uuid.uuid4().hex[:8]}"
+        c1, s1 = await _create_test_company_and_sub(db, status="active", ext_sub_id=sub_id_1, ext_cus_id="cus_1")
+
+        sub_id_2 = f"sub_drifted_{uuid.uuid4().hex[:8]}"
+        provider.set_subscription_status(sub_id_2, {"status": "halted", "id": sub_id_2})
+        c2, s2 = await _create_test_company_and_sub(db, status="active", ext_sub_id=sub_id_2, ext_cus_id="cus_2")
+
+        c3, s3 = await _create_test_company_and_sub(db, status="trial", ext_sub_id=None, ext_cus_id=None)
+
+        service = BillingReconciliationService(provider)
+        summary = await service.reconcile_all_tenants(db, batch_size=2)
+
+        assert summary["total_reconciled"] >= 3
+        assert summary["total_matched"] >= 2  # c1 and c3
+        assert summary["total_drifted"] >= 1  # c2
+        assert "results" in summary
+        assert len(summary["results"]) == summary["total_reconciled"]
+
+        # Ensure no mutations occurred
+        await db.refresh(s1)
+        await db.refresh(s2)
+        assert s1.status == "active"
+        assert s2.status == "active"
+
+
+async def test_multi_tenant_failure_isolation():
+    """Verify that a provider failure for one tenant does not abort the batch."""
+    async with AsyncSessionLocal() as db:
+        provider = MockPaymentProvider()
+        sub_err = f"sub_error_{uuid.uuid4().hex[:8]}"
+        c_err, s_err = await _create_test_company_and_sub(db, status="active", ext_sub_id=sub_err, ext_cus_id="cus_err")
+
+        sub_ok = f"sub_ok_{uuid.uuid4().hex[:8]}"
+        c_ok, s_ok = await _create_test_company_and_sub(db, status="active", ext_sub_id=sub_ok, ext_cus_id="cus_ok")
+
+        service = BillingReconciliationService(provider)
+        summary = await service.reconcile_all_tenants(db, batch_size=10)
+
+        # Batch completes successfully
+        assert summary["total_reconciled"] >= 2
+        assert summary["total_unavailable"] >= 1
+
+        # Error details captured without crash
+        err_res = next((r for r in summary["results"] if r["company_id"] == c_err.id), None)
+        assert err_res is not None
+        assert err_res["drift_type"] == "provider_unavailable"
+
+
+async def test_reconciliation_concurrent_safety():
+    """Verify concurrent read-only reconciliations execute safely without deadlocks."""
+    async with AsyncSessionLocal() as db:
+        provider = MockPaymentProvider()
+        sub_id = f"sub_conc_{uuid.uuid4().hex[:8]}"
+        comp, sub = await _create_test_company_and_sub(db, status="active", ext_sub_id=sub_id, ext_cus_id="cus_conc")
+        service = BillingReconciliationService(provider)
+
+        # Run two reconciliations concurrently
+        res1, res2 = await asyncio.gather(
+            service.reconcile_tenant(db, comp.id),
+            service.reconcile_tenant(db, comp.id),
+        )
+
+        assert res1["is_matched"] is True
+        assert res2["is_matched"] is True
+
+
+def test_superadmin_platform_reconciliation_api():
+    """Verify GET /api/v1/superadmin/billing/reconciliation RBAC and response structure."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.dependencies import get_current_user, get_current_active_user, require_super_admin
+    from app.models.user import UserRole
+
+    client = TestClient(app)
+
+    super_user = User(id=1025, email="super@platform.com", is_super_admin=True, role=UserRole.ADMIN.value, company_id=None)
+    tenant_user = User(id=2001, email="admin@tenant.com", is_super_admin=False, role=UserRole.ADMIN.value, company_id=1)
+
+    # 1. Unauthenticated -> 401
+    app.dependency_overrides.clear()
+    assert client.get("/api/v1/superadmin/billing/reconciliation").status_code == 401
+
+    # 2. Tenant Admin -> 403
+    app.dependency_overrides[get_current_user] = lambda: tenant_user
+    app.dependency_overrides[get_current_active_user] = lambda: tenant_user
+    assert client.get("/api/v1/superadmin/billing/reconciliation").status_code == 403
+
+    # 3. Super Admin -> 200
+    app.dependency_overrides[get_current_user] = lambda: super_user
+    app.dependency_overrides[get_current_active_user] = lambda: super_user
+    app.dependency_overrides[require_super_admin] = lambda: super_user
+
+    res = client.get("/api/v1/superadmin/billing/reconciliation?batch_size=10")
+    assert res.status_code == 200
+    data = res.json()
+    assert "total_reconciled" in data
+    assert "total_matched" in data
+    assert "total_drifted" in data
+    assert "total_unavailable" in data
+    assert "results" in data
+
+    app.dependency_overrides.clear()

@@ -5,24 +5,26 @@ import qrcode
 from decimal import Decimal
 from datetime import datetime
 from urllib.parse import quote_plus
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from sqlalchemy import select, desc
 from app.services.entitlement import get_entitlement_service, EntitlementService
 from app.models.subscription import Plan, SubscriptionInvoice, Subscription, ManualPaymentTransaction
 from app.models.user import ActivityLog
 from app.schemas.saas_billing import (
-    PlanOut, 
-    SubscriptionSummaryOut, 
+    PlanOut,
+    SubscriptionSummaryOut,
     UsageLimitsOut,
     SubscriptionInvoiceOut,
     BillingHistoryOut,
     UPIQRCodeOut,
     UPISubmitRequest,
-    UPISubmitResponse
+    UPISubmitResponse,
+    ManualPaymentHistoryOut,
 )
 
 from app.db.session import get_db_session
@@ -62,7 +64,7 @@ async def create_checkout(
 ):
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company to create checkout")
-        
+
     checkout_url = await billing_service.create_checkout(
         db=db,
         company_id=current_user.company_id,
@@ -81,7 +83,7 @@ async def webhook(
 ):
     signature = request.headers.get("X-Mock-Signature") or request.headers.get("X-Razorpay-Signature") or request.headers.get("Stripe-Signature", "")
     payload = await request.body()
-    
+
     return await billing_service.handle_webhook(db=db, payload=payload, signature=signature)
 
 
@@ -93,7 +95,7 @@ async def get_tenant_billing_summary(
 ):
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company")
-        
+
     entitlements = await entitlement_service.get_company_entitlements(db, current_user.company_id)
     return entitlements
 
@@ -105,7 +107,7 @@ async def get_tenant_usage_limits(
 ):
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company")
-        
+
     limits = await entitlement_service.get_limits(db, current_user.company_id)
     return limits
 
@@ -125,7 +127,7 @@ async def list_invoices(
 ):
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company")
-        
+
     result = await db.execute(
         select(SubscriptionInvoice)
         .where(SubscriptionInvoice.company_id == current_user.company_id)
@@ -141,7 +143,7 @@ async def get_invoice_detail(
 ):
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company")
-        
+
     result = await db.execute(
         select(SubscriptionInvoice)
         .where(
@@ -152,7 +154,7 @@ async def get_invoice_detail(
     invoice = result.scalar_one_or_none()
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
-        
+
     return invoice
 
 @router.get("/history", response_model=List[BillingHistoryOut])
@@ -162,14 +164,14 @@ async def get_billing_history(
 ):
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company")
-        
+
     # Find the subscription for the company to properly query ActivityLogs
     sub_res = await db.execute(select(Subscription).where(Subscription.company_id == current_user.company_id))
     subscription = sub_res.scalar_one_or_none()
-    
+
     if not subscription:
         return []
-        
+
     # We want ActivityLogs for the Subscription entity.
     # We might also want ActivityLogs for the Invoices, but we can query them separately or just stick to Subscription logs (which cover plan changes, payment succeeded/failed).
     result = await db.execute(
@@ -346,3 +348,82 @@ async def submit_subscription_upi_utr(
     )
 
 
+@router.get("/upi/transactions", response_model=List[ManualPaymentHistoryOut])
+async def list_tenant_upi_transactions(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = Query(None, description="Filter by transaction status (pending, verified, rejected)"),
+    current_user: User = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = (
+        select(ManualPaymentTransaction)
+        .options(selectinload(ManualPaymentTransaction.plan))
+        .where(ManualPaymentTransaction.company_id == current_user.company_id)
+        .order_by(desc(ManualPaymentTransaction.id))
+    )
+    if status:
+        query = query.where(ManualPaymentTransaction.status == status.strip().lower())
+
+    result = await db.execute(query.limit(limit).offset(offset))
+    txns = result.scalars().all()
+
+    return [
+        ManualPaymentHistoryOut(
+            id=t.id,
+            transaction_reference=t.transaction_reference,
+            utr_reference=t.utr_reference,
+            plan_id=t.plan_id,
+            plan_name=t.plan.name if t.plan else None,
+            amount=float(t.amount),
+            currency=t.currency,
+            payment_method=t.payment_method,
+            status=t.status,
+            rejection_reason=t.rejection_reason,
+            submitted_at=t.submitted_at,
+            verified_at=t.verified_at,
+            created_at=t.created_at,
+            updated_at=t.updated_at,
+        )
+        for t in txns
+    ]
+
+
+@router.get("/upi/transactions/{reference}", response_model=ManualPaymentHistoryOut)
+async def get_tenant_upi_transaction_detail(
+    reference: str,
+    current_user: User = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    clean_ref = reference.strip()
+    result = await db.execute(
+        select(ManualPaymentTransaction)
+        .options(selectinload(ManualPaymentTransaction.plan))
+        .where(
+            ManualPaymentTransaction.transaction_reference == clean_ref,
+            ManualPaymentTransaction.company_id == current_user.company_id,
+        )
+    )
+    txn = result.scalar_one_or_none()
+    if not txn:
+        raise HTTPException(
+            status_code=404,
+            detail="Payment transaction not found for this tenant",
+        )
+
+    return ManualPaymentHistoryOut(
+        id=txn.id,
+        transaction_reference=txn.transaction_reference,
+        utr_reference=txn.utr_reference,
+        plan_id=txn.plan_id,
+        plan_name=txn.plan.name if txn.plan else None,
+        amount=float(txn.amount),
+        currency=txn.currency,
+        payment_method=txn.payment_method,
+        status=txn.status,
+        rejection_reason=txn.rejection_reason,
+        submitted_at=txn.submitted_at,
+        verified_at=txn.verified_at,
+        created_at=txn.created_at,
+        updated_at=txn.updated_at,
+    )

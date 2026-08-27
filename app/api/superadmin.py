@@ -24,7 +24,10 @@ from app.schemas.superadmin import (
     AuditLogOut,
     SubscriptionInvoiceOut,
     BillingReconciliationOut,
+    PlatformBillingReconciliationOut,
     BillingWebhookEventOut,
+    ManualPaymentTransactionOut,
+    ManualPaymentRejectRequest,
 )
 from app.schemas.user import UserOut
 from app.schemas.base import PaginatedResponse
@@ -369,8 +372,19 @@ async def list_company_invoices(
     return await service.list_company_invoices(db, company_id, limit, offset)
 
 
+@router.get("/billing/reconciliation", response_model=PlatformBillingReconciliationOut)
+async def reconcile_platform_billing(
+    batch_size: int = Query(50, ge=1, le=200, description="Batch size for tenant reconciliation"),
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db_session),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.reconcile_platform_billing(db, current_user, batch_size=batch_size)
+
+
 @router.get("/companies/{company_id}/billing/reconciliation", response_model=BillingReconciliationOut)
 async def reconcile_company_billing(
+
     company_id: int = Path(..., ge=1),
     current_user: User = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db_session),
@@ -419,3 +433,39 @@ async def get_company_audit_logs(
     service: SuperAdminService = Depends(get_superadmin_service),
 ):
     return await service.list_company_audit_logs(db, company_id, limit, offset)
+
+
+# =============================================================================
+# 7. MANUAL UPI PAYMENT VERIFICATION (PHASE 5.9B)
+# =============================================================================
+
+@router.get("/manual-payments", response_model=PaginatedResponse[ManualPaymentTransactionOut])
+async def list_manual_payments(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = Query(None, description="Filter by transaction status (e.g. pending, verified, rejected)"),
+    db: AsyncSession = Depends(get_db_session),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.list_manual_payments(db, limit=limit, offset=offset, status=status)
+
+
+@router.post("/manual-payments/{transaction_id}/verify", response_model=ManualPaymentTransactionOut)
+async def verify_manual_payment(
+    transaction_id: int = Path(..., ge=1),
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db_session),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.verify_manual_payment(db, transaction_id, current_user)
+
+
+@router.post("/manual-payments/{transaction_id}/reject", response_model=ManualPaymentTransactionOut)
+async def reject_manual_payment(
+    transaction_id: int = Path(..., ge=1),
+    data: ManualPaymentRejectRequest = Body(...),
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db_session),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.reject_manual_payment(db, transaction_id, current_user, data.rejection_reason)

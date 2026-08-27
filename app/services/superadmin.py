@@ -1,5 +1,7 @@
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
+from decimal import Decimal
+import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm import selectinload
@@ -8,7 +10,7 @@ from app.models.company import Company
 from app.models.settings import CompanySettings
 from app.models.user import User, ActivityLog, UserRole
 from app.models.project import Project
-from app.models.subscription import Plan, Subscription
+from app.models.subscription import Plan, Subscription, SubscriptionInvoice, ManualPaymentTransaction
 from app.core.security import get_password_hash
 from app.schemas.superadmin import (
     DashboardStatsOut,
@@ -29,9 +31,10 @@ from app.schemas.superadmin import (
     EntitlementOut,
     AuditLogOut,
     BillingWebhookEventOut,
+    ManualPaymentTransactionOut,
 )
 from app.schemas.user import UserOut
-from app.utils.helpers import AppError, NotFoundError, ConflictError
+from app.utils.helpers import AppError, NotFoundError, ConflictError, BadRequestError
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.services.entitlement import get_entitlement_service
 
@@ -970,7 +973,7 @@ class SuperAdminService:
         company = await db.get(Company, company_id)
         if not company:
             raise NotFoundError("Company not found")
-        
+
         data = await self.entitlement_service.get_company_entitlements(db, company_id)
         return EntitlementOut(**data)
 
@@ -982,17 +985,17 @@ class SuperAdminService:
             raise NotFoundError("Company not found")
 
         from app.models.subscription import SubscriptionInvoice
-        
+
         query = (
             select(SubscriptionInvoice)
             .where(SubscriptionInvoice.company_id == company_id)
             .order_by(SubscriptionInvoice.created_at.desc())
         )
         count_query = select(func.count()).select_from(SubscriptionInvoice).where(SubscriptionInvoice.company_id == company_id)
-        
+
         total = await db.scalar(count_query) or 0
         rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
-        
+
         items = [
             {
                 "id": inv.id,
@@ -1011,7 +1014,7 @@ class SuperAdminService:
             }
             for inv in rows
         ]
-        
+
         from app.schemas.base import PaginationMeta
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
         return PaginatedResponse(items=items, meta=meta)
@@ -1038,7 +1041,26 @@ class SuperAdminService:
         recon_service = BillingReconciliationService(provider)
         return await recon_service.reconcile_tenant(db, company_id, current_user)
 
+    async def reconcile_platform_billing(
+        self, db: AsyncSession, current_user: User, batch_size: int = 50
+    ) -> Dict[str, Any]:
+        from app.core.config import settings
+        from app.services.billing.mock_provider import MockPaymentProvider
+        from app.services.billing.razorpay_provider import RazorpayPaymentProvider
+        from app.services.billing.reconciliation_service import BillingReconciliationService
+
+        if settings.PAYMENT_PROVIDER == "razorpay":
+            if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
+                raise AppError(status_code=503, message="Razorpay credentials not configured")
+            provider = RazorpayPaymentProvider()
+        else:
+            provider = MockPaymentProvider()
+
+        recon_service = BillingReconciliationService(provider)
+        return await recon_service.reconcile_all_tenants(db, batch_size=batch_size, current_user=current_user)
+
     async def list_company_billing_events(
+
         self, db: AsyncSession, company_id: int, limit: int = 20, offset: int = 0
     ) -> PaginatedResponse[BillingWebhookEventOut]:
         company = await db.get(Company, company_id)
@@ -1149,6 +1171,295 @@ class SuperAdminService:
 
         meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
         return PaginatedResponse[AuditLogOut](items=items, meta=meta)
+
+    # =========================================================================
+    # 7. MANUAL UPI PAYMENT VERIFICATION (PHASE 5.9B)
+    # =========================================================================
+    async def list_manual_payments(
+        self,
+        db: AsyncSession,
+        limit: int = 20,
+        offset: int = 0,
+        status: Optional[str] = None,
+    ) -> PaginatedResponse[ManualPaymentTransactionOut]:
+        query = (
+            select(ManualPaymentTransaction)
+            .options(
+                selectinload(ManualPaymentTransaction.company),
+                selectinload(ManualPaymentTransaction.plan),
+            )
+            .order_by(ManualPaymentTransaction.id.desc())
+        )
+        count_query = select(func.count()).select_from(ManualPaymentTransaction)
+
+        if status:
+            clean_status = status.strip().lower()
+            query = query.where(ManualPaymentTransaction.status == clean_status)
+            count_query = count_query.where(ManualPaymentTransaction.status == clean_status)
+
+        total = await db.scalar(count_query) or 0
+        rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
+
+        items = [
+            ManualPaymentTransactionOut(
+                id=r.id,
+                company_id=r.company_id,
+                company_name=r.company.name if r.company else None,
+                subscription_id=r.subscription_id,
+                plan_id=r.plan_id,
+                plan_name=r.plan.name if r.plan else None,
+                invoice_id=r.invoice_id,
+                amount=float(r.amount),
+                currency=r.currency,
+                payment_method=r.payment_method,
+                transaction_reference=r.transaction_reference,
+                utr_reference=r.utr_reference,
+                status=r.status,
+                rejection_reason=r.rejection_reason,
+                verified_by=r.verified_by,
+                verified_at=r.verified_at,
+                submitted_at=r.submitted_at,
+                created_at=r.created_at,
+            )
+            for r in rows
+        ]
+
+        meta = PaginationMeta(total=int(total), limit=limit, offset=offset)
+        return PaginatedResponse[ManualPaymentTransactionOut](items=items, meta=meta)
+
+    async def verify_manual_payment(
+        self,
+        db: AsyncSession,
+        transaction_id: int,
+        current_user: User,
+    ) -> ManualPaymentTransactionOut:
+        # 1. Lock ManualPaymentTransaction row FOR UPDATE
+        stmt = (
+            select(ManualPaymentTransaction)
+            .options(
+                selectinload(ManualPaymentTransaction.company),
+                selectinload(ManualPaymentTransaction.plan),
+            )
+            .where(ManualPaymentTransaction.id == transaction_id)
+            .with_for_update()
+        )
+        txn = await db.scalar(stmt)
+        if not txn:
+            raise NotFoundError("Manual payment transaction not found")
+
+        # 2. Status protection
+        if txn.status == "verified":
+            raise BadRequestError("Payment transaction has already been verified")
+        if txn.status == "rejected":
+            raise BadRequestError("Payment transaction was rejected and cannot be verified")
+        if txn.status != "pending":
+            raise BadRequestError(f"Payment transaction cannot be verified with status '{txn.status}'")
+
+        # 3. Company validation
+        company = await db.get(Company, txn.company_id)
+        if not company:
+            raise NotFoundError("Company associated with transaction not found")
+
+        # 4. Plan resolution & validation
+        plan = await db.get(Plan, txn.plan_id)
+        if not plan:
+            raise NotFoundError("Plan associated with transaction not found")
+        if not plan.is_active:
+            raise BadRequestError("Plan associated with transaction is no longer active")
+
+        # 5. Authoritative price & currency recalculation & comparison
+        authoritative_price = Decimal(str(plan.price))
+        if txn.amount != authoritative_price:
+            raise BadRequestError(
+                f"Transaction amount ({txn.amount}) does not match authoritative plan price ({authoritative_price})"
+            )
+        if txn.currency != plan.currency:
+            raise BadRequestError(
+                f"Transaction currency ({txn.currency}) does not match authoritative plan currency ({plan.currency})"
+            )
+
+        # 6. Subscription resolution & validation
+        subscription = await db.get(Subscription, txn.subscription_id)
+        if not subscription:
+            raise NotFoundError("Subscription associated with transaction not found")
+        if subscription.company_id != txn.company_id:
+            raise BadRequestError("Subscription company does not match transaction company")
+
+        # 7. Subscription status lifecycle protection
+        if subscription.status in ("cancelled", "expired"):
+            raise BadRequestError(
+                f"Cannot activate {subscription.status} subscription via manual verification. Super Admin reactivation required first."
+            )
+
+        now = datetime.utcnow()
+
+        # 8. SubscriptionInvoice resolution or creation
+        invoice = None
+        if txn.invoice_id:
+            invoice = await db.get(SubscriptionInvoice, txn.invoice_id)
+            if invoice:
+                if invoice.company_id != txn.company_id or invoice.subscription_id != txn.subscription_id:
+                    raise BadRequestError("Invoice relationships do not match transaction")
+                invoice.status = "paid"
+                invoice.paid_at = now
+                invoice.total_amount = txn.amount
+                invoice.subtotal = txn.amount
+                invoice.currency = txn.currency
+
+        if not invoice:
+            inv_number = f"INV-UPI-{txn.company_id}-{uuid.uuid4().hex[:8].upper()}"
+            invoice = SubscriptionInvoice(
+                company_id=txn.company_id,
+                subscription_id=txn.subscription_id,
+                invoice_number=inv_number,
+                status="paid",
+                subtotal=txn.amount,
+                tax_amount=Decimal("0.00"),
+                total_amount=txn.amount,
+                currency=txn.currency,
+                issued_at=txn.submitted_at or now,
+                paid_at=now,
+                created_at=now,
+            )
+            db.add(invoice)
+            await db.flush()
+            txn.invoice_id = invoice.id
+
+        # 9. Update ManualPaymentTransaction
+        txn.status = "verified"
+        txn.verified_by = current_user.id
+        txn.verified_at = now
+
+        # 10. Activate Subscription & apply plan
+        subscription.status = "active"
+        subscription.plan_id = txn.plan_id
+
+        # 11. Platform Audit Log
+        audit_log = ActivityLog(
+            action="UPI_PAYMENT_VERIFIED",
+            entity="ManualPaymentTransaction",
+            entity_id=txn.id,
+            performed_by=current_user.id,
+            details={
+                "transaction_id": txn.id,
+                "company_id": txn.company_id,
+                "plan_id": txn.plan_id,
+                "amount": float(txn.amount),
+                "currency": txn.currency,
+                "transaction_reference": txn.transaction_reference,
+                "utr_reference": txn.utr_reference,
+                "verified_by": current_user.id,
+                "timestamp": now.isoformat(),
+            },
+        )
+        db.add(audit_log)
+
+        await db.commit()
+        await db.refresh(txn)
+
+        return ManualPaymentTransactionOut(
+            id=txn.id,
+            company_id=txn.company_id,
+            company_name=company.name,
+            subscription_id=txn.subscription_id,
+            plan_id=txn.plan_id,
+            plan_name=plan.name,
+            invoice_id=txn.invoice_id,
+            amount=float(txn.amount),
+            currency=txn.currency,
+            payment_method=txn.payment_method,
+            transaction_reference=txn.transaction_reference,
+            utr_reference=txn.utr_reference,
+            status=txn.status,
+            rejection_reason=txn.rejection_reason,
+            verified_by=txn.verified_by,
+            verified_at=txn.verified_at,
+            submitted_at=txn.submitted_at,
+            created_at=txn.created_at,
+        )
+
+    async def reject_manual_payment(
+        self,
+        db: AsyncSession,
+        transaction_id: int,
+        current_user: User,
+        rejection_reason: str,
+    ) -> ManualPaymentTransactionOut:
+        clean_reason = rejection_reason.strip()
+        if not clean_reason:
+            raise BadRequestError("Rejection reason is required")
+
+        stmt = (
+            select(ManualPaymentTransaction)
+            .options(
+                selectinload(ManualPaymentTransaction.company),
+                selectinload(ManualPaymentTransaction.plan),
+            )
+            .where(ManualPaymentTransaction.id == transaction_id)
+            .with_for_update()
+        )
+        txn = await db.scalar(stmt)
+        if not txn:
+            raise NotFoundError("Manual payment transaction not found")
+
+        if txn.status == "verified":
+            raise BadRequestError("Cannot reject already verified payment transaction")
+        if txn.status == "rejected":
+            raise BadRequestError("Payment transaction is already rejected")
+        if txn.status != "pending":
+            raise BadRequestError(f"Payment transaction cannot be rejected with status '{txn.status}'")
+
+        company = await db.get(Company, txn.company_id)
+        if not company:
+            raise NotFoundError("Company associated with transaction not found")
+
+        plan = await db.get(Plan, txn.plan_id)
+
+        now = datetime.utcnow()
+        txn.status = "rejected"
+        txn.rejection_reason = clean_reason
+        txn.verified_by = None
+        txn.verified_at = None
+
+        audit_log = ActivityLog(
+            action="UPI_PAYMENT_REJECTED",
+            entity="ManualPaymentTransaction",
+            entity_id=txn.id,
+            performed_by=current_user.id,
+            details={
+                "transaction_id": txn.id,
+                "company_id": txn.company_id,
+                "plan_id": txn.plan_id,
+                "rejection_reason": clean_reason,
+                "rejected_by": current_user.id,
+                "timestamp": now.isoformat(),
+            },
+        )
+        db.add(audit_log)
+
+        await db.commit()
+        await db.refresh(txn)
+
+        return ManualPaymentTransactionOut(
+            id=txn.id,
+            company_id=txn.company_id,
+            company_name=company.name if company else None,
+            subscription_id=txn.subscription_id,
+            plan_id=txn.plan_id,
+            plan_name=plan.name if plan else None,
+            invoice_id=txn.invoice_id,
+            amount=float(txn.amount),
+            currency=txn.currency,
+            payment_method=txn.payment_method,
+            transaction_reference=txn.transaction_reference,
+            utr_reference=txn.utr_reference,
+            status=txn.status,
+            rejection_reason=txn.rejection_reason,
+            verified_by=txn.verified_by,
+            verified_at=txn.verified_at,
+            submitted_at=txn.submitted_at,
+            created_at=txn.created_at,
+        )
 
 
 def get_superadmin_service() -> SuperAdminService:

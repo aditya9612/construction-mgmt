@@ -102,3 +102,21 @@ class UPISubmitResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+
+class ManualPaymentHistoryOut(BaseModel):
+    id: int
+    transaction_reference: str
+    utr_reference: Optional[str] = None
+    plan_id: int
+    plan_name: Optional[str] = None
+    amount: float
+    currency: str
+    payment_method: str
+    status: str
+    rejection_reason: Optional[str] = None
+    submitted_at: Optional[datetime] = None
+    verified_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
