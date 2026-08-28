@@ -134,8 +134,18 @@ CACHE_TTL = 300  #  5 min auto refresh
 # HELPER
 # =========================================
 async def get_user_project_ids(db, user: User):
+    if getattr(user, "is_super_admin", False):
+        result = await db.execute(select(m.Project.id))
+        return [r[0] for r in result.all()]
     if user.company_id is None:
-        return []
+        if user.role == UserRole.ADMIN.value:
+            result = await db.execute(select(m.Project.id))
+            return [r[0] for r in result.all()]
+        result = await db.execute(
+            select(m.ProjectMember.project_id)
+            .where(m.ProjectMember.user_id == user.id)
+        )
+        return [r[0] for r in result.all()]
     if user.role == UserRole.ADMIN.value:
         result = await db.execute(
             select(m.Project.id).where(m.Project.company_id == user.company_id)
@@ -3037,25 +3047,41 @@ async def labour_dashboard(
     # =========================================
 
     project = None
+    assigned_date = None
+
+    # Base filter for tenant isolation, only apply if user actually has a company_id (graceful for old data)
+    tenant_filter = (Project.company_id == current_user.company_id) if current_user.company_id else True
 
     if user_settings and user_settings.default_project_id:
-        project = await db.scalar(
-            select(Project)
-            .join(LabourProject, LabourProject.project_id == Project.id)
-            .where(
-                LabourProject.labour_id == labour.id,
-                LabourProject.project_id == user_settings.default_project_id,
+        row = (
+            await db.execute(
+                select(Project, LabourProject.assigned_date)
+                .join(LabourProject, LabourProject.project_id == Project.id)
+                .where(
+                    LabourProject.labour_id == labour.id,
+                    LabourProject.project_id == user_settings.default_project_id,
+                    tenant_filter,
+                )
             )
-        )
+        ).first()
+        if row:
+            project, assigned_date = row[0], row[1]
 
     if project is None:
-        project = await db.scalar(
-            select(Project)
-            .join(LabourProject, LabourProject.project_id == Project.id)
-            .where(LabourProject.labour_id == labour.id)
-            .order_by(LabourProject.assigned_date.desc(), LabourProject.id.desc())
-            .limit(1)
-        )
+        row = (
+            await db.execute(
+                select(Project, LabourProject.assigned_date)
+                .join(LabourProject, LabourProject.project_id == Project.id)
+                .where(
+                    LabourProject.labour_id == labour.id,
+                    tenant_filter,
+                )
+                .order_by(LabourProject.assigned_date.desc(), LabourProject.id.desc())
+                .limit(1)
+            )
+        ).first()
+        if row:
+            project, assigned_date = row[0], row[1]
 
     project_count = await db.scalar(
         select(func.count(func.distinct(LabourProject.project_id))).where(
@@ -3143,13 +3169,26 @@ async def labour_dashboard(
         and row.attendance_date.year == current_year
     ]
 
-    total_days = len(month_rows)
+    # Calculate applicable working days
+    applicable_start = month_start
+    if assigned_date and assigned_date > month_start:
+        applicable_start = assigned_date
+
+    applicable_end = today
+    
+    total_days = 0
+    if applicable_start <= applicable_end:
+        # Assuming no specific weekly off configured globally, elapsed days = total days
+        total_days = (applicable_end - applicable_start).days + 1
+
     present_days = sum(1 for r in month_rows if r.status == AttendanceStatus.PRESENT)
-    absent_days = sum(1 for r in month_rows if r.status == AttendanceStatus.ABSENT)
     half_days = sum(1 for r in month_rows if r.status == AttendanceStatus.HALF_DAY)
+    
+    # Absent days is applicable days minus present and half days
+    absent_days = max(0, total_days - present_days - half_days)
 
     attendance_percentage = (
-        round((present_days / total_days) * 100, 2) if total_days else 0
+        round(((present_days + 0.5 * half_days) / total_days) * 100, 2) if total_days else 0
     )
 
     today_hours = (

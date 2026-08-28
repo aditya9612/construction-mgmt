@@ -11,7 +11,8 @@ from app.models.settings import CompanySettings
 from app.models.user import User, ActivityLog, UserRole
 from app.models.project import Project
 from app.models.subscription import Plan, Subscription, SubscriptionInvoice, ManualPaymentTransaction
-from app.core.security import get_password_hash
+from app.core.security import get_password_hash, verify_password
+from app.core.config import settings
 from app.schemas.superadmin import (
     DashboardStatsOut,
     CompanyOut,
@@ -32,6 +33,10 @@ from app.schemas.superadmin import (
     AuditLogOut,
     BillingWebhookEventOut,
     ManualPaymentTransactionOut,
+    SuperAdminProfileOut,
+    SuperAdminProfileUpdate,
+    SuperAdminChangePassword,
+    SuperAdminPasswordChangeResponse,
 )
 from app.schemas.user import UserOut
 from app.utils.helpers import AppError, NotFoundError, ConflictError, BadRequestError
@@ -1459,6 +1464,174 @@ class SuperAdminService:
             verified_at=txn.verified_at,
             submitted_at=txn.submitted_at,
             created_at=txn.created_at,
+        )
+
+    # =========================================================================
+    # 9. SUPER ADMIN PROFILE & PASSWORD MANAGEMENT
+    # =========================================================================
+    async def get_profile(self, user: User) -> SuperAdminProfileOut:
+        return SuperAdminProfileOut(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            mobile=user.mobile,
+            role=user.role,
+            is_super_admin=user.is_super_admin,
+            is_active=user.is_active,
+            company_id=user.company_id,
+            created_at=user.created_at,
+            updated_at=user.updated_at,
+        )
+
+    async def update_profile(
+        self,
+        db: AsyncSession,
+        user: User,
+        data: SuperAdminProfileUpdate,
+        redis: Any = None,
+    ) -> SuperAdminProfileOut:
+        db_user = await db.get(User, user.id)
+        if not db_user or not db_user.is_super_admin:
+            raise NotFoundError("Super Admin user not found")
+
+        updated_fields = []
+        email_changed = False
+
+        if data.full_name is not None and data.full_name.strip() != "":
+            db_user.full_name = data.full_name.strip()
+            updated_fields.append("full_name")
+
+        if data.mobile is not None:
+            clean_mobile = data.mobile.strip()
+            if clean_mobile != db_user.mobile:
+                existing_mob = await db.scalar(
+                    select(User).where(User.mobile == clean_mobile, User.id != db_user.id)
+                )
+                if existing_mob:
+                    raise ConflictError("Mobile number already registered")
+                db_user.mobile = clean_mobile
+                updated_fields.append("mobile")
+
+        if data.email is not None:
+            clean_email = str(data.email).strip().lower()
+            if clean_email != db_user.email:
+                existing_email = await db.scalar(
+                    select(User).where(User.email == clean_email, User.id != db_user.id)
+                )
+                if existing_email:
+                    raise ConflictError("Email already registered")
+                db_user.email = clean_email
+                updated_fields.append("email")
+                email_changed = True
+
+        # Invariants: MUST NEVER modify company_id or is_super_admin
+        db_user.is_super_admin = True
+        db_user.company_id = None
+        db_user.updated_at = datetime.utcnow()
+
+        if updated_fields:
+            audit_log = ActivityLog(
+                action="SUPER_ADMIN_PROFILE_UPDATED",
+                entity="User",
+                entity_id=db_user.id,
+                performed_by=db_user.id,
+                details={
+                    "updated_fields": updated_fields,
+                    "email_changed": email_changed,
+                    "timestamp": datetime.utcnow().isoformat(),
+                },
+            )
+            db.add(audit_log)
+
+            await db.commit()
+            await db.refresh(db_user)
+
+            if redis is not None:
+                try:
+                    await redis.delete(f"cache:user:{db_user.id}")
+                    if email_changed:
+                        import time
+                        now_ts = time.time()
+                        ttl = getattr(settings, "JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60) * 60
+                        await redis.setex(f"logout_all:user:{db_user.id}", ttl, str(now_ts))
+                except Exception:
+                    pass
+
+        return await self.get_profile(db_user)
+
+    async def change_password(
+        self,
+        db: AsyncSession,
+        user: User,
+        data: SuperAdminChangePassword,
+        redis: Any = None,
+        current_token: Optional[str] = None,
+    ) -> SuperAdminPasswordChangeResponse:
+        db_user = await db.get(User, user.id)
+        if not db_user or not db_user.is_super_admin:
+            raise NotFoundError("Super Admin user not found")
+
+        # 1. Verify current password
+        if not verify_password(data.current_password, db_user.hashed_password):
+            raise BadRequestError("Current password is incorrect")
+
+        # 2. Verify confirmation matches
+        if data.new_password != data.confirm_password:
+            raise BadRequestError("New password and confirm password do not match")
+
+        # 3. Prevent same password
+        if data.current_password == data.new_password:
+            raise BadRequestError("New password cannot be the same as current password")
+
+        # 4. Hash and update securely
+        db_user.hashed_password = get_password_hash(data.new_password)
+        db_user.updated_at = datetime.utcnow()
+        db_user.is_super_admin = True
+        db_user.company_id = None
+
+        # 5. Audit log without sensitive data
+        audit_log = ActivityLog(
+            action="SUPER_ADMIN_PASSWORD_CHANGED",
+            entity="User",
+            entity_id=db_user.id,
+            performed_by=db_user.id,
+            details={
+                "message": "Password changed successfully",
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+        )
+        db.add(audit_log)
+
+        await db.commit()
+        await db.refresh(db_user)
+
+        # 6. Session & token revocation via Redis
+        if redis is not None:
+            try:
+                import time
+                now_ts = time.time()
+                ttl = getattr(settings, "JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60) * 60
+                await redis.setex(f"logout_all:user:{db_user.id}", ttl, str(now_ts))
+                await redis.delete(f"cache:user:{db_user.id}")
+
+                if current_token:
+                    from app.core.security import decode_access_token
+                    try:
+                        payload = decode_access_token(current_token)
+                        jti = payload.get("jti")
+                        exp = payload.get("exp")
+                        if jti and exp:
+                            tok_ttl = int(exp) - int(time.time())
+                            if tok_ttl > 0:
+                                await redis.setex(f"blocklist:jti:{jti}", tok_ttl, "true")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        return SuperAdminPasswordChangeResponse(
+            success=True,
+            message="Password changed successfully",
         )
 
 

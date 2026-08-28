@@ -40,6 +40,8 @@ class LabourCreate(BaseModel):
 
     contractor_id: Optional[int] = None
 
+    project_id: Optional[int] = None
+
     status: Optional[e.LabourStatus] = e.LabourStatus.ACTIVE
 
     notes: Optional[str] = None
@@ -137,6 +139,7 @@ class LabourUpdate(BaseModel):
 
 class LabourOut(BaseModel):
     id: int
+    company_id: Optional[int] = None
     worker_code: str
     user_id: Optional[int] = None
     role: Optional[str] = None

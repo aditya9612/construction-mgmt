@@ -1,8 +1,9 @@
 from typing import Optional, List
 from fastapi import APIRouter, Depends, Query, Path, Body
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db_session
-from app.core.dependencies import require_super_admin
+from app.core.dependencies import require_super_admin, get_request_redis, security
 from app.models.user import User
 from app.schemas.superadmin import (
     DashboardStatsOut,
@@ -28,6 +29,10 @@ from app.schemas.superadmin import (
     BillingWebhookEventOut,
     ManualPaymentTransactionOut,
     ManualPaymentRejectRequest,
+    SuperAdminProfileOut,
+    SuperAdminProfileUpdate,
+    SuperAdminChangePassword,
+    SuperAdminPasswordChangeResponse,
 )
 from app.schemas.user import UserOut
 from app.schemas.base import PaginatedResponse
@@ -38,6 +43,44 @@ router = APIRouter(
     tags=["superadmin"],
     dependencies=[Depends(require_super_admin)],
 )
+
+
+# =============================================================================
+# 0. PROFILE & PASSWORD MANAGEMENT
+# =============================================================================
+
+@router.get("/profile", response_model=SuperAdminProfileOut)
+async def get_superadmin_profile(
+    current_user: User = Depends(require_super_admin),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.get_profile(current_user)
+
+
+@router.put("/profile", response_model=SuperAdminProfileOut)
+async def update_superadmin_profile(
+    data: SuperAdminProfileUpdate = Body(...),
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    return await service.update_profile(db, current_user, data, redis=redis)
+
+
+@router.post("/change-password", response_model=SuperAdminPasswordChangeResponse)
+async def change_superadmin_password(
+    data: SuperAdminChangePassword = Body(...),
+    current_user: User = Depends(require_super_admin),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    service: SuperAdminService = Depends(get_superadmin_service),
+):
+    current_token = credentials.credentials if credentials else None
+    return await service.change_password(
+        db, current_user, data, redis=redis, current_token=current_token
+    )
 
 
 # =============================================================================

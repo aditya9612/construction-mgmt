@@ -16,25 +16,53 @@ async def assert_project_access(
     project_id: int,
     current_user: User,
 ):
+    if getattr(current_user, "is_super_admin", False):
+        return
+
     if current_user.role == UserRole.ADMIN.value:
         # Check tenant access
         project = await db.get(m.Project, project_id)
-        if not project or project.company_id != current_user.company_id:
+        if not project:
+            raise PermissionDeniedError("Project not found")
+        if current_user.company_id is not None and project.company_id != current_user.company_id:
             raise PermissionDeniedError("Project belongs to another company")
         return
 
-    exists = await db.scalar(
+    query = (
         select(func.count())
         .select_from(m.ProjectMember)
         .join(m.Project, m.Project.id == m.ProjectMember.project_id)
         .where(
             m.ProjectMember.project_id == project_id,
             m.ProjectMember.user_id == current_user.id,
-            m.Project.company_id == current_user.company_id
         )
     )
+    if current_user.company_id is not None:
+        query = query.where(m.Project.company_id == current_user.company_id)
+
+    exists = await db.scalar(query)
 
     if not exists:
+        if current_user.role == UserRole.LABOUR.value:
+            from app.models.labour import Labour, LabourProject
+
+            labour_query = (
+                select(func.count())
+                .select_from(LabourProject)
+                .join(Labour, Labour.id == LabourProject.labour_id)
+                .join(m.Project, m.Project.id == LabourProject.project_id)
+                .where(
+                    LabourProject.project_id == project_id,
+                    Labour.user_id == current_user.id,
+                )
+            )
+            if current_user.company_id is not None:
+                labour_query = labour_query.where(m.Project.company_id == current_user.company_id)
+
+            labour_exists = await db.scalar(labour_query)
+            if labour_exists:
+                return
+
         raise PermissionDeniedError("User is not part of this project or company")
 
 
@@ -58,10 +86,14 @@ async def validate_contractor_access(
     """
     Ensure user has access to contractor via project mapping
     """
+    if getattr(current_user, "is_super_admin", False):
+        return
 
     from app.models.contractor import Contractor
     contractor = await db.get(Contractor, contractor_id)
-    if not contractor or contractor.company_id != current_user.company_id:
+    if not contractor:
+        raise PermissionDeniedError("Access denied")
+    if current_user.company_id is not None and contractor.company_id != current_user.company_id:
         raise PermissionDeniedError("Access denied")
 
     result = await db.execute(

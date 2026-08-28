@@ -255,3 +255,38 @@ class ManualPaymentRejectRequest(BaseSchema):
     rejection_reason: constr(min_length=3, max_length=500)  # type: ignore
 
 
+# =============================================================================
+# 9. SUPER ADMIN PROFILE & PASSWORD MANAGEMENT
+# =============================================================================
+
+class SuperAdminProfileOut(BaseSchema):
+    id: int
+    email: EmailStr
+    full_name: Optional[str] = None
+    mobile: Optional[str] = None
+    role: str
+    is_super_admin: bool = True
+    is_active: bool = True
+    company_id: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class SuperAdminProfileUpdate(BaseSchema):
+    full_name: Optional[constr(min_length=2, max_length=100)] = None  # type: ignore
+    mobile: Optional[constr(min_length=7, max_length=20)] = None  # type: ignore
+    email: Optional[EmailStr] = None
+
+
+class SuperAdminChangePassword(BaseSchema):
+    current_password: str = Field(..., min_length=1)
+    new_password: constr(min_length=6, max_length=128)  # type: ignore
+    confirm_password: str = Field(..., min_length=1)
+
+
+class SuperAdminPasswordChangeResponse(BaseSchema):
+    success: bool = True
+    message: str = "Password changed successfully"
+
+
+

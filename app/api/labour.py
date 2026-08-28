@@ -48,8 +48,18 @@ from app.models.project import ProjectOTPolicy
 
 
 async def get_user_project_ids(db, user):
+    if getattr(user, "is_super_admin", False):
+        result = await db.execute(select(Project.id))
+        return [r[0] for r in result.all()]
     if user.company_id is None:
-        return []
+        if user.role == UserRole.ADMIN.value:
+            result = await db.execute(select(Project.id))
+            return [r[0] for r in result.all()]
+        result = await db.execute(
+            select(ProjectMember.project_id)
+            .where(ProjectMember.user_id == user.id)
+        )
+        return [r[0] for r in result.all()]
     if user.role == UserRole.ADMIN.value:
         result = await db.execute(
             select(Project.id).where(Project.company_id == user.company_id)
@@ -130,6 +140,17 @@ async def create_labour(
         )
     logger.info(f"Creating labour name={payload.labour_name}")
 
+    # Extract user attributes to avoid MissingGreenlet after rollback
+    current_user_company_id = current_user.company_id
+    current_user_id = current_user.id
+
+    if payload.email:
+        existing_user = await db.scalar(select(User).where(User.email == payload.email))
+        if existing_user:
+            raise HTTPException(
+                status_code=400, detail="User with this email already exists"
+            )
+
     data = payload.model_dump(exclude_unset=True)
 
     # PROFILE IMAGE
@@ -181,17 +202,38 @@ async def create_labour(
                 profile_image=image_path,
                 role=UserRole.LABOUR.value,
                 is_active=(payload.status == LabourStatus.ACTIVE),
-                created_by=current_user.id,
+                company_id=current_user_company_id,
+                created_by=current_user_id,
             )
             db.add(user)
             await db.flush()
 
             data["user_id"] = user.id
+            project_id = data.pop("project_id", None)
 
             obj = Labour(**data)
-            obj.company_id = current_user.company_id
+            obj.company_id = current_user_company_id
             db.add(obj)
             await db.flush()
+
+            if project_id:
+                await assert_project_access(
+                    db, project_id=project_id, current_user=current_user
+                )
+                db.add(
+                    LabourProject(
+                        labour_id=obj.id,
+                        project_id=project_id,
+                    )
+                )
+                db.add(
+                    ProjectMember(
+                        project_id=project_id,
+                        user_id=user.id,
+                    )
+                )
+                await db.flush()
+
             await db.refresh(
                 obj,
                 attribute_names=[
@@ -207,6 +249,11 @@ async def create_labour(
 
         except IntegrityError as e:
             await db.rollback()
+            error_str = str(e).lower()
+            if "email" in error_str or "users.ix_users_email" in error_str:
+                raise HTTPException(
+                    status_code=400, detail="User with this email already exists"
+                )
 
             logger.warning(f"Labour creation retry due to integrity error: {e}")
 
@@ -247,14 +294,22 @@ async def list_labour(
         return PaginatedResponse[s.LabourOut].model_validate(cached)
 
     query = (
-        select(Labour).options(
-            selectinload(Labour.user),
-            selectinload(Labour.contractor),
-            selectinload(Labour.labour_type),
+        (
+            select(Labour).options(
+                selectinload(Labour.user),
+                selectinload(Labour.contractor),
+                selectinload(Labour.labour_type),
+            )
         )
-    ).where(Labour.company_id == current_user.company_id).distinct()
+        .where(Labour.company_id == current_user.company_id)
+        .distinct()
+    )
 
-    count_query = select(func.count(func.distinct(Labour.id))).select_from(Labour).where(Labour.company_id == current_user.company_id)
+    count_query = (
+        select(func.count(func.distinct(Labour.id)))
+        .select_from(Labour)
+        .where(Labour.company_id == current_user.company_id)
+    )
 
     #  Subquery instead of JOIN
     if project_id:
@@ -691,12 +746,12 @@ async def delete_labour(
 # @router.post("/assign-project", response_model=s.LabourProjectOut)
 # async def assign_labour_to_project(
 #     payload: s.LabourAssignProject,
-#     current_user: User = Depends(d.require_roles(LABOUR_DELETE_ROLES)),
+#     current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
 #     db: AsyncSession = Depends(get_db_session),
 # ):
 #     # check labour
 #     labour = await db.get(Labour, payload.labour_id)
-#     if not labour:
+#     if not labour or (current_user.company_id is not None and labour.company_id != current_user.company_id):
 #         raise NotFoundError("Labour not found")
 
 #     # check project access
@@ -721,6 +776,23 @@ async def delete_labour(
 #     )
 
 #     db.add(obj)
+
+#     # If user exists for this labour, also map in ProjectMember
+#     if labour.user_id:
+#         pm_exists = await db.scalar(
+#             select(ProjectMember).where(
+#                 ProjectMember.project_id == payload.project_id,
+#                 ProjectMember.user_id == labour.user_id,
+#             )
+#         )
+#         if not pm_exists:
+#             db.add(
+#                 ProjectMember(
+#                     project_id=payload.project_id,
+#                     user_id=labour.user_id,
+#                 )
+#             )
+
 #     await db.flush()
 #     await db.refresh(obj)
 
@@ -944,7 +1016,9 @@ async def weekly_report(
         )
     ).scalar_one_or_none()
 
-    if not labour or (labour.company_id is not None and labour.company_id != current_user.company_id):
+    if not labour or (
+        labour.company_id is not None and labour.company_id != current_user.company_id
+    ):
         raise NotFoundError("Labour not found")
 
     project_ids = (
@@ -1051,7 +1125,9 @@ async def monthly_report(
         )
     ).scalar_one_or_none()
 
-    if not labour or (labour.company_id is not None and labour.company_id != current_user.company_id):
+    if not labour or (
+        labour.company_id is not None and labour.company_id != current_user.company_id
+    ):
         raise NotFoundError("Labour not found")
 
     project_ids = (
@@ -1190,7 +1266,7 @@ async def generate_payroll(
                         LabourWageRecord.start_date <= UserAttendance.attendance_date,
                         LabourWageRecord.end_date >= UserAttendance.attendance_date,
                     )
-                )
+                ),
             )
         )
 
@@ -1245,25 +1321,38 @@ async def generate_payroll(
             total_wage = data["total_wage"]
 
             payroll = await db.scalar(
-                select(LabourPayroll).where(
+                select(LabourPayroll)
+                .where(
                     LabourPayroll.labour_id == labour_id,
                     LabourPayroll.project_id == project_id,
                     LabourPayroll.month == payload.month,
                     LabourPayroll.year == payload.year,
-                ).with_for_update()
+                )
+                .with_for_update()
             )
 
             if payroll:
-                if payroll.status in (PayrollStatus.LOCKED, PayrollStatus.PARTIAL, PayrollStatus.PAID, PayrollStatus.PENDING):
+                if payroll.status in (
+                    PayrollStatus.LOCKED,
+                    PayrollStatus.PARTIAL,
+                    PayrollStatus.PAID,
+                    PayrollStatus.PENDING,
+                ):
                     from fastapi import HTTPException
-                    raise HTTPException(status_code=400, detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}")
+
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}",
+                    )
 
                 payroll.total_working_hours = data["working_hours"]
                 payroll.total_overtime_hours = data["overtime_hours"]
                 payroll.total_wage = total_wage
-                
-                payroll.remaining_amount = max(Decimal("0"), total_wage - payroll.paid_amount)
-                
+
+                payroll.remaining_amount = max(
+                    Decimal("0"), total_wage - payroll.paid_amount
+                )
+
                 payroll.status = PayrollStatus.DRAFT
 
                 await db.flush()
@@ -1301,28 +1390,41 @@ async def generate_payroll(
                     await db.flush()
             except IntegrityError:
                 payroll = await db.scalar(
-                    select(LabourPayroll).where(
+                    select(LabourPayroll)
+                    .where(
                         LabourPayroll.labour_id == labour_id,
                         LabourPayroll.project_id == project_id,
                         LabourPayroll.month == payload.month,
                         LabourPayroll.year == payload.year,
-                    ).with_for_update()
+                    )
+                    .with_for_update()
                 )
                 if payroll:
-                    if payroll.status in (PayrollStatus.LOCKED, PayrollStatus.PARTIAL, PayrollStatus.PAID, PayrollStatus.PENDING):
+                    if payroll.status in (
+                        PayrollStatus.LOCKED,
+                        PayrollStatus.PARTIAL,
+                        PayrollStatus.PAID,
+                        PayrollStatus.PENDING,
+                    ):
                         from fastapi import HTTPException
-                        raise HTTPException(status_code=400, detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}")
+
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}",
+                        )
 
                     payroll.total_working_hours = data["working_hours"]
                     payroll.total_overtime_hours = data["overtime_hours"]
                     payroll.total_wage = total_wage
-                    
-                    payroll.remaining_amount = max(Decimal("0"), total_wage - payroll.paid_amount)
-                    
+
+                    payroll.remaining_amount = max(
+                        Decimal("0"), total_wage - payroll.paid_amount
+                    )
+
                     payroll.status = PayrollStatus.DRAFT
 
                     await db.flush()
-            
+
             output.append(payroll)
 
         await r.bump_cache_version(redis, VERSION_KEY)
@@ -1363,7 +1465,9 @@ async def lock_payroll(
 
     try:
         if current_user.company_id is None:
-            raise HTTPException(status_code=403, detail="Super Admin cannot lock payroll")
+            raise HTTPException(
+                status_code=403, detail="Super Admin cannot lock payroll"
+            )
 
         payrolls = await db.scalars(
             select(LabourPayroll)
@@ -1378,13 +1482,15 @@ async def lock_payroll(
         payrolls = payrolls.all()
 
         if len(payrolls) != len(payload.payroll_ids):
-            raise HTTPException(status_code=400, detail="One or more payroll records not found")
+            raise HTTPException(
+                status_code=400, detail="One or more payroll records not found"
+            )
 
         for p in payrolls:
             if p.status != PayrollStatus.DRAFT:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Cannot lock Payroll {p.id}. Current Status: {p.status.value}. Only DRAFT payrolls can be locked."
+                    detail=f"Cannot lock Payroll {p.id}. Current Status: {p.status.value}. Only DRAFT payrolls can be locked.",
                 )
 
         for p in payrolls:
@@ -1404,6 +1510,7 @@ async def lock_payroll(
         await db.rollback()
         logger.exception("Payroll lock failed")
         raise
+
 
 # =========================
 # PAYROLL UNLOCK
@@ -1432,7 +1539,9 @@ async def unlock_payroll(
 
     try:
         if current_user.company_id is None:
-            raise HTTPException(status_code=403, detail="Super Admin cannot unlock payroll")
+            raise HTTPException(
+                status_code=403, detail="Super Admin cannot unlock payroll"
+            )
 
         payrolls = await db.scalars(
             select(LabourPayroll)
@@ -1447,13 +1556,15 @@ async def unlock_payroll(
         payrolls = payrolls.all()
 
         if len(payrolls) != len(payload.payroll_ids):
-            raise HTTPException(status_code=400, detail="One or more payroll records not found")
+            raise HTTPException(
+                status_code=400, detail="One or more payroll records not found"
+            )
 
         for p in payrolls:
             if p.status != PayrollStatus.LOCKED or p.paid_amount > 0:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Cannot unlock Payroll {p.id}. Current Status: {p.status.value}. Paid Amount: {p.paid_amount}. Only LOCKED payrolls with zero paid_amount can be unlocked."
+                    detail=f"Cannot unlock Payroll {p.id}. Current Status: {p.status.value}. Paid Amount: {p.paid_amount}. Only LOCKED payrolls with zero paid_amount can be unlocked.",
                 )
 
         for p in payrolls:
@@ -1474,6 +1585,7 @@ async def unlock_payroll(
         logger.exception("Payroll unlock failed")
         raise
 
+
 # =========================
 # PAYROLL PAYMENT
 # =========================
@@ -1492,12 +1604,14 @@ async def pay_salary(
     )
 
     payroll = await db.scalar(
-        select(LabourPayroll).where(
+        select(LabourPayroll)
+        .where(
             LabourPayroll.labour_id == payload.labour_id,
             LabourPayroll.project_id == payload.project_id,
             LabourPayroll.month == payload.month,
             LabourPayroll.year == payload.year,
-        ).with_for_update()
+        )
+        .with_for_update()
     )
 
     if not payroll:
@@ -1507,7 +1621,9 @@ async def pay_salary(
         raise ValidationError("Payment amount must be greater than zero")
 
     if payroll.status == PayrollStatus.DRAFT:
-        raise HTTPException(status_code=400, detail="Cannot pay DRAFT payroll. Please lock it first.")
+        raise HTTPException(
+            status_code=400, detail="Cannot pay DRAFT payroll. Please lock it first."
+        )
 
     if payroll.status == PayrollStatus.PAID:
         raise HTTPException(status_code=400, detail="Payroll is already PAID in full.")
@@ -1550,10 +1666,15 @@ async def pay_salary(
     db.add(entry)
     await db.flush()  # get entry.id
 
-    wages_payable_acc = await db.scalar(select(Account).where(Account.code == "WAGES_PAYABLE"))
+    wages_payable_acc = await db.scalar(
+        select(Account).where(Account.code == "WAGES_PAYABLE")
+    )
     if not wages_payable_acc:
         from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="WAGES_PAYABLE account is not configured.")
+
+        raise HTTPException(
+            status_code=400, detail="WAGES_PAYABLE account is not configured."
+        )
 
     from app.utils.accounting import get_primary_cash_account
 
@@ -2184,13 +2305,25 @@ async def export_payroll_excel(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=payroll.xlsx"},
     )
+
+
 @router.post("/wages", response_model=payroll_s.LabourWageOut)
 async def create_wage_record(
     payload: payroll_s.LabourWageGenerateRequest,
-    current_user: User = Depends(d.require_roles([UserRole.ADMIN.value, UserRole.PROJECT_MANAGER.value, UserRole.ACCOUNTANT.value])),
-    db: AsyncSession = Depends(get_db_session)
+    current_user: User = Depends(
+        d.require_roles(
+            [
+                UserRole.ADMIN.value,
+                UserRole.PROJECT_MANAGER.value,
+                UserRole.ACCOUNTANT.value,
+            ]
+        )
+    ),
+    db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+    await assert_project_access(
+        db, project_id=payload.project_id, current_user=current_user
+    )
 
     labour = await db.get(Labour, payload.labour_id)
     if not labour:
@@ -2199,35 +2332,52 @@ async def create_wage_record(
     target_account_id = payload.bank_account_id
     if payload.payment_mode.lower() == "bank":
         if not payload.bank_account_id:
-            raise HTTPException(status_code=400, detail="bank_account_id is required for Bank Transfer")
+            raise HTTPException(
+                status_code=400, detail="bank_account_id is required for Bank Transfer"
+            )
         from app.models.accountant import BankAccount
-        bank_acc = await db.scalar(select(BankAccount).where(BankAccount.id == payload.bank_account_id))
+
+        bank_acc = await db.scalar(
+            select(BankAccount).where(BankAccount.id == payload.bank_account_id)
+        )
         if not bank_acc:
             raise NotFoundError("Bank account not found")
         target_account_id = bank_acc.account_id
 
     from sqlalchemy.exc import DBAPIError
+
     try:
         async with db.begin_nested():
             overlapping = await db.scalar(
-                select(LabourWageRecord).where(
+                select(LabourWageRecord)
+                .where(
                     LabourWageRecord.labour_id == payload.labour_id,
                     LabourWageRecord.project_id == payload.project_id,
                     LabourWageRecord.start_date <= payload.end_date,
-                    LabourWageRecord.end_date >= payload.start_date
-                ).with_for_update()
+                    LabourWageRecord.end_date >= payload.start_date,
+                )
+                .with_for_update()
             )
             if overlapping:
-                raise HTTPException(status_code=409, detail="Wage period overlaps with an existing wage record")
-
-            attendance_rows = (await db.execute(
-                select(LabourAttendance).where(
-                    LabourAttendance.labour_id == payload.labour_id,
-                    LabourAttendance.project_id == payload.project_id,
-                    LabourAttendance.attendance_date >= payload.start_date,
-                    LabourAttendance.attendance_date <= payload.end_date
+                raise HTTPException(
+                    status_code=409,
+                    detail="Wage period overlaps with an existing wage record",
                 )
-            )).scalars().all()
+
+            attendance_rows = (
+                (
+                    await db.execute(
+                        select(LabourAttendance).where(
+                            LabourAttendance.labour_id == payload.labour_id,
+                            LabourAttendance.project_id == payload.project_id,
+                            LabourAttendance.attendance_date >= payload.start_date,
+                            LabourAttendance.attendance_date <= payload.end_date,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
 
             hourly_rate = (labour.effective_daily_wage or Decimal("0")) / Decimal("8")
             total_wage = Decimal("0")
@@ -2236,9 +2386,17 @@ async def create_wage_record(
                 if att.status == AttendanceStatus.ABSENT:
                     continue
                 elif att.status == AttendanceStatus.HALF_DAY:
-                    total_wage += (hourly_rate * Decimal("4")) + (Decimal(str(att.overtime_rate or 0)) * Decimal(str(att.overtime_hours or 0)))
+                    total_wage += (hourly_rate * Decimal("4")) + (
+                        Decimal(str(att.overtime_rate or 0))
+                        * Decimal(str(att.overtime_hours or 0))
+                    )
                 else:
-                    total_wage += (hourly_rate * Decimal(str(att.working_hours or 0))) + (Decimal(str(att.overtime_rate or 0)) * Decimal(str(att.overtime_hours or 0)))
+                    total_wage += (
+                        hourly_rate * Decimal(str(att.working_hours or 0))
+                    ) + (
+                        Decimal(str(att.overtime_rate or 0))
+                        * Decimal(str(att.overtime_hours or 0))
+                    )
 
             wage_record = LabourWageRecord(
                 labour_id=payload.labour_id,
@@ -2251,20 +2409,28 @@ async def create_wage_record(
                 payment_mode=payload.payment_mode,
                 bank_account_id=target_account_id,
                 status="PENDING",
-                created_by=current_user.id
+                created_by=current_user.id,
             )
             db.add(wage_record)
             await db.flush()
     except DBAPIError as e:
-        if e.orig and hasattr(e.orig, "args") and len(e.orig.args) > 0 and e.orig.args[0] == 1213:
-            logger.warning(f"Deadlock detected during wage generation for labour {payload.labour_id}")
+        if (
+            e.orig
+            and hasattr(e.orig, "args")
+            and len(e.orig.args) > 0
+            and e.orig.args[0] == 1213
+        ):
+            logger.warning(
+                f"Deadlock detected during wage generation for labour {payload.labour_id}"
+            )
             raise HTTPException(
                 status_code=409,
-                detail="A wage record for this labour and period is already being created or exists. Please retry."
+                detail="A wage record for this labour and period is already being created or exists. Please retry.",
             )
         raise
 
     return wage_record
+
 
 @router.get("/wages", response_model=PaginatedResponse[payroll_s.LabourWageRegisterOut])
 async def list_wages(
@@ -2277,16 +2443,17 @@ async def list_wages(
     labour_id: Optional[int] = None,
     project_id: Optional[int] = None,
     current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
         return PaginatedResponse(
-            items=[],
-            meta=PaginationMeta(total=0, limit=limit, offset=offset)
+            items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset)
         )
 
     if project_id:
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
 
     query = (
         select(LabourWageRecord, Labour)
@@ -2319,8 +2486,18 @@ async def list_wages(
         count_query = count_query.where(LabourWageRecord.status == status)
 
     if start_date and end_date:
-        query = query.where(and_(LabourWageRecord.start_date <= end_date, LabourWageRecord.end_date >= start_date))
-        count_query = count_query.where(and_(LabourWageRecord.start_date <= end_date, LabourWageRecord.end_date >= start_date))
+        query = query.where(
+            and_(
+                LabourWageRecord.start_date <= end_date,
+                LabourWageRecord.end_date >= start_date,
+            )
+        )
+        count_query = count_query.where(
+            and_(
+                LabourWageRecord.start_date <= end_date,
+                LabourWageRecord.end_date >= start_date,
+            )
+        )
 
     query = query.order_by(LabourWageRecord.id.desc()).limit(limit).offset(offset)
 
@@ -2329,26 +2506,37 @@ async def list_wages(
 
     items = []
     for wage, labour in rows:
-        items.append({
-            "id": wage.id,
-            "labour_name": labour.labour_name,
-            "labour_type": labour.labour_type.name if labour.labour_type else None,
-            "period": f"{wage.start_date} to {wage.end_date}",
-            "gross_wage": wage.gross_wage,
-            "net_wage": wage.net_wage,
-            "status": wage.status
-        })
+        items.append(
+            {
+                "id": wage.id,
+                "labour_name": labour.labour_name,
+                "labour_type": labour.labour_type.name if labour.labour_type else None,
+                "period": f"{wage.start_date} to {wage.end_date}",
+                "gross_wage": wage.gross_wage,
+                "net_wage": wage.net_wage,
+                "status": wage.status,
+            }
+        )
 
     return PaginatedResponse(
         items=items,
-        meta=PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
+        meta=PaginationMeta(total=int(total or 0), limit=limit, offset=offset),
     )
+
 
 @router.post("/wages/{id}/pay")
 async def pay_wage_record(
     id: int,
-    current_user: User = Depends(d.require_roles([UserRole.ADMIN.value, UserRole.PROJECT_MANAGER.value, UserRole.ACCOUNTANT.value])),
-    db: AsyncSession = Depends(get_db_session)
+    current_user: User = Depends(
+        d.require_roles(
+            [
+                UserRole.ADMIN.value,
+                UserRole.PROJECT_MANAGER.value,
+                UserRole.ACCOUNTANT.value,
+            ]
+        )
+    ),
+    db: AsyncSession = Depends(get_db_session),
 ):
     wage_record = await db.scalar(
         select(LabourWageRecord).where(LabourWageRecord.id == id).with_for_update()
@@ -2356,7 +2544,9 @@ async def pay_wage_record(
     if not wage_record:
         raise NotFoundError("Wage record not found")
 
-    await assert_project_access(db, project_id=wage_record.project_id, current_user=current_user)
+    await assert_project_access(
+        db, project_id=wage_record.project_id, current_user=current_user
+    )
 
     if wage_record.status == "PAID":
         raise HTTPException(status_code=409, detail="Wage record is already PAID")
@@ -2364,7 +2554,9 @@ async def pay_wage_record(
     amount = wage_record.net_wage
 
     if amount <= 0:
-        raise HTTPException(status_code=400, detail="Payment amount must be greater than zero")
+        raise HTTPException(
+            status_code=400, detail="Payment amount must be greater than zero"
+        )
 
     wage_record.status = "PAID"
     await db.flush()
@@ -2384,75 +2576,105 @@ async def pay_wage_record(
     db.add(entry)
     await db.flush()
 
-    wages_payable_acc = await db.scalar(select(Account).where(Account.code == "WAGES_PAYABLE"))
+    wages_payable_acc = await db.scalar(
+        select(Account).where(Account.code == "WAGES_PAYABLE")
+    )
     if not wages_payable_acc:
-        raise HTTPException(status_code=400, detail="WAGES_PAYABLE account is not configured.")
+        raise HTTPException(
+            status_code=400, detail="WAGES_PAYABLE account is not configured."
+        )
 
     if wage_record.payment_mode and wage_record.payment_mode.lower() == "bank":
         if not wage_record.bank_account_id:
-            raise HTTPException(status_code=400, detail="bank_account_id is required for Bank Transfer")
+            raise HTTPException(
+                status_code=400, detail="bank_account_id is required for Bank Transfer"
+            )
         from app.models.accountant import BankAccount
-        bank_acc = await db.scalar(select(BankAccount).where(BankAccount.id == wage_record.bank_account_id))
+
+        bank_acc = await db.scalar(
+            select(BankAccount).where(BankAccount.id == wage_record.bank_account_id)
+        )
         if not bank_acc:
             raise NotFoundError("Bank account not found")
         credit_account_id = bank_acc.account_id
     else:
         from app.utils.accounting import get_primary_cash_account
+
         try:
             cash_acc = await get_primary_cash_account(db)
             credit_account_id = cash_acc.id
         except ValueError:
-            raise HTTPException(status_code=400, detail="Primary Cash Account not configured")
+            raise HTTPException(
+                status_code=400, detail="Primary Cash Account not configured"
+            )
 
-    db.add(JournalLine(entry_id=entry.id, account_id=wages_payable_acc.id, debit=amount, credit=0))
-    db.add(JournalLine(entry_id=entry.id, account_id=credit_account_id, debit=0, credit=amount))
+    db.add(
+        JournalLine(
+            entry_id=entry.id, account_id=wages_payable_acc.id, debit=amount, credit=0
+        )
+    )
+    db.add(
+        JournalLine(
+            entry_id=entry.id, account_id=credit_account_id, debit=0, credit=amount
+        )
+    )
 
     return {"message": "Wage paid successfully"}
+
 
 @router.get("/wages/stats", response_model=payroll_s.LabourWageStatsOut)
 async def get_wage_stats(
     project_id: int = Query(...),
     current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     pending = await db.scalar(
-        select(func.sum(LabourWageRecord.net_wage))
-        .where(LabourWageRecord.project_id == project_id, LabourWageRecord.status == "PENDING")
+        select(func.sum(LabourWageRecord.net_wage)).where(
+            LabourWageRecord.project_id == project_id,
+            LabourWageRecord.status == "PENDING",
+        )
     ) or Decimal("0")
 
     paid = await db.scalar(
-        select(func.sum(LabourWageRecord.net_wage))
-        .where(LabourWageRecord.project_id == project_id, LabourWageRecord.status == "PAID")
+        select(func.sum(LabourWageRecord.net_wage)).where(
+            LabourWageRecord.project_id == project_id, LabourWageRecord.status == "PAID"
+        )
     ) or Decimal("0")
 
     advance = await db.scalar(
-        select(func.sum(Expense.amount))
-        .where(Expense.project_id == project_id, Expense.category == "Labour Advance")
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id, Expense.category == "Labour Advance"
+        )
     ) or Decimal("0")
 
     contractor = await db.scalar(
-        select(func.sum(Expense.amount))
-        .where(Expense.project_id == project_id, Expense.category == "Contractor")
+        select(func.sum(Expense.amount)).where(
+            Expense.project_id == project_id, Expense.category == "Contractor"
+        )
     ) or Decimal("0")
 
     return {
         "pending_payroll": pending,
         "paid_payroll": paid,
         "advance_given": advance,
-        "contractor_payment": contractor
+        "contractor_payment": contractor,
     }
 
 
-async def _get_active_labour_or_404(db: AsyncSession, labour_id: int, current_user: User):
+async def _get_active_labour_or_404(
+    db: AsyncSession, labour_id: int, current_user: User
+):
     if current_user.company_id is None:
         raise HTTPException(
             status_code=403,
             detail="Super Admin cannot access company labour directly",
         )
     obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
-    if not obj or (obj.company_id is not None and obj.company_id != current_user.company_id):
+    if not obj or (
+        obj.company_id is not None and obj.company_id != current_user.company_id
+    ):
         raise NotFoundError("Labour record not found")
     return obj
 
@@ -2464,19 +2686,16 @@ async def generate_labour_qr(
     db: AsyncSession = Depends(get_db_session),
 ):
     labour = await _get_active_labour_or_404(db, labour_id, current_user)
-    
+
     qr_buf = generate_qr(entity_type="LAB", entity_id=labour.id)
-    
+
     headers = {
         "Cache-Control": "no-store",
-        "Content-Disposition": f'inline; filename="labour_{labour.id}.png"'
+        "Content-Disposition": f'inline; filename="labour_{labour.id}.png"',
     }
-    
-    return StreamingResponse(
-        qr_buf, 
-        media_type="image/png",
-        headers=headers
-    )
+
+    return StreamingResponse(qr_buf, media_type="image/png", headers=headers)
+
 
 @router.get("/{labour_id}", response_model=s.LabourOut)
 async def get_labour(
@@ -2512,7 +2731,9 @@ async def get_labour(
         .where(Labour.id == labour_id)
     )
 
-    if not obj or (obj.company_id is not None and obj.company_id != current_user.company_id):
+    if not obj or (
+        obj.company_id is not None and obj.company_id != current_user.company_id
+    ):
         raise NotFoundError("Labour record not found")
 
     #  MANY-TO-MANY ACCESS CHECK
@@ -2942,4 +3163,3 @@ async def get_aggregate_report(
         )
         for row in rows
     ]
-
