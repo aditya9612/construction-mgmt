@@ -303,6 +303,7 @@ async def list_users(
             UserRole.ADMIN.value,
             UserRole.PROJECT_MANAGER.value,
             UserRole.SITE_ENGINEER.value,
+            UserRole.ACCOUNTANT.value,
         ])
     ),
     db: AsyncSession = Depends(get_db_session),

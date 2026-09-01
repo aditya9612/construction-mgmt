@@ -8,11 +8,11 @@ from typing import Optional
 from fastapi.responses import FileResponse, StreamingResponse
 from app.models.accountant import RedevelopmentOffer
 from app.schemas.accountant import OfferCreate, OfferOut
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, extract
 from app.core.enums import AccountType, PaymentMode, PettyCashTransactionType
-from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine, BankTransaction, FundTransfer, GSTReturn, BankAccount, TDSDeduction, VendorBill, PettyCashTransaction
+from app.models.accountant import Account, FixedAsset, JournalEntry, JournalLine, BankTransaction, FundTransfer, GSTReturn, BankAccount, TDSDeduction, VendorBill, PettyCashTransaction, PaymentVoucher
 from app.schemas.accountant import (
     AccountCreate,
     AccountOut,
@@ -36,6 +36,7 @@ from app.models.billing import RABill
 from app.models.invoice import Invoice, Transaction
 from app.models.user import User
 from app.core.dependencies import require_roles
+from app.schemas.payment_voucher import PaymentVoucherOut
 
 from app.utils.helpers import NotFoundError, ValidationError
 from app.utils.qr import generate_qr
@@ -777,6 +778,148 @@ async def receipt_summary(
     )
 
     return {"total_receipts": float(total or 0)}
+
+@router.get("/receipts/{id}")
+async def get_receipt(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    txn = await db.get(Transaction, id)
+    if not txn or txn.type != "receipt":
+        raise NotFoundError("Receipt not found")
+    return txn
+
+@router.post("/receipts/{id}/reverse")
+async def reverse_receipt(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    txn = await db.get(Transaction, id)
+    if not txn or txn.type != "receipt":
+        raise NotFoundError("Receipt not found")
+
+    if txn.reference and txn.reference.startswith("REV-"):
+        raise ValidationError("Cannot reverse a reversal transaction")
+
+    existing_reversal = await db.scalar(
+        select(Transaction).where(Transaction.reference == f"REV-{txn.id}")
+    )
+    if existing_reversal:
+        raise ValidationError("Receipt has already been reversed")
+
+    reversal = Transaction(
+        project_id=txn.project_id,
+        invoice_id=None,
+        type="receipt",
+        amount=-txn.amount,
+        mode=txn.mode,
+        reference=f"REV-{txn.id}",
+        created_by=current_user.id,
+    )
+    db.add(reversal)
+    await db.commit()
+    await db.refresh(reversal)
+
+    return {
+        "message": "Receipt reversed successfully",
+        "original_receipt_id": txn.id,
+        "reversal_transaction_id": reversal.id,
+        "original_amount": float(txn.amount),
+        "reversed_amount": float(reversal.amount),
+        "reference": reversal.reference
+    }
+
+@router.get("/payables/outstanding")
+async def outstanding_payables(
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    rows = (await db.execute(select(RABill).order_by(RABill.created_at.desc()))).scalars().all()
+
+    # fetch all payments in one go
+    paid_map = dict(
+        (
+            await db.execute(
+                select(Transaction.linked_to, func.sum(Transaction.amount))
+                .where(Transaction.linked_to.like("ra:%"))
+                .group_by(Transaction.linked_to)
+            )
+        ).all()
+    )
+
+    result = []
+
+    for ra in rows:
+        key = f"ra:{ra.id}"
+        paid = paid_map.get(key, 0) or Decimal(0)
+
+        pending = Decimal(ra.total_amount) - paid
+
+        if pending <= 0:
+            continue
+            
+        status = "partial" if paid > 0 else "pending"
+
+        result.append(
+            {
+                "ra_id": ra.id,
+                "project_id": ra.project_id,
+                "contractor_id": ra.contractor_id,
+                "total_amount": float(ra.total_amount),
+                "paid_amount": float(paid),
+                "pending_amount": float(pending),
+                "status": status,
+            }
+        )
+
+    return result
+
+@router.get("/payment-requests", response_model=list[PaymentVoucherOut])
+async def list_payment_requests(
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES))
+):
+    from app.models.accountant import VendorBill
+    from app.models.project import Project
+    from app.models.material import Supplier
+    from app.models.contractor import Contractor
+    from sqlalchemy.orm import aliased
+    from sqlalchemy import case
+    
+    query = (
+        select(
+            PaymentVoucher,
+            Project.project_name,
+            case(
+                (PaymentVoucher.party_type == "Supplier", Supplier.supplier_name),
+                (PaymentVoucher.party_type == "Contractor", Contractor.name),
+                else_=None
+            ).label("party_name")
+        )
+        .outerjoin(VendorBill, PaymentVoucher.vendor_bill_id == VendorBill.id)
+        .outerjoin(Project, VendorBill.project_id == Project.id)
+        .outerjoin(Supplier, (PaymentVoucher.party_type == "Supplier") & (PaymentVoucher.supplier_id == Supplier.id))
+        .outerjoin(Contractor, (PaymentVoucher.party_type == "Contractor") & (PaymentVoucher.contractor_id == Contractor.id))
+        .order_by(PaymentVoucher.created_at.desc())
+    )
+    
+    if status:
+        query = query.where(PaymentVoucher.status == status)
+        
+    rows = (await db.execute(query)).all()
+    
+    items = []
+    for row in rows:
+        pv = row.PaymentVoucher
+        pv_dict = pv.__dict__.copy()
+        pv_dict["project_name"] = row.project_name
+        pv_dict["party_name"] = row.party_name
+        items.append(PaymentVoucherOut.model_validate(pv_dict))
+        
+    return items
 
 @router.get("/payables")
 async def list_payables(
@@ -2577,11 +2720,60 @@ async def create_fund_transfer(
 
 @router.get("/transfers", response_model=list[FundTransferOut])
 async def list_fund_transfers(
+    transfer_type: Optional[str] = Query(None, pattern="^(deposit|withdrawal|transfer)$"),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    result = await db.scalars(select(FundTransfer))
+    stmt = select(FundTransfer)
+    if transfer_type:
+        from app.models.settings import CompanySettings
+        settings = await db.scalar(select(CompanySettings))
+        cash_ids = []
+        if settings:
+            if settings.primary_cash_account_id:
+                cash_ids.append(settings.primary_cash_account_id)
+            if settings.petty_cash_account_id:
+                cash_ids.append(settings.petty_cash_account_id)
+                
+        bank_ids = list(await db.scalars(select(BankAccount.account_id)))
+        
+        # Fallback if lists are empty (e.g., system not fully configured)
+        if not cash_ids:
+            cash_ids = [-1]
+        if not bank_ids:
+            bank_ids = [-1]
+            
+        if transfer_type == "deposit":
+            stmt = stmt.where(
+                FundTransfer.from_account_id.in_(cash_ids),
+                FundTransfer.to_account_id.in_(bank_ids)
+            )
+        elif transfer_type == "withdrawal":
+            stmt = stmt.where(
+                FundTransfer.from_account_id.in_(bank_ids),
+                FundTransfer.to_account_id.in_(cash_ids)
+            )
+        elif transfer_type == "transfer":
+            stmt = stmt.where(
+                FundTransfer.from_account_id.in_(bank_ids),
+                FundTransfer.to_account_id.in_(bank_ids)
+            )
+            
+    # Preserve existing logic perfectly if no filter is supplied.
+    result = await db.scalars(stmt)
     return result.all()
+
+
+@router.get("/transfers/{id}", response_model=FundTransferOut)
+async def get_fund_transfer(
+    id: int,
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session)
+):
+    ft = await db.get(FundTransfer, id)
+    if not ft:
+        raise NotFoundError("Fund transfer not found")
+    return ft
 
 # ===================== GST & TAXATION =====================
 
