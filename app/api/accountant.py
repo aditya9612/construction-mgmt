@@ -3060,12 +3060,49 @@ async def reconcile_gst(
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
+    import json
+    
     # In-memory comparison
     content = await file.read()
     text = content.decode('utf-8')
-    lines = text.splitlines()
     
     mismatches = []
+    
+    # Try parsing as JSON first
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            for row in data:
+                inv_no = str(row.get('invoice_no', row.get('inv_no', row.get('Invoice Number', '')))).strip()
+                vendor = str(row.get('vendor', row.get('party', row.get('Vendor Name', '')))).strip()
+                try:
+                    portal_gst = float(row.get('gst_amount', row.get('portal_gst', row.get('Total GST', 0.0))))
+                except (ValueError, TypeError):
+                    portal_gst = 0.0
+                
+                if not inv_no:
+                    continue
+                    
+                # Query ERP
+                erp_bill = await db.scalar(select(VendorBill).where(VendorBill.bill_number == inv_no))
+                if not erp_bill:
+                    mismatches.append(GSTReconciliationMismatch(
+                        invoice_no=inv_no, vendor=vendor, erp_gst=0.0, portal_gst=portal_gst,
+                        difference=portal_gst, status="MISSING_IN_ERP"
+                    ))
+                else:
+                    erp_gst = float(erp_bill.total_amount) * 0.18 # Mock ERP GST
+                    diff = abs(erp_gst - portal_gst)
+                    if diff > 1.0: # 1 rupee tolerance
+                        mismatches.append(GSTReconciliationMismatch(
+                            invoice_no=inv_no, vendor=vendor, erp_gst=erp_gst, portal_gst=portal_gst,
+                            difference=diff, status="MISMATCH"
+                        ))
+            return mismatches
+    except json.JSONDecodeError:
+        pass # Fallback to CSV parsing below
+        
+    lines = text.splitlines()
     # Assume CSV: invoice_no, vendor, gst_amount
     for line in lines[1:]: # Skip header
         if not line.strip(): continue
@@ -3212,12 +3249,49 @@ async def reconcile_gst(
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
+    import json
+    
     # In-memory comparison
     content = await file.read()
     text = content.decode('utf-8')
-    lines = text.splitlines()
     
     mismatches = []
+    
+    # Try parsing as JSON first
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            for row in data:
+                inv_no = str(row.get('invoice_no', row.get('inv_no', row.get('Invoice Number', '')))).strip()
+                vendor = str(row.get('vendor', row.get('party', row.get('Vendor Name', '')))).strip()
+                try:
+                    portal_gst = float(row.get('gst_amount', row.get('portal_gst', row.get('Total GST', 0.0))))
+                except (ValueError, TypeError):
+                    portal_gst = 0.0
+                
+                if not inv_no:
+                    continue
+                    
+                # Query ERP
+                erp_bill = await db.scalar(select(VendorBill).where(VendorBill.bill_number == inv_no))
+                if not erp_bill:
+                    mismatches.append(GSTReconciliationMismatch(
+                        invoice_no=inv_no, vendor=vendor, erp_gst=0.0, portal_gst=portal_gst,
+                        difference=portal_gst, status="MISSING_IN_ERP"
+                    ))
+                else:
+                    erp_gst = float(erp_bill.total_amount) * 0.18 # Mock ERP GST
+                    diff = abs(erp_gst - portal_gst)
+                    if diff > 1.0: # 1 rupee tolerance
+                        mismatches.append(GSTReconciliationMismatch(
+                            invoice_no=inv_no, vendor=vendor, erp_gst=erp_gst, portal_gst=portal_gst,
+                            difference=diff, status="MISMATCH"
+                        ))
+            return mismatches
+    except json.JSONDecodeError:
+        pass # Fallback to CSV parsing below
+        
+    lines = text.splitlines()
     # Assume CSV: invoice_no, vendor, gst_amount
     for line in lines[1:]: # Skip header
         if not line.strip(): continue
