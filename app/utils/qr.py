@@ -72,7 +72,7 @@ def generate_qr(
 
     # Save to in-memory buffer
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf)
     buf.seek(0)
 
     return buf

@@ -128,7 +128,7 @@ def calculate_item(unit, length, width, height, rate):
 # =========================================================
 
 
-async def get_quotation_or_404(quotation_id: int, db: AsyncSession):
+async def get_quotation_or_404(quotation_id: int, db: AsyncSession, current_user):
 
     result = await db.execute(
         select(QuotationMaster)
@@ -147,6 +147,15 @@ async def get_quotation_or_404(quotation_id: int, db: AsyncSession):
 
     if not quotation:
         raise HTTPException(404, "Quotation not found")
+
+    # Tenant / Client Validation
+    if current_user.role == UserRole.CLIENT:
+        if quotation.client_user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this quotation")
+    else:
+        # Standard tenant users must belong to the company that owns the quotation
+        if not current_user.company_id or quotation.company_id != current_user.company_id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this quotation")
 
     return quotation
 
@@ -1305,6 +1314,7 @@ async def create_quotation(
         quotation = QuotationMaster(
 
             quotation_no=quotation_no,
+            company_id=current_user.company_id,
 
             # CLIENT
             client_user_id=payload.client_user_id,
@@ -1623,6 +1633,7 @@ async def create_quotation(
         return await get_quotation_or_404(
             quotation.id,
             db,
+            current_user,
         )
 
     # =====================================================
@@ -1686,6 +1697,13 @@ async def list_quotations(
         selectinload(QuotationMaster.extra_charge_items),
     )
 
+    if current_user.role == UserRole.CLIENT:
+        query = query.where(QuotationMaster.client_user_id == current_user.id)
+    elif current_user.company_id:
+        query = query.where(QuotationMaster.company_id == current_user.company_id)
+    else:
+        return []
+
     if project_id:
         query = query.where(QuotationMaster.project_id == project_id)
 
@@ -1708,7 +1726,7 @@ async def get_quotation(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    return await get_quotation_or_404(quotation_id, db)
+    return await get_quotation_or_404(quotation_id, db, current_user)
 
 
 # =========================================================
@@ -1724,7 +1742,7 @@ async def update_quotation(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # =====================================================
     # ONLY DRAFT QUOTATION CAN BE UPDATED
@@ -1772,7 +1790,7 @@ async def update_quotation(
     await db.commit()
     await db.refresh(quotation)
 
-    return await get_quotation_or_404(quotation_id, db)
+    return await get_quotation_or_404(quotation_id, db, current_user)
 
 
 # =========================================================
@@ -1787,7 +1805,7 @@ async def delete_quotation(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # =====================================================
     # APPROVED CHECK
@@ -1826,7 +1844,7 @@ async def add_quotation_item(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # =====================================================
     # APPROVED CHECK
@@ -1920,7 +1938,7 @@ async def add_quotation_item(
 
     await db.refresh(quotation)
 
-    return await get_quotation_or_404(quotation.id, db)
+    return await get_quotation_or_404(quotation.id, db, current_user)
 
 
 # =========================================================
@@ -1947,7 +1965,7 @@ async def update_quotation_item(
     if not item:
         raise HTTPException(status_code=404, detail="Quotation item not found")
 
-    quotation = await get_quotation_or_404(item.quotation_id, db)
+    quotation = await get_quotation_or_404(item.quotation_id, db, current_user)
 
     # =====================================================
     # ONLY DRAFT QUOTATION CAN BE MODIFIED
@@ -2090,7 +2108,7 @@ async def update_quotation_item(
 
     await db.refresh(quotation)
 
-    return await get_quotation_or_404(quotation.id, db)
+    return await get_quotation_or_404(quotation.id, db, current_user)
 
 # =========================================================
 # DELETE ITEM
@@ -2111,7 +2129,7 @@ async def delete_quotation_item(
     if not item:
         raise HTTPException(404, "Quotation item not found")
 
-    quotation = await get_quotation_or_404(item.quotation_id, db)
+    quotation = await get_quotation_or_404(item.quotation_id, db, current_user)
 
     # =====================================================
     # APPROVED CHECK
@@ -2152,7 +2170,7 @@ async def preview_quotation(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    return await get_quotation_or_404(quotation_id, db)
+    return await get_quotation_or_404(quotation_id, db, current_user)
 
 
 # =========================================================
@@ -2167,7 +2185,7 @@ async def approve_quotation(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # Already approved
     if quotation.is_approved:
@@ -2216,7 +2234,7 @@ async def reject_quotation(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # Quotation must be sent first
     if quotation.status == QuotationStatus.DRAFT:
@@ -2288,7 +2306,7 @@ async def convert_to_bill(
     if not locked:
         raise HTTPException(404, "Quotation not found")
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # APPROVAL CHECK
 
@@ -2417,7 +2435,7 @@ async def convert_to_work_order(
     if not locked:
         raise HTTPException(404, "Quotation not found")
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # =====================================================
     # APPROVAL CHECK
@@ -2534,7 +2552,7 @@ async def add_labour_item(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     if quotation.is_approved:
         raise HTTPException(
@@ -2597,7 +2615,7 @@ async def add_labour_item(
 
     await db.refresh(quotation)
 
-    return await get_quotation_or_404(quotation.id, db)
+    return await get_quotation_or_404(quotation.id, db, current_user)
 
 # =========================================================
 # UPDATE LABOUR ITEM
@@ -2629,6 +2647,7 @@ async def update_labour_item(
     quotation = await get_quotation_or_404(
         labour_item.quotation_id,
         db,
+        current_user,
     )
 
     # =====================================================
@@ -2707,6 +2726,7 @@ async def update_labour_item(
     return await get_quotation_or_404(
         quotation.id,
         db,
+        current_user,
     )
 
 # =========================================================
@@ -2730,7 +2750,7 @@ async def delete_labour_item(
     if not labour_item:
         raise HTTPException(404, "Labour item not found")
 
-    quotation = await get_quotation_or_404(labour_item.quotation_id, db)
+    quotation = await get_quotation_or_404(labour_item.quotation_id, db, current_user)
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
@@ -2761,7 +2781,7 @@ async def add_material_item(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # =====================================================
     # APPROVED CHECK
@@ -2845,7 +2865,7 @@ async def add_material_item(
         ],
     )
 
-    return await get_quotation_or_404(quotation.id, db)
+    return await get_quotation_or_404(quotation.id, db, current_user)
 
 # =========================================================
 # UPDATE MATERIAL ITEM
@@ -2874,7 +2894,7 @@ async def update_material_item(
             detail="Material item not found"
         )
 
-    quotation = await get_quotation_or_404(material_item.quotation_id, db)
+    quotation = await get_quotation_or_404(material_item.quotation_id, db, current_user)
 
     # =====================================================
     # APPROVED CHECK
@@ -2951,7 +2971,7 @@ async def update_material_item(
         ],
     )
 
-    return await get_quotation_or_404(quotation.id, db)
+    return await get_quotation_or_404(quotation.id, db, current_user)
 
 # =========================================================
 # DELETE MATERIAL ITEM
@@ -2974,7 +2994,7 @@ async def delete_material_item(
     if not material_item:
         raise HTTPException(404, "Material item not found")
 
-    quotation = await get_quotation_or_404(material_item.quotation_id, db)
+    quotation = await get_quotation_or_404(material_item.quotation_id, db, current_user)
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
@@ -3004,7 +3024,7 @@ async def list_material_items(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     return quotation.material_items
 
@@ -3022,7 +3042,7 @@ async def add_extra_charge(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     if quotation.is_approved:
         raise HTTPException(
@@ -3068,7 +3088,7 @@ async def add_extra_charge(
 
     await db.refresh(extra_charge)
 
-    return await get_quotation_or_404(quotation_id, db)
+    return await get_quotation_or_404(quotation_id, db, current_user)
 
 # =========================================================
 # UPDATE EXTRA CHARGE
@@ -3100,7 +3120,7 @@ async def update_extra_charge(
             detail="Extra charge not found",
         )
 
-    quotation = await get_quotation_or_404(extra_charge.quotation_id, db)
+    quotation = await get_quotation_or_404(extra_charge.quotation_id, db, current_user)
 
     # =====================================================
     # APPROVED CHECK
@@ -3152,7 +3172,7 @@ async def update_extra_charge(
 
     await db.refresh(extra_charge)
 
-    return await get_quotation_or_404(quotation.id, db)
+    return await get_quotation_or_404(quotation.id, db, current_user)
 
 
 # =========================================================
@@ -3176,7 +3196,7 @@ async def delete_extra_charge(
     if not extra_charge:
         raise HTTPException(404, "Extra charge not found")
 
-    quotation = await get_quotation_or_404(extra_charge.quotation_id, db)
+    quotation = await get_quotation_or_404(extra_charge.quotation_id, db, current_user)
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
@@ -3206,7 +3226,7 @@ async def list_extra_charges(
     current_user: User = Depends(get_current_active_user),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     return quotation.extra_charge_items
 
@@ -3222,7 +3242,7 @@ async def generate_pdf(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user),
 ):
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     result = await db.execute(select(CompanySettings))
     company_settings = result.scalars().first()
@@ -3265,7 +3285,7 @@ async def convert_quotation_to_project(
     if not locked:
         raise HTTPException(404, "Quotation not found")
 
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     if not quotation.is_approved:
         raise HTTPException(
@@ -3294,6 +3314,7 @@ async def convert_quotation_to_project(
 
     project = Project(
         business_id=business_id,
+        company_id=quotation.company_id,
         project_name=quotation.project_name,
         type=quotation.project_type,
         site_address=quotation.site_address,
@@ -3355,7 +3376,7 @@ async def send_quotation(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user),
 ):
-    quotation = await get_quotation_or_404(quotation_id, db)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
     # Client validation
     if not quotation.client_user_id:

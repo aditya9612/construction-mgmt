@@ -1,4 +1,4 @@
-from typing import Callable, Iterable, List
+from typing import Callable, Iterable, List, Optional, Dict, Any
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -12,6 +12,7 @@ from app.db.session import get_db_session
 from app.models.user import User, UserRole
 from app.core.request_context import set_current_user_id
 from app.models.rbac import Permission, RolePermission
+from app.models.company import Company
 
 security = HTTPBearer()
 
@@ -177,6 +178,52 @@ async def get_current_active_user(
     return current_user
 
 
+async def get_current_tenant(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session)
+) -> Company:
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not belong to any company."
+        )
+    company = await db.scalar(select(Company).where(Company.id == current_user.company_id))
+    if not company or not company.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Company is inactive or not found."
+        )
+    return company
+
+
+async def require_super_admin(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    if not current_user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super Admin privileges required."
+        )
+    return current_user
+
+
+async def require_tenant_admin(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    if not current_user.company_id or current_user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant Admin privileges required.",
+        )
+    if current_user.role != UserRole.ADMIN.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant Admin privileges required.",
+        )
+    return current_user
+
+
+
 # def require_roles(allowed_roles: Iterable[UserRole]) -> Callable[[User], User]:
 #     allowed: List[UserRole] = list(allowed_roles)
 
@@ -266,6 +313,49 @@ def require_permissions(required_permissions: list[str]):
     return _dependency
 
 
+def require_feature(feature_key: str, feature_label: Optional[str] = None):
+    """
+    Enforces that the current tenant's active subscription has the specified feature enabled.
+    Super Admins (platform level) are exempt from tenant feature limits.
+    """
+    async def _dependency(
+        current_user: User = Depends(get_current_active_user),
+        db: AsyncSession = Depends(get_db_session),
+    ) -> User:
+        if current_user.is_super_admin:
+            return current_user
+
+        if not current_user.company_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not belong to any tenant company.",
+            )
+
+        from app.services.entitlement import get_entitlement_service
+        service = get_entitlement_service()
+        entitlements = await service.get_company_entitlements(db, current_user.company_id)
+
+        if not entitlements.get("is_active"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Tenant subscription is {entitlements.get('status')}. Feature '{feature_label or feature_key}' is unavailable.",
+            )
+
+        has_feat = bool(entitlements.get("features", {}).get(feature_key, False))
+        if not has_feat:
+            label = feature_label or feature_key
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"The '{label}' feature is not included in your company plan. Please upgrade to access this feature.",
+            )
+
+        return current_user
+
+    _dependency.__name__ = f"require_feature_{feature_key}"
+    return _dependency
+
+
 def get_request_redis(request: Request):
     redis = getattr(request.app.state, "redis", None)
     return redis
+

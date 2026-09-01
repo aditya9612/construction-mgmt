@@ -55,28 +55,45 @@ async def get_document_stats(
     current_user: User = Depends(get_current_active_user),
 ):
     """
-    Returns statistics for the document repository.
+    Returns statistics for the document repository scoped to the tenant.
     """
-    total_size = await db.scalar(select(func.coalesce(func.sum(Document.file_size), 0)).where(Document.is_folder == False, Document.is_deleted == False))
-    pending_count = await db.scalar(
-        select(func.count(Document.id)).where(
+    size_query = (
+        select(func.coalesce(func.sum(Document.file_size), 0))
+        .join(Project, Document.project_id == Project.id)
+        .where(Document.is_folder == False, Document.is_deleted == False)
+    )
+    pending_query = (
+        select(func.count(Document.id))
+        .join(Project, Document.project_id == Project.id)
+        .where(
             Document.status.in_([DocumentStatus.PENDING, DocumentStatus.UNDER_REVIEW]),
             Document.is_folder == False,
             Document.is_deleted == False,
         )
     )
-    total_docs = await db.scalar(
-        select(func.count(Document.id)).where(
+    docs_query = (
+        select(func.count(Document.id))
+        .join(Project, Document.project_id == Project.id)
+        .where(
             Document.is_folder == False,
             Document.is_deleted == False,
         )
     )
 
+    if not current_user.is_super_admin:
+        size_query = size_query.where(Project.company_id == current_user.company_id)
+        pending_query = pending_query.where(Project.company_id == current_user.company_id)
+        docs_query = docs_query.where(Project.company_id == current_user.company_id)
+
+    total_size = await db.scalar(size_query)
+    pending_count = await db.scalar(pending_query)
+    total_docs = await db.scalar(docs_query)
+
     return DocumentStats(
-        total_storage_bytes=int(total_size),
-        total_storage_gb=round(float(total_size) / (1024**3), 2),
-        pending_approvals=int(pending_count),
-        total_documents=int(total_docs),
+        total_storage_bytes=int(total_size or 0),
+        total_storage_gb=round(float(total_size or 0) / (1024**3), 2),
+        pending_approvals=int(pending_count or 0),
+        total_documents=int(total_docs or 0),
     )
 
 
@@ -95,6 +112,10 @@ async def create_document(
     """
     Uploads a physical file and creates a document record.
     """
+    project = await db.get(Project, project_id)
+    if not project or (not current_user.is_super_admin and project.company_id != current_user.company_id):
+        raise NotFoundError("Project not found")
+
     # =====================================
     # SECURE VALIDATION AND SAVE
     # =====================================
@@ -129,13 +150,8 @@ async def create_document(
 
     await bump_cache_version(redis, VERSION_KEY)
 
-    # Load project name
-    project_name = await db.scalar(
-        select(Project.project_name).where(Project.id == obj.project_id)
-    )
-
     out = DocumentOut.model_validate(obj)
-    out.project_name = project_name
+    out.project_name = project.project_name
 
     return out
 
@@ -152,6 +168,10 @@ async def create_folder(
     """
     Creates a new folder in the document repository.
     """
+    project = await db.get(Project, project_id)
+    if not project or (not current_user.is_super_admin and project.company_id != current_user.company_id):
+        raise NotFoundError("Project not found")
+
     obj = Document(
         project_id=project_id,
         title=title,
@@ -167,12 +187,8 @@ async def create_folder(
 
     await bump_cache_version(redis, VERSION_KEY)
 
-    project_name = await db.scalar(
-        select(Project.project_name).where(Project.id == obj.project_id)
-    )
-
     out = DocumentOut.model_validate(obj)
-    out.project_name = project_name
+    out.project_name = project.project_name
 
     return out
 
@@ -190,14 +206,28 @@ async def list_documents(
     redis=Depends(get_request_redis),
 ):
     version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:documents:list:{version}:{limit}:{offset}:{search}:{document_type}:{project_id}:{parent_id}"
+    cid = current_user.company_id or "all"
+    cache_key = f"cache:documents:list:{cid}:{version}:{limit}:{offset}:{search}:{document_type}:{project_id}:{parent_id}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
         return PaginatedResponse[DocumentOut].model_validate(cached)
 
-    # Join with Project to get project_name
-    query = select(Document, Project.project_name).outerjoin(Project, Document.project_id == Project.id)
-    count_query = select(func.count()).select_from(Document)
+    # Join with Project to get project_name and filter by company_id
+    query = (
+        select(Document, Project.project_name)
+        .join(Project, Document.project_id == Project.id)
+        .where(Document.is_deleted == False)
+    )
+    count_query = (
+        select(func.count())
+        .select_from(Document)
+        .join(Project, Document.project_id == Project.id)
+        .where(Document.is_deleted == False)
+    )
+
+    if not current_user.is_super_admin:
+        query = query.where(Project.company_id == current_user.company_id)
+        count_query = count_query.where(Project.company_id == current_user.company_id)
 
     if search:
         like = f"%{search}%"
@@ -245,16 +275,21 @@ async def get_document(
     redis=Depends(get_request_redis),
 ):
     version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:documents:get:{version}:{document_id}"
+    cid = current_user.company_id or "all"
+    cache_key = f"cache:documents:get:{cid}:{version}:{document_id}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
         return DocumentOut.model_validate(cached)
 
-    result = await db.execute(
+    query = (
         select(Document, Project.project_name)
-        .outerjoin(Project, Document.project_id == Project.id)
-        .where(Document.id == document_id)
+        .join(Project, Document.project_id == Project.id)
+        .where(Document.id == document_id, Document.is_deleted == False)
     )
+    if not current_user.is_super_admin:
+        query = query.where(Project.company_id == current_user.company_id)
+
+    result = await db.execute(query)
     row = result.first()
     if row is None:
         raise NotFoundError("Document not found")
@@ -279,10 +314,19 @@ async def update_document(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    obj = await db.get(Document, document_id)
+    query = (
+        select(Document, Project.project_name)
+        .join(Project, Document.project_id == Project.id)
+        .where(Document.id == document_id, Document.is_deleted == False)
+    )
+    if not current_user.is_super_admin:
+        query = query.where(Project.company_id == current_user.company_id)
 
-    if not obj:
+    row = (await db.execute(query)).first()
+    if not row:
         raise NotFoundError("Document not found")
+
+    obj, proj_name = row
 
     if obj.status in [DocumentStatus.UNDER_REVIEW, DocumentStatus.APPROVED]:
         raise ValidationError(f"Cannot edit document. Current status is {obj.status}")
@@ -327,12 +371,8 @@ async def update_document(
 
     await bump_cache_version(redis, VERSION_KEY)
 
-    project_name = await db.scalar(
-        select(Project.project_name).where(Project.id == obj.project_id)
-    )
-
     out = DocumentOut.model_validate(obj)
-    out.project_name = project_name
+    out.project_name = proj_name
 
     return out
 
@@ -344,7 +384,15 @@ async def delete_document(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    obj = await db.scalar(select(Document).where(Document.id == document_id))
+    query = (
+        select(Document)
+        .join(Project, Document.project_id == Project.id)
+        .where(Document.id == document_id, Document.is_deleted == False)
+    )
+    if not current_user.is_super_admin:
+        query = query.where(Project.company_id == current_user.company_id)
+
+    obj = await db.scalar(query)
     if obj is None:
         raise NotFoundError("Document not found")
 
@@ -369,8 +417,15 @@ async def download_document(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    doc = await db.get(Document, document_id)
+    query = (
+        select(Document)
+        .join(Project, Document.project_id == Project.id)
+        .where(Document.id == document_id, Document.is_deleted == False)
+    )
+    if not current_user.is_super_admin:
+        query = query.where(Project.company_id == current_user.company_id)
 
+    doc = await db.scalar(query)
     if not doc or not doc.file_url:
         raise NotFoundError("Document or file not found")
 

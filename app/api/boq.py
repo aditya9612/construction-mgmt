@@ -23,6 +23,7 @@ from app.core.dependencies import (
 )
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
+from app.utils.common import assert_project_access
 from app.models.boq import BOQ, BOQAudit, BOQGroup
 from app.models.settings import CompanySettings
 from app.models.master_data import ActivityType
@@ -138,6 +139,8 @@ async def create_boq(
         logger.warning(f"Project not found project_id={payload.project_id}")
         raise NotFoundError("Project not found")
 
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+
     # =========================
     # MASTER DATA VALIDATION (ADD HERE)
     # =========================
@@ -235,7 +238,7 @@ async def list_boq(
     version = await get_cache_version(redis, VERSION_KEY)
 
     cache_key = (
-        f"cache:boq:list:{version}:{limit}:{offset}:{search}:"
+        f"cache:boq:list:{current_user.company_id}:{version}:{limit}:{offset}:{search}:"
         f"{status}:{project_id}:{category}:{version_no}"
     )
 
@@ -246,9 +249,9 @@ async def list_boq(
     if search:
         logger.info(f"BOQ search query={search}")
 
-    # Exclude soft-deleted BOQs by default
-    query = select(BOQ).where(BOQ.status != "Deleted")
-    count_query = select(func.count()).select_from(BOQ).where(BOQ.status != "Deleted")
+    # Exclude soft-deleted BOQs by default and filter by company
+    query = select(BOQ).join(Project, Project.id == BOQ.project_id).where(Project.company_id == current_user.company_id, BOQ.status != "Deleted")
+    count_query = select(func.count()).select_from(BOQ).join(Project, Project.id == BOQ.project_id).where(Project.company_id == current_user.company_id, BOQ.status != "Deleted")
 
     if search:
         like = f"%{search}%"
@@ -376,6 +379,8 @@ async def import_boq_excel(
     )
     if not parent:
         raise NotFoundError("BOQ Group not found")
+
+    await assert_project_access(db, project_id=parent.project_id, current_user=current_user)
 
     content = await file.read()
     wb = openpyxl.load_workbook(filename=BytesIO(content), data_only=True)
@@ -642,6 +647,8 @@ async def update_actuals(
     if not obj:
         raise NotFoundError("BOQ not found")
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     # prevent modifying historical versions
     if not obj.is_latest:
         raise InvalidStateError("Cannot modify old BOQ version.")
@@ -670,6 +677,7 @@ async def boq_summary(
     current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     result = await db.execute(
         select(func.count(), func.sum(BOQ.total_cost), func.sum(BOQ.actual_cost)).where(
             BOQ.project_id == project_id, BOQ.is_latest == True, BOQ.status != "Deleted"
@@ -695,6 +703,7 @@ async def boq_comparison(
     current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     rows = (
         (
             await db.execute(
@@ -733,6 +742,8 @@ async def boq_report(
 
     if not base:
         raise NotFoundError("BOQ not found")
+
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
 
     rows = (
         (
@@ -780,6 +791,8 @@ async def boq_alerts(
     if not base:
         raise NotFoundError("BOQ not found")
 
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+
     rows = (
         (
             await db.execute(
@@ -822,6 +835,8 @@ async def get_versions(
     if not base:
         raise NotFoundError("BOQ not found")
 
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+
     result = await db.execute(
         select(BOQ.version_no)
         .where(
@@ -841,6 +856,7 @@ async def get_boq_by_project(
     current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     rows = (
         (
             await db.execute(
@@ -883,6 +899,8 @@ async def add_item(
 
     if not parent:
         raise NotFoundError("BOQ not found")
+
+    await assert_project_access(db, project_id=parent.project_id, current_user=current_user)
 
     # prevent modifying old versions
     if not parent.is_latest:
@@ -965,6 +983,8 @@ async def get_items(
 
     if not base:
         raise NotFoundError("BOQ not found")
+
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
 
     rows = (
         (
@@ -1081,6 +1101,8 @@ async def bulk_add_items(
 
     if not parent:
         raise NotFoundError("BOQ not found")
+
+    await assert_project_access(db, project_id=parent.project_id, current_user=current_user)
 
     if not parent.is_latest:
         raise InvalidStateError(
@@ -1220,6 +1242,8 @@ async def create_version(
     if not base:
         raise NotFoundError("BOQ not found")
 
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+
     if base.approval_status != "Approved":
         raise InvalidStateError(
             "Only approved BOQ versions can create a new version."
@@ -1313,6 +1337,8 @@ async def export_boq_json(
     if not base:
         raise NotFoundError("BOQ not found")
 
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+
     rows = (
         (
             await db.execute(
@@ -1341,6 +1367,7 @@ async def export_boq_excel(
     base = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
     if not base:
         raise NotFoundError("BOQ not found")
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
 
     project = await db.scalar(select(Project).options(selectinload(Project.owner)).where(Project.id == base.project_id))
 
@@ -1364,6 +1391,7 @@ async def export_boq_pdf(
     base = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
     if not base:
         raise NotFoundError("BOQ not found")
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
 
     project = await db.scalar(select(Project).options(selectinload(Project.owner)).where(Project.id == base.project_id))
 
@@ -1391,6 +1419,8 @@ async def boq_optimize(
 
     if not base:
         raise NotFoundError("BOQ not found")
+
+    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
 
     rows = (
         (
@@ -1519,6 +1549,8 @@ async def generate_tasks_from_boq(
 
     if not boq:
         raise NotFoundError("BOQ not found")
+
+    await assert_project_access(db, project_id=boq.project_id, current_user=current_user)
 
     # prevent task generation from historical versions
     if not boq.is_latest:

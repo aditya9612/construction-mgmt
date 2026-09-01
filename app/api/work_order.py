@@ -108,12 +108,16 @@ async def list_work_orders(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(WORK_ORDER_READ_ROLES)),
 ):
-    query = select(WorkOrder)
+    query = select(WorkOrder).join(Project)
+
+    if current_user.company_id:
+        query = query.where(Project.company_id == current_user.company_id)
+    else:
+        return []
 
     if str(current_user.role) != UserRole.ADMIN.value:
         query = (
-            query.join(Project)
-            .join(Project.members)
+            query.join(Project.members)
             .where(Project.members.any(user_id=current_user.id))
         )
 

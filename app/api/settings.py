@@ -326,23 +326,23 @@ os.makedirs(
     response_model=CompanySettingsOut
 )
 async def get_company_settings(
+    current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session)
 ):
+    if not current_user.company_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot access tenant company settings."
+        )
 
-    result = await db.execute(
-        select(CompanySettings)
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == current_user.company_id)
     )
 
-    settings = result.scalars().first()
-
     if not settings:
-
-        settings = CompanySettings()
-
+        settings = CompanySettings(company_id=current_user.company_id)
         db.add(settings)
-
         await db.commit()
-
         await db.refresh(settings)
 
     return settings
@@ -358,19 +358,21 @@ async def get_company_settings(
 )
 async def update_company_settings(
     payload: CompanySettingsUpdate,
+    current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session)
 ):
+    if not current_user.company_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot update tenant company settings."
+        )
 
-    result = await db.execute(
-        select(CompanySettings)
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == current_user.company_id)
     )
 
-    settings = result.scalars().first()
-
     if not settings:
-
-        settings = CompanySettings()
-
+        settings = CompanySettings(company_id=current_user.company_id)
         db.add(settings)
 
     update_data = payload.model_dump(
@@ -378,10 +380,10 @@ async def update_company_settings(
     )
 
     for key, value in update_data.items():
-        setattr(settings, key, value)
+        if key != "company_id":
+            setattr(settings, key, value)
 
     await db.commit()
-
     await db.refresh(settings)
 
     return settings
@@ -394,25 +396,27 @@ async def update_company_settings(
 @router.post("/upload-logo")
 async def upload_logo(
     file: UploadFile = File(...),
+    current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session)
 ):
+    if not current_user.company_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot upload tenant company logo."
+        )
 
-    result = await db.execute(
-        select(CompanySettings)
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == current_user.company_id)
     )
 
-    settings = result.scalars().first()
-
     if not settings:
-
-        settings = CompanySettings()
-
+        settings = CompanySettings(company_id=current_user.company_id)
         db.add(settings)
 
     file_path = await validate_and_save_image(
         file=file,
         upload_dir=UPLOAD_DIR,
-        prefix="logo"
+        prefix=f"logo_{current_user.company_id}"
     )
 
     settings.company_logo = file_path
@@ -432,23 +436,27 @@ async def upload_logo(
 @router.post("/upload-signature")
 async def upload_signature(
     file: UploadFile = File(...),
+    current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session)
 ):
+    if not current_user.company_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot upload tenant company signature."
+        )
 
-    result = await db.execute(
-        select(CompanySettings)
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == current_user.company_id)
     )
 
-    settings = result.scalars().first()
-
     if not settings:
-        settings = CompanySettings()
+        settings = CompanySettings(company_id=current_user.company_id)
         db.add(settings)
 
     file_path = await validate_and_save_image(
         file=file,
         upload_dir=UPLOAD_DIR,
-        prefix="signature"
+        prefix=f"signature_{current_user.company_id}"
     )
 
     settings.signature_image = file_path
@@ -458,4 +466,4 @@ async def upload_signature(
     return {
         "message": "Signature uploaded successfully",
         "file_path": file_path
-    }
+    }

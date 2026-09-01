@@ -49,6 +49,7 @@ class Labour(Base, TimestampMixin):
     __tablename__ = "labour"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    company_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("companies.id", ondelete="RESTRICT"), index=True)
 
     worker_code: Mapped[str] = mapped_column(
         String(50), unique=True, index=True, nullable=False

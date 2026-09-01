@@ -11,6 +11,7 @@ import uuid
 import ezdxf
 import pandas as pd
 from datetime import datetime
+from typing import Optional
 import matplotlib.pyplot as plt
 
 from app.models.cad_conversion import CADConversion
@@ -122,7 +123,7 @@ def generate_preview(points, output_path):
 
 
 # -------------------- MAIN --------------------
-async def csv_to_dxf(file_path: str, db: AsyncSession):
+async def csv_to_dxf(file_path: str, db: AsyncSession, company_id: Optional[int] = None):
     # 🔥 FIXED CSV READ
     df = pd.read_csv(file_path, skipinitialspace=True)
     df.columns = df.columns.str.strip().str.lower()
@@ -162,18 +163,25 @@ async def csv_to_dxf(file_path: str, db: AsyncSession):
 
     generate_preview(points, out)
 
-    db.add(CADConversion(project_name="Survey", file_path=out, area=0))
+    db.add(CADConversion(project_name="Survey", file_path=out, area=0, company_id=company_id))
     await db.commit()
 
     return out
 
 
 # -------------------- API --------------------
+from app.core.dependencies import get_current_active_user
+from app.models.user import User
+
 @router.post("/csv-to-dxf")
-async def convert(file: UploadFile = File(...), db: AsyncSession = Depends(get_db_session)):
+async def convert(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+):
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files allowed")
-    
+
     content = await file.read()
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="CSV file too large (max 5MB)")
@@ -184,11 +192,11 @@ async def convert(file: UploadFile = File(...), db: AsyncSession = Depends(get_d
     def _save_cad():
         with open(temp_path, "wb") as f:
             f.write(content)
-            
+
     await run_in_threadpool(_save_cad)
 
     try:
-        dxf_path = await csv_to_dxf(temp_path, db)
+        dxf_path = await csv_to_dxf(temp_path, db, company_id=current_user.company_id)
     finally:
         os.remove(temp_path)
 
@@ -200,6 +208,13 @@ async def convert(file: UploadFile = File(...), db: AsyncSession = Depends(get_d
 
 
 @router.get("/logs", response_model=list[CADConversionOut])
-async def logs(db: AsyncSession = Depends(get_db_session)):
-    res = await db.execute(select(CADConversion))
+async def logs(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = select(CADConversion)
+    if not current_user.is_super_admin:
+        query = query.where(CADConversion.company_id == current_user.company_id)
+    query = query.order_by(CADConversion.id.desc())
+    res = await db.execute(query)
     return res.scalars().all()

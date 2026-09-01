@@ -369,12 +369,14 @@ async def assert_client_is_project_member(
 async def check_duplicate_payment(
     db: AsyncSession,
     payload: "s.ClientPaymentCreate | s.ClientPaymentBase",
+    current_user: User,
     exclude_payment_id: int | None = None,
 ):
     """Prevent duplicate cheque/reference payments."""
     stmt = None
     if payload.payment_method == PaymentMethod.CHEQUE:
         stmt = select(ClientPayment).where(
+            ClientPayment.company_id == current_user.company_id,
             ClientPayment.bank_name == payload.bank_name.strip(),
             ClientPayment.cheque_no == payload.cheque_no.strip(),
             ClientPayment.payment_status.notin_(NON_BLOCKING_DUPLICATE_STATUSES),
@@ -385,6 +387,7 @@ async def check_duplicate_payment(
         PaymentMethod.UPI,
     ):
         stmt = select(ClientPayment).where(
+            ClientPayment.company_id == current_user.company_id,
             ClientPayment.reference_no == payload.reference_no.strip(),
             ClientPayment.payment_status.notin_(NON_BLOCKING_DUPLICATE_STATUSES),
         )
@@ -647,7 +650,7 @@ async def get_invoice_payment_summary(
 
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.project_id == project_id)
+        .where(ClientPayment.project_id == project_id, ClientPayment.company_id == current_user.company_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.invoice),
@@ -719,7 +722,7 @@ async def get_payment_history(
 
     # Count
     count_stmt = select(func.count(ClientPayment.id)).where(
-        ClientPayment.project_id == project_id
+        ClientPayment.project_id == project_id, ClientPayment.company_id == current_user.company_id
     )
     if current_user.role == UserRole.CLIENT.value:
         count_stmt = count_stmt.where(ClientPayment.client_user_id == current_user.id)
@@ -729,7 +732,7 @@ async def get_payment_history(
     # Data
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.project_id == project_id)
+        .where(ClientPayment.project_id == project_id, ClientPayment.company_id == current_user.company_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.invoice),
@@ -893,8 +896,8 @@ async def payment_analytics(
 
     def scope(stmt_):
         if is_client:
-            return stmt_.where(ClientPayment.client_user_id == current_user.id)
-        return stmt_
+            return stmt_.where(ClientPayment.client_user_id == current_user.id, ClientPayment.company_id == current_user.company_id)
+        return stmt_.where(ClientPayment.company_id == current_user.company_id)
 
     # Payment method breakdown
     method_rows = (
@@ -986,12 +989,12 @@ async def payment_analytics(
             await db.scalar(
                 select(func.count(Invoice.id.distinct()))
                 .join(ProjectMember, ProjectMember.project_id == Invoice.project_id)
-                .where(ProjectMember.user_id == current_user.id)
+                .where(ProjectMember.user_id == current_user.id, Invoice.company_id == current_user.company_id)
             )
             or 0
         )
     else:
-        total_invoices = await db.scalar(select(func.count(Invoice.id))) or 0
+        total_invoices = await db.scalar(select(func.count(Invoice.id)).where(Invoice.company_id == current_user.company_id)) or 0
 
     # TODO: Implement proper overdue calculation when due_date is added to Invoice
     overdue_invoices = 0
@@ -1043,7 +1046,7 @@ async def export_client_payments_excel(
         if not search:
             search = None
 
-    stmt = select(ClientPayment).options(
+    stmt = select(ClientPayment).where(ClientPayment.company_id == current_user.company_id).options(
         selectinload(ClientPayment.client_user),
         selectinload(ClientPayment.project),
         selectinload(ClientPayment.invoice),
@@ -1208,7 +1211,7 @@ async def export_client_payments_pdf(
         if not search:
             search = None
 
-    stmt = select(ClientPayment).options(
+    stmt = select(ClientPayment).where(ClientPayment.company_id == current_user.company_id).options(
         selectinload(ClientPayment.client_user),
         selectinload(ClientPayment.project),
         selectinload(ClientPayment.invoice),
@@ -1443,7 +1446,7 @@ async def create_client_payment(
     validate_and_normalize_payment_fields(data)
     project = await get_project_or_404(db, data.project_id)
     await assert_client_is_project_member(db, data.project_id, current_user)
-    await check_duplicate_payment(db, data)
+    await check_duplicate_payment(db, data, current_user)
 
     # Validate invoice
     invoice_obj = await db.get(Invoice, data.invoice_id)
@@ -1465,6 +1468,7 @@ async def create_client_payment(
 
     try:
         payment = ClientPayment(
+            company_id=current_user.company_id,
             payment_no="",
             client_user_id=current_user.id,
             invoice_id=data.invoice_id,
@@ -1607,7 +1611,7 @@ async def list_client_payments(
         if not search:
             search = None
 
-    stmt = select(ClientPayment).options(
+    stmt = select(ClientPayment).where(ClientPayment.company_id == current_user.company_id).options(
         selectinload(ClientPayment.client_user),
         selectinload(ClientPayment.project),
         selectinload(ClientPayment.invoice),
@@ -1682,7 +1686,7 @@ async def get_client_payment(
     """Get a single client payment by ID."""
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id)
+        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.project),
@@ -1718,7 +1722,7 @@ async def update_client_payment(
     """Update a client payment (only before verification)."""
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id)
+        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.project),
@@ -1767,7 +1771,7 @@ async def update_client_payment(
         )
 
     validate_and_normalize_payment_fields(data)
-    await check_duplicate_payment(db, data, exclude_payment_id=payment_id)
+    await check_duplicate_payment(db, data, current_user, exclude_payment_id=payment_id)
 
     # Validate invoice if changed
     if data.invoice_id and data.invoice_id != payment.invoice_id:
@@ -1885,7 +1889,7 @@ async def delete_client_payment(
     """Cancel/delete a client payment (only before verification)."""
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id)
+        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
         .options(
             selectinload(ClientPayment.invoice),
         )
@@ -1980,7 +1984,7 @@ async def verify_client_payment(
     """Verify (approve/reject) a client payment. Staff-only endpoint."""
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id)
+        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.project),
@@ -2152,7 +2156,7 @@ async def download_payment_receipt(
     """Download payment receipt as PDF."""
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id)
+        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.project),

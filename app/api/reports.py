@@ -484,9 +484,15 @@ from app.models.user import User, UserRole, UserAttendance, ActivityLog
 from app.utils.common import assert_project_access
 
 
+from app.core.dependencies import require_feature
+
 REPORT_READ_ROLES = [role.value for role in UserRole]
 
-router = APIRouter(prefix="/reports", tags=["Reports"])
+router = APIRouter(
+    prefix="/reports",
+    tags=["Reports"],
+    dependencies=[Depends(require_feature("advanced_reports", "Reports & Analytics"))],
+)
 
 
 # ===================== PROJECT REPORTS =====================
@@ -518,9 +524,20 @@ async def export_projects_excel(
     # ======================================================
     # Company Portfolio Report
     # ======================================================
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot export company portfolio directly",
+        )
 
     projects = (
-        (await db.execute(select(m.Project).order_by(m.Project.id.desc())))
+        (
+            await db.execute(
+                select(m.Project)
+                .where(m.Project.company_id == current_user.company_id)
+                .order_by(m.Project.id.desc())
+            )
+        )
         .scalars()
         .all()
     )
@@ -586,7 +603,16 @@ async def export_projects_pdf(
         return await service.export_pdf(db, project_id, current_user)
 
     # Export ALL projects
-    projects_query = select(m.Project).order_by(m.Project.id.desc())
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot export company portfolio directly",
+        )
+    projects_query = (
+        select(m.Project)
+        .where(m.Project.company_id == current_user.company_id)
+        .order_by(m.Project.id.desc())
+    )
     projects = (await db.execute(projects_query)).scalars().all()
 
     total_projects = len(projects)
@@ -1845,6 +1871,7 @@ async def daily_report(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     dsr = await db.scalar(
         select(m.DailySiteReport).where(
             m.DailySiteReport.project_id == project_id,
@@ -1865,6 +1892,7 @@ async def export_daily_pdf(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     dsr = await db.scalar(
         select(m.DailySiteReport).where(
             m.DailySiteReport.project_id == project_id,
@@ -1905,6 +1933,7 @@ async def weekly_progress(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     week_ago = datetime.utcnow() - timedelta(days=7)
 
     result = await db.execute(
@@ -1936,6 +1965,7 @@ async def labour_report(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     from app.models.labour import Labour
 
     result = await db.execute(
@@ -2183,6 +2213,7 @@ async def material_report(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     result = await db.execute(
         select(Material)
         .where(Material.project_id == project_id)
@@ -2203,6 +2234,7 @@ async def export_material_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     stmt = (
         select(Material)
         .options(joinedload(Material.material_master).joinedload(MaterialMaster.unit))
@@ -2273,6 +2305,7 @@ async def issue_report(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     open_issues = await db.scalar(
         select(func.count())
         .select_from(m.Issue)
@@ -2303,6 +2336,7 @@ async def export_issue_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     result = await db.execute(
         select(m.Issue)
         .where(m.Issue.project_id == project_id)
@@ -2359,6 +2393,7 @@ async def client_report_download(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     result = await db.execute(
         select(m.DailySiteReport)
         .where(
@@ -2539,6 +2574,7 @@ async def project_financial_summary_by_id(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     #  Revenue (owner invoices only)
     revenue = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
@@ -3205,15 +3241,29 @@ async def business_intelligence_kpis(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot access company business intelligence",
+        )
+
     # Revenue (owner invoices)
     revenue = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.type == "owner", Invoice.status == InvoiceStatus.PAID
+        select(func.sum(Invoice.total_amount))
+        .join(m.Project, m.Project.id == Invoice.project_id)
+        .where(
+            Invoice.type == "owner",
+            Invoice.status == InvoiceStatus.PAID,
+            m.Project.company_id == current_user.company_id,
         )
     )
 
     # Expenditure (all expenses)
-    expense = await db.scalar(select(func.sum(Expense.amount)))
+    expense = await db.scalar(
+        select(func.sum(Expense.amount))
+        .join(m.Project, m.Project.id == Expense.project_id)
+        .where(m.Project.company_id == current_user.company_id)
+    )
 
     revenue_val = float(revenue or 0)
     expense_val = float(expense or 0)
@@ -3334,6 +3384,7 @@ async def commercial_execution_analytics(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     from app.models.boq import BOQ
 
     # BOQ Items
@@ -3394,6 +3445,7 @@ async def contractor_execution_analytics(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     from app.models.billing import RABill
 
     bills = (

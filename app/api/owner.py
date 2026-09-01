@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import OwnerTransactionType, ProjectStatus
 from app.db.session import get_db_session
+from app.api.user import get_current_active_user, User
 from app.models.owner import Owner, OwnerTransaction, OwnerPaymentSchedule
 from app.models.project import Project
 from app.models.invoice import Invoice
@@ -48,6 +49,7 @@ router = APIRouter(
 async def create_owner(
     payload: OwnerCreate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
     logger.info(f"Creating owner name={payload.owner_name}")
 
@@ -60,6 +62,7 @@ async def create_owner(
             )
 
             obj = Owner(**data)
+            obj.company_id = current_user.company_id
 
             db.add(obj)
             await db.flush()
@@ -80,8 +83,9 @@ async def create_owner(
 async def list_owners(
     search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
-    query = select(Owner)
+    query = select(Owner).where(Owner.company_id == current_user.company_id)
 
     if search:
         query = query.where(Owner.owner_name.ilike(f"%{search}%"))
@@ -95,6 +99,7 @@ async def list_owners(
 @router.get("/portfolio", response_model=ClientPortfolioResponse)
 async def get_client_portfolio(
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
     """
     Returns an aggregated view of clients (owners) with their project counts,
@@ -103,7 +108,7 @@ async def get_client_portfolio(
     logger.info("Fetching client portfolio summary")
 
     # 1. Fetch all owners
-    owners_result = await db.execute(select(Owner))
+    owners_result = await db.execute(select(Owner).where(Owner.company_id == current_user.company_id))
     owners = owners_result.scalars().all()
 
     portfolio_items = []
@@ -251,10 +256,11 @@ async def create_payment_milestone(
 async def get_owner(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
     obj = await db.scalar(select(Owner).where(Owner.id == owner_id))
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Owner not found")
 
     return OwnerOut.model_validate(obj)
@@ -265,12 +271,13 @@ async def update_owner(
     owner_id: int,
     payload: OwnerUpdate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
     logger.info(f"Updating owner id={owner_id}")
 
     obj = await db.scalar(select(Owner).where(Owner.id == owner_id))
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         logger.warning(f"Owner not found id={owner_id}")
         raise NotFoundError("Owner not found")
 
@@ -300,12 +307,13 @@ async def update_owner(
 async def delete_owner(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
 ):
     logger.info(f"Deleting owner id={owner_id}")
 
     obj = await db.scalar(select(Owner).where(Owner.id == owner_id))
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         logger.warning(f"Owner not found id={owner_id}")
         raise NotFoundError("Owner not found")
 

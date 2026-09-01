@@ -17,6 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 from datetime import datetime
 from typing import Optional
+from sqlalchemy import Boolean, Date, Enum, Float, Index, Integer, String, Text, ForeignKey, DateTime, func
 from app.models.base import Base, TimestampMixin
 from sqlalchemy import ForeignKey, DateTime, func
 from sqlalchemy.orm import relationship
@@ -107,6 +108,13 @@ class User(Base, TimestampMixin):
         foreign_keys="QuotationMaster.client_user_id",
         back_populates="client",
     )
+
+    company_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("companies.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    is_super_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
+    company = relationship("Company", back_populates="users")
 
     @property
     def user_id(self) -> int:

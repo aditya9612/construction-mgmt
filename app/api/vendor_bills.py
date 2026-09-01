@@ -40,6 +40,7 @@ async def create_vendor_bill(
         raise HTTPException(status_code=400, detail="Bill number already exists")
         
     bill = VendorBill(
+        company_id=current_user.company_id,
         supplier_id=payload.supplier_id,
         project_id=payload.project_id,
         purchase_order_id=payload.purchase_order_id,
@@ -102,7 +103,7 @@ async def create_vendor_bill(
     except Exception as e:
         logger.error(f"Failed to create notification for vendor bill creation: {e}")
     
-    return await _get_bill_with_details(db, bill.id)
+    return await _get_bill_with_details(db, bill.id, current_user)
 
 @router.get("", response_model=List[VendorBillOut])
 async def list_vendor_bills(
@@ -111,7 +112,7 @@ async def list_vendor_bills(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES))
 ):
     from sqlalchemy.orm import selectinload
-    query = select(VendorBill, Supplier.supplier_name.label("supplier_name")).outerjoin(Supplier, Supplier.id == VendorBill.supplier_id).options(selectinload(VendorBill.items))
+    query = select(VendorBill, Supplier.supplier_name.label("supplier_name")).outerjoin(Supplier, Supplier.id == VendorBill.supplier_id).options(selectinload(VendorBill.items)).where(VendorBill.company_id == current_user.company_id)
     if status:
         query = query.where(VendorBill.status == status)
     
@@ -136,7 +137,7 @@ async def get_vendor_bill(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES))
 ):
-    bill_out = await _get_bill_with_details(db, id)
+    bill_out = await _get_bill_with_details(db, id, current_user)
     if not bill_out:
         raise HTTPException(status_code=404, detail="Vendor Bill not found")
     return bill_out
@@ -154,7 +155,7 @@ async def approve_vendor_bill(
     from decimal import Decimal
     
     # Lock for update
-    result = await db.execute(select(VendorBill).where(VendorBill.id == id).with_for_update())
+    result = await db.execute(select(VendorBill).where(VendorBill.id == id, VendorBill.company_id == current_user.company_id).with_for_update())
     bill = result.scalar_one_or_none()
     
     if not bill:
@@ -240,7 +241,7 @@ async def pay_vendor_bill(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES))
 ):
-    bill = await db.get(VendorBill, id)
+    bill = await db.scalar(select(VendorBill).where(VendorBill.id == id, VendorBill.company_id == current_user.company_id))
     if not bill:
         raise HTTPException(status_code=404, detail="Vendor Bill not found")
         
@@ -354,7 +355,7 @@ async def reverse_vendor_payment(
     # ----------------------------------------
     # Validate Vendor Bill
     # ----------------------------------------
-    bill = await db.get(VendorBill, bill_id)
+    bill = await db.scalar(select(VendorBill).where(VendorBill.id == bill_id, VendorBill.company_id == current_user.company_id))
     if not bill:
         raise HTTPException(status_code=404, detail="Vendor Bill not found")
 
@@ -550,13 +551,13 @@ async def reverse_vendor_payment(
         "status": bill.status,
     }
 
-async def _get_bill_with_details(db: AsyncSession, bill_id: int):
+async def _get_bill_with_details(db: AsyncSession, bill_id: int, current_user: User):
     from sqlalchemy.orm import selectinload
     result = await db.execute(
         select(VendorBill, Supplier.supplier_name.label("supplier_name"))
         .options(selectinload(VendorBill.items))
         .outerjoin(Supplier, Supplier.id == VendorBill.supplier_id)
-        .where(VendorBill.id == bill_id)
+        .where(VendorBill.id == bill_id, VendorBill.company_id == current_user.company_id)
     )
     row = result.first()
     if not row:

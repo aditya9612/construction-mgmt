@@ -340,6 +340,7 @@ class Supplier(Base, TimestampMixin):
     __tablename__ = "suppliers"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("companies.id", ondelete="RESTRICT"), index=True)
 
     supplier_name: Mapped[str] = mapped_column(String(255), nullable=False)
     contact_person: Mapped[Optional[str]] = mapped_column(String(255))

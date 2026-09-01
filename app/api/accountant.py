@@ -298,7 +298,12 @@ async def create_account(
     data = payload.dict()
     if isinstance(data.get("type"), str):
         data["type"] = data["type"].lower()
-    obj = Account(**data)
+    
+    # Enforce company_id
+    if "company_id" in data:
+        del data["company_id"]
+    
+    obj = Account(company_id=current_user.company_id, **data)
     db.add(obj)
     try:
         await db.commit()
@@ -335,7 +340,7 @@ async def list_accounts(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
     # Base query
-    query = select(Account)
+    query = select(Account).where(Account.company_id == current_user.company_id)
     
     if type:
         query = query.where(Account.type == type)
@@ -394,7 +399,7 @@ async def get_accounts_tree(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    accounts = (await db.execute(select(Account).order_by(Account.id))).scalars().all()
+    accounts = (await db.execute(select(Account).where(Account.company_id == current_user.company_id).order_by(Account.id))).scalars().all()
     
     # Build tree
     acc_map = {}
@@ -426,7 +431,7 @@ async def export_accounts(
 ):
     import io, csv
     from fastapi.responses import StreamingResponse
-    accounts = (await db.execute(select(Account).order_by(Account.id))).scalars().all()
+    accounts = (await db.execute(select(Account).where(Account.company_id == current_user.company_id).order_by(Account.id))).scalars().all()
     
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -507,7 +512,7 @@ async def import_accounts(
             
     existing_codes = set()
     if codes_to_check:
-        existing_accounts = await db.scalars(select(Account.code).where(Account.code.in_(codes_to_check)))
+        existing_accounts = await db.scalars(select(Account.code).where(Account.code.in_(codes_to_check), Account.company_id == current_user.company_id))
         existing_codes = set(existing_accounts.all())
 
     for i, parts in rows_data:
@@ -542,7 +547,7 @@ async def import_accounts(
                 errors.append(f"Line {i}: Invalid parent ID '{parent_id_str}'")
                 continue
 
-        acc = Account(name=name, code=code, type=acc_type, parent_id=parent_id)
+        acc = Account(name=name, code=code, type=acc_type, parent_id=parent_id, company_id=current_user.company_id)
         db.add(acc)
         valid += 1
             
@@ -563,7 +568,7 @@ async def get_account_detail(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    acc = await db.get(Account, id)
+    acc = await db.scalar(select(Account).where(Account.id == id, Account.company_id == current_user.company_id))
     if not acc:
         raise NotFoundError("Account not found")
         
@@ -595,14 +600,14 @@ async def get_account_detail(
     out.opening_balance = 0.0
     
     if acc.parent_id:
-        parent = await db.get(Account, acc.parent_id)
+        parent = await db.scalar(select(Account).where(Account.id == acc.parent_id, Account.company_id == current_user.company_id))
         if parent:
             p_out = AccountOut.from_orm(parent)
             p_out.name = parent.name.replace(" [Inactive]", "") if parent.name.endswith(" [Inactive]") else parent.name
             p_out.status = "Inactive" if parent.name.endswith("[Inactive]") else "Active"
             out.parent = p_out
             
-    children = (await db.execute(select(Account).where(Account.parent_id == acc.id))).scalars().all()
+    children = (await db.execute(select(Account).where(Account.parent_id == acc.id, Account.company_id == current_user.company_id))).scalars().all()
     for child in children:
         c_out = AccountOut.from_orm(child)
         c_out.name = child.name.replace(" [Inactive]", "") if child.name.endswith(" [Inactive]") else child.name
@@ -618,7 +623,7 @@ async def update_account(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
 ):
-    acc = await db.get(Account, id)
+    acc = await db.scalar(select(Account).where(Account.id == id, Account.company_id == current_user.company_id))
     if not acc:
         raise NotFoundError("Account not found")
         
@@ -659,7 +664,7 @@ async def delete_account(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
 ):
-    acc = await db.get(Account, id)
+    acc = await db.scalar(select(Account).where(Account.id == id, Account.company_id == current_user.company_id))
     if not acc:
         raise NotFoundError("Account not found")
         
@@ -690,7 +695,7 @@ async def get_account_ledger(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    acc = await db.get(Account, id)
+    acc = await db.scalar(select(Account).where(Account.id == id, Account.company_id == current_user.company_id))
     if not acc:
         raise NotFoundError("Account not found")
         
@@ -1178,7 +1183,7 @@ async def create_bank_account(
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
 ):
     # Verify account_id exists and is an ASSET
-    account = await db.get(Account, payload.account_id)
+    account = await db.scalar(select(Account).where(Account.id == payload.account_id, Account.company_id == current_user.company_id))
     if not account:
         raise NotFoundError("Account not found")
     if account.type != AccountType.ASSET:
@@ -1186,7 +1191,7 @@ async def create_bank_account(
         
     parent_name = ""
     if account.parent_id:
-        parent = await db.get(Account, account.parent_id)
+        parent = await db.scalar(select(Account).where(Account.id == account.parent_id, Account.company_id == current_user.company_id))
         if parent:
             parent_name = parent.name.lower()
             
@@ -1328,7 +1333,7 @@ async def import_bank_accounts(
             errors.append(f"Line {i}: Invalid account ID '{account_id_str}'")
             continue
             
-        acc = await db.get(Account, account_id)
+        acc = await db.scalar(select(Account).where(Account.id == account_id, Account.company_id == current_user.company_id))
         if not acc or acc.type != AccountType.ASSET:
             errors.append(f"Line {i}: Account must be a valid ASSET account")
             continue
@@ -1373,7 +1378,7 @@ async def get_bank_account(
     query = (
         select(BankAccount, Account.name.label("ledger_name"))
         .join(Account, Account.id == BankAccount.account_id)
-        .where(BankAccount.id == id)
+        .where(BankAccount.id == id, Account.company_id == current_user.company_id)
     )
     result = await db.execute(query)
     row = result.first()
@@ -1402,7 +1407,8 @@ async def update_bank_account(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
 ):
-    bank_acc = await db.get(BankAccount, id)
+    query = select(BankAccount).join(Account).where(BankAccount.id == id, Account.company_id == current_user.company_id)
+    bank_acc = await db.scalar(query)
     if not bank_acc:
         raise NotFoundError("Bank account not found")
         
@@ -1454,7 +1460,8 @@ async def get_bank_account_ledger(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    bank_acc = await db.get(BankAccount, id)
+    query = select(BankAccount).join(Account).where(BankAccount.id == id, Account.company_id == current_user.company_id)
+    bank_acc = await db.scalar(query)
     if not bank_acc:
         raise NotFoundError("Bank account not found")
         
@@ -1565,7 +1572,7 @@ async def create_petty_cash_transaction(
             raise ValidationError("Category ID is required for CASH_OUT")
         if payload.category_id == cash_acc.id:
             raise ValidationError("Category cannot be the Petty Cash account")
-        category_acc = await db.get(Account, payload.category_id)
+        category_acc = await db.scalar(select(Account).where(Account.id == payload.category_id, Account.company_id == current_user.company_id))
         if not category_acc or category_acc.type != AccountType.EXPENSE:
             raise ValidationError("Category must be a valid Expense account")
 
@@ -1574,7 +1581,7 @@ async def create_petty_cash_transaction(
             raise ValidationError("Source Account ID is required for CASH_IN")
         if payload.source_account_id == cash_acc.id:
             raise ValidationError("Source account cannot be the Petty Cash account")
-        source_acc = await db.get(Account, payload.source_account_id)
+        source_acc = await db.scalar(select(Account).where(Account.id == payload.source_account_id, Account.company_id == current_user.company_id))
         # Assuming source should be Asset (Bank) or Liability based on existing system. 
         # But wait, BankAccount might enforce ASSET. We will allow ASSET.
         if not source_acc or source_acc.type != AccountType.ASSET:
@@ -2150,7 +2157,7 @@ async def trial_balance(
         )
         .join(JournalLine, JournalLine.account_id == Account.id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-        .where(JournalEntry.status == "Posted")
+        .where(JournalEntry.status == "Posted", Account.company_id == current_user.company_id)
         .group_by(Account.id)
     )
 
@@ -2200,7 +2207,7 @@ async def balance_sheet(
         )
         .join(JournalLine, JournalLine.account_id == Account.id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-        .where(JournalEntry.status == "Posted")
+        .where(JournalEntry.status == "Posted", Account.company_id == current_user.company_id)
     )
     if as_of:
         query = query.where(func.date(JournalEntry.entry_date) <= as_of)
@@ -2240,7 +2247,7 @@ async def balance_sheet(
         select(func.sum(JournalLine.credit - JournalLine.debit))
         .join(Account, Account.id == JournalLine.account_id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-        .where(Account.type == AccountType.INCOME.value)
+        .where(Account.type == AccountType.INCOME.value, Account.company_id == current_user.company_id)
         .where(JournalEntry.status == "Posted")
     )
 
@@ -2248,7 +2255,7 @@ async def balance_sheet(
         select(func.sum(JournalLine.debit - JournalLine.credit))
         .join(Account, Account.id == JournalLine.account_id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-        .where(Account.type == AccountType.EXPENSE.value)
+        .where(Account.type == AccountType.EXPENSE.value, Account.company_id == current_user.company_id)
         .where(JournalEntry.status == "Posted")
     )
 
@@ -2694,8 +2701,8 @@ async def create_fund_transfer(
     from app.utils.accounting import auto_post_journal
     
     # Validation logic to ensure accounts exist
-    from_acc = await db.get(Account, payload.from_account_id)
-    to_acc = await db.get(Account, payload.to_account_id)
+    from_acc = await db.scalar(select(Account).where(Account.id == payload.from_account_id, Account.company_id == current_user.company_id))
+    to_acc = await db.scalar(select(Account).where(Account.id == payload.to_account_id, Account.company_id == current_user.company_id))
     
     if not from_acc or not to_acc:
         raise NotFoundError("Accounts not found")
