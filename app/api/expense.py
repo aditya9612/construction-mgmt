@@ -26,9 +26,10 @@ from app.models.boq import BOQ
 from sqlalchemy import select, func
 from decimal import Decimal
 
+from fastapi.responses import StreamingResponse
 from app.models.user import User, UserRole
 from app.utils.boq_calc import recalculate_boq_actuals
-from app.core.dependencies import require_roles
+from app.core.dependencies import require_permission
 
 EXPENSE_READ_ROLES = [
     r.value
@@ -57,7 +58,7 @@ router = APIRouter(prefix="/expenses", tags=["expenses"])
 async def create_expense(
     payload: ExpenseCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("expenses.create")),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     logger.info(
@@ -65,7 +66,7 @@ async def create_expense(
     )
 
     project = await db.get(Project, payload.project_id)
-    if not project:
+    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
         logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
 
@@ -168,11 +169,16 @@ async def get_by_date_range(
     start: date,
     end: date,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
-    result = await db.execute(
-        select(Expense).where(Expense.expense_date.between(start, end))
+    query = (
+        select(Expense)
+        .join(Project, Expense.project_id == Project.id)
+        .where(Expense.expense_date.between(start, end))
     )
+    if current_user.company_id is not None:
+        query = query.where(Project.company_id == current_user.company_id)
+    result = await db.execute(query)
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 
@@ -189,9 +195,12 @@ async def list_expenses(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
-    query = select(Expense)
+    query = select(Expense).join(Project, Expense.project_id == Project.id)
+
+    if current_user.company_id is not None:
+        query = query.where(Project.company_id == current_user.company_id)
 
     if category:
         query = query.where(Expense.category == category)
@@ -215,9 +224,12 @@ async def list_expenses(
 async def get_expense(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
-    obj = await db.get(Expense, id)
+    query = select(Expense).join(Project, Expense.project_id == Project.id).where(Expense.id == id)
+    if current_user.company_id is not None:
+        query = query.where(Project.company_id == current_user.company_id)
+    obj = await db.scalar(query)
 
     if not obj:
         raise NotFoundError("Expense not found")
@@ -230,7 +242,7 @@ async def update_expense(
     id: int,
     payload: ExpenseUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("expenses.edit")),
 ):
     import time
     logger.info(f"Updating expense id={id}")
@@ -241,6 +253,17 @@ async def update_expense(
     if not obj:
         logger.warning(f"Expense not found id={id}")
         raise NotFoundError("Expense not found")
+
+    # Validate parent project belongs to caller's company
+    project = await db.get(Project, obj.project_id)
+    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+        logger.warning(f"Expense access denied or project not found id={id}")
+        raise NotFoundError("Expense not found")
+
+    if payload.project_id and payload.project_id != obj.project_id:
+        new_project = await db.get(Project, payload.project_id)
+        if not new_project or (current_user.company_id is not None and new_project.company_id != current_user.company_id):
+            raise NotFoundError("Project not found")
 
     if obj.source_type == "attendance_auto":
         raise HTTPException(
@@ -372,7 +395,7 @@ async def update_expense(
 async def delete_expense(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("expenses.delete")),
 ):
     logger.info(f"Deleting expense id={id}")
 
@@ -384,6 +407,12 @@ async def delete_expense(
 
         if not obj:
             logger.warning(f"Expense not found id={id}")
+            raise NotFoundError("Expense not found")
+
+        # Validate parent project belongs to caller's company
+        project = await db.get(Project, obj.project_id)
+        if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+            logger.warning(f"Expense access denied or project not found id={id}")
             raise NotFoundError("Expense not found")
 
         # 2. Attendance Protection
@@ -478,8 +507,11 @@ async def delete_expense(
 async def get_by_project(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
+    project = await db.get(Project, project_id)
+    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+        raise NotFoundError("Project not found")
     result = await db.execute(select(Expense).where(Expense.project_id == project_id).order_by(Expense.created_at.desc()))
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
@@ -489,9 +521,16 @@ async def get_by_project(
 async def get_by_category(
     category: str,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
-    result = await db.execute(select(Expense).where(Expense.category == category))
+    query = (
+        select(Expense)
+        .join(Project, Expense.project_id == Project.id)
+        .where(Expense.category == category)
+    )
+    if current_user.company_id is not None:
+        query = query.where(Project.company_id == current_user.company_id)
+    result = await db.execute(query)
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 
@@ -500,9 +539,16 @@ async def get_by_category(
 async def get_by_payment_mode(
     mode: str,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
-    result = await db.execute(select(Expense).where(Expense.payment_mode == mode))
+    query = (
+        select(Expense)
+        .join(Project, Expense.project_id == Project.id)
+        .where(Expense.payment_mode == mode)
+    )
+    if current_user.company_id is not None:
+        query = query.where(Project.company_id == current_user.company_id)
+    result = await db.execute(query)
     rows = result.scalars().all()
     return [ExpenseOut.model_validate(r) for r in rows]
 
@@ -511,8 +557,11 @@ async def get_by_payment_mode(
 async def summary(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
+    project = await db.get(Project, project_id)
+    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+        raise NotFoundError("Project not found")
     total = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
@@ -524,8 +573,11 @@ async def summary(
 async def boq_comparison(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
+    project = await db.get(Project, project_id)
+    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+        raise NotFoundError("Project not found")
     boq_items = (await db.execute(
         select(BOQ).where(BOQ.project_id == project_id, BOQ.is_latest == True)
     )).scalars().all()
@@ -559,33 +611,43 @@ from datetime import datetime
 @router.get("/dashboard", response_model=ExpenseDashboardOut)
 async def get_dashboard(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
     # Total Expense
-    total_expense = float(await db.scalar(select(func.sum(Expense.amount))) or 0.0)
+    tot_q = select(func.sum(Expense.amount)).join(Project, Expense.project_id == Project.id)
 
     # Monthly Expense
     today = date.today()
     start_of_month = today.replace(day=1)
-    monthly_expense = float(await db.scalar(
-        select(func.sum(Expense.amount)).where(Expense.expense_date >= start_of_month)
-    ) or 0.0)
+    mon_q = (
+        select(func.sum(Expense.amount))
+        .join(Project, Expense.project_id == Project.id)
+        .where(Expense.expense_date >= start_of_month)
+    )
 
-    # For simple estimation, consider all currently assigned project expenses
-    project_expense = total_expense  # in a real app might exclude HQ expenses
+    cat_q = (
+        select(Expense.category, func.sum(Expense.amount))
+        .join(Project, Expense.project_id == Project.id)
+        .group_by(Expense.category)
+    )
+
+    if current_user.company_id is not None:
+        tot_q = tot_q.where(Project.company_id == current_user.company_id)
+        mon_q = mon_q.where(Project.company_id == current_user.company_id)
+        cat_q = cat_q.where(Project.company_id == current_user.company_id)
+
+    total_expense = float(await db.scalar(tot_q) or 0.0)
+    monthly_expense = float(await db.scalar(mon_q) or 0.0)
+    project_expense = total_expense
 
     # Direct vs Indirect
-    direct_expense = total_expense * 0.8  # dummy fallback if category lacks distinction
+    direct_expense = total_expense * 0.8
     indirect_expense = total_expense * 0.2
 
     # Trend (Last 6 months)
     trend = []
 
-    # Category Summary
-    cat_res = await db.execute(
-        select(Expense.category, func.sum(Expense.amount))
-        .group_by(Expense.category)
-    )
+    cat_res = await db.execute(cat_q)
     cat_summary = []
     for cat, amt in cat_res.all():
         amt_float = float(amt)
@@ -601,7 +663,7 @@ async def get_dashboard(
         project_expense=float(project_expense),
         direct_expense=float(direct_expense),
         indirect_expense=float(indirect_expense),
-        pending_approval_count=0, # Assuming all are approved for now
+        pending_approval_count=0,
         trend=trend,
         category_summary=cat_summary
     )
@@ -609,19 +671,28 @@ async def get_dashboard(
 @router.get("/project-allocations", response_model=ProjectAllocationsOut)
 async def get_project_allocations(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
     # Group by project
-    res = await db.execute(
+    res_q = (
         select(Project.id, Project.project_name, func.sum(Expense.amount))
         .join(Expense, Expense.project_id == Project.id)
-        .group_by(Project.id, Project.project_name)
     )
+    rec_q = (
+        select(Expense)
+        .join(Project, Expense.project_id == Project.id)
+    )
+
+    if current_user.company_id is not None:
+        res_q = res_q.where(Project.company_id == current_user.company_id)
+        rec_q = rec_q.where(Project.company_id == current_user.company_id)
+
+    res = await db.execute(res_q.group_by(Project.id, Project.project_name))
     projects = []
     for pid, pname, amt in res.all():
         projects.append(ProjectAllocationCard(
             project_name=pname,
-            material_cost=float(amt) * 0.5, # Placeholder logic since material module might not be fully linked here
+            material_cost=float(amt) * 0.5,
             labour_cost=float(amt) * 0.3,
             equipment_cost=float(amt) * 0.1,
             other_expense=float(amt) * 0.1,
@@ -629,7 +700,7 @@ async def get_project_allocations(
         ))
 
     recent = []
-    expenses = (await db.execute(select(Expense).join(Project).order_by(Expense.created_at.desc()).limit(10))).scalars().all()
+    expenses = (await db.execute(rec_q.order_by(Expense.created_at.desc()).limit(10))).scalars().all()
     for e in expenses:
         proj = await db.get(Project, e.project_id)
         recent.append(ProjectAllocationRecent(
@@ -645,22 +716,23 @@ async def get_project_allocations(
 @router.get("/ledger", response_model=list[ExpenseLedgerRow])
 async def get_expense_ledger(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_READ_ROLES)),
+    current_user: User = Depends(require_permission("expenses.view")),
 ):
     from app.core.enums import AccountType
-    expense_accs = (await db.execute(
-        select(Account.id).where(or_(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
-    )).scalars().all()
+    acc_q = select(Account.id).where(or_(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
+    if current_user.company_id is not None:
+        acc_q = acc_q.where(Account.company_id == current_user.company_id)
+    expense_accs = (await db.execute(acc_q)).scalars().all()
 
     if not expense_accs:
         return []
 
-    res = await db.execute(
+    res_q = (
         select(JournalEntry, JournalLine)
         .join(JournalLine)
         .where(JournalLine.account_id.in_(expense_accs), JournalEntry.status == "Posted")
-        .order_by(JournalEntry.entry_date.asc())
     )
+    res = await db.execute(res_q.order_by(JournalEntry.entry_date.asc()))
 
     rows = []
     running_balance = 0.0
@@ -681,7 +753,7 @@ async def get_expense_ledger(
 async def import_expenses(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EXPENSE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("expenses.upload")),
 ):
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files allowed")
@@ -694,14 +766,36 @@ async def import_expenses(
     valid = 0
     errors = 0
     for row in reader:
+        proj_id = row.get("project_id") or row.get("Project ID")
+        if proj_id:
+            try:
+                pid = int(proj_id)
+                proj = await db.get(Project, pid)
+                if not proj or (current_user.company_id is not None and proj.company_id != current_user.company_id):
+                    errors += 1
+                    continue
+            except (ValueError, TypeError):
+                errors += 1
+                continue
         valid += 1
     return {"valid_records": valid, "errors": errors, "message": "Import preview successful"}
 
 @router.get("/export")
-async def export_expenses(db: AsyncSession = Depends(get_db_session)):
+async def export_expenses(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("expenses.export")),
+):
+    query = select(Expense, Project.project_name).join(Project, Expense.project_id == Project.id)
+    if current_user.company_id is not None:
+        query = query.where(Project.company_id == current_user.company_id)
+    expenses = (await db.execute(query.order_by(Expense.expense_date.desc()))).all()
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Expense No", "Date", "Category", "Project", "Vendor", "Amount", "GST", "Payment Mode", "Status"])
+    for row in expenses:
+        exp, pname = row[0], row[1]
+        writer.writerow([exp.id, exp.expense_date, exp.category, pname, "", exp.amount, "", exp.payment_mode, "Approved"])
     output.seek(0)
     return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=expenses.csv"})
 

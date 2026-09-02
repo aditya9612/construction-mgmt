@@ -6,7 +6,7 @@ from app.db.session import get_db_session
 from app.models.settings import CompanySettings, UserSettings
 from app.schemas.settings import CompanySettingsOut, CompanySettingsUpdate, UserSettingsUpdate, UserSettingsOut
 from app.models.user import User
-from app.core.dependencies import get_current_active_user
+from app.core.dependencies import get_current_active_user, require_permission
 from app.schemas.user import UserOut
 from datetime import date
 from typing import Optional
@@ -326,7 +326,7 @@ os.makedirs(
     response_model=CompanySettingsOut
 )
 async def get_company_settings(
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("settings.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
     if not current_user.company_id:
@@ -358,7 +358,7 @@ async def get_company_settings(
 )
 async def update_company_settings(
     payload: CompanySettingsUpdate,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("settings.edit")),
     db: AsyncSession = Depends(get_db_session)
 ):
     if not current_user.company_id:
@@ -396,7 +396,7 @@ async def update_company_settings(
 @router.post("/upload-logo")
 async def upload_logo(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("settings.upload")),
     db: AsyncSession = Depends(get_db_session)
 ):
     if not current_user.company_id:
@@ -436,7 +436,7 @@ async def upload_logo(
 @router.post("/upload-signature")
 async def upload_signature(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("settings.upload")),
     db: AsyncSession = Depends(get_db_session)
 ):
     if not current_user.company_id:

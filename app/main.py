@@ -66,7 +66,7 @@ from app.api.attendance import router as attendance_router
 from app.api.notification import router as notification_router
 from app.api.payments import router as payments_router
 from app.api.superadmin import router as superadmin_router
-# from app.api.rbac import router as rbac_router
+from app.api.rbac import router as rbac_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal, async_engine
@@ -118,8 +118,13 @@ async def lifespan(app: FastAPI):
     recon_worker = None
     recon_task = None
     if settings.BILLING_RECONCILIATION_ENABLED:
-        from app.workers.billing_reconciliation_worker import BillingReconciliationWorker
-        recon_worker = BillingReconciliationWorker(redis_client=getattr(app.state, "redis", None))
+        from app.workers.billing_reconciliation_worker import (
+            BillingReconciliationWorker,
+        )
+
+        recon_worker = BillingReconciliationWorker(
+            redis_client=getattr(app.state, "redis", None)
+        )
         recon_task = asyncio.create_task(recon_worker.start())
         app.state.billing_recon_worker = recon_worker
 
@@ -137,10 +142,9 @@ async def lifespan(app: FastAPI):
         redis = getattr(app.state, "redis", None)
         if redis is not None:
             await redis.close()
-            
+
         logger.info("Disposing SQLAlchemy async engine...")
         await async_engine.dispose()
-
 
 
 def create_app() -> FastAPI:
@@ -169,10 +173,10 @@ def create_app() -> FastAPI:
 
     # Register Audit Logging Middleware as outermost wrapper possible (after CORS)
     application.add_middleware(AuditLogMiddleware)
-    
+
     # Register Security Headers Middleware
     application.add_middleware(SecurityHeadersMiddleware)
-    
+
     # Register GZip Middleware as the absolute outermost wrapper
     application.add_middleware(GZipMiddleware, minimum_size=settings.GZIP_MINIMUM_SIZE)
 
@@ -289,6 +293,7 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     from app.api.health import router as advanced_health_router
+
     application.include_router(advanced_health_router)
 
     api_router = APIRouter(dependencies=[default_rate_limiter_dependency()])
@@ -298,7 +303,7 @@ def create_app() -> FastAPI:
 
     api_router.include_router(auth_router)
     api_router.include_router(user_router)
-    # api_router.include_router(rbac_router)
+    api_router.include_router(rbac_router)
     api_router.include_router(project_router)
     api_router.include_router(qc_router)
     api_router.include_router(safety_router)
@@ -345,6 +350,7 @@ def create_app() -> FastAPI:
     api_router.include_router(superadmin_router)
 
     from app.api.saas_billing import router as saas_billing_router
+
     api_router.include_router(saas_billing_router)
     application.include_router(api_router, prefix="/api/v1")
 
@@ -430,11 +436,13 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
 
                     await redis.publish(
                         f"chat:{chat_id}",
-                        json.dumps({
-                            "type": "delivered",
-                            "chat_id": chat_id,
-                            "message_id": msg_id
-                        })
+                        json.dumps(
+                            {
+                                "type": "delivered",
+                                "chat_id": chat_id,
+                                "message_id": msg_id,
+                            }
+                        ),
                     )
 
             await manager.broadcast(chat_id, data)
@@ -448,8 +456,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
 
     try:
         done, pending = await asyncio.wait(
-            [redis_task, ws_task],
-            return_when=asyncio.FIRST_COMPLETED
+            [redis_task, ws_task], return_when=asyncio.FIRST_COMPLETED
         )
         for task in pending:
             task.cancel()
@@ -457,7 +464,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
                 await task
             except asyncio.CancelledError:
                 pass
-        
+
         # Re-raise exceptions from completed tasks (like WebSocketDisconnect)
         for task in done:
             task.result()

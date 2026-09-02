@@ -21,7 +21,7 @@ from app.utils.common import assert_project_access
 
 from app.models.approval import Approval
 from app.models.user import User
-from app.core.dependencies import get_current_active_user, require_roles
+from app.core.dependencies import get_current_active_user, require_roles, require_permission
 
 from app.models.user import UserRole
 
@@ -55,7 +55,7 @@ router = APIRouter(prefix="/billing", tags=["Billing"])
 async def create_ra_bill(
     payload: RABillCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.create")),
 ):
     from app.models.work_order import WorkOrder
     from app.models.final_measurement import FinalMeasurement
@@ -259,7 +259,7 @@ async def list_ra_bills(
     status: Optional[str] = None,
     pagination: PaginationParams = Depends(),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_READ_ROLES)),
+    current_user: User = Depends(require_permission("billing.view")),
 ):
     from app.models.work_order import WorkOrder
     from app.models.project import Project
@@ -360,7 +360,7 @@ async def list_ra_bills(
 async def get_ra_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_READ_ROLES)),
+    current_user: User = Depends(require_permission("billing.view")),
 ):
     from app.models.work_order import WorkOrder
 
@@ -417,7 +417,7 @@ async def update_ra_bill(
     id: int,
     payload: RABillUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.edit")),
 ):
     from app.models.work_order import WorkOrder
 
@@ -508,7 +508,7 @@ async def update_ra_bill(
 async def delete_ra_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.delete")),
 ):
     obj = await db.get(RABill, id)
     if not obj:
@@ -535,7 +535,7 @@ async def delete_ra_bill(
 async def submit_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.edit")),
 ):
     obj = await db.get(RABill, id)
     if not obj:
@@ -557,7 +557,7 @@ async def submit_bill(
 async def approve_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.approve")),
 ):
     obj = await db.get(RABill, id)
     if not obj:
@@ -651,7 +651,7 @@ async def approve_bill(
 async def pay_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.edit")),
 ):
     obj = await db.get(RABill, id)
     if not obj:

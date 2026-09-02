@@ -25,6 +25,7 @@ from app.core.enums import (
 )
 from app.db.session import get_db_session
 from app.core import dependencies as d
+from app.core.dependencies import require_permission
 from app.models.settings import UserSettings
 from app.models.user import User, UserRole
 from app.models.owner import Owner
@@ -269,7 +270,7 @@ async def get_kpi_comparison(db):
 
 @router.get("/admin", response_model=AdminDashboardOut)
 async def admin_dashboard(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -278,8 +279,6 @@ async def admin_dashboard(
             status_code=403,
             detail="Super Admin cannot access tenant dashboard directly",
         )
-    if current_user.role != UserRole.ADMIN.value:
-        return {"error": "Access denied"}
 
     async def logic():
         today = get_naive_local_now().date()
@@ -583,7 +582,7 @@ async def admin_dashboard(
 # =========================================
 @router.get("/engineer")
 async def engineer_dashboard(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -618,7 +617,9 @@ async def engineer_dashboard(
         }
 
     version = await r.get_cache_version(redis, VERSION_KEY)
-    return await cache_get_set(redis, "engineer_dashboard", version, logic)
+    return await cache_get_set(
+        redis, f"engineer_dashboard:{current_user.company_id}:{current_user.id}", version, logic
+    )
 
 
 # =========================================
@@ -626,7 +627,7 @@ async def engineer_dashboard(
 # =========================================
 @router.get("/manager")
 async def manager_dashboard(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -667,7 +668,9 @@ async def manager_dashboard(
         }
 
     version = await r.get_cache_version(redis, VERSION_KEY)
-    return await cache_get_set(redis, "manager_dashboard", version, logic)
+    return await cache_get_set(
+        redis, f"manager_dashboard:{current_user.company_id}:{current_user.id}", version, logic
+    )
 
 
 # =========================================
@@ -675,7 +678,7 @@ async def manager_dashboard(
 # =========================================
 @router.get("/accountant", response_model=AccountantDashboardOut)
 async def accountant_dashboard(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1037,7 +1040,7 @@ async def accountant_dashboard(
 
 @router.get("/pm-command-center", response_model=PMCommandCenterOut)
 async def pm_command_center(
-    current_user: User = Depends(d.require_roles([UserRole.PROJECT_MANAGER.value])),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1395,12 +1398,14 @@ async def pm_command_center(
         ).dict()
 
     version = await r.get_cache_version(redis, VERSION_KEY)
-    return await cache_get_set(redis, "pm_command_center", version, logic)
+    return await cache_get_set(
+        redis, f"pm_command_center:{current_user.company_id}:{current_user.id}", version, logic
+    )
 
 
 @router.get("/project-manager-summary", response_model=PMSummaryOut)
 async def pm_summary(
-    current_user: User = Depends(d.require_roles([UserRole.PROJECT_MANAGER.value])),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     project_ids = await get_user_project_ids(db, current_user)
@@ -1527,7 +1532,7 @@ async def pm_summary(
 # =========================================
 @router.post("/refresh")
 async def refresh_dashboard(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.manage")),
     redis=Depends(d.get_request_redis),
 ):
     await r.bump_cache_version(redis, VERSION_KEY)
@@ -1543,7 +1548,7 @@ import io
 
 @router.get("/accountant/export")
 async def export_dashboard(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.export")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1614,7 +1619,7 @@ async def export_dashboard(
 
 @router.get("/admin/projects/export/csv")
 async def export_master_projects_csv(
-    current_user: User = Depends(d.require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("dashboard.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -1653,7 +1658,7 @@ async def export_master_projects_csv(
 
 @router.get("/admin/projects/export/pdf")
 async def export_master_projects_pdf(
-    current_user: User = Depends(d.require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("dashboard.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -1747,16 +1752,10 @@ _HIGH_PRIORITY_KEYS = [
 @router.get("/client", response_model=ClientDashboardV2Out)
 async def client_dashboard(
     project_id: int,
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    if current_user.role not in [
-        UserRole.CLIENT.value,
-        UserRole.ADMIN.value,
-    ]:
-        raise HTTPException(status_code=403, detail="Access denied")
-
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
 
@@ -2204,7 +2203,7 @@ async def client_dashboard(
 # =========================================
 @router.get("/graph/labour")
 async def labour_trend(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -2236,7 +2235,7 @@ async def labour_trend(
 
 @router.get("/graph/expense")
 async def expense_trend(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -2271,7 +2270,7 @@ async def dashboard_graph(
     start_date: date | None = None,
     end_date: date | None = None,
     group_by: str = "daily",
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -2377,7 +2376,7 @@ async def dashboard_graph(
 
 @router.get("/graph/forecast")
 async def expense_forecast(
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     project_ids = await get_user_project_ids(db, current_user)
@@ -2483,12 +2482,14 @@ from statistics import mean
 @router.get("/graph/advanced-forecast")
 async def advanced_forecast(
     project_id: int | None = None,
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     project_ids = await get_user_project_ids(db, current_user)
 
     if project_id:
+        if project_id not in project_ids:
+            raise NotFoundError("Project not found or access denied")
         project_ids = [project_id]
 
     result = await db.execute(
@@ -2632,12 +2633,14 @@ import numpy as np
 async def ml_forecast(
     project_id: int | None = None,
     periods: int = 3,
-    current_user: User = Depends(d.require_roles(DASHBOARD_READ_ROLES)),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     project_ids = await get_user_project_ids(db, current_user)
 
     if project_id:
+        if project_id not in project_ids:
+            raise NotFoundError("Project not found or access denied")
         project_ids = [project_id]
 
     result = await db.execute(
@@ -2729,7 +2732,7 @@ async def ml_forecast(
 @router.get("/engineer/{project_id}", response_model=EnhancedDashboardOut)
 # @router.get("/engineer/details", response_model=EnhancedDashboardOut)
 async def site_engineer_dashboard(
-    current_user: User = Depends(d.require_roles([UserRole.SITE_ENGINEER.value])),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
     project_id: Optional[int] = None,

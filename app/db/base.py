@@ -53,6 +53,6 @@ from app.models.quotation import QuotationItem, QuotationMaster, QuotationStatus
 from app.models.project_visualization import ProjectVisualization
 from app.models.agreement import Agreement
 from app.models.notification import Notification
-from app.models.rbac import Permission , RolePermission
+from app.models.rbac import Permission, RolePermission, Role, UserPermissionOverride  # noqa: F401
 from app.models.client_payment import ClientPayment  # noqa: F401
 from app.models.work_update import WorkUpdate, WorkUpdateImage  # noqa: F401

@@ -7,7 +7,7 @@ from app.db.session import get_db_session
 from app.models.notification import Notification
 from app.schemas.notification import NotificationOut, PMNotificationOut
 from app.models.user import User
-from app.core.dependencies import get_current_active_user
+from app.core.dependencies import get_current_active_user, require_permission
 from app.utils.helpers import NotFoundError
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
@@ -35,7 +35,7 @@ async def get_notifications(
 # ===================== GET PM NOTIFICATIONS =====================
 @router.get("/project-manager", response_model=list[PMNotificationOut])
 async def get_pm_notifications(
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("notifications.view")),
     db: AsyncSession = Depends(get_db_session),
     limit: int = 50,
 ):
