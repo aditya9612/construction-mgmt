@@ -19,7 +19,7 @@ from app.cache.redis import (
 from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
-    require_roles,
+    require_permission,
 )
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
@@ -39,7 +39,7 @@ from app.schemas.boq import (
     BOQImportResponse,
     BOQImportError,
 )
-from app.utils.helpers import InvalidStateError, NotFoundError, ValidationError
+from app.utils.helpers import InvalidStateError, NotFoundError, ValidationError, PermissionDeniedError
 from app.core.logger import logger
 from app.models.boq import BOQAudit
 
@@ -67,7 +67,7 @@ FONT_BOLD = "Helvetica-Bold"
 if os.path.exists("C:/Windows/Fonts/arial.ttf"):
     pdfmetrics.registerFont(TTFont("Arial", "C:/Windows/Fonts/arial.ttf"))
     FONT_NAME = "Arial"
-    FONT_BOLD = "Arial" # Fallback if bold not found
+    FONT_BOLD = "Arial"  # Fallback if bold not found
 elif os.path.exists("C:/Windows/Fonts/arialbd.ttf"):
     pdfmetrics.registerFont(TTFont("Arial-Bold", "C:/Windows/Fonts/arialbd.ttf"))
     FONT_BOLD = "Arial-Bold"
@@ -82,34 +82,8 @@ router = APIRouter(
     dependencies=[default_rate_limiter_dependency()],
 )
 
-
-READ_ONLY_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.ACCOUNTANT,
-        UserRole.CLIENT,
-    ]
-]
-
-WRITE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.ACCOUNTANT,
-    ]
-]
-
-TASK_GENERATION_ROLES = [
-    UserRole.ADMIN,
-    UserRole.PROJECT_MANAGER,
-    UserRole.SITE_ENGINEER
-]
-
 VERSION_KEY = "cache_version:boq"
+
 
 # ------------------ HELPERS ------------------
 
@@ -122,65 +96,87 @@ def calculate_cost(
     return total, variance
 
 
-# ------------------ CREATE ------------------
+async def assert_project_access_masked(
+    db: AsyncSession,
+    *,
+    project_id: int,
+    current_user: User,
+) -> Project:
+    """Validate project existence, company ownership, and project membership.
+
+    Masks foreign/inaccessible projects as 404 Not Found.
+    """
+    project = await db.scalar(select(Project).where(Project.id == project_id))
+    if not project:
+        raise NotFoundError("Project not found")
+
+    is_super = getattr(current_user, "is_super_admin", False) or getattr(current_user, "role", None) in ["Super Admin", "SuperAdmin"]
+    if not is_super and current_user.company_id is not None and project.company_id != current_user.company_id:
+        raise NotFoundError("Project not found")
+
+    try:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    except (PermissionDeniedError, NotFoundError):
+        raise NotFoundError("Project not found")
+
+    return project
+
+
+async def _get_boq_or_404(
+    db: AsyncSession,
+    *,
+    boq_id: int,
+    current_user: User,
+) -> tuple[BOQ, Project]:
+    """Resolve BOQ -> Project -> Company ownership chain and verify access.
+
+    Masks foreign/nonexistent resources as 404 Not Found.
+    """
+    obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
+    if not obj:
+        raise NotFoundError("BOQ item not found")
+
+    project = await assert_project_access_masked(db, project_id=obj.project_id, current_user=current_user)
+    return obj, project
+
+
+# ------------------ 1. CREATE ------------------
 
 
 @router.post("", response_model=BOQOut)
 async def create_boq(
     payload: BOQCreate,
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     logger.info(f"Creating BOQ project_id={payload.project_id}")
 
-    project = await db.scalar(select(Project).where(Project.id == payload.project_id))
-    if not project:
-        logger.warning(f"Project not found project_id={payload.project_id}")
-        raise NotFoundError("Project not found")
+    project = await assert_project_access_masked(db, project_id=payload.project_id, current_user=current_user)
 
-    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
-
-    # =========================
-    # MASTER DATA VALIDATION (ADD HERE)
-    # =========================
-    activity = await db.get(
-        ActivityType,
-        payload.activity_type_id
-    )
-
+    # Master data validation
+    activity = await db.get(ActivityType, payload.activity_type_id)
     if not activity:
-        raise NotFoundError(
-            "Invalid activity type"
-        )
+        raise NotFoundError("Invalid activity type")
 
     unit_name = "unit"
-
     if activity.default_unit_id:
         from app.models.master_data import Unit
 
-        unit_obj = await db.get(
-            Unit,
-            activity.default_unit_id
-        )
-
+        unit_obj = await db.get(Unit, activity.default_unit_id)
         if unit_obj:
             unit_name = unit_obj.name
 
     try:
-
         quantity = Decimal(str(payload.quantity))
         unit_cost = Decimal(str(payload.unit_cost))
-
         total_cost, variance = calculate_cost(quantity, unit_cost)
 
         group = BOQGroup(
             project_id=payload.project_id,
             name=payload.item_name,
         )
-
         db.add(group)
-
         await db.flush()
 
         obj = BOQ(
@@ -204,13 +200,10 @@ async def create_boq(
         )
 
         db.add(obj)
-
         await db.flush()
-
         await bump_cache_version(redis, VERSION_KEY)
 
         logger.info(f"BOQ created id={obj.id} project_id={payload.project_id}")
-
         return BOQOut.model_validate(obj)
 
     except Exception:
@@ -218,7 +211,7 @@ async def create_boq(
         raise
 
 
-# ------------------ LIST ------------------
+# ------------------ 2. LIST ------------------
 
 
 @router.get("", response_model=PaginatedResponse[BOQOut])
@@ -231,14 +224,21 @@ async def list_boq(
     project_id: Optional[int] = None,
     category: Optional[str] = None,
     version_no: Optional[int] = None,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_super = getattr(current_user, "is_super_admin", False) or getattr(current_user, "role", None) in ["Super Admin", "SuperAdmin"]
+
+    # If project_id is supplied, enforce project membership and mask foreign as 404
+    if project_id is not None:
+        await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
+
     version = await get_cache_version(redis, VERSION_KEY)
+    tenant_cache_id = current_user.company_id if current_user.company_id is not None else "superadmin"
 
     cache_key = (
-        f"cache:boq:list:{current_user.company_id}:{version}:{limit}:{offset}:{search}:"
+        f"cache:boq:list:{tenant_cache_id}:{version}:{limit}:{offset}:{search}:"
         f"{status}:{project_id}:{category}:{version_no}"
     )
 
@@ -249,17 +249,19 @@ async def list_boq(
     if search:
         logger.info(f"BOQ search query={search}")
 
-    # Exclude soft-deleted BOQs by default and filter by company
-    query = select(BOQ).join(Project, Project.id == BOQ.project_id).where(Project.company_id == current_user.company_id, BOQ.status != "Deleted")
-    count_query = select(func.count()).select_from(BOQ).join(Project, Project.id == BOQ.project_id).where(Project.company_id == current_user.company_id, BOQ.status != "Deleted")
+    # Exclude soft-deleted BOQs
+    query = select(BOQ).join(Project, Project.id == BOQ.project_id).where(BOQ.status != "Deleted")
+    count_query = select(func.count()).select_from(BOQ).join(Project, Project.id == BOQ.project_id).where(BOQ.status != "Deleted")
+
+    if not is_super:
+        query = query.where(Project.company_id == current_user.company_id)
+        count_query = count_query.where(Project.company_id == current_user.company_id)
 
     if search:
         like = f"%{search}%"
         query = query.where(BOQ.item_name.ilike(like))
         count_query = count_query.where(BOQ.item_name.ilike(like))
 
-    # Allow filtering by specific status if provided
-    # (e.g. status="Approved", status="Pending")
     if status:
         query = query.where(BOQ.status == status)
         count_query = count_query.where(BOQ.status == status)
@@ -297,19 +299,15 @@ async def list_boq(
     }
 
     await cache_set_json(redis, cache_key, result)
-
     return PaginatedResponse[BOQOut].model_validate(result)
 
 
-# ------------------ GET ------------------
+# ------------------ 3. TEMPLATE ------------------
 
-
-
-# ------------------ TEMPLATE & IMPORT ------------------
 
 @router.get("/template/excel")
 async def download_boq_template(
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
     wb = Workbook()
@@ -363,15 +361,17 @@ async def download_boq_template(
 
     file = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     wb.save(file.name)
-
     return FileResponse(file.name, filename="BOQ_Template.xlsx")
+
+
+# ------------------ 4. IMPORT ------------------
 
 
 @router.post("/groups/{group_id}/import/excel", response_model=BOQImportResponse)
 async def import_boq_excel(
     group_id: int,
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     parent = await db.scalar(
@@ -380,11 +380,10 @@ async def import_boq_excel(
     if not parent:
         raise NotFoundError("BOQ Group not found")
 
-    await assert_project_access(db, project_id=parent.project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=parent.project_id, current_user=current_user)
 
     content = await file.read()
     wb = openpyxl.load_workbook(filename=BytesIO(content), data_only=True)
-    # Target the BOQ Entry sheet explicitly, or fallback to active
     ws = wb["BOQ Entry"] if "BOQ Entry" in wb.sheetnames else wb.active
 
     from app.models.master_data import ActivityType
@@ -489,39 +488,33 @@ async def import_boq_excel(
     )
 
 
+# ------------------ 5. GET ------------------
+
+
 @router.get("/{boq_id}", response_model=BOQOut)
 async def get_boq(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-
-    if obj is None:
-        logger.warning(f"BOQ not found id={boq_id}")
-        raise NotFoundError("BOQ item not found")
-
+    obj, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
     return BOQOut.model_validate(obj)
 
 
-# ------------------ UPDATE ------------------
+# ------------------ 6. UPDATE ------------------
 
 
 @router.put("/{boq_id}", response_model=BOQOut)
 async def update_boq(
     boq_id: int,
     payload: BOQUpdate,
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     logger.info(f"Updating BOQ id={boq_id}")
 
-    obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-
-    if obj is None:
-        logger.warning(f"BOQ not found for update id={boq_id}")
-        raise NotFoundError("BOQ item not found")
+    obj, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     # prevent modifying historical versions
     if not obj.is_latest:
@@ -538,29 +531,16 @@ async def update_boq(
         data = payload.model_dump(exclude_unset=True)
 
         if payload.activity_type_id is not None:
-
-            activity = await db.get(
-                ActivityType,
-                payload.activity_type_id
-            )
-
+            activity = await db.get(ActivityType, payload.activity_type_id)
             if not activity:
-                raise NotFoundError(
-                    "Invalid activity type"
-                )
+                raise NotFoundError("Invalid activity type")
 
             obj.category = activity.category
-
             unit_name = "unit"
 
             if activity.default_unit_id:
                 from app.models.master_data import Unit
-
-                unit_obj = await db.get(
-                    Unit,
-                    activity.default_unit_id
-                )
-
+                unit_obj = await db.get(Unit, activity.default_unit_id)
                 if unit_obj:
                     unit_name = unit_obj.name
 
@@ -583,7 +563,6 @@ async def update_boq(
         await bump_cache_version(redis, VERSION_KEY)
 
         logger.info(f"BOQ updated id={boq_id}")
-
         return BOQOut.model_validate(obj)
 
     except Exception:
@@ -591,23 +570,19 @@ async def update_boq(
         raise
 
 
-# ------------------ DELETE ------------------
+# ------------------ 7. DELETE ------------------
 
 
 @router.delete("/{boq_id}")
 async def delete_boq(
     boq_id: int,
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     logger.info(f"Deleting BOQ id={boq_id}")
 
-    obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-
-    if obj is None:
-        logger.warning(f"BOQ not found for delete id={boq_id}")
-        raise NotFoundError("BOQ item not found")
+    obj, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     if not obj.is_latest:
         raise InvalidStateError(
@@ -620,16 +595,14 @@ async def delete_boq(
         )
 
     obj.status = "Deleted"
-
     await db.flush()
     await bump_cache_version(redis, VERSION_KEY)
 
     logger.info(f"BOQ soft-deleted id={boq_id}")
-
     return {"message": "BOQ deleted successfully", "boq_id": boq_id}
 
 
-# ------------------ ACTUALS ------------------
+# ------------------ 8. ACTUALS ------------------
 
 
 @router.post("/{boq_id}/actuals", response_model=BOQOut)
@@ -637,17 +610,12 @@ async def update_actuals(
     boq_id: int,
     payload: BOQActualsUpdate,
     redis=Depends(get_request_redis),
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Updating BOQ actuals id={boq_id}")
 
-    obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-
-    if not obj:
-        raise NotFoundError("BOQ not found")
-
-    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    obj, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     # prevent modifying historical versions
     if not obj.is_latest:
@@ -662,22 +630,18 @@ async def update_actuals(
         status_code=403,
         detail="Manual BOQ actuals override is disabled to guarantee financial determinism. Actuals are calculated automatically from usage and expenses."
     )
-    await bump_cache_version(redis, VERSION_KEY)
-    logger.info(f"BOQ actuals updated id={boq_id}")
-
-    return BOQOut.model_validate(obj)
 
 
-# ------------------ SUMMARY ------------------
+# ------------------ 9. SUMMARY ------------------
 
 
 @router.get("/summary/{project_id}")
 async def boq_summary(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
     result = await db.execute(
         select(func.count(), func.sum(BOQ.total_cost), func.sum(BOQ.actual_cost)).where(
             BOQ.project_id == project_id, BOQ.is_latest == True, BOQ.status != "Deleted"
@@ -694,16 +658,16 @@ async def boq_summary(
     }
 
 
-# ------------------ COMPARISON ------------------
+# ------------------ 10. COMPARISON ------------------
 
 
 @router.get("/comparison/{project_id}")
 async def boq_comparison(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
     rows = (
         (
             await db.execute(
@@ -729,21 +693,16 @@ async def boq_comparison(
     ]
 
 
-# ------------------ REPORT ------------------
+# ------------------ 11. REPORT ------------------
 
 
 @router.get("/{boq_id}/report")
 async def boq_report(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    base = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-
-    if not base:
-        raise NotFoundError("BOQ not found")
-
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     rows = (
         (
@@ -772,26 +731,16 @@ async def boq_report(
     }
 
 
-# ------------------ ALERTS ------------------
+# ------------------ 12. ALERTS ------------------
 
 
 @router.get("/{boq_id}/alerts")
 async def boq_alerts(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    base = await db.scalar(
-        select(BOQ).where(
-            BOQ.id == boq_id,
-            BOQ.status != "Deleted",
-        )
-    )
-
-    if not base:
-        raise NotFoundError("BOQ not found")
-
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     rows = (
         (
@@ -810,7 +759,6 @@ async def boq_alerts(
     )
 
     alerts = []
-
     for r in rows:
         if r.actual_cost > r.total_cost:
             alerts.append(
@@ -823,19 +771,16 @@ async def boq_alerts(
     return {"alerts": alerts}
 
 
+# ------------------ 13. VERSIONS ------------------
+
+
 @router.get("/{boq_id}/versions")
 async def get_versions(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # Get base BOQ to find project
-    base = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-
-    if not base:
-        raise NotFoundError("BOQ not found")
-
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     result = await db.execute(
         select(BOQ.version_no)
@@ -850,13 +795,16 @@ async def get_versions(
     return {"versions": [v[0] for v in result.fetchall()]}
 
 
+# ------------------ 14. PROJECT BOQ ------------------
+
+
 @router.get("/project/{project_id}", response_model=list[BOQOut])
 async def get_boq_by_project(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
     rows = (
         (
             await db.execute(
@@ -876,14 +824,14 @@ async def get_boq_by_project(
     return [BOQOut.model_validate(r) for r in rows]
 
 
-# ------------------ ITEMS ------------------
+# ------------------ 15. ADD ITEM ------------------
 
 
 @router.post("/groups/{group_id}/items", response_model=BOQOut)
 async def add_item(
     group_id: int,
     payload: BOQCreate,
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -900,7 +848,7 @@ async def add_item(
     if not parent:
         raise NotFoundError("BOQ not found")
 
-    await assert_project_access(db, project_id=parent.project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=parent.project_id, current_user=current_user)
 
     # prevent modifying old versions
     if not parent.is_latest:
@@ -913,36 +861,24 @@ async def add_item(
             "Approved BOQ cannot be modified. Create a new version first."
         )
 
-    activity = await db.get(
-        ActivityType,
-        payload.activity_type_id
-    )
-
+    activity = await db.get(ActivityType, payload.activity_type_id)
     if not activity:
-        raise NotFoundError(
-            "Invalid activity type"
-        )
+        raise NotFoundError("Invalid activity type")
 
     unit_name = "unit"
-
     if activity.default_unit_id:
         from app.models.master_data import Unit
-
-        unit_obj = await db.get(
-            Unit,
-            activity.default_unit_id
-        )
-
+        unit_obj = await db.get(Unit, activity.default_unit_id)
         if unit_obj:
             unit_name = unit_obj.name
 
     quantity = Decimal(str(payload.quantity))
     unit_cost = Decimal(str(payload.unit_cost))
-
     total_cost, variance = calculate_cost(quantity, unit_cost)
 
+    # Force project_id to parent.project_id to prevent cross-project injection
     obj = BOQ(
-        project_id=payload.project_id,
+        project_id=parent.project_id,
         boq_group_id=parent.boq_group_id,
         version_no=parent.version_no,
         is_latest=True,
@@ -961,16 +897,18 @@ async def add_item(
 
     db.add(obj)
     await db.flush()
-
     await bump_cache_version(redis, VERSION_KEY)
 
     return BOQOut.model_validate(obj)
 
 
+# ------------------ 16. GET ITEMS ------------------
+
+
 @router.get("/groups/{group_id}/items", response_model=list[BOQOut])
 async def get_items(
     group_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     base = await db.scalar(
@@ -984,7 +922,7 @@ async def get_items(
     if not base:
         raise NotFoundError("BOQ not found")
 
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=base.project_id, current_user=current_user)
 
     rows = (
         (
@@ -1005,18 +943,18 @@ async def get_items(
     return [BOQOut.model_validate(r) for r in rows]
 
 
+# ------------------ 17. UPDATE ITEM ------------------
+
+
 @router.put("/items/{item_id}", response_model=BOQOut)
 async def update_item(
     item_id: int,
     payload: BOQUpdate,
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    obj = await db.scalar(select(BOQ).where(BOQ.id == item_id, BOQ.status != "Deleted"))
-
-    if not obj:
-        raise NotFoundError("Item not found")
+    obj, _ = await _get_boq_or_404(db, boq_id=item_id, current_user=current_user)
 
     # prevent modifying historical versions
     if not obj.is_latest:
@@ -1032,29 +970,16 @@ async def update_item(
     data = payload.model_dump(exclude_unset=True)
 
     if payload.activity_type_id is not None:
-
-        activity = await db.get(
-            ActivityType,
-            payload.activity_type_id
-        )
-
+        activity = await db.get(ActivityType, payload.activity_type_id)
         if not activity:
-            raise NotFoundError(
-                "Invalid activity type"
-            )
+            raise NotFoundError("Invalid activity type")
 
         obj.category = activity.category
-
         unit_name = "unit"
 
         if activity.default_unit_id:
             from app.models.master_data import Unit
-
-            unit_obj = await db.get(
-                Unit,
-                activity.default_unit_id
-            )
-
+            unit_obj = await db.get(Unit, activity.default_unit_id)
             if unit_obj:
                 unit_name = unit_obj.name
 
@@ -1067,25 +992,23 @@ async def update_item(
     unit_cost = Decimal(str(obj.unit_cost))
 
     total, variance = calculate_cost(quantity, unit_cost, obj.actual_cost or Decimal(0))
-
     obj.total_cost = total
     obj.variance_cost = variance
 
     await db.flush()
-
     await bump_cache_version(redis, VERSION_KEY)
 
     return BOQOut.model_validate(obj)
 
+
+# ------------------ 18. BULK ADD ITEMS ------------------
 
 
 @router.post("/groups/{group_id}/items/bulk")
 async def bulk_add_items(
     group_id: int,
     payload: BOQBulkCreate,
-    BOQImportResponse,
-    BOQImportError,
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -1102,7 +1025,7 @@ async def bulk_add_items(
     if not parent:
         raise NotFoundError("BOQ not found")
 
-    await assert_project_access(db, project_id=parent.project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=parent.project_id, current_user=current_user)
 
     if not parent.is_latest:
         raise InvalidStateError(
@@ -1118,38 +1041,24 @@ async def bulk_add_items(
 
     try:
         for item in payload.items:
-
-            activity = await db.get(
-                ActivityType,
-                item.activity_type_id
-            )
-
+            activity = await db.get(ActivityType, item.activity_type_id)
             if not activity:
                 raise NotFoundError("Invalid activity type")
 
             unit_name = "unit"
-
             if activity.default_unit_id:
                 from app.models.master_data import Unit
-
-                unit_obj = await db.get(
-                    Unit,
-                    activity.default_unit_id
-                )
-
+                unit_obj = await db.get(Unit, activity.default_unit_id)
                 if unit_obj:
                     unit_name = unit_obj.name
 
             quantity = Decimal(str(item.quantity))
             unit_cost = Decimal(str(item.unit_cost))
+            total_cost, variance = calculate_cost(quantity, unit_cost)
 
-            total_cost, variance = calculate_cost(
-                quantity,
-                unit_cost
-            )
-
+            # Force project_id to parent.project_id to prevent injection
             obj = BOQ(
-                project_id=item.project_id,
+                project_id=parent.project_id,
                 boq_group_id=parent.boq_group_id,
                 version_no=parent.version_no,
                 is_latest=True,
@@ -1190,17 +1099,17 @@ async def bulk_add_items(
     }
 
 
+# ------------------ 19. DELETE ITEM ------------------
+
+
 @router.delete("/items/{item_id}")
 async def delete_item(
     item_id: int,
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    obj = await db.scalar(select(BOQ).where(BOQ.id == item_id, BOQ.status != "Deleted"))
-
-    if not obj:
-        raise NotFoundError("Item not found")
+    obj, _ = await _get_boq_or_404(db, boq_id=item_id, current_user=current_user)
 
     # prevent deleting historical versions
     if not obj.is_latest:
@@ -1212,22 +1121,21 @@ async def delete_item(
         raise InvalidStateError(
             "Approved BOQ cannot be modified. Create a new version first."
         )
+
     obj.status = "Deleted"
-
     await db.flush()
-
     await bump_cache_version(redis, VERSION_KEY)
 
     return {"message": "BOQ deleted successfully", "item_id": item_id}
 
 
-# ------------------ CREATE VERSION ------------------
+# ------------------ 20. CREATE VERSION ------------------
 
 
 @router.post("/groups/{group_id}/versions")
 async def create_version(
     group_id: int,
-    current_user: User = Depends(require_roles(WRITE_ROLES)),
+    current_user: User = Depends(require_permission("boq.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -1242,7 +1150,7 @@ async def create_version(
     if not base:
         raise NotFoundError("BOQ not found")
 
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=base.project_id, current_user=current_user)
 
     if base.approval_status != "Approved":
         raise InvalidStateError(
@@ -1250,12 +1158,10 @@ async def create_version(
         )
 
     group = await db.get(BOQGroup, base.boq_group_id)
-
     if not group:
         raise NotFoundError("BOQ group not found")
 
     new_version = group.current_version + 1
-
     group.current_version = new_version
     group.name = base.item_name
 
@@ -1308,7 +1214,6 @@ async def create_version(
             )
         )
     await db.flush()
-
     await bump_cache_version(redis, VERSION_KEY)
 
     return {
@@ -1318,26 +1223,16 @@ async def create_version(
     }
 
 
-# ------------------ EXPORT ------------------
+# ------------------ 21. EXPORT JSON ------------------
 
 
 @router.get("/{boq_id}/export/json")
 async def export_boq_json(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    base = await db.scalar(
-        select(BOQ).where(
-            BOQ.id == boq_id,
-            BOQ.status != "Deleted",
-        )
-    )
-
-    if not base:
-        raise NotFoundError("BOQ not found")
-
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     rows = (
         (
@@ -1358,69 +1253,70 @@ async def export_boq_json(
     return [BOQOut.model_validate(r).model_dump() for r in rows]
 
 
+# ------------------ 22. EXPORT EXCEL ------------------
+
+
 @router.get("/{boq_id}/export/excel")
 async def export_boq_excel(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    base = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-    if not base:
-        raise NotFoundError("BOQ not found")
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     project = await db.scalar(select(Project).options(selectinload(Project.owner)).where(Project.id == base.project_id))
+    if not project:
+        raise NotFoundError("Project not found")
 
     rows = (await db.execute(select(BOQ).where(BOQ.boq_group_id == base.boq_group_id, BOQ.version_no == base.version_no, BOQ.status != "Deleted").order_by(BOQ.id.asc()))).scalars().all()
     if not rows:
         raise NotFoundError("No BOQ data found")
 
-    company_settings = await db.scalar(select(CompanySettings))
+    # Scope company settings to project.company_id to prevent cross-tenant branding leak
+    company_settings = await db.scalar(select(CompanySettings).where(CompanySettings.company_id == project.company_id))
     company_name = company_settings.company_name if company_settings and company_settings.company_name else "Construction Company"
 
     file_path = await _generate_boq_excel(base, list(rows), project, current_user, company_name)
     return FileResponse(file_path, filename=f"BOQ_{project.business_id}_v{base.version_no}.xlsx")
 
 
+# ------------------ 23. EXPORT PDF ------------------
+
+
 @router.get("/{boq_id}/export/pdf")
 async def export_boq_pdf(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    base = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-    if not base:
-        raise NotFoundError("BOQ not found")
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     project = await db.scalar(select(Project).options(selectinload(Project.owner)).where(Project.id == base.project_id))
+    if not project:
+        raise NotFoundError("Project not found")
 
     rows = (await db.execute(select(BOQ).where(BOQ.boq_group_id == base.boq_group_id, BOQ.version_no == base.version_no, BOQ.status != "Deleted").order_by(BOQ.id.asc()))).scalars().all()
     if not rows:
         raise NotFoundError("No BOQ data found")
 
-    company_settings = await db.scalar(select(CompanySettings))
+    # Scope company settings to project.company_id to prevent cross-tenant branding leak
+    company_settings = await db.scalar(select(CompanySettings).where(CompanySettings.company_id == project.company_id))
     company_name = company_settings.company_name if company_settings and company_settings.company_name else "Construction Company"
 
     file_path = await _generate_boq_pdf(base, list(rows), project, current_user, company_name)
     return FileResponse(file_path, filename=f"BOQ_{project.business_id}_v{base.version_no}.pdf")
 
 
-# ------------------ OPTIMIZE ------------------
+# ------------------ 24. OPTIMIZE ------------------
 
 
 @router.get("/{boq_id}/optimize")
 async def boq_optimize(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    base = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
-
-    if not base:
-        raise NotFoundError("BOQ not found")
-
-    await assert_project_access(db, project_id=base.project_id, current_user=current_user)
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     rows = (
         (
@@ -1439,7 +1335,6 @@ async def boq_optimize(
     )
 
     suggestions = []
-
     for r in rows:
         if r.actual_cost > r.total_cost:
             suggestions.append(
@@ -1453,20 +1348,22 @@ async def boq_optimize(
     return {"suggestions": suggestions}
 
 
-# ------------------ AUDIT LOGS ------------------
+# ------------------ 25. AUDIT LOGS ------------------
 
 
 @router.get("/{boq_id}/logs")
 async def boq_logs(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
+
     rows = (
         (
             await db.execute(
                 select(BOQAudit)
-                .where(BOQAudit.boq_id == boq_id)
+                .where(BOQAudit.boq_id == base.id)
                 .order_by(BOQAudit.id.desc())
             )
         )
@@ -1486,17 +1383,22 @@ async def boq_logs(
     ]
 
 
+# ------------------ 26. AUDIT LOGS CSV EXPORT ------------------
+
+
 @router.get("/{boq_id}/logs/export/csv")
 async def export_boq_logs_csv(
     boq_id: int,
-    current_user: User = Depends(require_roles(READ_ONLY_ROLES)),
+    current_user: User = Depends(require_permission("boq.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    base, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
+
     rows = (
         (
             await db.execute(
                 select(BOQAudit)
-                .where(BOQAudit.boq_id == boq_id)
+                .where(BOQAudit.boq_id == base.id)
                 .order_by(BOQAudit.id.desc())
             )
         )
@@ -1533,24 +1435,17 @@ async def export_boq_logs_csv(
     )
 
 
+# ------------------ 27. TASK GENERATION ------------------
+
+
 @router.post("/{boq_id}/generate-tasks")
 async def generate_tasks_from_boq(
     boq_id: int,
     milestone_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_GENERATION_ROLES)),
+    current_user: User = Depends(require_permission("tasks.create")),
 ):
-    boq = await db.scalar(
-        select(BOQ).where(
-            BOQ.id == boq_id,
-            BOQ.status != "Deleted",
-        )
-    )
-
-    if not boq:
-        raise NotFoundError("BOQ not found")
-
-    await assert_project_access(db, project_id=boq.project_id, current_user=current_user)
+    boq, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
     # prevent task generation from historical versions
     if not boq.is_latest:
@@ -1561,6 +1456,11 @@ async def generate_tasks_from_boq(
 
     # prevent duplicate task generation
     existing_task = await db.scalar(select(Task).where(Task.boq_id == boq.id))
+    if existing_task:
+        return {
+            "message": "Task already exists for this BOQ",
+            "task_id": existing_task.id,
+        }
 
     if milestone_id:
         from app.models.project import Milestone
@@ -1574,12 +1474,6 @@ async def generate_tasks_from_boq(
             raise ValidationError(
                 "Milestone does not belong to the same project as the BOQ"
             )
-
-    if existing_task:
-        return {
-            "message": "Task already exists for this BOQ",
-            "task_id": existing_task.id,
-        }
 
     task = Task(
         project_id=boq.project_id,
@@ -1595,7 +1489,6 @@ async def generate_tasks_from_boq(
     )
 
     db.add(task)
-
     await db.flush()
     await db.refresh(task)
 

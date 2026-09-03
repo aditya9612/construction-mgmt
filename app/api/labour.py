@@ -48,18 +48,14 @@ from app.models.project import ProjectOTPolicy
 
 
 async def get_user_project_ids(db, user):
-    if getattr(user, "is_super_admin", False):
+    if (
+        getattr(user, "is_super_admin", False)
+        or getattr(user, "role", None) == UserRole.SUPER_ADMIN.value
+    ):
         result = await db.execute(select(Project.id))
         return [r[0] for r in result.all()]
     if user.company_id is None:
-        if user.role == UserRole.ADMIN.value:
-            result = await db.execute(select(Project.id))
-            return [r[0] for r in result.all()]
-        result = await db.execute(
-            select(ProjectMember.project_id)
-            .where(ProjectMember.user_id == user.id)
-        )
-        return [r[0] for r in result.all()]
+        return []
     if user.role == UserRole.ADMIN.value:
         result = await db.execute(
             select(Project.id).where(Project.company_id == user.company_id)
@@ -129,7 +125,7 @@ ATTENDANCE_VERSION_KEY = "cache_version:labour_attendance"
 async def create_labour(
     payload: s.LabourCreate = Depends(),
     profile_image: UploadFile = File(None),
-    current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -171,11 +167,11 @@ async def create_labour(
             payload.contractor_id,
         )
 
-        if not contractor:
-            raise HTTPException(
-                status_code=404,
-                detail="Contractor not found",
-            )
+        if not contractor or (
+            current_user_company_id is not None
+            and contractor.company_id != current_user_company_id
+        ):
+            raise NotFoundError("Contractor not found")
 
     # =========================================
     # ADD HERE
@@ -217,9 +213,12 @@ async def create_labour(
             await db.flush()
 
             if project_id:
-                await assert_project_access(
-                    db, project_id=project_id, current_user=current_user
-                )
+                try:
+                    await assert_project_access(
+                        db, project_id=project_id, current_user=current_user
+                    )
+                except Exception:
+                    raise NotFoundError("Project not found")
                 db.add(
                     LabourProject(
                         labour_id=obj.id,
@@ -269,7 +268,7 @@ async def list_labour(
     search: Optional[str] = None,
     status: Optional[LabourStatus] = None,
     project_id: Optional[int] = None,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -279,15 +278,16 @@ async def list_labour(
             meta=PaginationMeta(total=0, limit=limit, offset=offset),
         )
     if project_id:
-        await assert_project_access(
-            db, project_id=project_id, current_user=current_user
-        )
+        try:
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
+        except Exception:
+            raise NotFoundError("Project not found")
 
     version = await r.get_cache_version(redis, VERSION_KEY)
 
-    cache_key = (
-        f"cache:labour:list:{version}:{limit}:{offset}:{search}:{status}:{project_id}"
-    )
+    cache_key = f"cache:labour:list:{version}:{current_user.company_id}:{limit}:{offset}:{search}:{status}:{project_id}"
 
     cached = await r.cache_get_json(redis, cache_key)
     if cached:
@@ -368,14 +368,17 @@ async def get_payroll_list(
     year: int,
     contractor_id: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     query = (
         select(LabourPayroll, Labour)
@@ -430,10 +433,15 @@ async def get_payroll_stats(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    try:
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     payroll_sum = await db.execute(
         select(
@@ -481,10 +489,15 @@ async def get_contractor_liability(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    try:
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     query = (
         select(
@@ -541,7 +554,7 @@ async def update_labour(
     status: Optional[LabourStatus] = Form(None),
     notes: Optional[str] = Form(None),
     profile_image: UploadFile = File(None),
-    current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -620,8 +633,11 @@ async def update_labour(
             contractor_id,
         )
 
-        if not contractor:
-            raise ValidationError("Invalid contractor_id")
+        if not contractor or (
+            current_user.company_id is not None
+            and contractor.company_id != current_user.company_id
+        ):
+            raise NotFoundError("Contractor not found")
 
     # PROFILE IMAGE UPDATE
     if profile_image:
@@ -688,7 +704,7 @@ async def update_labour(
 @router.delete("/{labour_id}", status_code=200)
 async def delete_labour(
     labour_id: int,
-    current_user: User = Depends(d.require_roles(LABOUR_DELETE_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1002,7 +1018,7 @@ async def delete_labour(
 )
 async def weekly_report(
     labour_id: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -1109,7 +1125,7 @@ from decimal import Decimal
 )
 async def monthly_report(
     labour_id: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     from app.utils.common import assert_project_access
@@ -1221,16 +1237,7 @@ async def monthly_report(
 @router.post("/payroll/generate", response_model=list[s.PayrollOut])
 async def generate_payroll(
     payload: s.PayrollGenerate,
-    current_user: User = Depends(
-        d.require_roles(
-            [
-                UserRole.ADMIN.value,
-                UserRole.PROJECT_MANAGER.value,
-                UserRole.ACCOUNTANT.value,
-                UserRole.SITE_ENGINEER.value,
-            ]
-        )
-    ),
+    current_user: User = Depends(d.require_permission("payroll.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1244,11 +1251,14 @@ async def generate_payroll(
     if payload.year < 2000:
         raise ValidationError("Invalid year")
 
-    await assert_project_access(
-        db=db,
-        project_id=payload.project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db=db,
+            project_id=payload.project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     try:
         result = await db.execute(
@@ -1444,16 +1454,7 @@ async def generate_payroll(
 @router.post("/payroll/lock", response_model=list[s.PayrollOut])
 async def lock_payroll(
     payload: s.PayrollLock,
-    current_user: User = Depends(
-        d.require_roles(
-            [
-                UserRole.ADMIN.value,
-                UserRole.PROJECT_MANAGER.value,
-                UserRole.ACCOUNTANT.value,
-                UserRole.SITE_ENGINEER.value,
-            ]
-        )
-    ),
+    current_user: User = Depends(d.require_permission("payroll.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1518,16 +1519,7 @@ async def lock_payroll(
 @router.post("/payroll/unlock", response_model=list[s.PayrollOut])
 async def unlock_payroll(
     payload: s.PayrollUnlock,
-    current_user: User = Depends(
-        d.require_roles(
-            [
-                UserRole.ADMIN.value,
-                UserRole.PROJECT_MANAGER.value,
-                UserRole.ACCOUNTANT.value,
-                UserRole.SITE_ENGINEER.value,
-            ]
-        )
-    ),
+    current_user: User = Depends(d.require_permission("payroll.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1592,16 +1584,19 @@ async def unlock_payroll(
 @router.post("/payroll/pay")
 async def pay_salary(
     payload: s.PayrollPayment,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.approve")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
 
-    await assert_project_access(
-        db,
-        project_id=payload.project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db,
+            project_id=payload.project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     payroll = await db.scalar(
         select(LabourPayroll)
@@ -1721,16 +1716,19 @@ async def pay_salary(
 @router.post("/advance")
 async def advance_payment(
     payload: s.AdvancePayment,
-    current_user: User = Depends(d.require_roles(PAYROLL_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
 
-    await assert_project_access(
-        db,
-        project_id=payload.project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db,
+            project_id=payload.project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     labour = await db.get(Labour, payload.labour_id)
     project = await db.get(Project, payload.project_id)
@@ -1786,13 +1784,16 @@ async def attendance_dashboard(
     to_date: date,
     labour_id: int | None = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("attendance.view")),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     # =====================================================
     # BUILD FILTERS
@@ -1958,7 +1959,7 @@ async def attendance_dashboard(
 
 @router.get("/dashboard/stats", response_model=s.DashboardStatsOut)
 async def dashboard_stats(
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     today = date.today()
@@ -1994,20 +1995,15 @@ async def dashboard_stats(
 @router.get("/contractor/{contractor_id}")
 async def get_labour_by_contractor(
     contractor_id: int,
-    current_user: User = Depends(
-        d.require_roles(
-            [
-                r.value
-                for r in [
-                    UserRole.ADMIN,
-                    UserRole.PROJECT_MANAGER,
-                    UserRole.SITE_ENGINEER,
-                ]
-            ]
-        )
-    ),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    contractor = await db.get(Contractor, contractor_id)
+    if not contractor or (
+        current_user.company_id is not None
+        and contractor.company_id != current_user.company_id
+    ):
+        return []
     project_ids = await get_user_project_ids(db, current_user)
 
     result = await db.execute(
@@ -2038,14 +2034,17 @@ async def get_labour_by_contractor(
 @router.get("/summary/skill")
 async def labour_skill_summary(
     project_id: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     result = await db.execute(
         select(LabourType.skill_category, func.count(Labour.id))
@@ -2065,16 +2064,19 @@ async def labour_skill_summary(
 # =========================
 @router.get("/report/export")
 async def export_excel(
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.export")),
     project_id: int = Query(...),
     db: AsyncSession = Depends(get_db_session),
 ):
 
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     project_ids = await get_user_project_ids(db, current_user)
     result = await db.execute(
@@ -2116,10 +2118,15 @@ async def export_attendance_excel(
     from_date: date,
     to_date: date,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("attendance.export")),
 ):
 
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    try:
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     query = (
         select(UserAttendance, Labour)
@@ -2179,7 +2186,7 @@ async def export_payroll_excel(
     end_date: Optional[date] = None,
     labour_id: Optional[int] = None,
     format: Literal["excel", "pdf"] = Query("excel", description="Export format"),
-    current_user: User = Depends(d.require_roles(PAYROLL_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
     project_ids = await get_user_project_ids(db, current_user)
@@ -2310,23 +2317,21 @@ async def export_payroll_excel(
 @router.post("/wages", response_model=payroll_s.LabourWageOut)
 async def create_wage_record(
     payload: payroll_s.LabourWageGenerateRequest,
-    current_user: User = Depends(
-        d.require_roles(
-            [
-                UserRole.ADMIN.value,
-                UserRole.PROJECT_MANAGER.value,
-                UserRole.ACCOUNTANT.value,
-            ]
-        )
-    ),
+    current_user: User = Depends(d.require_permission("payroll.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db, project_id=payload.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=payload.project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     labour = await db.get(Labour, payload.labour_id)
-    if not labour:
+    if not labour or (
+        current_user.company_id is not None
+        and labour.company_id != current_user.company_id
+    ):
         raise NotFoundError("Labour not found")
 
     target_account_id = payload.bank_account_id
@@ -2442,7 +2447,7 @@ async def list_wages(
     status: Optional[str] = None,
     labour_id: Optional[int] = None,
     project_id: Optional[int] = None,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -2451,9 +2456,12 @@ async def list_wages(
         )
 
     if project_id:
-        await assert_project_access(
-            db, project_id=project_id, current_user=current_user
-        )
+        try:
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
+        except Exception:
+            raise NotFoundError("Project not found")
 
     query = (
         select(LabourWageRecord, Labour)
@@ -2527,25 +2535,31 @@ async def list_wages(
 @router.post("/wages/{id}/pay")
 async def pay_wage_record(
     id: int,
-    current_user: User = Depends(
-        d.require_roles(
-            [
-                UserRole.ADMIN.value,
-                UserRole.PROJECT_MANAGER.value,
-                UserRole.ACCOUNTANT.value,
-            ]
-        )
-    ),
+    current_user: User = Depends(d.require_permission("payroll.approve")),
     db: AsyncSession = Depends(get_db_session),
 ):
     wage_record = await db.scalar(
-        select(LabourWageRecord).where(LabourWageRecord.id == id).with_for_update()
+        select(LabourWageRecord).where(LabourWageRecord.id == id)
     )
     if not wage_record:
         raise NotFoundError("Wage record not found")
 
-    await assert_project_access(
-        db, project_id=wage_record.project_id, current_user=current_user
+    project = await db.get(Project, wage_record.project_id)
+    if not project or (
+        current_user.company_id is not None
+        and project.company_id != current_user.company_id
+    ):
+        raise NotFoundError("Wage record not found")
+
+    try:
+        await assert_project_access(
+            db, project_id=wage_record.project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Wage record not found")
+
+    wage_record = await db.scalar(
+        select(LabourWageRecord).where(LabourWageRecord.id == id).with_for_update()
     )
 
     if wage_record.status == "PAID":
@@ -2625,10 +2639,15 @@ async def pay_wage_record(
 @router.get("/wages/stats", response_model=payroll_s.LabourWageStatsOut)
 async def get_wage_stats(
     project_id: int = Query(...),
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    try:
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     pending = await db.scalar(
         select(func.sum(LabourWageRecord.net_wage)).where(
@@ -2682,7 +2701,7 @@ async def _get_active_labour_or_404(
 @router.get("/{labour_id}/qr", response_class=StreamingResponse)
 async def generate_labour_qr(
     labour_id: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     labour = await _get_active_labour_or_404(db, labour_id, current_user)
@@ -2700,7 +2719,7 @@ async def generate_labour_qr(
 @router.get("/{labour_id}", response_model=s.LabourOut)
 async def get_labour(
     labour_id: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -2777,14 +2796,17 @@ async def get_weekly_velocity(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     query = (
         select(
@@ -2836,10 +2858,15 @@ async def get_disbursement_history(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    try:
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     query = (
         select(Transaction)
@@ -2899,10 +2926,15 @@ async def get_fiscal_summary(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    try:
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     payroll_sum = await db.execute(
         select(
@@ -2962,10 +2994,15 @@ async def get_fiscal_summary(
 async def get_payroll_momentum(
     project_id: int,
     months: int = Query(6, ge=1, le=12),
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    try:
+        await assert_project_access(
+            db, project_id=project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     today = date.today()
     period_start = today - timedelta(days=30 * months)
@@ -3038,14 +3075,17 @@ async def get_aggregate_report(
     month: int,
     year: int,
     group_by: str = Query("monthly", pattern="^(daily|weekly|monthly)$"),
-    current_user: User = Depends(d.require_roles(LABOUR_READ_ROLES)),
+    current_user: User = Depends(d.require_permission("payroll.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    try:
+        await assert_project_access(
+            db,
+            project_id=project_id,
+            current_user=current_user,
+        )
+    except Exception:
+        raise NotFoundError("Project not found")
 
     # ------------------------------------------------------
     # Determine grouping expression

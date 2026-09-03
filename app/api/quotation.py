@@ -30,7 +30,7 @@ from app.models.quotation import (
 
 from app.models.user import User, ActivityLog, UserRole
 from app.models.owner import Owner
-from app.core.dependencies import get_current_active_user
+from app.core.dependencies import get_current_active_user, require_permission
 
 import app.schemas.quotation as s
 from decimal import Decimal
@@ -148,14 +148,18 @@ async def get_quotation_or_404(quotation_id: int, db: AsyncSession, current_user
     if not quotation:
         raise HTTPException(404, "Quotation not found")
 
+    # Super Admin cross-company visibility
+    if getattr(current_user, "is_super_admin", False) is True:
+        return quotation
+
     # Tenant / Client Validation
-    if current_user.role == UserRole.CLIENT:
+    if current_user.role == UserRole.CLIENT or current_user.role == "Client":
         if quotation.client_user_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized to access this quotation")
+            raise HTTPException(status_code=404, detail="Quotation not found")
     else:
         # Standard tenant users must belong to the company that owns the quotation
         if not current_user.company_id or quotation.company_id != current_user.company_id:
-            raise HTTPException(status_code=403, detail="Not authorized to access this quotation")
+            raise HTTPException(status_code=404, detail="Quotation not found")
 
     return quotation
 
@@ -1032,7 +1036,7 @@ def generate_quotation_pdf(
 async def create_quotation(
     payload: s.CreateQuotation,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.create")),
 ):
 
     try:
@@ -1049,7 +1053,7 @@ async def create_quotation(
                 detail="Client not found."
             )
 
-        if client.role != UserRole.CLIENT:
+        if client.role != UserRole.CLIENT and client.role != "Client":
             raise HTTPException(
                 status_code=400,
                 detail="Selected user is not a Client."
@@ -1060,6 +1064,17 @@ async def create_quotation(
                 status_code=400,
                 detail="Selected client is inactive."
             )
+
+        is_super = getattr(current_user, "is_super_admin", False) is True
+        if not is_super:
+            if client.company_id != current_user.company_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Client not found."
+                )
+            target_company_id = current_user.company_id
+        else:
+            target_company_id = client.company_id
 
         # =====================================================
         # ALLOW ONLY ONE ACTIVE QUOTATION PER CLIENT
@@ -1233,7 +1248,7 @@ async def create_quotation(
                     labour_data.labour_id,
                 )
 
-                if not labour:
+                if not labour or (target_company_id and labour.company_id != target_company_id):
                     raise HTTPException(
                         status_code=404,
                         detail=f"Labour ID {labour_data.labour_id} not found."
@@ -1270,6 +1285,14 @@ async def create_quotation(
                         detail=f"Material ID {material_data.material_id} not found."
                     )
 
+                if target_company_id and material.project_id:
+                    mat_proj = await db.get(Project, material.project_id)
+                    if not mat_proj or mat_proj.company_id != target_company_id:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Material ID {material_data.material_id} not found."
+                        )
+
         # =====================================================
         # VALIDATE EQUIPMENT IDs
         # =====================================================
@@ -1301,6 +1324,14 @@ async def create_quotation(
                         detail=f"Equipment ID {extra_data.equipment_id} not found."
                     )
 
+                if target_company_id and equipment.project_id:
+                    eq_proj = await db.get(Project, equipment.project_id)
+                    if not eq_proj or eq_proj.company_id != target_company_id:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Equipment ID {extra_data.equipment_id} not found."
+                        )
+
         # =====================================================
         # GENERATE QUOTATION NUMBER
         # =====================================================
@@ -1314,7 +1345,7 @@ async def create_quotation(
         quotation = QuotationMaster(
 
             quotation_no=quotation_no,
-            company_id=current_user.company_id,
+            company_id=target_company_id,
 
             # CLIENT
             client_user_id=payload.client_user_id,
@@ -1687,7 +1718,7 @@ async def list_quotations(
     limit: int = Query(50, ge=1, le=200, description="Max records to return"),
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.view")),
 ):
 
     query = select(QuotationMaster).options(
@@ -1697,7 +1728,9 @@ async def list_quotations(
         selectinload(QuotationMaster.extra_charge_items),
     )
 
-    if current_user.role == UserRole.CLIENT:
+    if getattr(current_user, "is_super_admin", False) is True:
+        pass
+    elif current_user.role == UserRole.CLIENT or current_user.role == "Client":
         query = query.where(QuotationMaster.client_user_id == current_user.id)
     elif current_user.company_id:
         query = query.where(QuotationMaster.company_id == current_user.company_id)
@@ -1723,7 +1756,7 @@ async def list_quotations(
 async def get_quotation(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.view")),
 ):
 
     return await get_quotation_or_404(quotation_id, db, current_user)
@@ -1739,7 +1772,7 @@ async def update_quotation(
     quotation_id: int,
     payload: s.UpdateQuotation,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -1802,7 +1835,7 @@ async def update_quotation(
 async def delete_quotation(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.delete")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -1841,7 +1874,7 @@ async def add_quotation_item(
     quotation_id: int,
     payload: s.QuotationItemCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -1951,7 +1984,7 @@ async def update_quotation_item(
     item_id: int,
     payload: s.QuotationItemUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     result = await db.execute(
@@ -2119,7 +2152,7 @@ async def update_quotation_item(
 async def delete_quotation_item(
     item_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     result = await db.execute(select(QuotationItem).where(QuotationItem.id == item_id))
@@ -2167,7 +2200,7 @@ async def delete_quotation_item(
 async def preview_quotation(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.view")),
 ):
 
     return await get_quotation_or_404(quotation_id, db, current_user)
@@ -2182,7 +2215,7 @@ async def preview_quotation(
 async def approve_quotation(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.approve")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -2231,7 +2264,7 @@ async def reject_quotation(
     quotation_id: int,
     payload: s.RejectQuotation,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.approve")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -2288,7 +2321,7 @@ async def convert_to_bill(
     project_id: int,  # Required query parameter
     contractor_id: int,  # Required query parameter
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.manage")),
 ):
 
     # GET QUOTATION AND LOCK THE ROW so a concurrent conversion
@@ -2322,14 +2355,14 @@ async def convert_to_bill(
 
     project = await db.get(Project, project_id)
 
-    if not project:
+    if not project or project.company_id != quotation.company_id:
         raise HTTPException(404, "Project not found")
 
     # VALIDATE CONTRACTOR
 
     contractor = await db.get(Contractor, contractor_id)
 
-    if not contractor:
+    if not contractor or contractor.company_id != quotation.company_id:
         raise HTTPException(404, "Contractor not found")
 
     # PREPARE AMOUNTS
@@ -2413,7 +2446,7 @@ async def convert_to_work_order(
     project_id: int,  # Required query parameter
     contractor_id: int,  # Required query parameter
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.manage")),
 ):
     from decimal import Decimal
 
@@ -2457,7 +2490,7 @@ async def convert_to_work_order(
 
     project = await db.get(Project, project_id)
 
-    if not project:
+    if not project or project.company_id != quotation.company_id:
         raise HTTPException(404, "Project not found")
 
     # =====================================================
@@ -2466,7 +2499,7 @@ async def convert_to_work_order(
 
     contractor = await db.get(Contractor, contractor_id)
 
-    if not contractor:
+    if not contractor or contractor.company_id != quotation.company_id:
         raise HTTPException(404, "Contractor not found")
 
     # =====================================================
@@ -2549,7 +2582,7 @@ async def add_labour_item(
     quotation_id: int,
     payload: s.QuotationLabourCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -2563,7 +2596,7 @@ async def add_labour_item(
     if payload.labour_id:
         labour = await db.get(Labour, payload.labour_id)
 
-        if not labour:
+        if not labour or (quotation.company_id and labour.company_id != quotation.company_id):
             raise HTTPException(
                 status_code=404,
                 detail="Labour not found"
@@ -2627,7 +2660,7 @@ async def update_labour_item(
     labour_item_id: int,
     payload: s.QuotationLabourUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     result = await db.execute(
@@ -2670,7 +2703,7 @@ async def update_labour_item(
     ):
         labour = await db.get(Labour, payload.labour_id)
 
-        if not labour:
+        if not labour or (quotation.company_id and labour.company_id != quotation.company_id):
             raise HTTPException(
                 status_code=404,
                 detail="Labour not found"
@@ -2738,7 +2771,7 @@ async def update_labour_item(
 async def delete_labour_item(
     labour_item_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     result = await db.execute(
@@ -2778,7 +2811,7 @@ async def add_material_item(
     quotation_id: int,
     payload: s.QuotationMaterialCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -2806,6 +2839,14 @@ async def add_material_item(
                 status_code=404,
                 detail="Material not found"
             )
+
+        if quotation.company_id and material.project_id:
+            mat_proj = await db.get(Project, material.project_id)
+            if not mat_proj or mat_proj.company_id != quotation.company_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Material not found"
+                )
 
     # =====================================================
     # CALCULATE AMOUNT
@@ -2877,7 +2918,7 @@ async def update_material_item(
     material_item_id: int,
     payload: s.QuotationMaterialUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     result = await db.execute(
@@ -2919,6 +2960,14 @@ async def update_material_item(
                 status_code=404,
                 detail="Material not found"
             )
+
+        if quotation.company_id and material.project_id:
+            mat_proj = await db.get(Project, material.project_id)
+            if not mat_proj or mat_proj.company_id != quotation.company_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Material not found"
+                )
 
     # =====================================================
     # UPDATE FIELDS
@@ -2982,7 +3031,7 @@ async def update_material_item(
 async def delete_material_item(
     material_item_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     result = await db.execute(
@@ -3021,7 +3070,7 @@ async def delete_material_item(
 async def list_material_items(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.view")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -3039,7 +3088,7 @@ async def add_extra_charge(
     quotation_id: int,
     payload: s.QuotationExtraChargeCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -3063,6 +3112,14 @@ async def add_extra_charge(
                 status_code=404,
                 detail="Equipment not found",
             )
+
+        if quotation.company_id and equipment.project_id:
+            eq_proj = await db.get(Project, equipment.project_id)
+            if not eq_proj or eq_proj.company_id != quotation.company_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Equipment not found",
+                )
 
     amount = payload.quantity * payload.rate
 
@@ -3103,7 +3160,7 @@ async def update_extra_charge(
     extra_charge_id: int,
     payload: s.QuotationExtraChargeUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     result = await db.execute(
@@ -3146,6 +3203,14 @@ async def update_extra_charge(
                 detail="Equipment not found",
             )
 
+        if quotation.company_id and equipment.project_id:
+            eq_proj = await db.get(Project, equipment.project_id)
+            if not eq_proj or eq_proj.company_id != quotation.company_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Equipment not found",
+                )
+
     # =====================================================
     # UPDATE FIELDS
     # =====================================================
@@ -3184,7 +3249,7 @@ async def update_extra_charge(
 async def delete_extra_charge(
     extra_charge_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
     result = await db.execute(
@@ -3223,7 +3288,7 @@ async def delete_extra_charge(
 async def list_extra_charges(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.view")),
 ):
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
@@ -3240,12 +3305,17 @@ async def list_extra_charges(
 async def generate_pdf(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.export")),
 ):
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
-    result = await db.execute(select(CompanySettings))
-    company_settings = result.scalars().first()
+    company_settings = None
+    if quotation.company_id:
+        result = await db.execute(select(CompanySettings).where(CompanySettings.company_id == quotation.company_id))
+        company_settings = result.scalars().first()
+    if not company_settings and current_user.company_id:
+        result = await db.execute(select(CompanySettings).where(CompanySettings.company_id == current_user.company_id))
+        company_settings = result.scalars().first()
 
     pdf_buffer = generate_quotation_pdf(quotation, company_settings)
 
@@ -3273,7 +3343,7 @@ async def convert_quotation_to_project(
     quotation_id: int,
     payload: s.QuotationToProjectConvertRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.manage")),
 ):
     # LOCK THE QUOTATION ROW (see note in convert_to_bill)
     lock_result = await db.execute(
@@ -3307,7 +3377,7 @@ async def convert_quotation_to_project(
 
     owner = await db.get(Owner, payload.owner_id)
 
-    if not owner:
+    if not owner or owner.company_id != quotation.company_id:
         raise HTTPException(status_code=404, detail="Owner not found")
 
     business_id = await generate_business_id(db, Project, "business_id", "PRJ")
@@ -3374,7 +3444,7 @@ async def convert_quotation_to_project(
 async def send_quotation(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("quotations.assign")),
 ):
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
 

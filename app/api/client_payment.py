@@ -52,7 +52,9 @@ from sqlalchemy.orm import selectinload
 from app.models.notification import Notification
 import app.schemas.client_payment as s
 from app.cache.redis import bump_cache_version
-from app.core.dependencies import get_request_redis, require_roles
+from app.core.dependencies import get_request_redis, require_permission
+from app.api.boq import assert_project_access_masked
+from app.models.settings import CompanySettings
 from app.core.enums import (
     InvoiceStatus,
     PaymentMethod,
@@ -78,29 +80,6 @@ COMPANY_ADDRESS_LINE = "123, Business Park, Andheri East, Mumbai - 400069"
 COMPANY_CONTACT_LINE = (
     "Tel: +91 22 1234 5678 | Email: accounts@cms.com | GSTIN: 27XXXXX1234X1ZX"
 )
-
-# ---------------------------------------------------------------------------
-# Role tables
-# ---------------------------------------------------------------------------
-CLIENT_PAYMENT_CREATE_ROLES = [r.value for r in (UserRole.CLIENT,)]
-
-PAYMENT_VERIFY_ROLES = [
-    UserRole.ADMIN.value,
-    UserRole.ACCOUNTANT.value,
-]
-
-CLIENT_PAYMENT_READ_ROLES = [
-    UserRole.ADMIN.value,
-    UserRole.ACCOUNTANT.value,
-    UserRole.CLIENT.value,
-]
-
-CLIENT_PAYMENT_REPORTING_ROLES = [
-    UserRole.CLIENT.value,
-    UserRole.ADMIN.value,
-    UserRole.ACCOUNTANT.value,
-]
-
 
 router = APIRouter(
     prefix="/client-payments",
@@ -265,15 +244,19 @@ def get_status_color(status_value: str) -> HexColor:
 # ===========================================================================
 
 
-async def get_client_or_404(db: AsyncSession, client_user_id: int) -> User:
-    """Validate that client_user_id refers to a real, active CLIENT user."""
-    client = await db.scalar(
-        select(User).where(
-            User.id == client_user_id,
-            User.role == UserRole.CLIENT.value,
-            User.is_deleted == False,
-        )
+async def get_client_or_404(
+    db: AsyncSession, client_user_id: int, current_user: User
+) -> User:
+    """Validate that client_user_id refers to a real, active CLIENT user within the same company."""
+    stmt = select(User).where(
+        User.id == client_user_id,
+        User.role == UserRole.CLIENT.value,
+        User.is_deleted == False,
     )
+    if not (getattr(current_user, "is_super_admin", False) is True):
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    client = await db.scalar(stmt)
     if not client:
         raise HTTPException(status_code=404, detail="Client not found.")
     if not client.is_active:
@@ -287,23 +270,10 @@ async def validate_client_project_membership(
     db: AsyncSession,
     client_user_id: int,
     project_id: int,
+    current_user: User,
 ) -> User:
-    """Validate user exists, is CLIENT, active, and assigned to project."""
-    client = await db.scalar(
-        select(User).where(
-            User.id == client_user_id,
-            User.role == UserRole.CLIENT.value,
-            User.is_deleted == False,
-        )
-    )
-    if not client:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Client not found."
-        )
-    if not client.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Client is inactive."
-        )
+    """Validate user exists, is CLIENT, active, in same company, and assigned to project."""
+    client = await get_client_or_404(db, client_user_id, current_user)
     member = await db.scalar(
         select(ProjectMember).where(
             ProjectMember.project_id == project_id,
@@ -318,11 +288,13 @@ async def validate_client_project_membership(
     return client
 
 
-async def get_project_or_404(db: AsyncSession, project_id: int) -> Project:
-    """Get project or raise 404/400 if invalid."""
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found.")
+async def get_project_or_404(
+    db: AsyncSession, project_id: int, current_user: User
+) -> Project:
+    """Get project or raise 404 with company scoping/masking."""
+    project = await assert_project_access_masked(
+        db, project_id=project_id, current_user=current_user
+    )
     if project.status == ProjectStatus.COMPLETED:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -336,21 +308,21 @@ async def get_project_or_404(db: AsyncSession, project_id: int) -> Project:
 
 
 def assert_client_owns_payment(current_user: User, payment: ClientPayment) -> None:
-    """Ownership guard: CLIENT may only access their own payments."""
+    """Ownership guard: CLIENT may only access their own payments. Masked to 404."""
     if (
         current_user.role == UserRole.CLIENT.value
         and payment.client_user_id != current_user.id
     ):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have access to this payment.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found.",
         )
 
 
 async def assert_client_is_project_member(
     db: AsyncSession, project_id: int, current_user: User
 ) -> None:
-    """Shared membership guard for CLIENT role."""
+    """Shared membership guard for CLIENT role. Masked to 404."""
     if current_user.role != UserRole.CLIENT.value:
         return
     member = await db.scalar(
@@ -361,8 +333,8 @@ async def assert_client_is_project_member(
     )
     if member is None:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not assigned to this project.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found.",
         )
 
 
@@ -643,19 +615,27 @@ async def get_invoice_payment_summary(
     project_id: int = Query(..., gt=0),
     invoice_id: int | None = Query(None),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
     """Get payment summary per invoice for a project."""
+    await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
     await assert_client_is_project_member(db, project_id, current_user)
 
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.project_id == project_id, ClientPayment.company_id == current_user.company_id)
+        .where(ClientPayment.project_id == project_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.invoice),
         )
     )
+
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
+
+    if current_user.role == UserRole.CLIENT.value:
+        stmt = stmt.where(ClientPayment.client_user_id == current_user.id)
 
     if invoice_id:
         stmt = stmt.where(ClientPayment.invoice_id == invoice_id)
@@ -715,15 +695,20 @@ async def get_payment_history(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
     """Get payment history timeline for a project."""
+    await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
     await assert_client_is_project_member(db, project_id, current_user)
+
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
 
     # Count
     count_stmt = select(func.count(ClientPayment.id)).where(
-        ClientPayment.project_id == project_id, ClientPayment.company_id == current_user.company_id
+        ClientPayment.project_id == project_id
     )
+    if not is_super_admin:
+        count_stmt = count_stmt.where(ClientPayment.company_id == current_user.company_id)
     if current_user.role == UserRole.CLIENT.value:
         count_stmt = count_stmt.where(ClientPayment.client_user_id == current_user.id)
 
@@ -732,12 +717,15 @@ async def get_payment_history(
     # Data
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.project_id == project_id, ClientPayment.company_id == current_user.company_id)
+        .where(ClientPayment.project_id == project_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.invoice),
         )
     )
+
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
 
     if current_user.role == UserRole.CLIENT.value:
         stmt = stmt.where(ClientPayment.client_user_id == current_user.id)
@@ -783,9 +771,11 @@ async def get_pending_invoices(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_REPORTING_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
     """Pending invoices available for payment."""
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
+
     stmt = (
         select(
             Invoice.id,
@@ -798,9 +788,12 @@ async def get_pending_invoices(
             Invoice.created_at,
             Project.project_name,
         )
-        .outerjoin(Project, Invoice.project_id == Project.id)
+        .join(Project, Invoice.project_id == Project.id)
         .where(Invoice.pending_amount > 0)
     )
+
+    if not is_super_admin:
+        stmt = stmt.where(Project.company_id == current_user.company_id)
 
     if current_user.role == UserRole.CLIENT.value:
         stmt = stmt.where(
@@ -812,6 +805,7 @@ async def get_pending_invoices(
         )
 
     if project_id:
+        await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
         await assert_client_is_project_member(db, project_id, current_user)
         stmt = stmt.where(Invoice.project_id == project_id)
 
@@ -825,9 +819,14 @@ async def get_pending_invoices(
                 )
             )
 
-    total_stmt = select(func.count(Invoice.id.distinct())).where(
-        Invoice.pending_amount > 0
+    total_stmt = (
+        select(func.count(Invoice.id.distinct()))
+        .join(Project, Invoice.project_id == Project.id)
+        .where(Invoice.pending_amount > 0)
     )
+
+    if not is_super_admin:
+        total_stmt = total_stmt.where(Project.company_id == current_user.company_id)
 
     if current_user.role == UserRole.CLIENT.value:
         total_stmt = total_stmt.where(
@@ -842,9 +841,7 @@ async def get_pending_invoices(
     if search:
         search_text = search.strip()
         if search_text:
-            total_stmt = total_stmt.outerjoin(
-                Project, Invoice.project_id == Project.id
-            ).where(
+            total_stmt = total_stmt.where(
                 or_(
                     Project.project_name.ilike(f"%{search_text}%"),
                     Invoice.description.ilike(f"%{search_text}%"),
@@ -889,15 +886,18 @@ async def get_pending_invoices(
 @router.get("/analytics", response_model=s.ClientPaymentAnalyticsOut)
 async def payment_analytics(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_REPORTING_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
     """Payment analytics - CLIENT sees own, others see org-wide."""
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
     is_client = current_user.role == UserRole.CLIENT.value
 
     def scope(stmt_):
+        if not is_super_admin:
+            stmt_ = stmt_.where(ClientPayment.company_id == current_user.company_id)
         if is_client:
-            return stmt_.where(ClientPayment.client_user_id == current_user.id, ClientPayment.company_id == current_user.company_id)
-        return stmt_.where(ClientPayment.company_id == current_user.company_id)
+            stmt_ = stmt_.where(ClientPayment.client_user_id == current_user.id)
+        return stmt_
 
     # Payment method breakdown
     method_rows = (
@@ -1028,7 +1028,7 @@ async def export_client_payments_excel(
     to_date: date | None = Query(None),
     search: str | None = Query(None),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_REPORTING_ROLES)),
+    current_user: User = Depends(require_permission("invoices.export")),
 ):
     """Export client payments to Excel file."""
     if from_date and to_date and from_date > to_date:
@@ -1046,20 +1046,28 @@ async def export_client_payments_excel(
         if not search:
             search = None
 
-    stmt = select(ClientPayment).where(ClientPayment.company_id == current_user.company_id).options(
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
+
+    stmt = select(ClientPayment).options(
         selectinload(ClientPayment.client_user),
         selectinload(ClientPayment.project),
         selectinload(ClientPayment.invoice),
     )
 
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
+
     if current_user.role == UserRole.CLIENT.value:
         stmt = stmt.where(ClientPayment.client_user_id == current_user.id)
     elif user_id is not None:
-        await get_client_or_404(db, user_id)
+        await get_client_or_404(db, user_id, current_user)
         stmt = stmt.where(ClientPayment.client_user_id == user_id)
 
     if project_id is not None:
+        await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
+        await assert_client_is_project_member(db, project_id, current_user)
         stmt = stmt.where(ClientPayment.project_id == project_id)
+
     if payment_method is not None:
         stmt = stmt.where(ClientPayment.payment_method == payment_method)
     if payment_status is not None:
@@ -1099,75 +1107,56 @@ async def export_client_payments_excel(
             "Payment No",
             "Client",
             "Project",
-            "Invoice No",
             "Amount",
-            "Payment Method",
+            "Method",
             "Status",
-            "Bank Name",
-            "Cheque No",
+            "Date",
             "Reference No",
-            "Payment Date",
-            "Verified By",
-            "Verified At",
-            "Remarks",
+            "Cheque No",
+            "Bank Name",
         ]
         sheet.append(headers)
-        for payment in payments:
+
+        for p in payments:
             sheet.append(
                 [
-                    payment.payment_no,
-                    payment.client_user.full_name if payment.client_user else "",
-                    payment.project.project_name if payment.project else "",
-                    f"INV-{payment.invoice.id:06d}" if payment.invoice else "",
-                    float(payment.amount),
-                    payment.payment_method.value,
-                    payment.payment_status.value,
-                    payment.bank_name or "",
-                    payment.cheque_no or "",
-                    payment.reference_no or "",
+                    p.payment_no,
+                    p.client_user.full_name if p.client_user else "N/A",
+                    p.project.project_name if p.project else "N/A",
+                    float(p.amount),
+                    p.payment_method.value,
+                    p.payment_status.value,
                     (
-                        payment.payment_date.strftime("%Y-%m-%d %H:%M")
-                        if payment.payment_date
+                        p.payment_date.strftime("%Y-%m-%d %H:%M")
+                        if p.payment_date
                         else ""
                     ),
-                    payment.verified_by or "",
-                    (
-                        payment.verified_at.strftime("%Y-%m-%d %H:%M")
-                        if payment.verified_at
-                        else ""
-                    ),
-                    payment.remarks or "",
+                    p.reference_no or "",
+                    p.cheque_no or "",
+                    p.bank_name or "",
                 ]
             )
-        for column_cells in sheet.columns:
-            length = max(
-                (len(str(cell.value)) if cell.value is not None else 0)
-                for cell in column_cells
-            )
-            sheet.column_dimensions[column_cells[0].column_letter].width = min(
-                max(length + 2, 12), 40
-            )
-        buffer = BytesIO()
-        workbook.save(buffer)
-        buffer.seek(0)
+
+        output = BytesIO()
+        workbook.save(output)
+        output.seek(0)
+
+        filename = (
+            f"client_payments_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        return StreamingResponse(
+            output,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
     except Exception:
-        logger.exception("Unable to generate client payments Excel export.")
+        logger.exception("Unable to generate Excel export.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unable to generate Excel export.",
+            detail="Error generating Excel export.",
         )
-
-    filename = f"client_payments_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    logger.info(
-        "Client payments exported to Excel by User %s (%s rows)",
-        current_user.id,
-        len(payments),
-    )
-    return StreamingResponse(
-        buffer,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
 
 
 # =============================================================================
@@ -1193,7 +1182,7 @@ async def export_client_payments_pdf(
     to_date: date | None = Query(None),
     search: str | None = Query(None),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_REPORTING_ROLES)),
+    current_user: User = Depends(require_permission("invoices.export")),
 ):
     """Export client payments to PDF report."""
     if from_date and to_date and from_date > to_date:
@@ -1211,20 +1200,28 @@ async def export_client_payments_pdf(
         if not search:
             search = None
 
-    stmt = select(ClientPayment).where(ClientPayment.company_id == current_user.company_id).options(
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
+
+    stmt = select(ClientPayment).options(
         selectinload(ClientPayment.client_user),
         selectinload(ClientPayment.project),
         selectinload(ClientPayment.invoice),
     )
 
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
+
     if current_user.role == UserRole.CLIENT.value:
         stmt = stmt.where(ClientPayment.client_user_id == current_user.id)
     elif user_id is not None:
-        await get_client_or_404(db, user_id)
+        await get_client_or_404(db, user_id, current_user)
         stmt = stmt.where(ClientPayment.client_user_id == user_id)
 
     if project_id is not None:
+        await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
+        await assert_client_is_project_member(db, project_id, current_user)
         stmt = stmt.where(ClientPayment.project_id == project_id)
+
     if payment_method is not None:
         stmt = stmt.where(ClientPayment.payment_method == payment_method)
     if payment_status is not None:
@@ -1273,10 +1270,32 @@ async def export_client_payments_pdf(
         body_style.leading = 10
         content = []
 
+        comp_settings = None
+        target_comp = payments[0].company_id if (payments and payments[0].company_id) else current_user.company_id
+        if target_comp:
+            comp_settings = await db.scalar(
+                select(CompanySettings).where(CompanySettings.company_id == target_comp)
+            )
+        header_name = (
+            comp_settings.company_name
+            if (comp_settings and comp_settings.company_name)
+            else COMPANY_NAME
+        )
+        header_address = (
+            comp_settings.address
+            if (comp_settings and comp_settings.address)
+            else COMPANY_ADDRESS_LINE
+        )
+        header_contact = (
+            f"Tel: {comp_settings.mobile_number or ''} | Email: {comp_settings.email or ''} | GSTIN: {comp_settings.gst_number or ''}"
+            if comp_settings
+            else COMPANY_CONTACT_LINE
+        )
+
         # Header
-        content.append(Paragraph(f"<b>{COMPANY_NAME}</b>", styles["Title"]))
-        content.append(Paragraph(COMPANY_ADDRESS_LINE, styles["Normal"]))
-        content.append(Paragraph(COMPANY_CONTACT_LINE, styles["Normal"]))
+        content.append(Paragraph(f"<b>{header_name}</b>", styles["Title"]))
+        content.append(Paragraph(header_address, styles["Normal"]))
+        content.append(Paragraph(header_contact, styles["Normal"]))
         content.append(Spacer(1, 20))
         content.append(Paragraph("<b>Client Payments Report</b>", styles["Heading1"]))
         content.append(
@@ -1419,7 +1438,7 @@ async def create_client_payment(
     receipt: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_CREATE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.create")),
 ):
     """Create a new client payment."""
     try:
@@ -1444,13 +1463,15 @@ async def create_client_payment(
         )
 
     validate_and_normalize_payment_fields(data)
-    project = await get_project_or_404(db, data.project_id)
+    project = await get_project_or_404(db, data.project_id, current_user)
     await assert_client_is_project_member(db, data.project_id, current_user)
     await check_duplicate_payment(db, data, current_user)
 
+    target_company_id = project.company_id or current_user.company_id
+
     # Validate invoice
     invoice_obj = await db.get(Invoice, data.invoice_id)
-    if invoice_obj is None:
+    if invoice_obj is None or invoice_obj.company_id != target_company_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found."
         )
@@ -1468,7 +1489,7 @@ async def create_client_payment(
 
     try:
         payment = ClientPayment(
-            company_id=current_user.company_id,
+            company_id=target_company_id,
             payment_no="",
             client_user_id=current_user.id,
             invoice_id=data.invoice_id,
@@ -1505,11 +1526,19 @@ async def create_client_payment(
             )
         )
         # =====================================================
-        # SEND NOTIFICATION TO ALL ADMINS
+        # SEND NOTIFICATION TO ALL ADMINS IN SAME COMPANY
         # =====================================================
 
         admins = (
-            (await db.execute(select(User).where(User.role == UserRole.ADMIN)))
+            (
+                await db.execute(
+                    select(User).where(
+                        User.role == UserRole.ADMIN,
+                        User.company_id == target_company_id,
+                        User.is_deleted == False,
+                    )
+                )
+            )
             .scalars()
             .all()
         )
@@ -1592,7 +1621,7 @@ async def list_client_payments(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
     """List client payments with filters."""
     if from_date and to_date and from_date > to_date:
@@ -1611,11 +1640,16 @@ async def list_client_payments(
         if not search:
             search = None
 
-    stmt = select(ClientPayment).where(ClientPayment.company_id == current_user.company_id).options(
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
+
+    stmt = select(ClientPayment).options(
         selectinload(ClientPayment.client_user),
         selectinload(ClientPayment.project),
         selectinload(ClientPayment.invoice),
     )
+
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
 
     # SECURITY: CLIENT may only see their own payments
     if current_user.role == UserRole.CLIENT.value:
@@ -1631,10 +1665,13 @@ async def list_client_payments(
             db=db,
             client_user_id=user_id,
             project_id=project_id,
+            current_user=current_user,
         )
         stmt = stmt.where(ClientPayment.client_user_id == user_id)
 
     if project_id is not None:
+        await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
+        await assert_client_is_project_member(db, project_id, current_user)
         stmt = stmt.where(ClientPayment.project_id == project_id)
     if payment_method is not None:
         stmt = stmt.where(ClientPayment.payment_method == payment_method)
@@ -1681,18 +1718,22 @@ async def list_client_payments(
 async def get_client_payment(
     payment_id: int = ApiPath(..., gt=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
     """Get a single client payment by ID."""
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
+        .where(ClientPayment.id == payment_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.project),
             selectinload(ClientPayment.invoice),
         )
     )
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
+
     payment = (await db.execute(stmt)).scalar_one_or_none()
 
     if not payment:
@@ -1713,22 +1754,26 @@ async def get_client_payment(
 @router.put("/{payment_id}", response_model=s.ClientPaymentOut)
 async def update_client_payment(
     payment_id: int = ApiPath(..., gt=0),
-    payload: s.ClientPaymentUpdateForm = Depends(),
+    payload: s.ClientPaymentCreateForm = Depends(),
     receipt: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_CREATE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.edit")),
 ):
     """Update a client payment (only before verification)."""
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
+        .where(ClientPayment.id == payment_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.project),
             selectinload(ClientPayment.invoice),
         )
     )
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
+
     payment = (await db.execute(stmt)).scalar_one_or_none()
 
     if not payment:
@@ -1776,7 +1821,8 @@ async def update_client_payment(
     # Validate invoice if changed
     if data.invoice_id and data.invoice_id != payment.invoice_id:
         invoice_obj = await db.get(Invoice, data.invoice_id)
-        if not invoice_obj:
+        target_comp = payment.company_id or current_user.company_id
+        if not invoice_obj or invoice_obj.company_id != target_comp:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found."
             )
@@ -1884,16 +1930,20 @@ async def delete_client_payment(
     payment_id: int = ApiPath(..., gt=0),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_CREATE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.delete")),
 ):
     """Cancel/delete a client payment (only before verification)."""
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
+        .where(ClientPayment.id == payment_id)
         .options(
             selectinload(ClientPayment.invoice),
         )
     )
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
+
     payment = (await db.execute(stmt)).scalar_one_or_none()
 
     if not payment:
@@ -1979,18 +2029,22 @@ async def verify_client_payment(
     payload: VerifyPaymentRequest = ...,
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(require_roles(PAYMENT_VERIFY_ROLES)),
+    current_user: User = Depends(require_permission("invoices.approve")),
 ):
     """Verify (approve/reject) a client payment. Staff-only endpoint."""
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
+        .where(ClientPayment.id == payment_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.project),
             selectinload(ClientPayment.invoice),
         )
     )
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
+
     payment = (await db.execute(stmt)).scalar_one_or_none()
 
     if not payment:
@@ -2151,18 +2205,22 @@ async def verify_client_payment(
 async def download_payment_receipt(
     payment_id: int = ApiPath(..., gt=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CLIENT_PAYMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.export")),
 ):
     """Download payment receipt as PDF."""
+    is_super_admin = getattr(current_user, "is_super_admin", False) is True
     stmt = (
         select(ClientPayment)
-        .where(ClientPayment.id == payment_id, ClientPayment.company_id == current_user.company_id)
+        .where(ClientPayment.id == payment_id)
         .options(
             selectinload(ClientPayment.client_user),
             selectinload(ClientPayment.project),
             selectinload(ClientPayment.invoice),
         )
     )
+    if not is_super_admin:
+        stmt = stmt.where(ClientPayment.company_id == current_user.company_id)
+
     payment = (await db.execute(stmt)).scalar_one_or_none()
 
     if not payment:
@@ -2193,10 +2251,32 @@ async def download_payment_receipt(
         styles = getSampleStyleSheet()
         content = []
 
+        comp_settings = None
+        target_comp = payment.company_id or current_user.company_id
+        if target_comp:
+            comp_settings = await db.scalar(
+                select(CompanySettings).where(CompanySettings.company_id == target_comp)
+            )
+        header_name = (
+            comp_settings.company_name
+            if (comp_settings and comp_settings.company_name)
+            else COMPANY_NAME
+        )
+        header_address = (
+            comp_settings.address
+            if (comp_settings and comp_settings.address)
+            else COMPANY_ADDRESS_LINE
+        )
+        header_contact = (
+            f"Tel: {comp_settings.mobile_number or ''} | Email: {comp_settings.email or ''} | GSTIN: {comp_settings.gst_number or ''}"
+            if comp_settings
+            else COMPANY_CONTACT_LINE
+        )
+
         # Company Header
-        content.append(Paragraph(f"<b>{COMPANY_NAME}</b>", styles["Title"]))
-        content.append(Paragraph(COMPANY_ADDRESS_LINE, styles["Normal"]))
-        content.append(Paragraph(COMPANY_CONTACT_LINE, styles["Normal"]))
+        content.append(Paragraph(f"<b>{header_name}</b>", styles["Title"]))
+        content.append(Paragraph(header_address, styles["Normal"]))
+        content.append(Paragraph(header_contact, styles["Normal"]))
         content.append(Spacer(1, 25))
 
         # Receipt Title
