@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,64 @@ APPROVAL_ROLES = [role.value for role in UserRole]
 
 router = APIRouter(prefix="/approvals", tags=["Approvals"])
 
+async def verify_approval_entity_access(db: AsyncSession, entity_type: str, entity_id: int, current_user: User):
+    if not current_user.company_id:
+        raise HTTPException(status_code=403, detail="Super Admin cannot access tenant approvals directly.")
+
+    entity_type_lower = entity_type.lower()
+
+    if entity_type_lower == "boq":
+        from app.models.boq import BOQ
+        entity = await db.get(BOQ, entity_id)
+        if not entity: raise NotFoundError("BOQ not found")
+        project_id = entity.project_id
+    elif entity_type_lower == "measurement":
+        from app.models.final_measurement import FinalMeasurement
+        entity = await db.get(FinalMeasurement, entity_id)
+        if not entity: raise NotFoundError("Measurement not found")
+        project_id = entity.project_id
+    elif entity_type_lower == "purchase_order":
+        from app.models.material import PurchaseOrder
+        entity = await db.get(PurchaseOrder, entity_id)
+        if not entity: raise NotFoundError("Purchase Order not found")
+        project_id = entity.project_id
+    elif entity_type_lower == "document":
+        from app.models.document import Document
+        entity = await db.get(Document, entity_id)
+        if not entity: raise NotFoundError("Document not found")
+        project_id = entity.project_id
+    elif entity_type_lower == "drawing":
+        from app.models.project import DrawingDocument
+        entity = await db.get(DrawingDocument, entity_id)
+        if not entity: raise NotFoundError("Drawing not found")
+        project_id = entity.project_id
+    elif entity_type_lower == "bill":
+        from app.models.billing import RABill
+        entity = await db.get(RABill, entity_id)
+        if not entity: raise NotFoundError("Bill not found")
+        project_id = entity.project_id
+    elif entity_type_lower == "journal_entry":
+        from app.models.accountant import JournalEntry
+        entity = await db.get(JournalEntry, entity_id)
+        if not entity: raise NotFoundError("Journal Entry not found")
+        
+        owner_user = await db.get(User, entity.created_by)
+        if not owner_user or owner_user.company_id != current_user.company_id:
+            raise HTTPException(status_code=403, detail="Cross-tenant access not allowed")
+        return entity
+    else:
+        raise ValidationError(f"Unsupported entity type: {entity_type}")
+
+    if 'project_id' in locals() and project_id is not None:
+        from app.models.project import Project
+        project = await db.get(Project, project_id)
+        if not project or project.company_id != current_user.company_id:
+            raise HTTPException(status_code=403, detail="Cross-tenant access not allowed")
+    
+    return entity
+
+
+
 
 @router.post("", response_model=ApprovalOut)
 async def create_approval(
@@ -23,6 +81,9 @@ async def create_approval(
     current_user: User = Depends(require_roles(APPROVAL_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    # Verify entity ownership first
+    await verify_approval_entity_access(db, payload.entity_type, payload.entity_id, current_user)
+
     existing = await db.scalar(
         select(Approval).where(
             Approval.entity_type == payload.entity_type,
@@ -104,7 +165,16 @@ async def list_approvals(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(APPROVAL_ROLES)),
 ):
-    result = await db.execute(select(Approval).order_by(Approval.id.desc()))
+    if not current_user.company_id:
+        return []
+    
+    stmt = (
+        select(Approval)
+        .join(User, Approval.requested_by == User.id)
+        .where(User.company_id == current_user.company_id)
+        .order_by(Approval.id.desc())
+    )
+    result = await db.execute(stmt)
     rows = result.scalars().all()
 
     return [ApprovalOut.model_validate(r) for r in rows]
@@ -120,6 +190,14 @@ async def approve(
     obj = await db.get(Approval, id)
     if not obj:
         raise NotFoundError("Approval not found")
+        
+    # Verify Approval ownership
+    requester = await db.get(User, obj.requested_by)
+    if not requester or requester.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="Cross-tenant approval access not allowed")
+
+    # Verify Target Entity ownership
+    await verify_approval_entity_access(db, obj.entity_type, obj.entity_id, current_user)
 
     if obj.status == "Approved":
         raise ValidationError("Already approved")
@@ -209,6 +287,14 @@ async def reject(
     obj = await db.get(Approval, id)
     if not obj:
         raise NotFoundError("Approval not found")
+
+    # Verify Approval ownership
+    requester = await db.get(User, obj.requested_by)
+    if not requester or requester.company_id != current_user.company_id:
+        raise HTTPException(status_code=403, detail="Cross-tenant approval access not allowed")
+
+    # Verify Target Entity ownership
+    await verify_approval_entity_access(db, obj.entity_type, obj.entity_id, current_user)
 
     if obj.status == "Rejected":
         raise ValidationError("Already rejected")

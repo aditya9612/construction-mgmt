@@ -170,6 +170,7 @@ async def create_invoice(
     total_amount = amount + gst_amount - tax_amount
 
     invoice = Invoice(
+        company_id=current_user.company_id,
         project_id=payload.project_id,
         owner_id=payload.owner_id,
         quotation_id=None,
@@ -281,6 +282,7 @@ async def create_invoice_from_quotation(
 
     # 8. Create invoice
     invoice = Invoice(
+        company_id=current_user.company_id,
         project_id=quotation.project_id,
         owner_id=project.owner_id,
         quotation_id=quotation.id,
@@ -369,7 +371,7 @@ async def list_invoices(
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
     rows = (
-        (await db.execute(select(Invoice).where(Invoice.pending_amount > 0)))
+        (await db.execute(select(Invoice).where(Invoice.pending_amount > 0, Invoice.company_id == current_user.company_id)))
         .scalars()
         .all()
     )
@@ -393,7 +395,7 @@ async def get_by_date_range(
         (
             await db.execute(
                 select(Invoice)
-                .where(Invoice.created_at.between(start_dt, end_dt))
+                .where(Invoice.created_at.between(start_dt, end_dt), Invoice.company_id == current_user.company_id)
                 .order_by(Invoice.created_at.desc())
             )
         )
@@ -410,7 +412,7 @@ async def get_invoice(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
-    obj = await db.get(Invoice, id)
+    obj = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
 
     if not obj:
         raise NotFoundError("Invoice not found")
@@ -427,7 +429,7 @@ async def update_invoice(
 ):
     logger.info(f"Updating invoice id={id}")
 
-    obj = await db.get(Invoice, id)
+    obj = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
 
     if not obj:
         logger.warning(f"Invoice not found id={id}")
@@ -468,7 +470,7 @@ async def delete_invoice(
 ):
     logger.info(f"Deleting invoice id={id}")
 
-    obj = await db.get(Invoice, id)
+    obj = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
 
     if not obj:
         logger.warning(f"Invoice not found id={id}")
@@ -497,7 +499,7 @@ async def get_by_project(
         (
             await db.execute(
                 select(Invoice)
-                .where(Invoice.project_id == project_id)
+                .where(Invoice.project_id == project_id, Invoice.company_id == current_user.company_id)
                 .order_by(Invoice.created_at.desc())
             )
         )
@@ -518,7 +520,7 @@ async def get_by_type(
         (
             await db.execute(
                 select(Invoice)
-                .where(Invoice.type == type)
+                .where(Invoice.type == type, Invoice.company_id == current_user.company_id)
                 .order_by(Invoice.created_at.desc())
             )
         )
@@ -598,7 +600,7 @@ async def generate_invoice_pdf(
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
 
-    obj = await db.get(Invoice, id)
+    obj = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
     if not obj:
         raise NotFoundError("Invoice not found")
 
@@ -737,6 +739,7 @@ async def create_labour_invoice(
             Invoice.project_id == project_id,
             Invoice.type == InvoiceType.LABOUR,
             Invoice.description == description,
+            Invoice.company_id == current_user.company_id
         )
     )
     if existing_invoice:
@@ -764,6 +767,7 @@ async def create_labour_invoice(
     try:
         # 6. Create invoice
         obj = Invoice(
+            company_id=current_user.company_id,
             project_id=project_id,
             owner_id=project.owner_id,
             type=InvoiceType.LABOUR,
@@ -836,6 +840,7 @@ async def create_material_invoice(
 
     try:
         obj = Invoice(
+            company_id=current_user.company_id,
             project_id=project_id,
             owner_id=project.owner_id,
             type=InvoiceType.MATERIAL,
@@ -914,6 +919,7 @@ async def create_invoice_from_measurement(
 
         # 4. Create invoice
         obj = Invoice(
+            company_id=current_user.company_id,
             project_id=measurement.project_id,
             owner_id=project.owner_id,
             type=InvoiceType.OWNER,
@@ -972,11 +978,11 @@ async def payment_summary(
     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     paid = await db.scalar(
-        select(func.sum(Invoice.paid_amount)).where(Invoice.project_id == project_id)
+        select(func.sum(Invoice.paid_amount)).where(Invoice.project_id == project_id, Invoice.company_id == current_user.company_id)
     )
 
     pending = await db.scalar(
-        select(func.sum(Invoice.pending_amount)).where(Invoice.project_id == project_id)
+        select(func.sum(Invoice.pending_amount)).where(Invoice.project_id == project_id, Invoice.company_id == current_user.company_id)
     )
 
     return {
@@ -1005,6 +1011,7 @@ async def analytics_summary(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id,
             Invoice.type == InvoiceType.OWNER,
+            Invoice.company_id == current_user.company_id
         )
     )
 
@@ -1018,12 +1025,13 @@ async def analytics_summary(
                     InvoiceType.MATERIAL,
                 ]
             ),
+            Invoice.company_id == current_user.company_id
         )
     )
 
     # 4. Paid amount (for financial progress)
     total_paid = await db.scalar(
-        select(func.sum(Invoice.paid_amount)).where(Invoice.project_id == project_id)
+        select(func.sum(Invoice.paid_amount)).where(Invoice.project_id == project_id, Invoice.company_id == current_user.company_id)
     )
 
     #  Convert safely (important for Decimal)
@@ -1052,7 +1060,7 @@ async def pay_invoice(
     current_user: User = Depends(require_roles(PAYMENT_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice = await db.get(Invoice, id)
+    invoice = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
 
     if not invoice:
         raise NotFoundError("Invoice not found")
@@ -1140,9 +1148,9 @@ async def receivable_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
 ):
-    inv_total = await db.scalar(select(func.sum(Invoice.total_amount))) or 0
-    inv_paid = await db.scalar(select(func.sum(Invoice.paid_amount))) or 0
-    inv_pending = await db.scalar(select(func.sum(Invoice.pending_amount))) or 0
+    inv_total = await db.scalar(select(func.sum(Invoice.total_amount)).where(Invoice.company_id == current_user.company_id)) or 0
+    inv_paid = await db.scalar(select(func.sum(Invoice.paid_amount)).where(Invoice.company_id == current_user.company_id)) or 0
+    inv_pending = await db.scalar(select(func.sum(Invoice.pending_amount)).where(Invoice.company_id == current_user.company_id)) or 0
 
     # Invoices overdue
     today = date.today()
@@ -1183,7 +1191,7 @@ async def receivable_aging(
     today = date.today()
 
     rows = (
-        (await db.execute(select(Invoice).where(Invoice.pending_amount > 0)))
+        (await db.execute(select(Invoice).where(Invoice.pending_amount > 0, Invoice.company_id == current_user.company_id)))
         .scalars()
         .all()
     )
@@ -1256,7 +1264,7 @@ async def get_client_ledger(
     # In a real scenario we need to filter by client_id. Since we formatted journal_number as J-INV-{id}, we could parse it and check invoice.owner_id.
     # For now, to fulfill the test safely without complex regex in SQL, we fetch invoices for this owner:
     invoices = (
-        (await db.execute(select(Invoice.id).where(Invoice.owner_id == client_id)))
+        (await db.execute(select(Invoice.id).where(Invoice.owner_id == client_id, Invoice.company_id == current_user.company_id)))
         .scalars()
         .all()
     )
@@ -1468,7 +1476,7 @@ async def send_invoice(
     # =====================================================
     # GET INVOICE
     # =====================================================
-    invoice = await db.get(Invoice, invoice_id)
+    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id, Invoice.company_id == current_user.company_id))
 
     if not invoice:
         raise HTTPException(

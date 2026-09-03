@@ -23,6 +23,7 @@ from app.schemas.user import (
     ProxyBulkCheckOutForm,
 )
 from datetime import datetime, date, timedelta, timezone
+from app.utils.common import assert_project_access
 from app.utils.helpers import calculate_distance
 from app.utils.timezone import get_naive_utc_now, localize_datetime, make_naive_utc
 from app.core.validators import (
@@ -92,6 +93,7 @@ async def check_in(
     late_minutes = 0
 
     if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
         project_result = await db.execute(
             select(Project).where(Project.id == project_id)
         )
@@ -565,6 +567,10 @@ async def list_attendance(
 
     stmt = select(UserAttendance)
     count_stmt = select(func.count()).select_from(UserAttendance)
+    
+    if current_user.company_id:
+        stmt = stmt.join(User, UserAttendance.user_id == User.id).where(User.company_id == current_user.company_id)
+        count_stmt = count_stmt.join(User, UserAttendance.user_id == User.id).where(User.company_id == current_user.company_id)
 
     # Build filters
     filters = []
@@ -623,6 +629,15 @@ async def proxy_check_in(
     actual_in_time_local = localize_datetime(actual_in_time_aware).replace(tzinfo=None)
     attendance_date = actual_in_time_local.date()
 
+    if payload.project_id:
+        await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+
+
+    if current_user.company_id:
+        users = (await db.execute(select(User.id).where(User.id.in_(payload.user_ids), User.company_id == current_user.company_id))).scalars().all()
+        if len(users) != len(payload.user_ids):
+            raise HTTPException(status_code=403, detail="Cross-tenant proxy check-in not allowed")
+
     checked_in_count = 0
     for uid in payload.user_ids:
         # Check if already checked in today
@@ -671,6 +686,15 @@ async def proxy_check_out(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if current_user.company_id:
+        valid_atts = (await db.execute(
+            select(UserAttendance.id)
+            .join(User, UserAttendance.user_id == User.id)
+            .where(UserAttendance.id.in_(payload.attendance_ids), User.company_id == current_user.company_id)
+        )).scalars().all()
+        if len(valid_atts) != len(payload.attendance_ids):
+            raise HTTPException(status_code=403, detail="Cross-tenant proxy check-out not allowed")
+
     actual_out_time = get_naive_utc_now()
     checked_out_count = 0
 
@@ -756,6 +780,9 @@ async def export_attendance_csv(
         .outerjoin(Project, UserAttendance.project_id == Project.id)
     )
 
+    if current_user.company_id:
+        query = query.where(User.company_id == current_user.company_id)
+
     query = query.where(UserAttendance.attendance_date >= start_date)
     query = query.where(UserAttendance.attendance_date <= end_date)
 
@@ -835,11 +862,16 @@ async def export_attendance_pdf_audit(
     if current_user.role not in APPROVE_ROLES:
         user_id = current_user.id
 
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
     query = (
         select(UserAttendance, User, Project)
         .join(User, UserAttendance.user_id == User.id)
         .outerjoin(Project, UserAttendance.project_id == Project.id)
     )
+    if current_user.company_id:
+        query = query.where(User.company_id == current_user.company_id)
+
     query = query.where(
         UserAttendance.attendance_date >= start_date,
         UserAttendance.attendance_date <= end_date,
@@ -943,6 +975,9 @@ async def export_attendance_payroll(
             "total_payout"
         ),
     ).join(UserAttendance, UserAttendance.user_id == User.id)
+
+    if current_user.company_id:
+        query = query.where(User.company_id == current_user.company_id)
 
     query = query.where(
         UserAttendance.attendance_date >= start_date,

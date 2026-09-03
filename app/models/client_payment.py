@@ -12,6 +12,8 @@ from sqlalchemy import (
     Text,
     func,
     Enum as SAEnum,
+    Column,
+    Integer,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,6 +28,7 @@ class ClientPayment(Base, TimestampMixin):
     __tablename__ = "client_payments"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=True)
 
     payment_no: Mapped[str] = mapped_column(
         String(30),

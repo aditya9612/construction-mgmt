@@ -24,7 +24,8 @@ from app.models.base import Base
 class Account(Base):
     __tablename__ = "accounts"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=True)
 
     name = Column(String(100), nullable=False)
     code = Column(String(20), unique=True, nullable=False)
@@ -253,7 +254,8 @@ class GSTReturn(Base):
 class VendorBill(Base):
     __tablename__ = "vendor_bills"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=True)
 
     supplier_id = Column(
         Integer, ForeignKey("suppliers.id"), nullable=False, index=True

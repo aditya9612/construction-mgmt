@@ -1044,7 +1044,19 @@ async def export_work_updates(
     )
 
     if project_id:
+        # Specific project already tenant-validated via assert_project_access above.
         query = query.where(WorkUpdate.project_id == project_id)
+    else:
+        # No project_id supplied - scope to the current tenant by joining
+        # through Project. Prevents cross-company data leaks regardless of
+        # which optional filters (user_id, date, status) are applied.
+        if not current_user.company_id:
+            raise ValidationError("No work updates found.")
+        query = query.join(
+            Project, Project.id == WorkUpdate.project_id
+        ).where(
+            Project.company_id == current_user.company_id
+        )
 
     if user_id:
         query = query.where(WorkUpdate.created_by_id == user_id)

@@ -65,6 +65,7 @@ from app.api.project_visualization import router as visualization_router
 from app.api.attendance import router as attendance_router
 from app.api.notification import router as notification_router
 from app.api.payments import router as payments_router
+from app.api.superadmin import router as superadmin_router
 # from app.api.rbac import router as rbac_router
 from app.cache.redis import create_redis_client
 from app.core.config import settings
@@ -114,15 +115,32 @@ async def lifespan(app: FastAPI):
             settings.APP_PORT,
         )
 
+    recon_worker = None
+    recon_task = None
+    if settings.BILLING_RECONCILIATION_ENABLED:
+        from app.workers.billing_reconciliation_worker import BillingReconciliationWorker
+        recon_worker = BillingReconciliationWorker(redis_client=getattr(app.state, "redis", None))
+        recon_task = asyncio.create_task(recon_worker.start())
+        app.state.billing_recon_worker = recon_worker
+
     try:
         yield
     finally:
+        if recon_worker is not None:
+            await recon_worker.stop()
+        if recon_task is not None:
+            try:
+                await asyncio.wait_for(recon_task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+
         redis = getattr(app.state, "redis", None)
         if redis is not None:
             await redis.close()
             
         logger.info("Disposing SQLAlchemy async engine...")
         await async_engine.dispose()
+
 
 
 def create_app() -> FastAPI:
@@ -231,7 +249,7 @@ def create_app() -> FastAPI:
 
                 try:
                     payload = jwt.decode(
-                        token, settings.SECRET_KEY, algorithms=["HS256"]
+                        token, settings.JWT_SECRET, algorithms=["HS256"]
                     )
 
                     user_id = int(payload.get("sub"))
@@ -324,7 +342,10 @@ def create_app() -> FastAPI:
     api_router.include_router(journal_router)
     api_router.include_router(work_update_router)
     api_router.include_router(payments_router)
+    api_router.include_router(superadmin_router)
 
+    from app.api.saas_billing import router as saas_billing_router
+    api_router.include_router(saas_billing_router)
     application.include_router(api_router, prefix="/api/v1")
 
     return application
@@ -343,7 +364,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
         return
 
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
         user_id = int(payload.get("sub"))
     except JWTError:
         await websocket.close()

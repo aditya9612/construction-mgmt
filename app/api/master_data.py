@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, List
 
 from app.db.session import get_db_session
+from app.api.user import get_current_active_user, User
 from app.models import master_data as m
 from app.schemas import master_data as s
 from sqlalchemy.orm import selectinload
@@ -221,6 +222,10 @@ async def create_unit(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
 
     # CHECK EXISTING UNIT
     existing = await db.scalar(
@@ -235,7 +240,8 @@ async def create_unit(
         db=db, model=m.Unit, prefix="UOM", name=payload.name
     )
 
-    obj = m.Unit(**payload.model_dump(), unique_code=unique_code)
+    obj = m.Unit(
+        company_id=_current_company_user.company_id,**payload.model_dump(), unique_code=unique_code)
 
     db.add(obj)
 
@@ -259,10 +265,14 @@ async def update_unit(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
 
     obj = await db.get(m.Unit, id)
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Unit not found")
 
     update_data = payload.model_dump(exclude_unset=True)
@@ -299,9 +309,13 @@ async def delete_unit(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
     obj = await db.get(m.Unit, id)
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Unit not found")
 
     obj.is_active = False
@@ -359,6 +373,10 @@ async def create_labour_type(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
 
     # CHECK EXISTING LABOUR TYPE
     existing = await db.scalar(
@@ -373,7 +391,8 @@ async def create_labour_type(
         db=db, model=m.LabourType, prefix="LAB", name=payload.name
     )
 
-    obj = m.LabourType(**payload.model_dump(), unique_code=unique_code)
+    obj = m.LabourType(
+        company_id=_current_company_user.company_id,**payload.model_dump(), unique_code=unique_code)
 
     db.add(obj)
 
@@ -400,13 +419,17 @@ async def update_labour_type(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
 
     obj = await db.get(
         m.LabourType,
         id,
     )
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Labour type not found")
 
     update_data = payload.model_dump(exclude_unset=True)
@@ -446,9 +469,13 @@ async def delete_labour_type(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
     obj = await db.get(m.LabourType, id)
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Labour type not found")
 
     obj.is_active = False
@@ -501,6 +528,10 @@ async def create_activity_type(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
 
     if payload.default_unit_id:
 
@@ -522,7 +553,8 @@ async def create_activity_type(
         db=db, model=m.ActivityType, prefix="ACT", name=payload.name
     )
 
-    obj = m.ActivityType(**payload.model_dump(), unique_code=unique_code)
+    obj = m.ActivityType(
+        company_id=_current_company_user.company_id,**payload.model_dump(), unique_code=unique_code)
 
     db.add(obj)
 
@@ -549,13 +581,17 @@ async def update_activity_type(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
 
     obj = await db.get(
         m.ActivityType,
         id,
     )
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Activity type not found")
 
     update_data = payload.model_dump(exclude_unset=True)
@@ -604,9 +640,13 @@ async def delete_activity_type(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
     obj = await db.get(m.ActivityType, id)
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Activity type not found")
 
     obj.is_active = False
@@ -694,6 +734,10 @@ async def create_material_master(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
 
     # ===== CHECK UNIT =====
     unit = await db.get(
@@ -727,6 +771,7 @@ async def create_material_master(
 
     # ===== CREATE MATERIAL MASTER =====
     obj = m.MaterialMaster(
+        company_id=_current_company_user.company_id,
         name=payload.name.strip(),
         category=payload.category,
         unit_id=payload.unit_id,
@@ -780,13 +825,17 @@ async def update_material_master(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
 
     obj = await db.get(
         m.MaterialMaster,
         id,
     )
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Material not found")
 
     update_data = payload.model_dump(exclude_unset=True)
@@ -865,9 +914,13 @@ async def delete_material_master(
     redis=Depends(get_request_redis),
     current_user: User = Depends(admin_required),
 ):
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
+    _current_company_user = current_user
     obj = await db.get(m.MaterialMaster, id)
 
-    if not obj:
+    if not obj or obj.company_id != current_user.company_id:
         raise NotFoundError("Material master not found")
 
     obj.is_active = False

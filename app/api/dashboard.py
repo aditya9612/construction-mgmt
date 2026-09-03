@@ -134,12 +134,31 @@ CACHE_TTL = 300  #  5 min auto refresh
 # HELPER
 # =========================================
 async def get_user_project_ids(db, user: User):
-    if user.role == UserRole.ADMIN.value:
+    if getattr(user, "is_super_admin", False):
         result = await db.execute(select(m.Project.id))
+        return [r[0] for r in result.all()]
+    if user.company_id is None:
+        if user.role == UserRole.ADMIN.value:
+            result = await db.execute(select(m.Project.id))
+            return [r[0] for r in result.all()]
+        result = await db.execute(
+            select(m.ProjectMember.project_id)
+            .where(m.ProjectMember.user_id == user.id)
+        )
+        return [r[0] for r in result.all()]
+    if user.role == UserRole.ADMIN.value:
+        result = await db.execute(
+            select(m.Project.id).where(m.Project.company_id == user.company_id)
+        )
         return [r[0] for r in result.all()]
 
     result = await db.execute(
-        select(m.ProjectMember.project_id).where(m.ProjectMember.user_id == user.id)
+        select(m.ProjectMember.project_id)
+        .join(m.Project, m.Project.id == m.ProjectMember.project_id)
+        .where(
+            m.ProjectMember.user_id == user.id,
+            m.Project.company_id == user.company_id,
+        )
     )
     return [r[0] for r in result.all()]
 
@@ -254,6 +273,11 @@ async def admin_dashboard(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot access tenant dashboard directly",
+        )
     if current_user.role != UserRole.ADMIN.value:
         return {"error": "Access denied"}
 
@@ -263,6 +287,7 @@ async def admin_dashboard(
         # ==========================================
         # 1. Project Overview
         # ==========================================
+        pids = await get_user_project_ids(db, current_user)
         project_stats = await db.execute(
             select(
                 func.count(m.Project.id),
@@ -304,7 +329,7 @@ async def admin_dashboard(
                         else_=0,
                     )
                 ),
-            )
+            ).where(m.Project.company_id == current_user.company_id)
         )
 
         total, active, completed, delayed = project_stats.one()
@@ -321,11 +346,16 @@ async def admin_dashboard(
         # ==========================================
         revenue = await db.scalar(
             select(func.sum(Invoice.total_amount)).where(
-                Invoice.status == InvoiceStatus.PAID.value
+                Invoice.status == InvoiceStatus.PAID.value,
+                Invoice.project_id.in_(pids) if pids else False,
             )
         )
 
-        expense = await db.scalar(select(func.sum(Expense.amount)))
+        expense = await db.scalar(
+            select(func.sum(Expense.amount)).where(
+                Expense.project_id.in_(pids) if pids else False
+            )
+        )
 
         financial = {
             "revenue": float(revenue or 0),
@@ -343,17 +373,24 @@ async def admin_dashboard(
                 UserAttendance.attendance_date == today,
                 UserAttendance.status != "absent",
                 User.role == UserRole.LABOUR.value,
+                UserAttendance.project_id.in_(pids) if pids else False,
             )
         )
 
         pending_approvals = await db.scalar(
-            select(func.count(Approval.id)).where(Approval.status == "Pending")
+            select(func.count(Approval.id)).where(
+                Approval.status == "Pending",
+                Approval.requested_by.in_(
+                    select(User.id).where(User.company_id == current_user.company_id)
+                ),
+            )
         )
 
         action_items = await db.scalar(
             select(func.count(Issue.id)).where(
                 Issue.priority == IssuePriority.HIGH.value,
                 Issue.status == IssueStatus.OPEN.value,
+                Issue.project_id.in_(pids) if pids else False,
             )
         )
 
@@ -361,11 +398,15 @@ async def admin_dashboard(
             select(func.count(DailySiteReport.id)).where(
                 DailySiteReport.report_date == today,
                 DailySiteReport.material_used.is_not(None),
+                DailySiteReport.project_id.in_(pids) if pids else False,
             )
         )
 
         open_issues = await db.scalar(
-            select(func.count(Issue.id)).where(Issue.status == IssueStatus.OPEN.value)
+            select(func.count(Issue.id)).where(
+                Issue.status == IssueStatus.OPEN.value,
+                Issue.project_id.in_(pids) if pids else False,
+            )
         )
 
         vitals = AdminVitals(
@@ -382,7 +423,9 @@ async def admin_dashboard(
         #  query instead of N queries inside the loop)
         # ==========================================
         projects_query = await db.execute(
-            select(m.Project).order_by(m.Project.id.asc())
+            select(m.Project)
+            .where(m.Project.company_id == current_user.company_id)
+            .order_by(m.Project.id.asc())
         )
         projects = projects_query.scalars().all()
 
@@ -453,7 +496,12 @@ async def admin_dashboard(
         # Active Users
         # ==========================================
         active_users = (
-            await db.scalar(select(func.count(User.id)).where(User.is_active == True))
+            await db.scalar(
+                select(func.count(User.id)).where(
+                    User.is_active == True,
+                    User.company_id == current_user.company_id,
+                )
+            )
             or 0
         )
 
@@ -524,7 +572,7 @@ async def admin_dashboard(
 
     return await cache_get_set(
         redis,
-        "admin_dashboard",
+        f"admin_dashboard:{current_user.company_id}",
         version,
         logic,
     )
@@ -631,6 +679,11 @@ async def accountant_dashboard(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Super Admin cannot access accountant dashboard",
+        )
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
 
@@ -972,7 +1025,9 @@ async def accountant_dashboard(
         )
 
     version = await r.get_cache_version(redis, VERSION_KEY)
-    return await cache_get_set(redis, "accountant_dashboard", version, logic)
+    return await cache_get_set(
+        redis, f"accountant_dashboard:{current_user.company_id}", version, logic
+    )
 
 
 # =========================================
@@ -1562,7 +1617,11 @@ async def export_master_projects_csv(
     current_user: User = Depends(d.require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
-    projects_query = await db.execute(select(m.Project))
+    if current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Super Admin cannot export projects")
+    projects_query = await db.execute(
+        select(m.Project).where(m.Project.company_id == current_user.company_id)
+    )
     projects = projects_query.scalars().all()
 
     buffer = io.StringIO()
@@ -1597,7 +1656,11 @@ async def export_master_projects_pdf(
     current_user: User = Depends(d.require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
-    projects_query = await db.execute(select(m.Project))
+    if current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Super Admin cannot export projects")
+    projects_query = await db.execute(
+        select(m.Project).where(m.Project.company_id == current_user.company_id)
+    )
     projects = projects_query.scalars().all()
 
     buffer = io.BytesIO()
@@ -2984,25 +3047,41 @@ async def labour_dashboard(
     # =========================================
 
     project = None
+    assigned_date = None
+
+    # Base filter for tenant isolation, only apply if user actually has a company_id (graceful for old data)
+    tenant_filter = (Project.company_id == current_user.company_id) if current_user.company_id else True
 
     if user_settings and user_settings.default_project_id:
-        project = await db.scalar(
-            select(Project)
-            .join(LabourProject, LabourProject.project_id == Project.id)
-            .where(
-                LabourProject.labour_id == labour.id,
-                LabourProject.project_id == user_settings.default_project_id,
+        row = (
+            await db.execute(
+                select(Project, LabourProject.assigned_date)
+                .join(LabourProject, LabourProject.project_id == Project.id)
+                .where(
+                    LabourProject.labour_id == labour.id,
+                    LabourProject.project_id == user_settings.default_project_id,
+                    tenant_filter,
+                )
             )
-        )
+        ).first()
+        if row:
+            project, assigned_date = row[0], row[1]
 
     if project is None:
-        project = await db.scalar(
-            select(Project)
-            .join(LabourProject, LabourProject.project_id == Project.id)
-            .where(LabourProject.labour_id == labour.id)
-            .order_by(LabourProject.assigned_date.desc(), LabourProject.id.desc())
-            .limit(1)
-        )
+        row = (
+            await db.execute(
+                select(Project, LabourProject.assigned_date)
+                .join(LabourProject, LabourProject.project_id == Project.id)
+                .where(
+                    LabourProject.labour_id == labour.id,
+                    tenant_filter,
+                )
+                .order_by(LabourProject.assigned_date.desc(), LabourProject.id.desc())
+                .limit(1)
+            )
+        ).first()
+        if row:
+            project, assigned_date = row[0], row[1]
 
     project_count = await db.scalar(
         select(func.count(func.distinct(LabourProject.project_id))).where(
@@ -3090,13 +3169,26 @@ async def labour_dashboard(
         and row.attendance_date.year == current_year
     ]
 
-    total_days = len(month_rows)
+    # Calculate applicable working days
+    applicable_start = month_start
+    if assigned_date and assigned_date > month_start:
+        applicable_start = assigned_date
+
+    applicable_end = today
+    
+    total_days = 0
+    if applicable_start <= applicable_end:
+        # Assuming no specific weekly off configured globally, elapsed days = total days
+        total_days = (applicable_end - applicable_start).days + 1
+
     present_days = sum(1 for r in month_rows if r.status == AttendanceStatus.PRESENT)
-    absent_days = sum(1 for r in month_rows if r.status == AttendanceStatus.ABSENT)
     half_days = sum(1 for r in month_rows if r.status == AttendanceStatus.HALF_DAY)
+    
+    # Absent days is applicable days minus present and half days
+    absent_days = max(0, total_days - present_days - half_days)
 
     attendance_percentage = (
-        round((present_days / total_days) * 100, 2) if total_days else 0
+        round(((present_days + 0.5 * half_days) / total_days) * 100, 2) if total_days else 0
     )
 
     today_hours = (

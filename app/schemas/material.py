@@ -140,7 +140,7 @@ class MaterialUpdate(BaseSchema):
 class MaterialOut(BaseSchema):
 
     id: int
-    material_code: str
+    material_code: Optional[str] = None
 
     project_id: int
 
@@ -152,11 +152,11 @@ class MaterialOut(BaseSchema):
     material_master_specification: Optional[str] = None
     material_master_hsn_code: Optional[str] = None
 
-    material_name: str
-    category: str
+    material_name: Optional[str] = ""
+    category: Optional[str] = ""
 
     unit_id: int
-    unit_name: str
+    unit_name: Optional[str] = ""
 
     supplier_id: int
     supplier_name: Optional[str] = None

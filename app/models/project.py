@@ -62,6 +62,12 @@ class Project(Base, TimestampMixin):
     business_id: Mapped[str] = mapped_column(
         String(20), unique=True, nullable=False, index=True
     )
+    
+    company_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    
+    company = relationship("Company", back_populates="projects")
 
     project_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

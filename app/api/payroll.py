@@ -21,8 +21,13 @@ from app.schemas.payroll import (
     StaffSalaryRegisterOut
 )
 from app.utils.accounting import get_payroll_account, get_primary_cash_account
+from app.core.dependencies import require_feature
 
-router = APIRouter(prefix="/accountant/payroll", tags=["Accountant Payroll"])
+router = APIRouter(
+    prefix="/accountant/payroll",
+    tags=["Accountant Payroll"],
+    dependencies=[Depends(require_feature("payroll", "Payroll Module"))],
+)
 
 def get_allowed_staff_roles():
     return [

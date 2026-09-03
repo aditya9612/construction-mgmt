@@ -62,8 +62,12 @@ async def list_payment_vouchers(
         .order_by(PaymentVoucher.created_at.desc())
     )
     
+    if not current_user.is_super_admin:
+        query = query.where(Project.company_id == current_user.company_id)
+
     if status:
         query = query.where(PaymentVoucher.status == status)
+
         
     rows = (await db.execute(query)).all()
     

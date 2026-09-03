@@ -8,6 +8,7 @@ class Contractor(Base):
     __tablename__ = "contractors"
 
     id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=True)
     contractor_id = Column(String(50), unique=True, nullable=False, index=True)
     name = Column(String(100), nullable=False)
     work_type = Column(String(50), nullable=False)

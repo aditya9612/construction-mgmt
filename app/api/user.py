@@ -27,7 +27,18 @@ async def get_current_user_optional(
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-        return await get_current_active_user(request=request, db=db)
+        from fastapi.security.utils import get_authorization_scheme_param
+        from fastapi.security import HTTPAuthorizationCredentials
+        from app.core.dependencies import get_current_user
+
+        authorization = request.headers.get("Authorization")
+        scheme, credentials = get_authorization_scheme_param(authorization)
+        if not (authorization and scheme.lower() == "bearer"):
+            return None
+
+        creds = HTTPAuthorizationCredentials(scheme=scheme, credentials=credentials)
+        user = await get_current_user(request=request, credentials=creds, db=db)
+        return await get_current_active_user(current_user=user)
     except Exception:
         return None
 
@@ -101,7 +112,7 @@ router = APIRouter(
 async def create_user(
     payload: UserCreatePayload = Depends(),
     profile_image: UploadFile = File(None),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
 ):
     """Create a user with any role. Provide either email+password or mobile_number."""
@@ -124,14 +135,30 @@ async def create_user(
                 422,
                 "Use /labour API to create labour users"
             )
+        if role == UserRole.ADMIN.value:
+            raise AppError(
+                403,
+                "Cannot create Admin users via this endpoint. Super Admins must use /superadmin/companies/{id}/admin"
+            )
     except ValueError:
         raise AppError(422, f"Invalid role. Use one of: {ROLES}")
 
     try:
         # ------------------------
-        # ACTOR (AUDIT SUPPORT)
+        # ACTOR & TENANT (AUDIT SUPPORT & ISOLATION)
         # ------------------------
-        creator_id = current_user.id if current_user else None
+        if current_user.company_id is None:
+            raise AppError(403, "User does not belong to any company.")
+            
+        creator_id = current_user.id
+        company_id = current_user.company_id
+
+        # ------------------------
+        # SAAS ENTITLEMENT: USER LIMIT & SUBSCRIPTION ENFORCEMENT
+        # ------------------------
+        from app.services.entitlement import get_entitlement_service
+        entitlement_service = get_entitlement_service()
+        await entitlement_service.assert_can_create_user(db, company_id)
 
         # ------------------------
         # IMAGE
@@ -186,6 +213,7 @@ async def create_user(
                 designation=payload.designation,
                 joining_date=payload.joining_date,
                 created_by=creator_id,
+                company_id=company_id,
             )
 
         # ------------------------
@@ -225,6 +253,7 @@ async def create_user(
                 designation=payload.designation,
                 joining_date=payload.joining_date,
                 created_by=creator_id,
+                company_id=company_id,
             )
 
         # ------------------------
@@ -321,9 +350,9 @@ async def list_users(
     if cached is not None:
         return PaginatedResponse[UserOut].model_validate(cached)
 
-    query = select(User).where(User.is_deleted == False)
+    query = select(User).where(User.is_deleted == False, User.company_id == current_user.company_id)
     count_query = select(func.count()).select_from(User).where(
-        User.is_deleted == False
+        User.is_deleted == False, User.company_id == current_user.company_id
     )
 
     if search:
@@ -523,7 +552,11 @@ async def get_user(
     db: AsyncSession = Depends(get_db_session),
 ):
     user = await db.scalar(
-        select(User).where(User.id == user_id, User.is_deleted == False)
+        select(User).where(
+            User.id == user_id, 
+            User.is_deleted == False,
+            User.company_id == current_user.company_id
+        )
     )
 
     if user is None:
@@ -544,7 +577,11 @@ async def update_user(
     logger.info(f"Updating user id={user_id}")
 
     user = await db.scalar(
-        select(User).where(User.id == user_id, User.is_deleted == False)
+        select(User).where(
+            User.id == user_id, 
+            User.is_deleted == False,
+            User.company_id == current_user.company_id
+        )
     )
     if user is None:
         raise NotFoundError("User not found")
@@ -576,7 +613,7 @@ async def update_user(
             data["mobile"] = mobile_val
 
             existing = await db.scalar(
-                select(User).where(and_(User.mobile == mobile_val, User.id != user_id))
+                select(User).where(and_(User.mobile == mobile_val, User.id != user_id, User.company_id == current_user.company_id))
             )
             if existing:
                 raise ConflictError("Mobile already registered")
@@ -590,7 +627,7 @@ async def update_user(
 
             existing = await db.scalar(
                 select(User).where(
-                    and_(User.email == data["email"], User.id != user_id)
+                    and_(User.email == data["email"], User.id != user_id, User.company_id == current_user.company_id)
                 )
             )
             if existing:
@@ -670,7 +707,11 @@ async def delete_user(
     logger.info(f"Deleting user id={user_id}")
 
     user = await db.scalar(
-        select(User).where(User.id == user_id, User.is_deleted == False)
+        select(User).where(
+            User.id == user_id, 
+            User.is_deleted == False,
+            User.company_id == current_user.company_id
+        )
     )
 
     if user is None:

@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
-from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
+from app.core.dependencies import get_current_active_user, get_request_redis, require_roles, require_feature
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.ai_prediction import AIPrediction
@@ -15,7 +15,14 @@ from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.utils.helpers import NotFoundError
 
 
-router = APIRouter(prefix="/ai", tags=["ai"], dependencies=[default_rate_limiter_dependency()])
+router = APIRouter(
+    prefix="/ai",
+    tags=["ai"],
+    dependencies=[
+        default_rate_limiter_dependency(),
+        Depends(require_feature("ai_features", "AI Predictions")),
+    ],
+)
 
 VERSION_KEY = "cache_version:ai_predictions"
 

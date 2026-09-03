@@ -67,6 +67,7 @@ async def create_contractor(
     logger.info(f"Creating contractor name={data.name}")
 
     payload = data.model_dump()
+    payload["company_id"] = current_user.company_id
 
     for _ in range(3):  # retry for race condition safety
         try:
@@ -97,7 +98,11 @@ async def pending_report(
 ):
     params = PaginationParams(limit=limit, offset=offset).normalized()
 
-    query = select(Contractor)
+    query = select(Contractor).where(Contractor.company_id == current_user.company_id)
+    count_query = select(func.count()).select_from(Contractor).where(Contractor.company_id == current_user.company_id)
+
+    # Calculate payment_pending directly in database
+    pending_amount = (Contractor.total_work_assigned - Contractor.payment_given)
 
     if current_user.role != UserRole.ADMIN:
         query = (
@@ -188,7 +193,7 @@ async def update_contractor(
 
     contractor = await db.get(Contractor, contractor_id)
 
-    if not contractor:
+    if not contractor or contractor.company_id != current_user.company_id:
         logger.warning(f"Contractor not found for update id={contractor_id}")
         raise NotFoundError("Contractor not found")
 
@@ -223,7 +228,7 @@ async def delete_contractor(
 
     contractor = await db.get(Contractor, contractor_id)
 
-    if not contractor:
+    if not contractor or contractor.company_id != current_user.company_id:
         logger.warning(f"Contractor not found for delete id={contractor_id}")
         raise NotFoundError("Contractor not found")
 

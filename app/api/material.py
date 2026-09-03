@@ -135,6 +135,8 @@ from app.schemas.material import (
 )
 
 from app.core.logger import logger
+from app.utils.common import assert_project_access
+from app.utils.helpers import PermissionDeniedError
 
 MATERIAL_READ_ROLES = [
     r.value
@@ -1006,6 +1008,7 @@ async def material_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     from decimal import Decimal
     from fastapi import HTTPException
 
@@ -1093,7 +1096,7 @@ async def list_suppliers(
         (
             await db.execute(
                 select(Supplier)
-                .where(Supplier.is_deleted == False)
+                .where(Supplier.is_deleted == False, Supplier.company_id == current_user.company_id)
                 .order_by(Supplier.id.desc())
                 .offset(skip)
                 .limit(limit)
@@ -1114,6 +1117,9 @@ async def generate_supplier_qr(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _s = await db.get(Supplier, supplier_id)
+    if not _s or _s.company_id != current_user.company_id:
+        raise NotFoundError("Supplier not found")
     supplier = await db.get(Supplier, supplier_id)
 
     if not supplier or supplier.is_deleted:
@@ -1141,6 +1147,9 @@ async def get_supplier(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _s = await db.get(Supplier, supplier_id)
+    if not _s or _s.company_id != current_user.company_id:
+        raise NotFoundError("Supplier not found")
     supplier = await db.get(Supplier, supplier_id)
 
     if not supplier or supplier.is_deleted:
@@ -1230,6 +1239,7 @@ async def create_supplier(
         existing = await db.scalar(
             select(Supplier).where(
                 Supplier.is_deleted.is_(False),
+                Supplier.company_id == current_user.company_id,
                 or_(*conditions),
             )
         )
@@ -1247,6 +1257,7 @@ async def create_supplier(
         phone_email=phone_email,
         gst_number=gst_number,
         address=address,
+        company_id=current_user.company_id,
     )
 
     try:
@@ -1274,6 +1285,9 @@ async def update_supplier(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _s = await db.get(Supplier, supplier_id)
+    if not _s or _s.company_id != current_user.company_id:
+        raise NotFoundError("Supplier not found")
     import re
 
     supplier = await db.get(Supplier, supplier_id)
@@ -1418,6 +1432,9 @@ async def delete_supplier(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
 ):
+    _s = await db.get(Supplier, id)
+    if not _s or _s.company_id != current_user.company_id:
+        raise NotFoundError("Supplier not found")
     obj = await db.get(Supplier, id)
 
     if not obj or obj.is_deleted:
@@ -1460,6 +1477,10 @@ async def get_supplier_materials(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
 
@@ -1516,6 +1537,7 @@ async def get_material_alerts(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     query = (
         select(
             Material,
@@ -1586,6 +1608,7 @@ async def create_po(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
 ):
 
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     if payload.quantity <= 0 or payload.rate <= 0:
         raise HTTPException(400, "Quantity and rate must be greater than 0")
 
@@ -1647,6 +1670,10 @@ async def get_po(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
 
+    _po = await db.get(PurchaseOrder, id)
+    if not _po:
+        raise NotFoundError("PO not found")
+    await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
     po = await db.get(PurchaseOrder, id)
 
     if not po or po.is_deleted:
@@ -1671,6 +1698,7 @@ async def list_po(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     limit = min(max(limit, 1), 100)
 
     if (
@@ -1710,6 +1738,10 @@ async def update_po(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _po = await db.get(PurchaseOrder, id)
+    if not _po:
+        raise NotFoundError("PO not found")
+    await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
     obj = await db.get(PurchaseOrder, id)
 
     if not obj or obj.is_deleted:
@@ -1767,6 +1799,10 @@ async def delete_po(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
 ):
 
+    _po = await db.get(PurchaseOrder, id)
+    if not _po:
+        raise NotFoundError("PO not found")
+    await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
     obj = await db.get(PurchaseOrder, id)
 
     if not obj or obj.is_deleted:
@@ -1808,6 +1844,7 @@ async def project_transactions(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
     if current_user.role != UserRole.ADMIN.value and project_id not in (
@@ -1858,6 +1895,10 @@ async def get_material_transactions(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
 
@@ -1920,8 +1961,9 @@ async def create_transfer(
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     redis=Depends(get_request_redis),
 ):
+    await assert_project_access(db, project_id=payload.from_project_id, current_user=current_user)
+    await assert_project_access(db, project_id=payload.to_project_id, current_user=current_user)
     try:
-
         if payload.quantity <= 0:
             raise HTTPException(
                 status_code=400,
@@ -1943,38 +1985,22 @@ async def create_transfer(
                 detail="Access denied",
             )
 
-        from_project = await db.get(
-            Project,
-            payload.from_project_id,
-        )
+        from_project = await db.get(Project, payload.from_project_id)
+        to_project = await db.get(Project, payload.to_project_id)
 
-        to_project = await db.get(
-            Project,
-            payload.to_project_id,
-        )
-
-        if not from_project:
+        if not from_project or (current_user.company_id is not None and from_project.company_id != current_user.company_id):
             raise HTTPException(
                 status_code=404,
                 detail="Source project not found",
             )
 
-        if not to_project:
+        if not to_project or (current_user.company_id is not None and to_project.company_id != current_user.company_id):
             raise HTTPException(
                 status_code=404,
                 detail="Destination project not found",
             )
 
         reference_id = f"TRF-{uuid.uuid4().hex[:8].upper()}"
-
-        # =====================================================
-        # SOURCE MATERIAL
-        # =====================================================
-        # NOTE: to reduce deadlock risk when two transfers cross-reference
-        # projects (A->B and B->A concurrently), always lock the lower
-        # material id first would require knowing destination id up front,
-        # which isn't possible before this point (it may not exist yet).
-        # Kept as-is; flagged as a known limitation.
 
         material = await db.scalar(
             select(Material)
@@ -1987,7 +2013,6 @@ async def create_transfer(
                 Material.id == payload.material_id,
                 Material.is_deleted == False,
             )
-            .with_for_update()
         )
 
         if not material:
@@ -2008,156 +2033,18 @@ async def create_transfer(
                 detail="Insufficient stock available",
             )
 
-        qty_purchased = material.quantity_purchased or Decimal("0")
-        total_amount = material.total_amount or Decimal("0")
-
-        avg_rate = total_amount / qty_purchased if qty_purchased > 0 else Decimal("0")
-
-        transfer_amount = avg_rate * payload.quantity
-
-        # =====================================================
-        # REDUCE STOCK FROM SOURCE
-        # =====================================================
-
-        material.quantity_used += payload.quantity
-
-        update_material_fields(material)
-
-        # =====================================================
-        # FIND DESTINATION MATERIAL
-        # =====================================================
-
-        destination_material = await db.scalar(
-            select(Material)
-            .where(
-                Material.project_id == payload.to_project_id,
-                Material.material_master_id == material.material_master_id,
-                Material.supplier_id == material.supplier_id,
-                Material.is_deleted == False,
-            )
-            .with_for_update()
-        )
-
-        # =====================================================
-        # CREATE DESTINATION MATERIAL IF NOT EXISTS
-        # =====================================================
-
-        if not destination_material:
-
-            material_code = await generate_business_id(
-                db=db,
-                model=Material,
-                column_name="material_code",
-                prefix="MAT",
-            )
-
-            destination_material = Material(
-                material_code=material_code,
-                project_id=payload.to_project_id,
-                material_master_id=material.material_master_id,
-                material_name=material.material_name,
-                category=material.category,
-                unit_id=material.unit_id,
-                supplier_id=material.supplier_id,
-                purchase_rate=avg_rate,
-                rate_type=material.rate_type,
-                quantity_purchased=payload.quantity,
-                quantity_used=Decimal("0"),
-                total_amount=transfer_amount,
-                payment_given=Decimal("0"),
-                payment_pending=Decimal("0"),
-                minimum_stock_level=material.minimum_stock_level,
-            )
-
-            update_material_fields(destination_material)
-
-            db.add(destination_material)
-
-            await db.flush()
-
-        else:
-
-            destination_material.quantity_purchased += payload.quantity
-
-            destination_material.total_amount += transfer_amount
-
-            update_material_fields(destination_material)
-
-        # =====================================================
-        # MATERIAL TRANSACTION
-        # =====================================================
-
-        tx_out = MaterialTransaction(
-            material_id=material.id,
-            project_id=payload.from_project_id,
-            type=TransactionType.TRANSFER_OUT,
-            quantity=-payload.quantity,
-            rate=avg_rate,
-            total_amount=transfer_amount,
-            issue_type=IssueType.TRANSFER,
-            reference_id=reference_id,
-        )
-
-        tx_in = MaterialTransaction(
-            material_id=destination_material.id,
-            project_id=payload.to_project_id,
-            type=TransactionType.TRANSFER_IN,
-            quantity=payload.quantity,
-            rate=avg_rate,
-            total_amount=transfer_amount,
-            issue_type=IssueType.TRANSFER,
-            reference_id=reference_id,
-        )
-
-        db.add(tx_out)
-        db.add(tx_in)
-
-        # =====================================================
-        # MATERIAL LEDGER
-        # =====================================================
-
-        ledger_out = MaterialLedger(
-            material_id=material.id,
-            project_id=payload.from_project_id,
-            type=TransactionType.TRANSFER_OUT,
-            quantity=-payload.quantity,
-            rate=avg_rate,
-            total_amount=transfer_amount,
-            issue_type=IssueType.TRANSFER,
-            reference_id=reference_id,
-        )
-
-        ledger_in = MaterialLedger(
-            material_id=destination_material.id,
-            project_id=payload.to_project_id,
-            type=TransactionType.TRANSFER_IN,
-            quantity=payload.quantity,
-            rate=avg_rate,
-            total_amount=transfer_amount,
-            issue_type=IssueType.TRANSFER,
-            reference_id=reference_id,
-        )
-
-        db.add(ledger_out)
-        db.add(ledger_in)
-
-        # =====================================================
-        # TRANSFER RECORD
-        # =====================================================
-
+        # Create transfer in PENDING status - DO NOT move stock yet
         transfer = MaterialTransfer(
             material_id=material.id,
             from_project_id=payload.from_project_id,
             to_project_id=payload.to_project_id,
             quantity=payload.quantity,
-            status="COMPLETED",
+            status="PENDING",
             reference_id=reference_id,
         )
 
         db.add(transfer)
-
         await db.commit()
-
         await db.refresh(transfer)
 
         await bump_cache_version(
@@ -2192,6 +2079,8 @@ async def list_transfers(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    if project_id is not None:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
     skip = max(skip, 0)
     limit = min(max(limit, 1), 100)
 
@@ -2205,6 +2094,19 @@ async def list_transfers(
     FromProject = aliased(Project)
     ToProject = aliased(Project)
 
+    filters = []
+    if current_user.company_id is not None:
+        filters.append(FromProject.company_id == current_user.company_id)
+        filters.append(ToProject.company_id == current_user.company_id)
+
+    if project_id is not None:
+        filters.append(
+            or_(
+                MaterialTransfer.from_project_id == project_id,
+                MaterialTransfer.to_project_id == project_id,
+            )
+        )
+
     query = (
         select(
             MaterialTransfer,
@@ -2213,31 +2115,23 @@ async def list_transfers(
             ToProject.project_name,
         )
         .select_from(MaterialTransfer)
-        .join(Material)
+        .join(Material, Material.id == MaterialTransfer.material_id)
         .join(FromProject, FromProject.id == MaterialTransfer.from_project_id)
         .join(ToProject, ToProject.id == MaterialTransfer.to_project_id)
     )
+    if filters:
+        query = query.where(*filters)
 
-    if project_id is not None:
-        query = query.where(
-            or_(
-                MaterialTransfer.from_project_id == project_id,
-                MaterialTransfer.to_project_id == project_id,
-            )
-        )
-
-    total = await db.scalar(
+    count_query = (
         select(func.count())
         .select_from(MaterialTransfer)
-        .where(
-            or_(
-                MaterialTransfer.from_project_id == project_id,
-                MaterialTransfer.to_project_id == project_id,
-            )
-        )
-        if project_id is not None
-        else select(func.count()).select_from(MaterialTransfer)
+        .join(FromProject, FromProject.id == MaterialTransfer.from_project_id)
+        .join(ToProject, ToProject.id == MaterialTransfer.to_project_id)
     )
+    if filters:
+        count_query = count_query.where(*filters)
+
+    total = await db.scalar(count_query)
 
     rows = (
         await db.execute(
@@ -2253,6 +2147,7 @@ async def list_transfers(
             "to_project": {"id": t.to_project_id, "name": to_name},
             "quantity": float(t.quantity),
             "status": t.status,
+            "created_at": t.created_at,
         }
         for t, material_name, from_name, to_name in rows
     ]
@@ -2274,43 +2169,41 @@ async def get_transfer(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    _tr = await db.get(MaterialTransfer, id)
+    if not _tr:
+        raise HTTPException(status_code=404, detail="Transfer not found")
 
-    FromProject = aliased(Project)
-    ToProject = aliased(Project)
+    from_project = await db.get(Project, _tr.from_project_id)
+    to_project = await db.get(Project, _tr.to_project_id)
+    if not from_project or not to_project:
+        raise HTTPException(status_code=404, detail="Transfer not found")
 
-    result = await db.execute(
-        select(
-            MaterialTransfer,
-            Material,
-            FromProject,
-            ToProject,
-        )
-        .join(Material, Material.id == MaterialTransfer.material_id)
-        .join(FromProject, FromProject.id == MaterialTransfer.from_project_id)
-        .join(ToProject, ToProject.id == MaterialTransfer.to_project_id)
-        .where(MaterialTransfer.id == id)
-    )
+    if current_user.company_id is not None and (
+        from_project.company_id != current_user.company_id
+        or to_project.company_id != current_user.company_id
+    ):
+        raise HTTPException(status_code=404, detail="Transfer not found")
 
-    row = result.first()
-
-    if not row:
-        raise HTTPException(404, "Transfer not found")
-
-    obj, material, from_project, to_project = row
+    await assert_project_access(db, project_id=_tr.from_project_id, current_user=current_user)
+    await assert_project_access(db, project_id=_tr.to_project_id, current_user=current_user)
 
     if current_user.role != UserRole.ADMIN.value and (
-        obj.from_project_id not in (current_user.allowed_projects or [])
-        and obj.to_project_id not in (current_user.allowed_projects or [])
+        _tr.from_project_id not in (current_user.allowed_projects or [])
+        and _tr.to_project_id not in (current_user.allowed_projects or [])
     ):
         raise HTTPException(403, "Access denied")
 
-    return build_transfer_response(obj, material, from_project, to_project)
+    material = await db.get(Material, _tr.material_id)
+    if not material:
+        raise HTTPException(status_code=404, detail="Material not found")
+
+    return build_transfer_response(_tr, material, from_project, to_project)
 
 
 # =================update_transfer_status=========
 
 
-VALID_STATUS = {"PENDING", "COMPLETED", "CANCELLED"}
+VALID_STATUS = {"COMPLETED", "CANCELLED"}
 
 
 @router.put("/transfers/{id}", response_model=TransferOut)
@@ -2319,65 +2212,240 @@ async def update_transfer_status(
     status: str,
     current_user: User = Depends(require_roles(MATERIAL_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
     status = status.upper().strip()
 
     if status not in VALID_STATUS:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid status. Allowed: {', '.join(VALID_STATUS)}",
+            detail=f"Invalid status. Allowed: {', '.join(sorted(VALID_STATUS))}",
         )
 
-    obj = await db.get(MaterialTransfer, id)
-
-    if not obj:
-        raise HTTPException(404, "Transfer not found")
-
-    # NOTE: create_transfer() applies the stock/ledger movement immediately
-    # and marks the transfer COMPLETED. This endpoint only flips the status
-    # label — it does NOT reverse quantity_used/quantity_purchased or the
-    # ledger entries. Changing status away from COMPLETED here will leave
-    # inventory numbers out of sync with the displayed status. Block that
-    # until a proper reversal flow exists.
-    if obj.status == "COMPLETED" and status != "COMPLETED":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Cannot change status of a completed transfer: stock has "
-                "already moved. Create a reverse transfer instead."
-            ),
+    try:
+        # Lock transfer row
+        obj = await db.scalar(
+            select(MaterialTransfer)
+            .where(MaterialTransfer.id == id)
+            .with_for_update()
         )
 
-    obj.status = status
+        if not obj:
+            raise HTTPException(status_code=404, detail="Transfer not found")
 
-    await db.commit()
-    await db.refresh(obj)
+        from_project = await db.get(Project, obj.from_project_id)
+        to_project = await db.get(Project, obj.to_project_id)
+        if not from_project or not to_project:
+            raise HTTPException(status_code=404, detail="Transfer not found")
 
-    material = await db.get(Material, obj.material_id)
-    from_project = await db.get(Project, obj.from_project_id)
-    to_project = await db.get(Project, obj.to_project_id)
+        if current_user.company_id is not None and (
+            from_project.company_id != current_user.company_id
+            or to_project.company_id != current_user.company_id
+        ):
+            raise HTTPException(status_code=404, detail="Transfer not found")
 
-    return TransferOut(
-        id=obj.id,
-        material=(
-            TransferMaterial(id=material.id, name=material.material_name)
-            if material
-            else None
-        ),
-        from_project=(
-            TransferProject(id=from_project.id, name=from_project.project_name)
-            if from_project
-            else None
-        ),
-        to_project=(
-            TransferProject(id=to_project.id, name=to_project.project_name)
-            if to_project
-            else None
-        ),
-        quantity=obj.quantity,
-        status=obj.status,
-        created_at=obj.created_at,
-    )
+        await assert_project_access(db, project_id=obj.from_project_id, current_user=current_user)
+        await assert_project_access(db, project_id=obj.to_project_id, current_user=current_user)
+
+        if current_user.role != UserRole.ADMIN.value and (
+            obj.from_project_id not in (current_user.allowed_projects or [])
+            and obj.to_project_id not in (current_user.allowed_projects or [])
+        ):
+            raise HTTPException(403, "Access denied")
+
+        if obj.status == "COMPLETED":
+            raise HTTPException(
+                status_code=400,
+                detail="Transfer is already completed",
+            )
+
+        if obj.status == "CANCELLED":
+            raise HTTPException(
+                status_code=400,
+                detail="Transfer is already cancelled",
+            )
+
+        if obj.status != "PENDING":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot transition transfer from {obj.status} to {status}",
+            )
+
+        if status == "CANCELLED":
+            # No stock movement on cancellation
+            obj.status = "CANCELLED"
+            await db.commit()
+            await db.refresh(obj)
+
+            material = await db.get(Material, obj.material_id)
+            return build_transfer_response(obj, material, from_project, to_project)
+
+        # status == "COMPLETED": Atomic stock movement
+        material = await db.scalar(
+            select(Material)
+            .options(
+                selectinload(Material.unit),
+                selectinload(Material.supplier),
+                selectinload(Material.material_master),
+            )
+            .where(
+                Material.id == obj.material_id,
+                Material.is_deleted == False,
+            )
+            .with_for_update()
+        )
+
+        if not material:
+            raise HTTPException(
+                status_code=404,
+                detail="Material not found",
+            )
+
+        if material.project_id != obj.from_project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Material does not belong to source project",
+            )
+
+        if material.remaining_stock < obj.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail="Insufficient stock available",
+            )
+
+        qty_purchased = material.quantity_purchased or Decimal("0")
+        total_amount = material.total_amount or Decimal("0")
+        avg_rate = total_amount / qty_purchased if qty_purchased > 0 else Decimal("0")
+        transfer_amount = avg_rate * obj.quantity
+
+        # 1. Reduce stock from source
+        material.quantity_used += obj.quantity
+        update_material_fields(material)
+
+        # 2. Find or create destination material
+        destination_material = await db.scalar(
+            select(Material)
+            .where(
+                Material.project_id == obj.to_project_id,
+                Material.material_master_id == material.material_master_id,
+                Material.supplier_id == material.supplier_id,
+                Material.is_deleted == False,
+            )
+            .with_for_update()
+        )
+
+        if not destination_material:
+            material_code = await generate_business_id(
+                db=db,
+                model=Material,
+                column_name="material_code",
+                prefix="MAT",
+            )
+
+            destination_material = Material(
+                material_code=material_code,
+                project_id=obj.to_project_id,
+                material_master_id=material.material_master_id,
+                material_name=material.material_name,
+                category=material.category,
+                unit_id=material.unit_id,
+                supplier_id=material.supplier_id,
+                purchase_rate=avg_rate,
+                rate_type=material.rate_type,
+                quantity_purchased=obj.quantity,
+                quantity_used=Decimal("0"),
+                total_amount=transfer_amount,
+                payment_given=Decimal("0"),
+                payment_pending=Decimal("0"),
+                minimum_stock_level=material.minimum_stock_level,
+            )
+            update_material_fields(destination_material)
+            db.add(destination_material)
+            await db.flush()
+        else:
+            destination_material.quantity_purchased += obj.quantity
+            destination_material.total_amount += transfer_amount
+            update_material_fields(destination_material)
+
+        # 3. Material Transactions
+        tx_out = MaterialTransaction(
+            material_id=material.id,
+            project_id=obj.from_project_id,
+            type=TransactionType.TRANSFER_OUT,
+            quantity=-obj.quantity,
+            rate=avg_rate,
+            total_amount=transfer_amount,
+            issue_type=IssueType.TRANSFER,
+            reference_id=obj.reference_id,
+        )
+
+        tx_in = MaterialTransaction(
+            material_id=destination_material.id,
+            project_id=obj.to_project_id,
+            type=TransactionType.TRANSFER_IN,
+            quantity=obj.quantity,
+            rate=avg_rate,
+            total_amount=transfer_amount,
+            issue_type=IssueType.TRANSFER,
+            reference_id=obj.reference_id,
+        )
+
+        db.add(tx_out)
+        db.add(tx_in)
+
+        # 4. Material Ledgers
+        ledger_out = MaterialLedger(
+            material_id=material.id,
+            project_id=obj.from_project_id,
+            type=TransactionType.TRANSFER_OUT,
+            quantity=-obj.quantity,
+            rate=avg_rate,
+            total_amount=transfer_amount,
+            issue_type=IssueType.TRANSFER,
+            reference_id=obj.reference_id,
+        )
+
+        ledger_in = MaterialLedger(
+            material_id=destination_material.id,
+            project_id=obj.to_project_id,
+            type=TransactionType.TRANSFER_IN,
+            quantity=obj.quantity,
+            rate=avg_rate,
+            total_amount=transfer_amount,
+            issue_type=IssueType.TRANSFER,
+            reference_id=obj.reference_id,
+        )
+
+        db.add(ledger_out)
+        db.add(ledger_in)
+
+        # 5. Mark COMPLETED
+        obj.status = "COMPLETED"
+
+        await db.commit()
+        await db.refresh(obj)
+
+        await bump_cache_version(
+            redis,
+            VERSION_KEY,
+        )
+
+        return build_transfer_response(
+            obj,
+            material,
+            from_project,
+            to_project,
+        )
+
+    except HTTPException:
+        await db.rollback()
+        raise
+    except AppError:
+        await db.rollback()
+        raise
+    except Exception:
+        await db.rollback()
+        raise
 
 
 # ================= USAGE =================
@@ -2458,6 +2526,10 @@ async def usage(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
 
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     import json
     import hashlib
 
@@ -2755,6 +2827,10 @@ async def purchase(
     redis=Depends(get_request_redis),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     import uuid
 
     import json
@@ -3046,6 +3122,7 @@ async def adjust_inventory(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
 
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     import json
     import hashlib
 
@@ -3364,6 +3441,7 @@ async def get_inventory_valuation(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     query = select(
         Material.quantity_purchased,
         Material.remaining_stock,
@@ -3405,6 +3483,7 @@ async def get_project_inventory(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     result = await db.execute(
         select(
             Material.id,
@@ -3457,6 +3536,10 @@ async def logs(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     limit = min(max(limit, 1), 100)
 
     if (
@@ -3535,6 +3618,10 @@ async def material_report(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
 
@@ -4292,6 +4379,10 @@ async def export_pdf(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     try:
         if current_user.role != UserRole.ADMIN.value and project_id not in (
             current_user.allowed_projects or []
@@ -4356,6 +4447,10 @@ async def export_excel(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    else:
+        raise PermissionDeniedError("Global query without project_id not permitted")
     try:
         if current_user.role != UserRole.ADMIN.value and project_id not in (
             current_user.allowed_projects or []
@@ -4407,6 +4502,10 @@ async def price_history(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     result = await db.execute(
         select(MaterialTransaction.rate, MaterialTransaction.created_at)
         .where(
@@ -4451,6 +4550,7 @@ async def create_material(
     redis=Depends(get_request_redis),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     from decimal import Decimal
 
     import json
@@ -4795,6 +4895,7 @@ async def download_procurement_report_pdf(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     if (
         current_user.role != UserRole.ADMIN.value
         and current_user.allowed_projects
@@ -4889,6 +4990,10 @@ async def generate_material_qr(
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     material = await _get_active_material_or_404(db, material_id)
 
     qr_buf = generate_qr(entity_type="MAT", entity_id=material.id)
@@ -4911,6 +5016,10 @@ async def get_material(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     result = await db.execute(
         select(
             Material,
@@ -4967,6 +5076,10 @@ async def update_material(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     obj = await db.scalar(
         select(Material)
         .where(
@@ -5224,6 +5337,10 @@ async def delete_material(
     redis=Depends(get_request_redis),
 ):
 
+    _m = await db.get(Material, material_id)
+    if not _m:
+        raise NotFoundError("Material not found")
+    await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
     obj = await db.scalar(
         select(Material).where(
             Material.id == material_id,
@@ -5279,6 +5396,7 @@ async def get_ai_material_recommendation(
     redis=Depends(get_request_redis),
 ):
 
+    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     version = await get_cache_version(redis, VERSION_KEY)
     cache_key = (
         f"cache:materials:ai_rec:{version}:{payload.project_id}:{payload.target_days}"
