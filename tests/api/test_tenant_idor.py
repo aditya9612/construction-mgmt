@@ -595,7 +595,7 @@ def test_equipment_tenant_isolation():
     assert resp.status_code == 200
     assert "items" in resp.json()
 
-    # 7. Super Admin standard equipment API -> BLOCKED
+    # 7. Super Admin equipment API access (Issue #38: SuperAdmin has platform-wide access)
     override_dependency(super_admin_user)
     resp = client.get("/api/v1/equipment/99999")
     assert resp.status_code in (403, 404)
@@ -603,7 +603,7 @@ def test_equipment_tenant_isolation():
     resp = client.get("/api/v1/equipment")
     assert resp.status_code in (200, 403)
     if resp.status_code == 200:
-        assert len(resp.json()["items"]) == 0
+        assert "items" in resp.json()
 
     clear_overrides()
 

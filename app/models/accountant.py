@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     func,
     JSON,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -28,7 +29,7 @@ class Account(Base):
     company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=True)
 
     name = Column(String(100), nullable=False)
-    code = Column(String(20), unique=True, nullable=False)
+    code = Column(String(20), nullable=False)
 
     type = Column(Enum(AccountType), nullable=False)
 
@@ -45,7 +46,10 @@ class Account(Base):
     parent_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
     parent = relationship("Account", remote_side=[id])
 
-    __table_args__ = (Index("ix_accounts_code", "code"),)
+    __table_args__ = (
+        UniqueConstraint("company_id", "code", name="uq_accounts_company_code"),
+        Index("ix_accounts_code", "code"),
+    )
 
 
 # ===================== JOURNAL ENTRY =====================

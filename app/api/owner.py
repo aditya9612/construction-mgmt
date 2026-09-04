@@ -1,19 +1,27 @@
 from datetime import date
 from decimal import Decimal
 from typing import Optional
+from io import BytesIO, StringIO
+import csv
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import and_, case, select
+from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
 
+from app.core.dependencies import require_permission
 from app.core.enums import OwnerTransactionType, ProjectStatus
+from app.core.logger import logger
 from app.db.session import get_db_session
-from app.api.user import get_current_active_user, User
 from app.models.owner import Owner, OwnerTransaction, OwnerPaymentSchedule
 from app.models.project import Project
 from app.models.invoice import Invoice
-from sqlalchemy import select, func
+from app.models.user import User
 from app.schemas.owner import (
     OwnerCreate,
     OwnerUpdate,
@@ -26,18 +34,8 @@ from app.schemas.owner import (
     OwnerPaymentScheduleCreate,
     OwnerPaymentScheduleOut,
 )
-from app.utils.helpers import NotFoundError, ValidationError
-from fastapi.responses import StreamingResponse
-from io import BytesIO, StringIO
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet
-import csv
-from fastapi.responses import StreamingResponse
-from app.core.logger import logger
 from app.utils.common import generate_business_id
-from sqlalchemy.exc import IntegrityError
+from app.utils.helpers import NotFoundError, ValidationError
 
 router = APIRouter(
     prefix="/owners",
@@ -45,14 +43,44 @@ router = APIRouter(
 )
 
 
+async def _get_scoped_owner(
+    db: AsyncSession,
+    owner_id: int,
+    current_user: User,
+) -> Owner:
+    """Retrieve Owner enforcing tenant boundary isolation through Owner.company_id."""
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    query = select(Owner).where(Owner.id == owner_id)
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Owner not found")
+        query = query.where(Owner.company_id == current_user.company_id)
+
+    obj = await db.scalar(query)
+    if not obj:
+        raise NotFoundError("Owner not found")
+
+    return obj
+
+
 @router.post("", response_model=OwnerOut)
 async def create_owner(
     payload: OwnerCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("owners.create")),
 ):
     logger.info(f"Creating owner name={payload.owner_name}")
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="User does not belong to any company.",
+        )
+
+    target_company_id = current_user.company_id
     data = payload.model_dump()
 
     for _ in range(3):
@@ -62,30 +90,46 @@ async def create_owner(
             )
 
             obj = Owner(**data)
-            obj.company_id = current_user.company_id
+            obj.company_id = target_company_id
 
             db.add(obj)
             await db.flush()
+            await db.commit()
             await db.refresh(obj)
 
             logger.info(f"Owner created id={obj.id}")
-
             return OwnerOut.model_validate(obj)
 
         except IntegrityError:
             await db.rollback()
             logger.warning("Retrying owner creation due to duplicate owner_code")
+        except Exception:
+            await db.rollback()
+            logger.exception("Owner creation failed")
+            raise HTTPException(
+                status_code=500,
+                detail="An internal error occurred while creating owner",
+            )
 
-    raise Exception("Failed to create owner with unique owner_code")
+    raise HTTPException(
+        status_code=500,
+        detail="Failed to create owner with unique owner_code after multiple retries",
+    )
 
 
 @router.get("", response_model=list[OwnerOut])
 async def list_owners(
     search: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("owners.view")),
 ):
-    query = select(Owner).where(Owner.company_id == current_user.company_id)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    query = select(Owner)
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.where(Owner.company_id == current_user.company_id)
 
     if search:
         query = query.where(Owner.owner_name.ilike(f"%{search}%"))
@@ -99,7 +143,7 @@ async def list_owners(
 @router.get("/portfolio", response_model=ClientPortfolioResponse)
 async def get_client_portfolio(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("owners.view")),
 ):
     """
     Returns an aggregated view of clients (owners) with their project counts,
@@ -107,8 +151,23 @@ async def get_client_portfolio(
     """
     logger.info("Fetching client portfolio summary")
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     # 1. Fetch all owners
-    owners_result = await db.execute(select(Owner).where(Owner.company_id == current_user.company_id))
+    owners_query = select(Owner)
+    if not is_sa:
+        if current_user.company_id is None:
+            return ClientPortfolioResponse(
+                summary=ClientPortfolioSummary(
+                    total_clients=0,
+                    total_outstanding_billing=Decimal("0"),
+                    average_satisfaction_score=0.0,
+                ),
+                items=[],
+            )
+        owners_query = owners_query.where(Owner.company_id == current_user.company_id)
+
+    owners_result = await db.execute(owners_query)
     owners = owners_result.scalars().all()
 
     portfolio_items = []
@@ -119,10 +178,10 @@ async def get_client_portfolio(
         return ClientPortfolioResponse(
             summary=ClientPortfolioSummary(
                 total_clients=0,
-                total_outstanding_billing=0,
-                average_satisfaction_score=0.0
+                total_outstanding_billing=Decimal("0"),
+                average_satisfaction_score=0.0,
             ),
-            items=[]
+            items=[],
         )
     # Batched Project Stats
     proj_stats_res = await db.execute(
@@ -209,7 +268,7 @@ async def get_client_portfolio(
 
 
 # =========================
-# PAYMENT TRACKER (NEW)
+# PAYMENT TRACKER
 # =========================
 
 
@@ -219,11 +278,43 @@ async def get_all_payments_tracker(
     project_id: Optional[int] = Query(None),
     status: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("owners.view")),
 ):
     """
-    Returns a global view of all owner payments/milestones as seen in the Payment Tracker design.
+    Returns a view of owner payments/milestones scoped to tenant permissions.
     """
-    query = select(OwnerPaymentSchedule)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if not is_sa and current_user.company_id is None:
+        return []
+
+    # If owner_id supplied, assert exists and belongs to caller company
+    if owner_id:
+        owner_q = select(Owner.id).where(Owner.id == owner_id)
+        if not is_sa:
+            owner_q = owner_q.where(Owner.company_id == current_user.company_id)
+        if not await db.scalar(owner_q):
+            raise NotFoundError("Owner not found")
+
+    # If project_id supplied, assert exists and belongs to caller company
+    if project_id:
+        proj_q = select(Project.id).where(Project.id == project_id)
+        if not is_sa:
+            proj_q = proj_q.where(Project.company_id == current_user.company_id)
+        if not await db.scalar(proj_q):
+            raise NotFoundError("Project not found")
+
+    query = (
+        select(OwnerPaymentSchedule)
+        .join(Owner, OwnerPaymentSchedule.owner_id == Owner.id)
+        .join(Project, OwnerPaymentSchedule.project_id == Project.id)
+    )
+
+    if not is_sa:
+        query = query.where(
+            Owner.company_id == current_user.company_id,
+            Project.company_id == current_user.company_id,
+        )
 
     if owner_id:
         query = query.where(OwnerPaymentSchedule.owner_id == owner_id)
@@ -244,10 +335,47 @@ async def get_all_payments_tracker(
 async def create_payment_milestone(
     payload: OwnerPaymentScheduleCreate,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("owners.create")),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if not is_sa and current_user.company_id is None:
+        raise NotFoundError("Owner not found")
+
+    # Validate Owner exists and belongs to tenant
+    owner_q = select(Owner).where(Owner.id == payload.owner_id)
+    if not is_sa:
+        owner_q = owner_q.where(Owner.company_id == current_user.company_id)
+    owner = await db.scalar(owner_q)
+    if not owner:
+        raise NotFoundError("Owner not found")
+
+    # Validate Project exists and belongs to tenant
+    proj_q = select(Project).where(Project.id == payload.project_id)
+    if not is_sa:
+        proj_q = proj_q.where(Project.company_id == current_user.company_id)
+    project = await db.scalar(proj_q)
+    if not project:
+        raise NotFoundError("Project not found")
+
+    # Validate Project.owner_id == Owner.id
+    if project.owner_id != payload.owner_id:
+        logger.warning(
+            f"Project owner mismatch: project={payload.project_id} belongs to owner={project.owner_id}, got owner={payload.owner_id}"
+        )
+        raise NotFoundError("Project not found")
+
     obj = OwnerPaymentSchedule(**payload.model_dump())
     db.add(obj)
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to create payment schedule milestone")
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while creating payment milestone",
+        )
     await db.refresh(obj)
     return obj
 
@@ -256,13 +384,9 @@ async def create_payment_milestone(
 async def get_owner(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("owners.view")),
 ):
-    obj = await db.scalar(select(Owner).where(Owner.id == owner_id))
-
-    if not obj or obj.company_id != current_user.company_id:
-        raise NotFoundError("Owner not found")
-
+    obj = await _get_scoped_owner(db, owner_id, current_user)
     return OwnerOut.model_validate(obj)
 
 
@@ -271,15 +395,11 @@ async def update_owner(
     owner_id: int,
     payload: OwnerUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("owners.edit")),
 ):
     logger.info(f"Updating owner id={owner_id}")
 
-    obj = await db.scalar(select(Owner).where(Owner.id == owner_id))
-
-    if not obj or obj.company_id != current_user.company_id:
-        logger.warning(f"Owner not found id={owner_id}")
-        raise NotFoundError("Owner not found")
+    obj = await _get_scoped_owner(db, owner_id, current_user)
 
     data = payload.model_dump(exclude_unset=True)
 
@@ -288,6 +408,7 @@ async def update_owner(
 
     try:
         await db.flush()
+        await db.commit()
         await db.refresh(obj)
     except IntegrityError:
         await db.rollback()
@@ -296,10 +417,12 @@ async def update_owner(
     except Exception:
         await db.rollback()
         logger.exception(f"Owner update failed id={owner_id}")
-        raise
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while updating owner",
+        )
 
     logger.info(f"Owner updated id={owner_id}")
-
     return OwnerOut.model_validate(obj)
 
 
@@ -307,15 +430,11 @@ async def update_owner(
 async def delete_owner(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("owners.delete")),
 ):
     logger.info(f"Deleting owner id={owner_id}")
 
-    obj = await db.scalar(select(Owner).where(Owner.id == owner_id))
-
-    if not obj or obj.company_id != current_user.company_id:
-        logger.warning(f"Owner not found id={owner_id}")
-        raise NotFoundError("Owner not found")
+    obj = await _get_scoped_owner(db, owner_id, current_user)
 
     # Prevent deletion if projects are linked
     project_count = await db.scalar(
@@ -326,27 +445,29 @@ async def delete_owner(
         logger.warning(
             f"Owner delete blocked id={owner_id}, linked_projects={project_count}"
         )
-
         raise ValidationError(
             f"Owner cannot be deleted because {project_count} project(s) are assigned to this owner. Reassign or delete the projects first."
         )
 
     # Prevent deletion if there are payments
-    from app.models.owner import OwnerPaymentSchedule, OwnerTransaction
-    from app.models.invoice import Invoice
-    payment_count = await db.scalar(select(func.count(OwnerPaymentSchedule.id)).where(OwnerPaymentSchedule.owner_id == owner_id))
-    transaction_count = await db.scalar(select(func.count(OwnerTransaction.id)).where(OwnerTransaction.owner_id == owner_id))
-    invoice_count = await db.scalar(select(func.count(Invoice.id)).where(Invoice.owner_id == owner_id))
+    payment_count = await db.scalar(
+        select(func.count(OwnerPaymentSchedule.id)).where(OwnerPaymentSchedule.owner_id == owner_id)
+    )
+    transaction_count = await db.scalar(
+        select(func.count(OwnerTransaction.id)).where(OwnerTransaction.owner_id == owner_id)
+    )
+    invoice_count = await db.scalar(
+        select(func.count(Invoice.id)).where(Invoice.owner_id == owner_id)
+    )
 
     if (payment_count or 0) > 0 or (transaction_count or 0) > 0 or (invoice_count or 0) > 0:
         logger.warning(f"Owner delete blocked id={owner_id}, related financial records exist.")
         raise ValidationError("Owner cannot be deleted because related financial records exist.")
 
-
     try:
         await db.delete(obj)
         await db.flush()
-
+        await db.commit()
     except IntegrityError:
         await db.rollback()
         logger.warning(f"Owner delete failed due to IntegrityError id={owner_id}")
@@ -354,24 +475,27 @@ async def delete_owner(
     except Exception:
         await db.rollback()
         logger.exception(f"Owner delete failed id={owner_id}")
-        raise
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while deleting owner",
+        )
 
     logger.info(f"Owner deleted id={owner_id}")
-
     return None
 
 
-@router.get("/{owner_id}/payments")
+@router.get("/{owner_id}/payments", response_model=list[OwnerTransactionOut])
 async def get_owner_payments(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("owners.view")),
 ):
-    owner = await db.get(Owner, owner_id)
-    if not owner:
-        raise NotFoundError("Owner not found")
+    owner = await _get_scoped_owner(db, owner_id, current_user)
 
     result = await db.execute(
-        select(OwnerTransaction).where(OwnerTransaction.owner_id == owner_id).order_by(OwnerTransaction.created_at.desc())
+        select(OwnerTransaction)
+        .where(OwnerTransaction.owner_id == owner.id)
+        .order_by(OwnerTransaction.created_at.desc())
     )
     rows = result.scalars().all()
 
@@ -382,13 +506,14 @@ async def get_owner_payments(
 async def get_owner_ledger(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("owners.view")),
 ):
-    owner = await db.get(Owner, owner_id)
-    if not owner:
-        raise NotFoundError("Owner not found")
+    owner = await _get_scoped_owner(db, owner_id, current_user)
 
     result = await db.execute(
-        select(OwnerTransaction).where(OwnerTransaction.owner_id == owner_id).order_by(OwnerTransaction.created_at.desc())
+        select(OwnerTransaction)
+        .where(OwnerTransaction.owner_id == owner.id)
+        .order_by(OwnerTransaction.created_at.desc())
     )
     transactions = result.scalars().all()
 
@@ -416,18 +541,16 @@ async def get_owner_ledger(
 async def export_owner_ledger_pdf(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("owners.export")),
 ):
     logger.info(f"Generating ledger PDF owner_id={owner_id}")
 
-    owner = await db.get(Owner, owner_id)
-    if not owner:
-        logger.warning(f"Owner not found id={owner_id}")
-        raise NotFoundError("Owner not found")
+    owner = await _get_scoped_owner(db, owner_id, current_user)
 
     try:
         result = await db.execute(
             select(OwnerTransaction)
-            .where(OwnerTransaction.owner_id == owner_id)
+            .where(OwnerTransaction.owner_id == owner.id)
             .order_by(OwnerTransaction.created_at.desc())
         )
         transactions = result.scalars().all()
@@ -498,9 +621,14 @@ async def export_owner_ledger_pdf(
 
         buffer.seek(0)
 
+    except ValidationError:
+        raise
     except Exception:
         logger.exception(f"PDF generation failed owner_id={owner_id}")
-        raise
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while generating ledger PDF",
+        )
 
     logger.info(f"Ledger PDF generated owner_id={owner_id}")
 
@@ -517,18 +645,16 @@ async def export_owner_ledger_pdf(
 async def export_owner_ledger_excel(
     owner_id: int,
     db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("owners.export")),
 ):
     logger.info(f"Generating ledger CSV owner_id={owner_id}")
 
-    owner = await db.get(Owner, owner_id)
-    if not owner:
-        logger.warning(f"Owner not found id={owner_id}")
-        raise NotFoundError("Owner not found")
+    owner = await _get_scoped_owner(db, owner_id, current_user)
 
     try:
         result = await db.execute(
             select(OwnerTransaction)
-            .where(OwnerTransaction.owner_id == owner_id)
+            .where(OwnerTransaction.owner_id == owner.id)
             .order_by(OwnerTransaction.created_at.desc())
         )
         transactions = result.scalars().all()
@@ -559,9 +685,14 @@ async def export_owner_ledger_excel(
         byte_buffer.write(string_buffer.getvalue().encode("utf-8"))
         byte_buffer.seek(0)
 
+    except ValidationError:
+        raise
     except Exception:
         logger.exception(f"CSV generation failed owner_id={owner_id}")
-        raise
+        raise HTTPException(
+            status_code=500,
+            detail="An internal error occurred while generating ledger CSV",
+        )
 
     logger.info(f"Ledger CSV generated owner_id={owner_id}")
 

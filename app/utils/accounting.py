@@ -149,3 +149,87 @@ async def get_revenue_account(db: AsyncSession) -> Account:
     if not acc:
         raise ValueError("Revenue account not configured.")
     return acc
+
+
+STANDARD_SYSTEM_ACCOUNTS = [
+    # Assets
+    {"name": "Main Bank Account", "code": "BANK", "type": "ASSET"},
+    {"name": "Primary Cash", "code": "CASH", "type": "ASSET"},
+    {"name": "Petty Cash", "code": "PETTY_CASH", "type": "ASSET"},
+    {"name": "Input GST", "code": "INPUT_GST", "type": "ASSET"},
+    {"name": "Accounts Receivable", "code": "ACCOUNTS_RECEIVABLE", "type": "ASSET"},
+    {"name": "Cash / Bank (1001)", "code": "1001", "type": "ASSET"},
+    {"name": "Accounts Receivable (1200)", "code": "1200", "type": "ASSET"},
+
+    # Liabilities
+    {"name": "Vendor Payable", "code": "VENDOR_PAYABLE", "type": "LIABILITY"},
+    {"name": "Contractor Payable", "code": "CONTRACTOR_PAYABLE", "type": "LIABILITY"},
+    {"name": "Wages Payable", "code": "WAGES_PAYABLE", "type": "LIABILITY"},
+    {"name": "Output GST", "code": "OUTPUT_GST", "type": "LIABILITY"},
+    {"name": "TDS Payable", "code": "TDS_PAYABLE", "type": "LIABILITY"},
+    {"name": "Retention Payable", "code": "RETENTION_PAYABLE", "type": "LIABILITY"},
+
+    # Income
+    {"name": "Sales Revenue", "code": "SALES_REVENUE", "type": "INCOME"},
+
+    # Expenses
+    {"name": "General Expense", "code": "GENERAL_EXPENSE", "type": "EXPENSE"},
+    {"name": "Operating Expense", "code": "EXPENSE", "type": "EXPENSE"},
+    {"name": "Labour Expense", "code": "LABOUR_EXPENSE", "type": "EXPENSE"},
+    {"name": "Wages Expense", "code": "WAGES_EXPENSE", "type": "EXPENSE"},
+    {"name": "Staff Salary Expense", "code": "SALARY_EXPENSE", "type": "EXPENSE"},
+    {"name": "Contractor Expense", "code": "CONTRACTOR_EXPENSE", "type": "EXPENSE"},
+]
+
+
+async def seed_company_chart_of_accounts(db: AsyncSession, company_id: int) -> dict:
+    """
+    Seeds the standard Chart of Accounts for a company idempotently,
+    and links the default accounts to CompanySettings.
+    """
+    from app.core.enums import AccountType
+    from app.models.settings import CompanySettings
+
+    # 1. Fetch existing accounts for this company
+    existing = await db.scalars(
+        select(Account).where(Account.company_id == company_id)
+    )
+    acc_map = {a.code: a for a in existing.all()}
+
+    # 2. Insert missing standard accounts
+    for item in STANDARD_SYSTEM_ACCOUNTS:
+        if item["code"] not in acc_map:
+            acc_type = AccountType[item["type"]]
+            new_acc = Account(
+                company_id=company_id,
+                name=item["name"],
+                code=item["code"],
+                type=acc_type,
+            )
+            db.add(new_acc)
+            await db.flush()
+            acc_map[item["code"]] = new_acc
+
+    # 3. Connect default account IDs into CompanySettings
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == company_id)
+    )
+    if settings:
+        if not settings.primary_cash_account_id and "CASH" in acc_map:
+            settings.primary_cash_account_id = acc_map["CASH"].id
+        if not settings.petty_cash_account_id and "PETTY_CASH" in acc_map:
+            settings.petty_cash_account_id = acc_map["PETTY_CASH"].id
+        if not settings.wages_account_id and "WAGES_EXPENSE" in acc_map:
+            settings.wages_account_id = acc_map["WAGES_EXPENSE"].id
+        if not settings.staff_salary_account_id and "SALARY_EXPENSE" in acc_map:
+            settings.staff_salary_account_id = acc_map["SALARY_EXPENSE"].id
+        if not settings.contractor_expense_account_id and "CONTRACTOR_EXPENSE" in acc_map:
+            settings.contractor_expense_account_id = acc_map["CONTRACTOR_EXPENSE"].id
+        if not settings.tds_payable_account_id and "TDS_PAYABLE" in acc_map:
+            settings.tds_payable_account_id = acc_map["TDS_PAYABLE"].id
+        if not settings.retention_payable_account_id and "RETENTION_PAYABLE" in acc_map:
+            settings.retention_payable_account_id = acc_map["RETENTION_PAYABLE"].id
+        await db.flush()
+
+    return acc_map
+

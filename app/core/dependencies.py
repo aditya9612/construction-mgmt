@@ -166,6 +166,7 @@ async def get_current_user(
 
 async def get_current_active_user(
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> User:
     if not current_user.is_active:
         raise HTTPException(
@@ -174,6 +175,27 @@ async def get_current_active_user(
 
     #  SET USER ID IN CONTEXT
     set_current_user_id(current_user.id)
+
+    # P0-1: Super Admin immediately returns, never blocked by tenant state
+    if getattr(current_user, "is_super_admin", False) is True:
+        return current_user
+
+    # Normal user must belong to a company
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not belong to any company.",
+        )
+
+    # Normal user company must exist and be active
+    company = await db.scalar(
+        select(Company).where(Company.id == current_user.company_id)
+    )
+    if not company or not company.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Company is inactive or not found.",
+        )
 
     return current_user
 
@@ -345,16 +367,13 @@ def has_permission(effective_permissions: set[str], required: str) -> bool:
 def require_permission(permission: str):
     """
     FastAPI dependency factory enforcing a single granular permission.
-    Evaluates Super Admin bypass, Tenant Admin bypass, and database-driven effective permissions.
+    Evaluates Super Admin bypass and database-driven effective permissions.
     """
     async def _dependency(
         current_user: User = Depends(get_current_active_user),
         db: AsyncSession = Depends(get_db_session),
     ) -> User:
-        if current_user.is_super_admin:
-            return current_user
-
-        if current_user.role == UserRole.ADMIN.value or current_user.role == "Admin":
+        if getattr(current_user, "is_super_admin", False) is True:
             return current_user
 
         effective_perms = await get_effective_user_permissions(db, current_user)
@@ -377,16 +396,13 @@ def require_permission(permission: str):
 def require_permissions(required_permissions: list[str]):
     """
     FastAPI dependency factory enforcing multiple permissions (all must be satisfied).
-    Evaluates Super Admin bypass, Tenant Admin bypass, and database-driven effective permissions.
+    Evaluates Super Admin bypass and database-driven effective permissions.
     """
     async def _dependency(
         current_user: User = Depends(get_current_active_user),
         db: AsyncSession = Depends(get_db_session),
     ) -> User:
-        if current_user.is_super_admin:
-            return current_user
-
-        if current_user.role == UserRole.ADMIN.value or current_user.role == "Admin":
+        if getattr(current_user, "is_super_admin", False) is True:
             return current_user
 
         effective_perms = await get_effective_user_permissions(db, current_user)

@@ -499,13 +499,25 @@ async def update_role_status(
             )
         )
 
-    # Fetch all non-deleted users with this role
-    result = await db.execute(
-        select(User).where(
-            User.role == role,
-            User.is_deleted == False
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    # P0-2 invariant: non-Super Admin users with company_id=None must be rejected with 403
+    if not is_sa and current_user.company_id is None:
+        raise AppError(
+            status_code=403,
+            message="User does not belong to any company."
         )
+
+    # Fetch all non-deleted users with this role, excluding Super Admin users
+    stmt = select(User).where(
+        User.role == role,
+        User.is_deleted == False,
+        User.is_super_admin == False,
     )
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    result = await db.execute(stmt)
     users = result.scalars().all()
 
     if not users:
@@ -780,6 +792,28 @@ async def get_user_audit_logs(
 ):
     logger.info(f"Fetching audit logs for user id={user_id}")
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if not is_sa:
+        target_user = await db.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.company_id == current_user.company_id,
+                User.is_deleted == False,
+            )
+        )
+        if target_user is None:
+            raise NotFoundError("User not found")
+    else:
+        target_user = await db.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.is_deleted == False,
+            )
+        )
+        if target_user is None:
+            raise NotFoundError("User not found")
+
     query = select(UserAuditLog).where(UserAuditLog.user_id == user_id)
 
     # filter by date range
@@ -810,6 +844,28 @@ async def get_grouped_audit_logs(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if not is_sa:
+        target_user = await db.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.company_id == current_user.company_id,
+                User.is_deleted == False,
+            )
+        )
+        if target_user is None:
+            raise NotFoundError("User not found")
+    else:
+        target_user = await db.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.is_deleted == False,
+            )
+        )
+        if target_user is None:
+            raise NotFoundError("User not found")
+
     result = await db.execute(
         select(UserAuditLog)
         .where(UserAuditLog.user_id == user_id)

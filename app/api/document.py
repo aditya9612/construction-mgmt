@@ -5,39 +5,51 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, File, UploadFile, Form
-from sqlalchemy import func, select
+from sqlalchemy import func, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.responses import StreamingResponse, FileResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
-from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
+from app.core.dependencies import get_request_redis, require_permission
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.document import Document
 from app.models.project import Project
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.core.enums import DocumentStatus
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.document import DocumentCreate, DocumentOut, DocumentUpdate, DocumentStats
 from app.utils.helpers import NotFoundError, ValidationError
-
-DOCUMENT_WRITE_ROLES = [r.value for r in [
-    UserRole.ADMIN,
-    UserRole.PROJECT_MANAGER,
-    UserRole.SITE_ENGINEER,
-]]
-
-DOCUMENT_DELETE_ROLES = [r.value for r in [
-    UserRole.ADMIN,
-    UserRole.PROJECT_MANAGER,
-]]
 
 router = APIRouter(prefix="/documents", tags=["documents"], dependencies=[default_rate_limiter_dependency()])
 
 VERSION_KEY = "cache_version:documents"
 UPLOAD_DIR = Path("uploads/documents")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_delete_physical_file(file_path: Optional[str]) -> None:
+    """
+    Safely delete a physical file from the storage directory.
+    - Prevents arbitrary filesystem path deletion / path traversal.
+    - Missing files or OS errors do not fail the database operation.
+    """
+    if not file_path:
+        return
+    try:
+        base_dir = UPLOAD_DIR.resolve()
+        target_path = Path(file_path).resolve()
+        if not target_path.is_relative_to(base_dir):
+            return
+        if target_path.is_file():
+            try:
+                target_path.unlink()
+            except (FileNotFoundError, PermissionError, OSError):
+                pass
+    except Exception:
+        pass
+
 
 def is_real_value(value):
     """
@@ -49,14 +61,17 @@ def is_real_value(value):
     """
     return value not in (None, "", "string")
 
+
 @router.get("/stats", response_model=DocumentStats)
 async def get_document_stats(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("documents.view")),
 ):
     """
     Returns statistics for the document repository scoped to the tenant.
     """
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     size_query = (
         select(func.coalesce(func.sum(Document.file_size), 0))
         .join(Project, Document.project_id == Project.id)
@@ -80,7 +95,7 @@ async def get_document_stats(
         )
     )
 
-    if not current_user.is_super_admin:
+    if not is_sa:
         size_query = size_query.where(Project.company_id == current_user.company_id)
         pending_query = pending_query.where(Project.company_id == current_user.company_id)
         docs_query = docs_query.where(Project.company_id == current_user.company_id)
@@ -105,16 +120,29 @@ async def create_document(
     parent_id: Optional[int] = Form(None),
     remarks: Optional[str] = Form(None),
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(DOCUMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("documents.upload")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     """
     Uploads a physical file and creates a document record.
     """
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     project = await db.get(Project, project_id)
-    if not project or (not current_user.is_super_admin and project.company_id != current_user.company_id):
+    if not project or (not is_sa and project.company_id != current_user.company_id):
         raise NotFoundError("Project not found")
+
+    # Validate parent folder if provided
+    if parent_id is not None:
+        parent = await db.get(Document, parent_id)
+        if (
+            not parent
+            or parent.is_deleted
+            or not parent.is_folder
+            or parent.project_id != project_id
+        ):
+            raise NotFoundError("Parent folder not found")
 
     # =====================================
     # SECURE VALIDATION AND SAVE
@@ -161,16 +189,29 @@ async def create_folder(
     project_id: int,
     title: str,
     parent_id: Optional[int] = None,
-    current_user: User = Depends(require_roles(DOCUMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("documents.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     """
     Creates a new folder in the document repository.
     """
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     project = await db.get(Project, project_id)
-    if not project or (not current_user.is_super_admin and project.company_id != current_user.company_id):
+    if not project or (not is_sa and project.company_id != current_user.company_id):
         raise NotFoundError("Project not found")
+
+    # Validate parent folder if provided
+    if parent_id is not None:
+        parent = await db.get(Document, parent_id)
+        if (
+            not parent
+            or parent.is_deleted
+            or not parent.is_folder
+            or parent.project_id != project_id
+        ):
+            raise NotFoundError("Parent folder not found")
 
     obj = Document(
         project_id=project_id,
@@ -201,12 +242,14 @@ async def list_documents(
     document_type: Optional[str] = None,
     project_id: Optional[int] = None,
     parent_id: Optional[int] = None,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("documents.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     version = await get_cache_version(redis, VERSION_KEY)
-    cid = current_user.company_id or "all"
+    cid = "global" if is_sa else str(current_user.company_id)
     cache_key = f"cache:documents:list:{cid}:{version}:{limit}:{offset}:{search}:{document_type}:{project_id}:{parent_id}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
@@ -225,7 +268,7 @@ async def list_documents(
         .where(Document.is_deleted == False)
     )
 
-    if not current_user.is_super_admin:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
         count_query = count_query.where(Project.company_id == current_user.company_id)
 
@@ -245,16 +288,12 @@ async def list_documents(
     if parent_id is not None:
         query = query.where(Document.parent_id == parent_id)
         count_query = count_query.where(Document.parent_id == parent_id)
-    else:
-        # Default to root documents if no parent_id specified (optional logic)
-        # query = query.where(Document.parent_id == None)
-        pass
 
     query = query.order_by(Document.is_folder.desc(), Document.id.desc()).limit(limit).offset(offset)
 
     total = await db.scalar(count_query)
     result = await db.execute(query)
-    
+
     items = []
     for doc, proj_name in result.all():
         out = DocumentOut.model_validate(doc)
@@ -270,12 +309,14 @@ async def list_documents(
 @router.get("/{document_id}", response_model=DocumentOut)
 async def get_document(
     document_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("documents.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     version = await get_cache_version(redis, VERSION_KEY)
-    cid = current_user.company_id or "all"
+    cid = "global" if is_sa else str(current_user.company_id)
     cache_key = f"cache:documents:get:{cid}:{version}:{document_id}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
@@ -286,7 +327,7 @@ async def get_document(
         .join(Project, Document.project_id == Project.id)
         .where(Document.id == document_id, Document.is_deleted == False)
     )
-    if not current_user.is_super_admin:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
 
     result = await db.execute(query)
@@ -310,16 +351,18 @@ async def update_document(
     status: Optional[DocumentStatus] = Form(None),
     version: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
-    current_user: User = Depends(require_roles(DOCUMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("documents.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     query = (
         select(Document, Project.project_name)
         .join(Project, Document.project_id == Project.id)
         .where(Document.id == document_id, Document.is_deleted == False)
     )
-    if not current_user.is_super_admin:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
 
     row = (await db.execute(query)).first()
@@ -343,12 +386,11 @@ async def update_document(
     if is_real_value(version):
         obj.version = version
 
-
     # Replace file if uploaded
     if file is not None:
-        # Delete old file
-        if obj.file_url and os.path.exists(obj.file_url):
-            os.remove(obj.file_url)
+        # Delete old file safely
+        if obj.file_url:
+            _safe_delete_physical_file(obj.file_url)
 
         # Save new file
         from app.core.validators import validate_and_save_document
@@ -380,16 +422,18 @@ async def update_document(
 @router.delete("/{document_id}", status_code=204)
 async def delete_document(
     document_id: int,
-    current_user: User = Depends(require_roles(DOCUMENT_DELETE_ROLES)),
+    current_user: User = Depends(require_permission("documents.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     query = (
         select(Document)
         .join(Project, Document.project_id == Project.id)
         .where(Document.id == document_id, Document.is_deleted == False)
     )
-    if not current_user.is_super_admin:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
 
     obj = await db.scalar(query)
@@ -399,9 +443,42 @@ async def delete_document(
     if obj.status in [DocumentStatus.UNDER_REVIEW, DocumentStatus.APPROVED]:
         raise ValidationError(f"Cannot delete document. Current status is {obj.status}")
 
-    # Delete physical file
-    if obj.file_url and os.path.exists(obj.file_url):
-        os.remove(obj.file_url)
+    files_to_delete = set()
+    if obj.file_url:
+        files_to_delete.add(obj.file_url)
+
+    all_descendant_ids = []
+    if obj.is_folder:
+        # Iteratively collect physical files of all descendant documents across arbitrary nesting depth
+        current_parent_ids = [obj.id]
+        while current_parent_ids:
+            children = (
+                await db.execute(
+                    select(Document.id, Document.is_folder, Document.file_url).where(
+                        Document.parent_id.in_(current_parent_ids),
+                    )
+                )
+            ).all()
+
+            next_parent_ids = []
+            for child_id, is_f, furl in children:
+                all_descendant_ids.append(child_id)
+                if furl:
+                    files_to_delete.add(furl)
+                if is_f:
+                    next_parent_ids.append(child_id)
+
+            current_parent_ids = next_parent_ids
+
+    # Safely delete physical files (guarded against path traversal and missing files)
+    for file_path in files_to_delete:
+        _safe_delete_physical_file(file_path)
+
+    # Delete all descendant database records across all nesting levels
+    if all_descendant_ids:
+        await db.execute(
+            delete(Document).where(Document.id.in_(all_descendant_ids))
+        )
 
     # Delete database record
     await db.delete(obj)
@@ -414,32 +491,39 @@ async def delete_document(
 @router.get("/{document_id}/download")
 async def download_document(
     document_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("documents.download")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     query = (
         select(Document)
         .join(Project, Document.project_id == Project.id)
         .where(Document.id == document_id, Document.is_deleted == False)
     )
-    if not current_user.is_super_admin:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
 
     doc = await db.scalar(query)
     if not doc or not doc.file_url:
         raise NotFoundError("Document or file not found")
 
-    if not os.path.exists(doc.file_url):
+    try:
+        base_dir = UPLOAD_DIR.resolve()
+        target_path = Path(doc.file_url).resolve()
+        if not target_path.is_relative_to(base_dir) or not target_path.is_file():
+            raise NotFoundError("Physical file not found")
+    except Exception:
         raise NotFoundError("Physical file not found")
 
     # Extract extension from stored file path
-    file_extension = Path(doc.file_url).suffix  # .jpg, .png, .pdf, etc.
+    file_extension = target_path.suffix  # .jpg, .png, .pdf, etc.
 
     # Preserve extension in download name
     download_name = f"{doc.title}{file_extension}"
 
     return FileResponse(
-        path=doc.file_url,
+        path=str(target_path),
         filename=download_name,
         media_type="application/octet-stream",
     )

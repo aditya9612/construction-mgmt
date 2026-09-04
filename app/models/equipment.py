@@ -53,12 +53,24 @@ class Equipment(Base, TimestampMixin):
             "project_id",
             "condition",
         ),
+        Index(
+            "ix_equipment_company_project",
+            "company_id",
+            "project_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
         Integer,
         primary_key=True,
         autoincrement=True,
+    )
+
+    company_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
     )
 
     project_id: Mapped[Optional[int]] = mapped_column(

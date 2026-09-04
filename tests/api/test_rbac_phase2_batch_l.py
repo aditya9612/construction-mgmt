@@ -854,8 +854,8 @@ async def test_batch_l_critical_super_admin():
                 await db.commit()
 
             res_dummy = await ac.get(f"/api/v1/client-payments/{pay_a1_id}", headers={"Authorization": f"Bearer {token_dummy}"})
-            # Since company_id is None and not super admin, payment lookup with company_id==None matches nothing -> 404
-            assert res_dummy.status_code == 404
+            # Under P0-1, company_id is None and not super admin -> rejected at auth dependency (403 Forbidden)
+            assert res_dummy.status_code in (403, 404)
 
 
 @pytest.mark.asyncio
