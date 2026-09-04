@@ -60,6 +60,7 @@ from app.api.accountant import router as accountant_router
 from app.api.vendor_bills import router as vendor_bills_router
 from app.api.chat import router as chats_router
 from app.api.quotation import router as quotation_router
+from app.api.dummy_quotation import router as dummy_quotation_router
 from app.api.agreement import router as agreement_router
 from app.api.project_visualization import router as visualization_router
 from app.api.attendance import router as attendance_router
@@ -330,6 +331,7 @@ def create_app() -> FastAPI:
     api_router.include_router(work_order_router)
     api_router.include_router(work_progress_router)
     api_router.include_router(quotation_router)
+    api_router.include_router(dummy_quotation_router)
     api_router.include_router(reports_router)
     api_router.include_router(alert_router)
     api_router.include_router(cad_router)

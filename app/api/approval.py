@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -184,6 +184,7 @@ async def list_approvals(
 async def approve(
     id: int,
     payload: ApprovalAction,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(require_roles(APPROVAL_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -272,6 +273,23 @@ async def approve(
         message=f"Your {obj.entity_type} approval request has been Approved.",
         type="success"
     )
+    
+    # WhatsApp Notification for Material/PO Approvals
+    if obj.entity_type in ["purchase_order", "boq", "measurement"]:
+        requester_user = await db.get(User, obj.requested_by)
+        if requester_user and requester_user.mobile:
+            from app.services.whatsapp_service import send_whatsapp_template
+            from app.core.config import settings
+            background_tasks.add_task(
+                send_whatsapp_template,
+                requester_user.mobile,
+                settings.WHATSAPP_MATERIAL_APPROVAL_TEMPLATE,
+                [
+                    {"type": "text", "text": obj.entity_type.replace('_', ' ').title()},
+                    {"type": "text", "text": str(obj.entity_id)}
+                ]
+            )
+
     await db.commit()
     
     return {"message": "Approved"}

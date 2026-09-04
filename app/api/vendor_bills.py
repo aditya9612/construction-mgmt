@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import List
@@ -31,6 +31,7 @@ ACCOUNTANT_WRITE_ROLES = ["Admin", "Accountant"]
 @router.post("", response_model=VendorBillOut, status_code=201)
 async def create_vendor_bill(
     payload: VendorBillCreate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES))
 ):
@@ -88,17 +89,31 @@ async def create_vendor_bill(
 
     try:
         async with AsyncSessionLocal() as notif_db:
-            members = await notif_db.scalars(
-                select(ProjectMember.user_id).where(ProjectMember.project_id == payload.project_id)
+            # Fetch users to get mobile numbers for WhatsApp
+            members_result = await notif_db.execute(
+                select(User).join(ProjectMember, ProjectMember.user_id == User.id).where(ProjectMember.project_id == payload.project_id)
             )
-            for member_id in members.all():
+            users = members_result.scalars().all()
+            for u in users:
                 await create_notification(
                     db=notif_db,
-                    user_id=member_id,
+                    user_id=u.id,
                     title="Vendor Bill Created",
                     message=f"Vendor Bill {bill.bill_number} has been created for project.",
                     type="INFO"
                 )
+                if u.mobile:
+                    from app.services.whatsapp_service import send_whatsapp_template
+                    from app.core.config import settings
+                    background_tasks.add_task(
+                        send_whatsapp_template,
+                        u.mobile,
+                        settings.WHATSAPP_VENDOR_BILL_TEMPLATE,
+                        [
+                            {"type": "text", "text": bill.bill_number},
+                            {"type": "text", "text": str(bill.total_amount)}
+                        ]
+                    )
             await notif_db.commit()
     except Exception as e:
         logger.error(f"Failed to create notification for vendor bill creation: {e}")
