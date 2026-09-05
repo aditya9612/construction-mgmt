@@ -52,12 +52,16 @@ MODULES = [
     "expenses",
     "invoices",
     "quotations",
+    "vendor_bills",
+    "payment_vouchers",
+    "journal",
 
     # =====================================================
-    # CONTRACTORS & OWNERS
+    # CONTRACTORS, WORK ORDERS & OWNERS
     # =====================================================
 
     "contractors",
+    "work_orders",
     "owners",
 
     # =====================================================
@@ -98,6 +102,12 @@ MODULES = [
     "alerts",
 
     # =====================================================
+    # APPROVALS
+    # =====================================================
+
+    "approvals",
+
+    # =====================================================
     # SETTINGS
     # =====================================================
 
@@ -119,13 +129,52 @@ ACTIONS = [
 ]
 
 
+MODULE_ACTIONS = {
+    "approvals": [
+        "view",
+        "create",
+        "approve",
+    ],
+    "work_orders": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+    ],
+    "vendor_bills": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+        "approve",
+        "pay",
+    ],
+    "payment_vouchers": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+        "pay",
+    ],
+    "journal": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+        "export",
+    ],
+}
+
+
 async def seed_permissions(db: AsyncSession):
 
     created = 0
 
     for module in MODULES:
 
-        for action in ACTIONS:
+        actions = MODULE_ACTIONS.get(module, ACTIONS)
+
+        for action in actions:
 
             code = f"{module}.{action}"
 

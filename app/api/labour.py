@@ -2327,7 +2327,13 @@ async def create_wage_record(
     except Exception:
         raise NotFoundError("Project not found")
 
-    labour = await db.get(Labour, payload.labour_id)
+    labour = (
+        await db.execute(
+            select(Labour)
+            .options(selectinload(Labour.labour_type))
+            .where(Labour.id == payload.labour_id)
+        )
+    ).scalar_one_or_none()
     if not labour or (
         current_user.company_id is not None
         and labour.company_id != current_user.company_id
@@ -2418,6 +2424,7 @@ async def create_wage_record(
             )
             db.add(wage_record)
             await db.flush()
+            await db.refresh(wage_record)
     except DBAPIError as e:
         if (
             e.orig
@@ -2434,6 +2441,7 @@ async def create_wage_record(
             )
         raise
 
+    wage_record.labour_name = labour.labour_name
     return wage_record
 
 

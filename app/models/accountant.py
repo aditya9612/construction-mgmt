@@ -12,8 +12,10 @@ from sqlalchemy import (
     func,
     JSON,
     UniqueConstraint,
+    select,
 )
 from sqlalchemy.orm import relationship
+from sqlalchemy.ext.hybrid import hybrid_property
 from datetime import datetime
 import enum
 from sqlalchemy import Text
@@ -352,6 +354,16 @@ class BankAccount(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+    account = relationship("Account")
+
+    @hybrid_property
+    def company_id(self):
+        return self.account.company_id if self.account else None
+
+    @company_id.expression
+    def company_id(cls):
+        return select(Account.company_id).where(Account.id == cls.account_id).scalar_subquery()
 
 
 class RecurringJournal(Base):

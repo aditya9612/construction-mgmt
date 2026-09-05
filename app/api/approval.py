@@ -1,99 +1,201 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+import logging
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
 from app.models.approval import Approval
 from app.schemas.approval import ApprovalCreate, ApprovalOut, ApprovalAction
-
-from app.models.user import User, UserRole
-from app.core.dependencies import get_current_active_user, require_roles
-
-from app.utils.helpers import NotFoundError, ValidationError
+from app.models.user import User
+from app.core.dependencies import require_permission
 from app.services.notification_service import create_notification
+from app.core.enums import DocumentStatus
 
-APPROVAL_ROLES = [role.value for role in UserRole]
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/approvals", tags=["Approvals"])
 
-async def verify_approval_entity_access(db: AsyncSession, entity_type: str, entity_id: int, current_user: User):
-    if not current_user.company_id:
-        raise HTTPException(status_code=403, detail="Super Admin cannot access tenant approvals directly.")
 
+def _check_tenant_access(current_user: User) -> bool:
+    """
+    Validates tenant access according to canonical Super Admin and multi-tenant rules.
+    - Canonical SA check: getattr(current_user, "is_super_admin", False) is True
+    - Non-SA users with company_id=None are strictly denied with HTTP 403.
+    Returns True if user is Super Admin, False otherwise.
+    """
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User must belong to a company to access approvals.",
+        )
+    return is_sa
+
+
+async def verify_approval_entity_access(
+    db: AsyncSession,
+    entity_type: str,
+    entity_id: int,
+    current_user: User,
+    is_sa: bool,
+):
+    """
+    Validates existence and tenant ownership of the target entity.
+    Foreign/nonexistent target entities are masked with HTTP 404 to prevent enumeration.
+    Super Admins are granted cross-company operational access.
+    """
     entity_type_lower = entity_type.lower()
 
     if entity_type_lower == "boq":
         from app.models.boq import BOQ
+
         entity = await db.get(BOQ, entity_id)
-        if not entity: raise NotFoundError("BOQ not found")
+        if not entity:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="BOQ not found",
+            )
         project_id = entity.project_id
+
     elif entity_type_lower == "measurement":
         from app.models.final_measurement import FinalMeasurement
+
         entity = await db.get(FinalMeasurement, entity_id)
-        if not entity: raise NotFoundError("Measurement not found")
+        if not entity:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Measurement not found",
+            )
         project_id = entity.project_id
+
     elif entity_type_lower == "purchase_order":
         from app.models.material import PurchaseOrder
+
         entity = await db.get(PurchaseOrder, entity_id)
-        if not entity: raise NotFoundError("Purchase Order not found")
+        if not entity or getattr(entity, "is_deleted", False):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Purchase Order not found",
+            )
         project_id = entity.project_id
+
     elif entity_type_lower == "document":
         from app.models.document import Document
+
         entity = await db.get(Document, entity_id)
-        if not entity: raise NotFoundError("Document not found")
+        if not entity or getattr(entity, "is_deleted", False):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found",
+            )
         project_id = entity.project_id
+
     elif entity_type_lower == "drawing":
         from app.models.project import DrawingDocument
+
         entity = await db.get(DrawingDocument, entity_id)
-        if not entity: raise NotFoundError("Drawing not found")
+        if not entity:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Drawing not found",
+            )
         project_id = entity.project_id
+
     elif entity_type_lower == "bill":
         from app.models.billing import RABill
+
         entity = await db.get(RABill, entity_id)
-        if not entity: raise NotFoundError("Bill not found")
+        if not entity:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Bill not found",
+            )
         project_id = entity.project_id
+
     elif entity_type_lower == "journal_entry":
         from app.models.accountant import JournalEntry
+
         entity = await db.get(JournalEntry, entity_id)
-        if not entity: raise NotFoundError("Journal Entry not found")
-        
+        if not entity:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Journal Entry not found",
+            )
+        if entity.created_by is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Journal Entry not found",
+            )
         owner_user = await db.get(User, entity.created_by)
-        if not owner_user or owner_user.company_id != current_user.company_id:
-            raise HTTPException(status_code=403, detail="Cross-tenant access not allowed")
+        if not owner_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Journal Entry not found",
+            )
+        if not is_sa and owner_user.company_id != current_user.company_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Journal Entry not found",
+            )
         return entity
+
     else:
-        raise ValidationError(f"Unsupported entity type: {entity_type}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported entity type: '{entity_type}'. Supported types are: boq, measurement, purchase_order, document, drawing, bill, journal_entry",
+        )
 
-    if 'project_id' in locals() and project_id is not None:
-        from app.models.project import Project
-        project = await db.get(Project, project_id)
-        if not project or project.company_id != current_user.company_id:
-            raise HTTPException(status_code=403, detail="Cross-tenant access not allowed")
-    
+    # For project-scoped entities: validate project ownership
+    if project_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"{entity_type} not found",
+        )
+
+    from app.models.project import Project
+
+    project = await db.get(Project, project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"{entity_type} not found",
+        )
+
+    if not is_sa and project.company_id != current_user.company_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"{entity_type} not found",
+        )
+
     return entity
-
-
 
 
 @router.post("", response_model=ApprovalOut)
 async def create_approval(
     payload: ApprovalCreate,
-    current_user: User = Depends(require_roles(APPROVAL_ROLES)),
+    current_user: User = Depends(require_permission("approvals.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # Verify entity ownership first
-    await verify_approval_entity_access(db, payload.entity_type, payload.entity_id, current_user)
+    is_sa = _check_tenant_access(current_user)
 
+    # Verify entity ownership and existence
+    entity = await verify_approval_entity_access(
+        db, payload.entity_type, payload.entity_id, current_user, is_sa
+    )
+
+    # Prevent duplicate Pending approvals for the same entity
     existing = await db.scalar(
         select(Approval).where(
-            Approval.entity_type == payload.entity_type,
+            func.lower(Approval.entity_type) == payload.entity_type.lower(),
             Approval.entity_id == payload.entity_id,
             Approval.status == "Pending",
         )
     )
-    
     if existing:
-        raise ValidationError("Approval already exists")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A pending approval request already exists for this entity.",
+        )
 
     obj = Approval(
         entity_type=payload.entity_type,
@@ -102,78 +204,66 @@ async def create_approval(
         remarks=payload.remarks,
         status="Pending",
     )
-
     db.add(obj)
-
     await db.flush()
 
-    if payload.entity_type.lower() == "boq":
-        from app.models.boq import BOQ
+    entity_type_lower = payload.entity_type.lower()
+    if entity_type_lower == "boq":
+        entity.approval_status = "Pending"
 
-        boq = await db.get(BOQ, payload.entity_id)
+    elif entity_type_lower == "measurement":
+        entity.status = "SUBMITTED"
 
-        if boq:
-            boq.approval_status = "Pending"
+    elif entity_type_lower == "purchase_order":
+        if entity.status not in ["CREATED", "REJECTED"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot submit PO for approval. Current status is {entity.status}",
+            )
+        entity.status = "PENDING"
 
-    elif payload.entity_type == "measurement":
-        from app.models.final_measurement import FinalMeasurement
-        measurement = await db.get(FinalMeasurement, payload.entity_id)
-        if measurement:
-            measurement.status = "SUBMITTED"
+    elif entity_type_lower == "document":
+        if entity.status not in [DocumentStatus.PENDING, DocumentStatus.REJECTED]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot submit document for approval. Current status is {entity.status}",
+            )
+        entity.status = DocumentStatus.UNDER_REVIEW
 
-    elif payload.entity_type == "purchase_order":
-        from app.models.material import PurchaseOrder
-        po = await db.get(PurchaseOrder, payload.entity_id)
-        if not po:
-            raise ValidationError("Purchase Order not found")
-        if po.status not in ["CREATED", "REJECTED"]:
-            raise ValidationError(f"Cannot submit PO for approval. Current status is {po.status}")
-        po.status = "PENDING"
+    elif entity_type_lower == "drawing":
+        entity.approval_status = DocumentStatus.UNDER_REVIEW
+        entity.approval_id = obj.id
 
-    elif payload.entity_type == "document":
-        from app.models.document import Document
-        from app.core.enums import DocumentStatus
-        
-        doc = await db.get(Document, payload.entity_id)
-        if not doc:
-            raise ValidationError("Document not found")
-        if doc.status not in [DocumentStatus.PENDING, DocumentStatus.REJECTED]:
-            raise ValidationError(f"Cannot submit document for approval. Current status is {doc.status}")
-        doc.status = DocumentStatus.UNDER_REVIEW
-
-    elif obj.entity_type == "drawing":
-        from app.models.project import DrawingDocument
-        from app.core.enums import DocumentStatus
-
-        drawing = await db.get(
-            DrawingDocument,
-            obj.entity_id
+    try:
+        await db.commit()
+        await db.refresh(obj)
+    except Exception as exc:
+        await db.rollback()
+        logger.exception(f"Failed to create approval request: {exc}")
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while creating the approval.",
         )
 
-        if drawing:
-            drawing.approval_status = DocumentStatus.UNDER_REVIEW
-            drawing.approval_id = obj.id
-            
-    await db.flush()
-    await db.commit()
-    await db.refresh(obj)
-
     return ApprovalOut.model_validate(obj)
+
 
 @router.get("", response_model=list[ApprovalOut])
 async def list_approvals(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(APPROVAL_ROLES)),
+    current_user: User = Depends(require_permission("approvals.view")),
 ):
-    if not current_user.company_id:
-        return []
-    
-    stmt = (
-        select(Approval)
-        .join(User, Approval.requested_by == User.id)
-        .where(User.company_id == current_user.company_id)
-        .order_by(Approval.id.desc())
-    )
+    is_sa = _check_tenant_access(current_user)
+
+    stmt = select(Approval).join(User, Approval.requested_by == User.id)
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+    elif current_user.company_id is not None:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    stmt = stmt.order_by(Approval.id.desc())
     result = await db.execute(stmt)
     rows = result.scalars().all()
 
@@ -184,96 +274,102 @@ async def list_approvals(
 async def approve(
     id: int,
     payload: ApprovalAction,
-    current_user: User = Depends(require_roles(APPROVAL_ROLES)),
+    current_user: User = Depends(require_permission("approvals.approve")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
+
     obj = await db.get(Approval, id)
     if not obj:
-        raise NotFoundError("Approval not found")
-        
-    # Verify Approval ownership
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval not found",
+        )
+
+    # Verify approval tenant ownership
     requester = await db.get(User, obj.requested_by)
-    if not requester or requester.company_id != current_user.company_id:
-        raise HTTPException(status_code=403, detail="Cross-tenant approval access not allowed")
+    if not requester:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval not found",
+        )
+    if not is_sa and requester.company_id != current_user.company_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval not found",
+        )
 
-    # Verify Target Entity ownership
-    await verify_approval_entity_access(db, obj.entity_type, obj.entity_id, current_user)
+    # Segregation of duties: requester cannot approve their own request
+    if current_user.id == obj.requested_by:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Requester cannot approve their own approval request.",
+        )
 
-    if obj.status == "Approved":
-        raise ValidationError("Already approved")
+    # State machine: only Pending approvals can be approved
+    if obj.status != "Pending":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot approve request with status '{obj.status}'. Only 'Pending' requests can be approved.",
+        )
+
+    # Verify Target Entity ownership and existence
+    entity = await verify_approval_entity_access(
+        db, obj.entity_type, obj.entity_id, current_user, is_sa
+    )
+
+    entity_type_lower = obj.entity_type.lower()
+    if entity_type_lower == "bill":
+        entity.status = "Approved"
+
+    elif entity_type_lower == "journal_entry":
+        entity.status = "Posted"
+
+    elif entity_type_lower == "boq":
+        entity.approval_status = "Approved"
+
+    elif entity_type_lower == "measurement":
+        entity.status = "APPROVED"
+
+    elif entity_type_lower == "purchase_order":
+        if entity.status != "PENDING":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot approve PO. Current status is {entity.status}",
+            )
+        entity.status = "APPROVED"
+
+    elif entity_type_lower == "document":
+        entity.status = DocumentStatus.APPROVED
+
+    elif entity_type_lower == "drawing":
+        entity.approval_status = DocumentStatus.APPROVED
+        entity.approval_id = obj.id
 
     obj.status = "Approved"
     obj.approved_by = current_user.id
     obj.remarks = payload.remarks
 
-    if obj.entity_type == "bill":
-        from app.models.billing import RABill
-
-        bill = await db.get(RABill, obj.entity_id)
-        if bill:
-            bill.status = "Approved"
-
-    elif obj.entity_type == "journal_entry":
-        from app.models.accountant import JournalEntry
-        journal = await db.get(JournalEntry, obj.entity_id)
-        if journal:
-            journal.status = "Posted"
-
-    elif obj.entity_type.lower() == "boq":
-        from app.models.boq import BOQ
-
-        boq = await db.get(BOQ, obj.entity_id)
-
-        if boq:
-            boq.approval_status = "Approved"
-
-    elif obj.entity_type == "measurement":
-        from app.models.final_measurement import FinalMeasurement
-        measurement = await db.get(FinalMeasurement, obj.entity_id)
-        if measurement:
-            measurement.status = "APPROVED"
-
-    elif obj.entity_type == "purchase_order":
-        from app.models.material import PurchaseOrder
-        po = await db.get(PurchaseOrder, obj.entity_id)
-        if po:
-            if po.status != "PENDING":
-                raise ValidationError(f"Cannot approve PO. Current status is {po.status}")
-            po.status = "APPROVED"
-
-    elif obj.entity_type == "document":
-        from app.models.document import Document
-        from app.core.enums import DocumentStatus
-        
-        doc = await db.get(Document, obj.entity_id)
-        if doc:
-            doc.status = DocumentStatus.APPROVED
-
-    elif obj.entity_type == "drawing":
-        from app.models.project import DrawingDocument
-        from app.core.enums import DocumentStatus
-
-        drawing = await db.get(
-            DrawingDocument,
-            obj.entity_id
+    try:
+        # Notification created within the same atomic transaction
+        await create_notification(
+            db,
+            user_id=obj.requested_by,
+            title="Approval Granted",
+            message=f"Your {obj.entity_type} approval request has been Approved.",
+            type="success",
+        )
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.exception(f"Unexpected error committing approval {id}: {exc}")
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while processing the approval.",
         )
 
-        if drawing:
-            drawing.approval_status = DocumentStatus.APPROVED
-            drawing.approval_id = obj.id
-
-    await db.flush()
-    await db.commit()
-    
-    await create_notification(
-        db,
-        user_id=obj.requested_by,
-        title="Approval Granted",
-        message=f"Your {obj.entity_type} approval request has been Approved.",
-        type="success"
-    )
-    await db.commit()
-    
     return {"message": "Approved"}
 
 
@@ -281,100 +377,107 @@ async def approve(
 async def reject(
     id: int,
     payload: ApprovalAction,
-    current_user: User = Depends(require_roles(APPROVAL_ROLES)),
+    current_user: User = Depends(require_permission("approvals.approve")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
+
     obj = await db.get(Approval, id)
     if not obj:
-        raise NotFoundError("Approval not found")
-
-    # Verify Approval ownership
-    requester = await db.get(User, obj.requested_by)
-    if not requester or requester.company_id != current_user.company_id:
-        raise HTTPException(status_code=403, detail="Cross-tenant approval access not allowed")
-
-    # Verify Target Entity ownership
-    await verify_approval_entity_access(db, obj.entity_type, obj.entity_id, current_user)
-
-    if obj.status == "Rejected":
-        raise ValidationError("Already rejected")
-
-
-    if not payload.remarks:
-        raise ValidationError(
-            "Remarks required for rejection"
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval not found",
         )
+
+    # Verify approval tenant ownership
+    requester = await db.get(User, obj.requested_by)
+    if not requester:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval not found",
+        )
+    if not is_sa and requester.company_id != current_user.company_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval not found",
+        )
+
+    # Segregation of duties: requester cannot reject their own request
+    if current_user.id == obj.requested_by:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Requester cannot reject their own approval request.",
+        )
+
+    # State machine: only Pending approvals can be rejected
+    if obj.status != "Pending":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot reject request with status '{obj.status}'. Only 'Pending' requests can be rejected.",
+        )
+
+    # Remarks are mandatory for rejection
+    if not payload.remarks or not payload.remarks.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Remarks required for rejection",
+        )
+
+    # Verify Target Entity ownership and existence
+    entity = await verify_approval_entity_access(
+        db, obj.entity_type, obj.entity_id, current_user, is_sa
+    )
+
+    entity_type_lower = obj.entity_type.lower()
+    if entity_type_lower == "bill":
+        entity.status = "Rejected"
+
+    elif entity_type_lower == "journal_entry":
+        entity.status = "Rejected"
+
+    elif entity_type_lower == "boq":
+        entity.approval_status = "Rejected"
+
+    elif entity_type_lower == "measurement":
+        entity.status = "REJECTED"
+
+    elif entity_type_lower == "purchase_order":
+        if entity.status != "PENDING":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot reject PO. Current status is {entity.status}",
+            )
+        entity.status = "REJECTED"
+
+    elif entity_type_lower == "document":
+        entity.status = DocumentStatus.REJECTED
+
+    elif entity_type_lower == "drawing":
+        entity.approval_status = DocumentStatus.REJECTED
+        entity.approval_id = obj.id
 
     obj.status = "Rejected"
     obj.approved_by = current_user.id
-    obj.remarks = payload.remarks
+    obj.remarks = payload.remarks.strip()
 
-    if obj.entity_type == "bill":
-        from app.models.billing import RABill
-
-        bill = await db.get(RABill, obj.entity_id)
-        if bill:
-            bill.status = "Rejected"
-
-    elif obj.entity_type == "journal_entry":
-        from app.models.accountant import JournalEntry
-        journal = await db.get(JournalEntry, obj.entity_id)
-        if journal:
-            journal.status = "Rejected"
-
-    elif obj.entity_type.lower() == "boq":
-        from app.models.boq import BOQ
-
-        boq = await db.get(BOQ, obj.entity_id)
-
-        if boq:
-            boq.approval_status = "Rejected"
-
-    elif obj.entity_type == "measurement":
-        from app.models.final_measurement import FinalMeasurement
-        measurement = await db.get(FinalMeasurement, obj.entity_id)
-        if measurement:
-            measurement.status = "REJECTED"
-
-    elif obj.entity_type == "purchase_order":
-        from app.models.material import PurchaseOrder
-        po = await db.get(PurchaseOrder, obj.entity_id)
-        if po:
-            if po.status != "PENDING":
-                raise ValidationError(f"Cannot reject PO. Current status is {po.status}")
-            po.status = "REJECTED"
-
-    elif obj.entity_type == "document":
-        from app.models.document import Document
-        from app.core.enums import DocumentStatus
-        
-        doc = await db.get(Document, obj.entity_id)
-        if doc:
-            doc.status = DocumentStatus.REJECTED
-
-    elif obj.entity_type == "drawing":
-        from app.models.project import DrawingDocument
-        from app.core.enums import DocumentStatus
-
-        drawing = await db.get(
-            DrawingDocument,
-            obj.entity_id
+    try:
+        # Notification created within the same atomic transaction
+        await create_notification(
+            db,
+            user_id=obj.requested_by,
+            title="Approval Rejected",
+            message=f"Your {obj.entity_type} approval request was Rejected.",
+            type="alert",
+        )
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.exception(f"Unexpected error committing rejection {id}: {exc}")
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while processing the rejection.",
         )
 
-        if drawing:
-            drawing.approval_status = DocumentStatus.REJECTED
-            drawing.approval_id = obj.id
-
-    await db.flush()
-    await db.commit()
-    
-    await create_notification(
-        db,
-        user_id=obj.requested_by,
-        title="Approval Rejected",
-        message=f"Your {obj.entity_type} approval request was Rejected.",
-        type="alert"
-    )
-    await db.commit()
-    
     return {"message": "Rejected"}
