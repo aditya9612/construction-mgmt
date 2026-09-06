@@ -406,7 +406,8 @@ async def test_super_admin_and_tenant_admin_bypass():
         res_sa2 = await client.get("/api/v1/test-rbac-engine/perm-projects-delete")
         assert res_sa2.status_code == 200
 
-        # Tenant Admin without permissions MUST NOT bypass permission checks (P0-4)
+        # Tenant Admin dynamically receives all catalog permissions (reports.view -> 200)
+        # but does not have arbitrary non-catalog permissions (perm-arbitrary -> 403)
         tenant_admin = User(
             id=1000,
             email="admin@test.com",
@@ -419,7 +420,7 @@ async def test_super_admin_and_tenant_admin_bypass():
         res_ta1 = await client.get("/api/v1/test-rbac-engine/perm-arbitrary")
         assert res_ta1.status_code == 403
         res_ta2 = await client.get("/api/v1/test-rbac-engine/perm-reports-view")
-        assert res_ta2.status_code == 403
+        assert res_ta2.status_code == 200
 
     app.dependency_overrides.clear()
 

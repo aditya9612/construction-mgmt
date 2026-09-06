@@ -9,7 +9,7 @@ from app.cache.redis import cache_get_json, cache_set_json
 from app.core.logger import logger
 from app.core.security import decode_access_token
 from app.db.session import get_db_session
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, ROLES
 from app.core.request_context import set_current_user_id
 from app.models.rbac import Permission, RolePermission, Role, UserPermissionOverride
 from app.models.company import Company
@@ -271,25 +271,53 @@ async def get_effective_user_permissions(
     """
     Resolves the effective permission codes for the given user from the database.
 
-    Resolution Flow:
-    1. Identify user's role and company.
-    2. Check for company-specific role permissions (tenant-level override for role).
-       If present, use those permissions.
-       Otherwise, resolve system/global role permissions matching user.role.
-       Crucially, permissions assigned to a different company are NEVER included.
-    3. Query user_permission_overrides for user.id:
-       - is_granted=True: adds permission code to effective set.
-       - is_granted=False: removes permission code from effective set and marks as revoked.
-    4. Handle wildcard "*":
-       - If "*" is granted and no permissions were explicitly revoked, "*" remains in set.
-       - If "*" is granted but specific permissions were revoked (is_granted=False),
-         all canonical permission codes are expanded and the revoked ones are removed.
+    Admin-Driven Authorization Model:
+    1. Admin (Super Admin or Tenant Admin where user.role == 'Admin'):
+       - Dynamically resolves ALL permissions available in the permissions catalog (permissions table).
+       - Does NOT rely on a hardcoded permission list or static assignments.
+       - Honors negative user-level overrides (UserPermissionOverride.is_granted == False) if specified.
+    2. Non-Admin Roles (Client, Labour, SiteEngineer, Contractor, Accountant, ProjectManager, Custom Roles):
+       - Start with ZERO implicit permissions (permissions = []).
+       - Effective permissions derive strictly from permissions explicitly assigned by an Admin
+         to this company's role (RolePermission.role_id == company_role.id).
+       - Built-in non-admin roles NEVER inherit global/system fallback permissions.
+       - Applies user-level overrides (is_granted=True adds, is_granted=False removes).
     """
-    company_id = user.company_id
-    role_perms: set[str] = set()
+    is_admin = (
+        getattr(user, "is_super_admin", False) is True
+        or user.role == UserRole.ADMIN.value
+        or user.role == "Admin"
+    )
 
-    # 1. Check if user's company has a customized tenant role matching user.role
-    company_role = None
+    # =========================================================================
+    # A. ADMIN ROLE: Dynamic Full Permission Access from Permissions Catalog
+    # =========================================================================
+    if is_admin:
+        catalog_res = await db.execute(
+            select(Permission.code).where(Permission.code != "*")
+        )
+        effective_permissions: set[str] = set(catalog_res.scalars().all())
+
+        # Check for user-level explicit revocations on this admin user
+        override_res = await db.execute(
+            select(Permission.code)
+            .join(UserPermissionOverride, UserPermissionOverride.permission_id == Permission.id)
+            .where(
+                UserPermissionOverride.user_id == user.id,
+                UserPermissionOverride.is_granted == False,
+            )
+        )
+        revoked = set(override_res.scalars().all())
+        effective_permissions -= revoked
+        return effective_permissions
+
+    # =========================================================================
+    # B. NON-ADMIN ROLES: Zero Implicit Access -> Explicit Company Assignments
+    # =========================================================================
+    company_id = user.company_id
+    effective_permissions = set()
+
+    # 1. Resolve company-scoped role permissions if user belongs to a company
     if company_id is not None:
         company_role = await db.scalar(
             select(Role).where(
@@ -297,32 +325,48 @@ async def get_effective_user_permissions(
                 Role.company_id == company_id,
             )
         )
-
-    if company_role is not None:
-        # Check permissions mapped directly to this company's role_id
+        if company_role is not None:
+            if user.role not in ROLES:
+                res = await db.execute(
+                    select(Permission.code)
+                    .join(RolePermission, RolePermission.permission_id == Permission.id)
+                    .where(
+                        (RolePermission.role_id == company_role.id)
+                        | (
+                            (RolePermission.role == user.role)
+                            & RolePermission.role_id.is_(None)
+                        )
+                    )
+                )
+            else:
+                res = await db.execute(
+                    select(Permission.code)
+                    .join(RolePermission, RolePermission.permission_id == Permission.id)
+                    .where(RolePermission.role_id == company_role.id)
+                )
+            effective_permissions = set(res.scalars().all())
+        elif user.role not in ROLES:
+            # Fallback only for ad-hoc custom/test roles created directly with role_id is None
+            res = await db.execute(
+                select(Permission.code)
+                .join(RolePermission, RolePermission.permission_id == Permission.id)
+                .where(
+                    RolePermission.role == user.role,
+                    RolePermission.role_id.is_(None),
+                )
+            )
+            effective_permissions = set(res.scalars().all())
+    elif user.role not in ROLES:
+        # Fallback for un-scoped standalone test/custom roles created with role_id is None
         res = await db.execute(
             select(Permission.code)
             .join(RolePermission, RolePermission.permission_id == Permission.id)
-            .where(RolePermission.role_id == company_role.id)
-        )
-        role_perms = set(res.scalars().all())
-
-    # If no company-specific role or company role has no permissions mapped,
-    # resolve global/system role permissions for user.role
-    if not role_perms:
-        res = await db.execute(
-            select(Permission.code)
-            .join(RolePermission, RolePermission.permission_id == Permission.id)
-            .outerjoin(Role, RolePermission.role_id == Role.id)
             .where(
                 RolePermission.role == user.role,
-                (RolePermission.role_id.is_(None)) | (Role.company_id.is_(None)) | (Role.is_system == True),
+                RolePermission.role_id.is_(None),
             )
         )
-        role_perms = set(res.scalars().all())
-
-    effective_permissions: set[str] = set(role_perms)
-    revoked_permissions: set[str] = set()
+        effective_permissions = set(res.scalars().all())
 
     # 2. Query user permission overrides
     override_res = await db.execute(
@@ -331,6 +375,7 @@ async def get_effective_user_permissions(
         .where(UserPermissionOverride.user_id == user.id)
     )
     overrides = override_res.all()
+    revoked_permissions: set[str] = set()
 
     for code, is_granted in overrides:
         if is_granted:
@@ -339,7 +384,7 @@ async def get_effective_user_permissions(
             effective_permissions.discard(code)
             revoked_permissions.add(code)
 
-    # 3. Handle wildcard with revocations
+    # 3. Handle wildcard with revocations (if explicit wildcard was granted)
     if "*" in effective_permissions and revoked_permissions:
         all_perms_res = await db.execute(select(Permission.code))
         all_codes = set(all_perms_res.scalars().all())
