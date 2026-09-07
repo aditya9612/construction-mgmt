@@ -220,3 +220,19 @@ def test_company_isolation():
     finally:
         # Restore superadmin override
         app.dependency_overrides[get_current_active_user] = get_superadmin
+
+
+def test_list_dummy_quotations():
+    """GET /api/v1/dummy-quotations/ -> 200, returns list of DummyQuotationOut."""
+    with TestClient(app) as tc:
+        # First create one
+        payload = {"items": [{"title": "List Item", "rate": 50.0}]}
+        tc.post("/api/v1/dummy-quotations/", json=payload)
+        
+        # Now list
+        resp = tc.get("/api/v1/dummy-quotations/")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert isinstance(data, list)
+        assert len(data) >= 1
+        assert "dummy_quotation_no" in data[0]

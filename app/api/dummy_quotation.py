@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 import io
 
@@ -268,6 +268,32 @@ async def create_dummy_quotation(
     await db.refresh(new_quote)
     
     return await get_dummy_quotation_or_404(new_quote.id, db, current_user)
+
+
+@router.get("/", response_model=List[DummyQuotationOut])
+async def list_dummy_quotations(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    client_name: Optional[str] = Query(None, description="Search by client name"),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user)
+):
+    query = select(DummyQuotation).options(
+        selectinload(DummyQuotation.items).selectinload(DummyQuotationItem.measurements)
+    )
+
+    if not current_user.is_super_admin:
+        if current_user.company_id:
+            query = query.where(DummyQuotation.company_id == current_user.company_id)
+        else:
+            return []
+
+    if client_name:
+        query = query.where(DummyQuotation.client_name.ilike(f"%{client_name}%"))
+
+    query = query.order_by(DummyQuotation.id.desc()).offset(skip).limit(limit)
+    result = await db.execute(query)
+    return result.scalars().unique().all()
 
 @router.get("/{quotation_id}", response_model=DummyQuotationOut)
 async def get_dummy_quotation(
