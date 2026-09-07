@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional
 from datetime import datetime
 
@@ -23,16 +23,14 @@ class AttachmentOut(BaseModel):
     file_size: Optional[int] = None
     thumbnail_url: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SenderOut(BaseModel):
     id: int
     name: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ReactionOut(BaseModel):
@@ -40,16 +38,14 @@ class ReactionOut(BaseModel):
     reaction: str
     is_reacted_by_me: bool = False
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ParentMessageOut(BaseModel):
     id: int
     message: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MessageOut(BaseModel):
@@ -81,8 +77,7 @@ class MessageOut(BaseModel):
 
     reply_count: int = 0
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ChatListOut(BaseModel):
@@ -98,8 +93,7 @@ class ChatListOut(BaseModel):
 
     is_pinned: bool = False
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class CreateGroup(BaseModel):
@@ -122,8 +116,7 @@ class ReplyOut(BaseModel):
 
     sender: Optional[SenderOut] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ChatInfoOut(BaseModel):
@@ -151,8 +144,7 @@ class ChatInfoOut(BaseModel):
 
     is_pinned: bool = False
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ChatUserOut(BaseModel):
@@ -172,8 +164,7 @@ class ChatUserOut(BaseModel):
 
     last_seen: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ChatUserSearchOut(BaseModel):
@@ -185,8 +176,7 @@ class ChatUserSearchOut(BaseModel):
 
     profile_image: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ChatMemberAddPayload(BaseModel):
@@ -216,8 +206,7 @@ class ChatListEnhancedOut(BaseModel):
 
     is_pinned: bool = False
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MessageReadUserOut(BaseModel):
@@ -229,8 +218,7 @@ class MessageReadUserOut(BaseModel):
 
     read_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MentionMessageOut(BaseModel):
@@ -248,5 +236,4 @@ class MentionMessageOut(BaseModel):
 
     attachments: list[AttachmentOut] = Field(default_factory=list)
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, EmailStr
+from pydantic import BaseModel, ConfigDict, Field, field_validator, EmailStr
 
 from typing import Optional, Literal
 
@@ -79,8 +79,7 @@ class QuotationMaterialOut(BaseModel):
 
     notes: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =========================================================
@@ -148,8 +147,7 @@ class QuotationLabourOut(BaseModel):
 
     notes: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =========================================================
@@ -201,8 +199,7 @@ class MeasurementOut(BaseModel):
 
     formula_used: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class QuotationExtraChargeCreate(BaseModel):
@@ -323,8 +320,7 @@ class QuotationItemOut(BaseModel):
 
     measurements: list[MeasurementOut]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =========================================================
@@ -585,8 +581,7 @@ class QuotationOut(BaseModel):
 
     extra_charge_items: list[QuotationExtraChargeOut]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =========================================================

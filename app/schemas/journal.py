@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional, Any
 from datetime import date, datetime
 from decimal import Decimal
@@ -11,8 +11,7 @@ class JournalLineOut(BaseModel):
     debit: Decimal
     credit: Decimal
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class JournalEntryOut(BaseModel):
     id: int
@@ -23,8 +22,7 @@ class JournalEntryOut(BaseModel):
     amount: Optional[Decimal] = None
     approval_id: Optional[int] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class JournalManualCreate(BaseModel):
     entry_date: date
@@ -53,8 +51,7 @@ class RecurringJournalOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class JournalEntryExtendedOut(BaseModel):
     id: int
@@ -69,5 +66,4 @@ class JournalEntryExtendedOut(BaseModel):
     amount: Optional[Decimal] = None
     approval_id: Optional[int] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

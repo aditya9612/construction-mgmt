@@ -10,6 +10,7 @@ from pydantic import (
     ConfigDict,
     Field,
     computed_field,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -1559,10 +1560,17 @@ class ProjectOTPolicyOut(ProjectOTPolicyCreate):
 
     project_id: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
-        json_encoders = {Decimal: float}
+    @field_serializer(
+        "normal_day_multiplier",
+        "sunday_multiplier",
+        "holiday_multiplier",
+        "fixed_ot_rate",
+        when_used="json",
+    )
+    def serialize_decimal(self, v: Optional[Decimal]) -> Optional[float]:
+        return float(v) if v is not None else None
 
 
 # =========================================

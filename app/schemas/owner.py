@@ -1,7 +1,7 @@
 from datetime import date
 from decimal import Decimal
 from typing import Optional
-from pydantic import Field, EmailStr, field_validator
+from pydantic import ConfigDict, Field, EmailStr, field_validator
 from app.schemas.base import BaseSchema
 import re
 
@@ -61,8 +61,7 @@ class OwnerOut(BaseSchema):
     address: Optional[str]
     pan: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =========================
@@ -79,8 +78,7 @@ class OwnerTransactionOut(BaseSchema):
     reference_id: Optional[int]
     description: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OwnerLedgerResponse(BaseSchema):
@@ -109,8 +107,7 @@ class ClientPortfolioItem(BaseSchema):
 
     status: str  # ACTIVE / INACTIVE
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ClientPortfolioSummary(BaseSchema):
@@ -150,5 +147,4 @@ class OwnerPaymentScheduleOut(BaseSchema):
     reference_code: Optional[str]
     description: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

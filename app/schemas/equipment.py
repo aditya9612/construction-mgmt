@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from pydantic import (
     ConfigDict,
@@ -763,7 +763,7 @@ class EquipmentPurchaseCreate(BaseSchema):
         max_length=100,
     )
 
-    quantity: int = Field(
+    quantity: Union[Decimal, int] = Field(
         ...,
         gt=0,
     )
@@ -773,6 +773,11 @@ class EquipmentPurchaseCreate(BaseSchema):
         gt=0,
         max_digits=12,
         decimal_places=2,
+    )
+
+    total_amount: Optional[Decimal] = Field(
+        None,
+        description="Client-provided total amount; ignored and reliably calculated server-side as quantity * unit_price",
     )
 
     warranty_end_date: Optional[date] = None
@@ -838,7 +843,7 @@ class EquipmentPurchaseUpdate(BaseSchema):
         max_length=100,
     )
 
-    quantity: Optional[int] = Field(
+    quantity: Optional[Union[Decimal, int]] = Field(
         None,
         gt=0,
     )
@@ -848,6 +853,11 @@ class EquipmentPurchaseUpdate(BaseSchema):
         gt=0,
         max_digits=12,
         decimal_places=2,
+    )
+
+    total_amount: Optional[Decimal] = Field(
+        None,
+        description="Client-provided total amount; ignored and reliably calculated server-side as quantity * unit_price",
     )
 
     warranty_end_date: Optional[date] = None
@@ -912,7 +922,7 @@ class EquipmentPurchaseOut(BaseSchema):
 
     invoice_number: str
 
-    quantity: int
+    quantity: Union[Decimal, int]
 
     unit_price: float
 
