@@ -28,7 +28,7 @@ from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas import labour as s
 from app.schemas import payroll as payroll_s
 from app.core.enums import WagePeriodType
-from app.utils.helpers import NotFoundError, PermissionDeniedError, ValidationError
+from app.utils.helpers import AppError, NotFoundError, PermissionDeniedError, ValidationError
 from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
 from app.models.approval import Approval
@@ -1348,8 +1348,6 @@ async def generate_payroll(
                     PayrollStatus.PAID,
                     PayrollStatus.PENDING,
                 ):
-                    from fastapi import HTTPException
-
                     raise HTTPException(
                         status_code=400,
                         detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}",
@@ -1399,7 +1397,8 @@ async def generate_payroll(
                     db.add(payroll)
                     await db.flush()
             except IntegrityError:
-                payroll = await db.scalar(
+                db.expunge(payroll)
+                existing_payroll = await db.scalar(
                     select(LabourPayroll)
                     .where(
                         LabourPayroll.labour_id == labour_id,
@@ -1409,39 +1408,45 @@ async def generate_payroll(
                     )
                     .with_for_update()
                 )
-                if payroll:
-                    if payroll.status in (
-                        PayrollStatus.LOCKED,
-                        PayrollStatus.PARTIAL,
-                        PayrollStatus.PAID,
-                        PayrollStatus.PENDING,
-                    ):
-                        from fastapi import HTTPException
+                if not existing_payroll:
+                    raise
 
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {payroll.status.value}",
-                        )
-
-                    payroll.total_working_hours = data["working_hours"]
-                    payroll.total_overtime_hours = data["overtime_hours"]
-                    payroll.total_wage = total_wage
-
-                    payroll.remaining_amount = max(
-                        Decimal("0"), total_wage - payroll.paid_amount
+                if existing_payroll.status in (
+                    PayrollStatus.LOCKED,
+                    PayrollStatus.PARTIAL,
+                    PayrollStatus.PAID,
+                    PayrollStatus.PENDING,
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cannot regenerate payroll for Labour {labour_id} because its status is {existing_payroll.status.value}",
                     )
 
-                    payroll.status = PayrollStatus.DRAFT
+                existing_payroll.total_working_hours = data["working_hours"]
+                existing_payroll.total_overtime_hours = data["overtime_hours"]
+                existing_payroll.total_wage = total_wage
 
-                    await db.flush()
+                existing_payroll.remaining_amount = max(
+                    Decimal("0"), total_wage - existing_payroll.paid_amount
+                )
+
+                existing_payroll.status = PayrollStatus.DRAFT
+
+                await db.flush()
+                payroll = existing_payroll
 
             output.append(payroll)
+
+        await db.commit()
 
         await r.bump_cache_version(redis, VERSION_KEY)
         await r.bump_cache_version(redis, "dashboard_version")
 
         return output
 
+    except (HTTPException, AppError):
+        await db.rollback()
+        raise
     except Exception:
         await db.rollback()
         logger.exception("Payroll generation failed")

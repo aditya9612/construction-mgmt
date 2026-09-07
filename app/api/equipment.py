@@ -643,9 +643,7 @@ async def usage_report(
         .join(Equipment, Equipment.id == EquipmentUsage.equipment_id)
         .where(
             Equipment.is_deleted == False,
-            Equipment.project_id.in_(
-                select(Project.id).where(Project.company_id == current_user.company_id)
-            ),
+            Equipment.company_id == current_user.company_id,
         )
     )
 
@@ -685,8 +683,16 @@ async def usage_report(
 # ========================== COST REPORT ===========================
 
 
-@router.get("/cost/report", response_model=List[CostReportItem])
-@router.get("/cost-report", response_model=List[CostReportItem])
+@router.get(
+    "/cost/report",
+    response_model=List[CostReportItem],
+    operation_id="equipment_cost_report",
+)
+@router.get(
+    "/cost-report",
+    response_model=List[CostReportItem],
+    operation_id="equipment_cost_report_alias",
+)
 async def cost_report(
     equipment_id: Optional[int] = Query(None),
     company_id: Optional[int] = Query(None, description="Optional: filter by company (SuperAdmin)"),
@@ -894,12 +900,18 @@ async def maintenance_alerts(
     upcoming_date = today + timedelta(days=days_ahead)
 
     # Nearest pending maintenance per equipment
-    subq_stmt = select(
-        EquipmentMaintenance.equipment_id,
-        func.min(EquipmentMaintenance.next_maintenance_date).label("next_date"),
-    ).where(
-        EquipmentMaintenance.next_maintenance_date.isnot(None),
-        EquipmentMaintenance.is_completed == False,
+    subq_stmt = (
+        select(
+            EquipmentMaintenance.equipment_id,
+            func.min(EquipmentMaintenance.next_maintenance_date).label("next_date"),
+        )
+        .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
+        .where(
+            EquipmentMaintenance.next_maintenance_date.isnot(None),
+            EquipmentMaintenance.is_completed == False,
+            Equipment.is_deleted == False,
+            Equipment.company_id == current_user.company_id,
+        )
     )
 
     if equipment_id:
@@ -920,16 +932,12 @@ async def maintenance_alerts(
             Equipment,
             Equipment.id == EquipmentMaintenance.equipment_id,
         )
-        .join(
-            Project,
-            Project.id == EquipmentMaintenance.project_id,
-        )
         .where(
             and_(
                 EquipmentMaintenance.next_maintenance_date.isnot(None),
                 EquipmentMaintenance.is_completed == False,
                 Equipment.is_deleted == False,
-                Project.company_id == current_user.company_id,
+                Equipment.company_id == current_user.company_id,
                 # Show all overdue and upcoming maintenance within the window
                 EquipmentMaintenance.next_maintenance_date <= upcoming_date,
             )
@@ -1527,12 +1535,8 @@ async def create_equipment(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Super Admin cannot create company equipment directly",
         )
-    if not payload.project_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="project_id is required to create equipment",
-        )
-    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+    if payload.project_id is not None:
+        await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     # Check duplicate code
     existing = await db.scalar(
         select(Equipment).where(
@@ -1728,26 +1732,8 @@ async def soft_delete_equipment(
             detail="Super Admin cannot delete company equipment directly",
         )
     obj = await get_active_equipment_or_404(db, equipment_id, current_user)
-    if obj.project_id:
-        try:
-            await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Equipment not found")
-    else:
-        # Verify company ownership for unallocated equipment
-        if current_user.company_id is not None:
-            other_company = await db.scalar(
-                select(User.company_id)
-                .join(EquipmentAuditLog, EquipmentAuditLog.user_id == User.id)
-                .where(
-                    EquipmentAuditLog.equipment_id == obj.id,
-                    User.company_id.isnot(None),
-                    User.company_id != current_user.company_id,
-                )
-                .limit(1)
-            )
-            if other_company is not None:
-                raise HTTPException(status_code=404, detail="Equipment not found")
+    if obj.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Equipment not found")
 
     today = date.today()
 
@@ -4606,14 +4592,17 @@ async def create_purchase(
 
     # ================= TOTAL AMOUNT =================
 
-    total_amount = Decimal(payload.quantity) * Decimal(payload.unit_price)
+    total_amount = (
+        Decimal(str(payload.quantity)) * Decimal(str(payload.unit_price))
+    ).quantize(Decimal("0.01"))
 
     try:
 
         # ================= CREATE PURCHASE =================
 
+        purchase_data = payload.model_dump(exclude={"total_amount"})
         purchase = EquipmentPurchase(
-            **payload.model_dump(),
+            **purchase_data,
             total_amount=total_amount,
         )
 
@@ -4641,7 +4630,11 @@ async def create_purchase(
                 "purchase_type": payload.purchase_type.value,
                 "vendor_name": payload.vendor_name,
                 "invoice_number": payload.invoice_number,
-                "quantity": payload.quantity,
+                "quantity": (
+                    payload.quantity
+                    if isinstance(payload.quantity, int)
+                    else float(payload.quantity)
+                ),
                 "unit_price": float(payload.unit_price),
                 "total_amount": float(total_amount),
             },
@@ -4972,7 +4965,7 @@ async def update_purchase(
 
     # ================= UPDATE DATA =================
 
-    update_data = payload.model_dump(exclude_unset=True)
+    update_data = payload.model_dump(exclude_unset=True, exclude={"total_amount"})
 
     old_values = {}
 
@@ -4995,7 +4988,9 @@ async def update_purchase(
     # ================= RECALCULATE TOTAL =================
 
     if purchase.quantity is not None and purchase.unit_price is not None:
-        purchase.total_amount = purchase.quantity * purchase.unit_price
+        purchase.total_amount = (
+            Decimal(str(purchase.quantity)) * Decimal(str(purchase.unit_price))
+        ).quantize(Decimal("0.01"))
 
     new_total_amount = purchase.total_amount or Decimal("0")
     new_boq_item_id = purchase.boq_item_id
@@ -5299,9 +5294,8 @@ async def get_transfer_history(
     if current_user.company_id is None:
         return {"items": [], "meta": {"total": 0, "limit": limit, "offset": offset}}
     eq = await get_active_equipment_or_404(db, equipment_id, current_user)
-    if not eq.project_id:
-        raise HTTPException(status_code=404, detail="Equipment not found")
-    await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
+    if eq.project_id is not None:
+        await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
 
     base_query = select(EquipmentAuditLog).where(
         EquipmentAuditLog.equipment_id == equipment_id,
@@ -5392,17 +5386,16 @@ async def list_transfer_history(
         await assert_project_access(db, project_id=project_id, current_user=current_user)
     if equipment_id:
         eq = await get_active_equipment_or_404(db, equipment_id, current_user)
-        if not eq.project_id:
-            raise HTTPException(status_code=404, detail="Equipment not found")
-        await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
+        if eq.project_id is not None:
+            await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
 
     query = (
         select(EquipmentAuditLog)
         .join(Equipment, Equipment.id == EquipmentAuditLog.equipment_id)
-        .join(Project, Project.id == Equipment.project_id)
         .where(
             EquipmentAuditLog.action == "TRANSFER",
-            Project.company_id == current_user.company_id,
+            Equipment.is_deleted == False,
+            Equipment.company_id == current_user.company_id,
         )
     )
 
@@ -5813,9 +5806,7 @@ async def equipment_full_pdf_report(
 
         equipment_stmt = select(Equipment).where(
             Equipment.is_deleted == False,
-            Equipment.project_id.in_(
-                select(Project.id).where(Project.company_id == current_user.company_id)
-            ),
+            Equipment.company_id == current_user.company_id,
         )
 
         if project_id:
@@ -5832,7 +5823,17 @@ async def equipment_full_pdf_report(
 
         equipments = (await db.execute(equipment_stmt)).scalars().all() or []
 
-        usage_stmt = select(EquipmentUsage)
+        usage_stmt = (
+            select(EquipmentUsage)
+            .join(Equipment, Equipment.id == EquipmentUsage.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            usage_stmt = usage_stmt.where(Equipment.project_id == project_id)
 
         if equipment_id:
             usage_stmt = usage_stmt.where(EquipmentUsage.equipment_id == equipment_id)
@@ -5845,7 +5846,19 @@ async def equipment_full_pdf_report(
 
         usages = (await db.execute(usage_stmt)).scalars().all() or []
 
-        maint_stmt = select(EquipmentMaintenance)
+        maint_stmt = (
+            select(EquipmentMaintenance)
+            .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.project_id == project_id
+            )
 
         if equipment_id:
             maint_stmt = maint_stmt.where(
@@ -5864,7 +5877,19 @@ async def equipment_full_pdf_report(
 
         maint = (await db.execute(maint_stmt)).scalars().all() or []
 
-        rental_stmt = select(EquipmentRental)
+        rental_stmt = (
+            select(EquipmentRental)
+            .join(Equipment, Equipment.id == EquipmentRental.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            rental_stmt = rental_stmt.where(
+                EquipmentRental.project_id == project_id
+            )
 
         if equipment_id:
             rental_stmt = rental_stmt.where(
@@ -5879,7 +5904,18 @@ async def equipment_full_pdf_report(
 
         rentals = (await db.execute(rental_stmt)).scalars().all() or []
 
-        purchase_stmt = select(EquipmentPurchase)
+        purchase_stmt = (
+            select(EquipmentPurchase)
+            .join(Project, Project.id == EquipmentPurchase.project_id)
+            .where(
+                Project.company_id == current_user.company_id
+            )
+        )
+
+        if project_id:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.project_id == project_id
+            )
 
         if equipment_id:
             purchase_stmt = purchase_stmt.where(
@@ -6319,9 +6355,7 @@ async def equipment_excel_report(
 
         equipment_stmt = select(Equipment).where(
             Equipment.is_deleted == False,
-            Equipment.project_id.in_(
-                select(Project.id).where(Project.company_id == current_user.company_id)
-            ),
+            Equipment.company_id == current_user.company_id,
         )
 
         if project_id:
@@ -6338,7 +6372,17 @@ async def equipment_excel_report(
 
         equipments = (await db.execute(equipment_stmt)).scalars().all() or []
 
-        usage_stmt = select(EquipmentUsage)
+        usage_stmt = (
+            select(EquipmentUsage)
+            .join(Equipment, Equipment.id == EquipmentUsage.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            usage_stmt = usage_stmt.where(Equipment.project_id == project_id)
 
         if equipment_id:
             usage_stmt = usage_stmt.where(EquipmentUsage.equipment_id == equipment_id)
@@ -6351,7 +6395,19 @@ async def equipment_excel_report(
 
         usages = (await db.execute(usage_stmt)).scalars().all() or []
 
-        maint_stmt = select(EquipmentMaintenance)
+        maint_stmt = (
+            select(EquipmentMaintenance)
+            .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.project_id == project_id
+            )
 
         if equipment_id:
             maint_stmt = maint_stmt.where(
@@ -6370,7 +6426,19 @@ async def equipment_excel_report(
 
         maint = (await db.execute(maint_stmt)).scalars().all() or []
 
-        rental_stmt = select(EquipmentRental)
+        rental_stmt = (
+            select(EquipmentRental)
+            .join(Equipment, Equipment.id == EquipmentRental.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            rental_stmt = rental_stmt.where(
+                EquipmentRental.project_id == project_id
+            )
 
         if equipment_id:
             rental_stmt = rental_stmt.where(
@@ -6385,7 +6453,18 @@ async def equipment_excel_report(
 
         rentals = (await db.execute(rental_stmt)).scalars().all() or []
 
-        purchase_stmt = select(EquipmentPurchase)
+        purchase_stmt = (
+            select(EquipmentPurchase)
+            .join(Project, Project.id == EquipmentPurchase.project_id)
+            .where(
+                Project.company_id == current_user.company_id
+            )
+        )
+
+        if project_id:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.project_id == project_id
+            )
 
         if equipment_id:
             purchase_stmt = purchase_stmt.where(
