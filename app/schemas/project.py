@@ -175,6 +175,8 @@ class MilestoneCreate(BaseSchema):
     description: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
+    actual_start_date: Optional[date] = None
+    actual_end_date: Optional[date] = None
     status: Optional[MilestoneStatus] = MilestoneStatus.PLANNED
 
     @field_validator("end_date")
@@ -804,7 +806,7 @@ class IssueBase(BaseSchema):
 
 
 class IssueCreate(IssueBase):
-    pass
+    assigned_to: Optional[int] = None
 
 
 class IssueUpdate(BaseSchema):
@@ -1191,14 +1193,14 @@ class WorkActivityResponse(BaseSchema):
     model_config = ConfigDict(from_attributes=True)
     id: int
     project_id: int
-    boq_item_id: int
+    boq_item_id: Optional[int] = None
     work_order_id: Optional[int] = None
     activity_name: str
     discipline: Optional[str] = None
     planned_quantity: Decimal
     total_completed: Decimal
     remaining_quantity: Decimal
-    completion_percentage: Decimal
+    completion_percentage: Optional[Decimal] = None
     unit: str
     engineer_id: Optional[int] = None
     status: WorkActivityStatus

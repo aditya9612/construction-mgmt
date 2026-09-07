@@ -104,9 +104,18 @@ async def get_document_stats(
     pending_count = await db.scalar(pending_query)
     total_docs = await db.scalar(docs_query)
 
+    raw_bytes = float(total_size or 0)
+    raw_gb = raw_bytes / (1024**3)
+    # Default to 4 decimal places (consistent with entitlement service).
+    # If storage exists (>0 bytes) but rounds to 0.0 at 4 decimals, provide precision up to 6 decimals
+    # so that small uploaded documents do not display as 0.
+    total_storage_gb = round(raw_gb, 4)
+    if raw_bytes > 0 and total_storage_gb == 0.0:
+        total_storage_gb = round(raw_gb, 6) or 0.000001
+
     return DocumentStats(
         total_storage_bytes=int(total_size or 0),
-        total_storage_gb=round(float(total_size or 0) / (1024**3), 2),
+        total_storage_gb=total_storage_gb,
         pending_approvals=int(pending_count or 0),
         total_documents=int(total_docs or 0),
     )

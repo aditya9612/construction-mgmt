@@ -69,6 +69,7 @@ from app.utils.common import (
     generate_business_id,
 )
 
+from app.core.dependencies import require_permission
 from app.utils.helpers import (
     NotFoundError,
     ValidationError,
@@ -107,6 +108,93 @@ WORK_UPDATE_DELETE_ROLES = [
         UserRole.SITE_ENGINEER,
     ]
 ]
+
+# =====================================================
+# BATCH X TENANT SCOPING HELPERS
+# =====================================================
+
+def _check_batch_x_wu_tenant_access(current_user: User) -> bool:
+    """
+    Validates tenant isolation for Batch X Work Updates.
+    Returns True if user is Super Admin.
+    Raises HTTP 403 if non-SA user has company_id is None.
+    """
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User has no company assigned",
+        )
+    return is_sa
+
+
+async def _get_scoped_project_for_wu(
+    db: AsyncSession,
+    project_id: int,
+    current_user: User,
+) -> Project:
+    is_sa = _check_batch_x_wu_tenant_access(current_user)
+    if is_sa:
+        project = await db.get(Project, project_id)
+    else:
+        project = await db.scalar(
+            select(Project).where(
+                Project.id == project_id,
+                Project.company_id == current_user.company_id,
+            )
+        )
+    if not project:
+        raise NotFoundError("Project not found")
+    return project
+
+
+async def _get_scoped_work_update(
+    db: AsyncSession,
+    work_update_id: int,
+    current_user: User,
+    load_relations: bool = False,
+) -> WorkUpdate:
+    is_sa = _check_batch_x_wu_tenant_access(current_user)
+    stmt = select(WorkUpdate).join(Project, Project.id == WorkUpdate.project_id)
+    if not is_sa:
+        stmt = stmt.where(Project.company_id == current_user.company_id)
+    stmt = stmt.where(WorkUpdate.id == work_update_id)
+
+    if load_relations:
+        stmt = stmt.options(
+            selectinload(WorkUpdate.project),
+            selectinload(WorkUpdate.task),
+            selectinload(WorkUpdate.activity_type),
+            selectinload(WorkUpdate.created_by),
+            selectinload(WorkUpdate.images),
+        )
+    obj = await db.scalar(stmt)
+    if not obj:
+        raise NotFoundError("Work update not found")
+    return obj
+
+
+async def _get_scoped_work_update_image(
+    db: AsyncSession,
+    image_id: int,
+    current_user: User,
+) -> WorkUpdateImage:
+    is_sa = _check_batch_x_wu_tenant_access(current_user)
+    stmt = (
+        select(WorkUpdateImage)
+        .join(WorkUpdate, WorkUpdate.id == WorkUpdateImage.work_update_id)
+        .join(Project, Project.id == WorkUpdate.project_id)
+    )
+    if not is_sa:
+        stmt = stmt.where(Project.company_id == current_user.company_id)
+    stmt = stmt.where(WorkUpdateImage.id == image_id).options(
+        selectinload(WorkUpdateImage.work_update).selectinload(WorkUpdate.project)
+    )
+    image = await db.scalar(stmt)
+    if not image:
+        raise NotFoundError("Image not found.")
+    return image
+
 
 router = APIRouter(
     prefix="/work-updates",
@@ -634,24 +722,20 @@ def export_work_updates_pdf(
 )
 async def create_work_update(
     payload: s.WorkUpdateCreate,
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Creating Work Update | project={payload.project_id}")
+
+    _check_batch_x_wu_tenant_access(current_user)
+    project = await _get_scoped_project_for_wu(db, payload.project_id, current_user)
+    _assert_project_open(project)
 
     await assert_project_access(
         db=db,
         project_id=payload.project_id,
         current_user=current_user,
     )
-
-    project = await db.get(Project, payload.project_id)
-    if not project:
-        raise NotFoundError("Project not found")
-
-    # FIX (Phase 1 / Section 1.2): reject work updates against a project
-    # that's Closed / Completed / Inactive / Cancelled.
-    _assert_project_open(project)
 
     await assert_task_project(
         db=db,
@@ -798,10 +882,11 @@ async def get_my_work_updates(
     sort_order: s.SortOrder = Query(s.SortOrder.DESC),
     limit: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_READ_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"My Work Updates | user_id={current_user.id}")
+    is_sa = _check_batch_x_wu_tenant_access(current_user)
 
     query = (
         select(WorkUpdate)
@@ -815,7 +900,13 @@ async def get_my_work_updates(
         .where(WorkUpdate.created_by_id == current_user.id)
     )
 
+    if not is_sa:
+        query = query.join(Project, Project.id == WorkUpdate.project_id).where(
+            Project.company_id == current_user.company_id
+        )
+
     if project_id:
+        await _get_scoped_project_for_wu(db, project_id, current_user)
         query = query.where(WorkUpdate.project_id == project_id)
 
     if status_filter:
@@ -910,20 +1001,19 @@ async def get_project_timeline(
     sort_order: s.SortOrder = Query(s.SortOrder.DESC),
     limit: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_READ_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Fetching Work Timeline | project={project_id}")
+
+    _check_batch_x_wu_tenant_access(current_user)
+    project = await _get_scoped_project_for_wu(db, project_id, current_user)
 
     await assert_project_access(
         db=db,
         project_id=project_id,
         current_user=current_user,
     )
-
-    project = await db.get(Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found.")
 
     if min_hours is not None and max_hours is not None and min_hours > max_hours:
         raise ValidationError("min_hours cannot be greater than max_hours.")
@@ -1010,17 +1100,16 @@ async def export_work_updates(
     from_date: date | None = Query(None),
     to_date: date | None = Query(None),
     format: ExportFormat = Query(ExportFormat.EXCEL),
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_READ_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
     Export Work Updates into Excel or PDF.
     """
+    is_sa = _check_batch_x_wu_tenant_access(current_user)
 
     if project_id:
-        project = await db.get(Project, project_id)
-        if not project:
-            raise ValidationError("Project not found.")
+        project = await _get_scoped_project_for_wu(db, project_id, current_user)
 
         await assert_project_access(
             db=db,
@@ -1096,25 +1185,14 @@ async def export_work_updates(
 )
 async def get_work_update(
     work_update_id: int,
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_READ_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Fetching Work Update | id={work_update_id}")
 
-    obj = await db.scalar(
-        select(WorkUpdate)
-        .options(
-            selectinload(WorkUpdate.project),
-            selectinload(WorkUpdate.task),
-            selectinload(WorkUpdate.activity_type),
-            selectinload(WorkUpdate.created_by),
-            selectinload(WorkUpdate.images),
-        )
-        .where(WorkUpdate.id == work_update_id)
+    obj = await _get_scoped_work_update(
+        db, work_update_id, current_user, load_relations=True
     )
-
-    if not obj:
-        raise NotFoundError("Work update not found")
 
     await assert_project_access(
         db=db,
@@ -1136,25 +1214,14 @@ async def get_work_update(
 async def upload_before_image(
     work_update_id: int,
     image: UploadFile = File(...),
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Uploading BEFORE image | work_update_id={work_update_id}")
 
-    work_update = await db.scalar(
-        select(WorkUpdate)
-        .options(
-            selectinload(WorkUpdate.images),
-            selectinload(WorkUpdate.project),
-            selectinload(WorkUpdate.task),
-            selectinload(WorkUpdate.activity_type),
-            selectinload(WorkUpdate.created_by),
-        )
-        .where(WorkUpdate.id == work_update_id)
+    work_update = await _get_scoped_work_update(
+        db, work_update_id, current_user, load_relations=True
     )
-
-    if not work_update:
-        raise NotFoundError("Work update not found.")
 
     await assert_project_access(
         db=db,
@@ -1248,25 +1315,14 @@ async def upload_before_image(
 async def update_work_update(
     work_update_id: int,
     payload: s.WorkUpdateUpdate,
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Updating Work Update | id={work_update_id}")
 
-    obj = await db.scalar(
-        select(WorkUpdate)
-        .options(
-            selectinload(WorkUpdate.images),
-            selectinload(WorkUpdate.project),
-            selectinload(WorkUpdate.task),
-            selectinload(WorkUpdate.activity_type),
-            selectinload(WorkUpdate.created_by),
-        )
-        .where(WorkUpdate.id == work_update_id)
+    obj = await _get_scoped_work_update(
+        db, work_update_id, current_user, load_relations=True
     )
-
-    if not obj:
-        raise NotFoundError("Work update not found")
 
     await assert_project_access(
         db=db,
@@ -1385,25 +1441,14 @@ async def update_work_update(
 async def upload_after_image(
     work_update_id: int,
     image: UploadFile = File(...),
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Uploading AFTER image | work_update_id={work_update_id}")
 
-    work_update = await db.scalar(
-        select(WorkUpdate)
-        .options(
-            selectinload(WorkUpdate.images),
-            selectinload(WorkUpdate.project),
-            selectinload(WorkUpdate.task),
-            selectinload(WorkUpdate.activity_type),
-            selectinload(WorkUpdate.created_by),
-        )
-        .where(WorkUpdate.id == work_update_id)
+    work_update = await _get_scoped_work_update(
+        db, work_update_id, current_user, load_relations=True
     )
-
-    if not work_update:
-        raise NotFoundError("Work update not found.")
 
     await assert_project_access(
         db=db,
@@ -1513,25 +1558,14 @@ async def upload_after_image(
 async def submit_work_update(
     work_update_id: int,
     payload: s.WorkUpdateSubmit,
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Submitting Work Update | id={work_update_id}")
 
-    obj = await db.scalar(
-        select(WorkUpdate)
-        .options(
-            selectinload(WorkUpdate.images),
-            selectinload(WorkUpdate.project),
-            selectinload(WorkUpdate.task),
-            selectinload(WorkUpdate.activity_type),
-            selectinload(WorkUpdate.created_by),
-        )
-        .where(WorkUpdate.id == work_update_id)
+    obj = await _get_scoped_work_update(
+        db, work_update_id, current_user, load_relations=True
     )
-
-    if not obj:
-        raise NotFoundError("Work update not found")
 
     await assert_project_access(
         db=db,
@@ -1624,17 +1658,12 @@ async def submit_work_update(
 )
 async def delete_work_update(
     work_update_id: int,
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_DELETE_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.delete")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.scalar(
-        select(WorkUpdate)
-        .options(selectinload(WorkUpdate.images))
-        .where(WorkUpdate.id == work_update_id)
+    obj = await _get_scoped_work_update(
+        db, work_update_id, current_user, load_relations=True
     )
-
-    if not obj:
-        raise NotFoundError("Work update not found")
 
     await assert_project_access(
         db=db,
@@ -1677,20 +1706,12 @@ async def delete_work_update(
 )
 async def delete_work_update_image(
     image_id: int,
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.delete")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Deleting Work Update Image | image_id={image_id}")
 
-    image = await db.scalar(
-        select(WorkUpdateImage)
-        .options(selectinload(WorkUpdateImage.work_update))
-        .where(WorkUpdateImage.id == image_id)
-    )
-
-    if not image:
-        raise NotFoundError("Image not found.")
-
+    image = await _get_scoped_work_update_image(db, image_id, current_user)
     work_update = image.work_update
 
     await assert_project_access(
@@ -1755,20 +1776,12 @@ async def delete_work_update_image(
 async def replace_work_update_image(
     image_id: int,
     new_image: UploadFile = File(...),
-    current_user: User = Depends(d.require_roles(WORK_UPDATE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_updates.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Replacing Work Update Image | image_id={image_id}")
 
-    image = await db.scalar(
-        select(WorkUpdateImage)
-        .options(selectinload(WorkUpdateImage.work_update))
-        .where(WorkUpdateImage.id == image_id)
-    )
-
-    if not image:
-        raise NotFoundError("Image not found.")
-
+    image = await _get_scoped_work_update_image(db, image_id, current_user)
     work_update = image.work_update
 
     await assert_project_access(

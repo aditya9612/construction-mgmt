@@ -22,7 +22,10 @@ MODULES = [
     "tasks",
     "milestones",
     "work_progress",
+    "work_updates",
     "dsr",
+    "site_requests",
+    "site_photos",
     "issues",
     "measurements",
 
@@ -130,6 +133,23 @@ ACTIONS = [
 
 
 MODULE_ACTIONS = {
+    "site_requests": [
+        "view",
+        "create",
+        "approve",
+    ],
+    "site_photos": [
+        "view",
+        "create",
+        "delete",
+    ],
+    "work_updates": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+        "export",
+    ],
     "approvals": [
         "view",
         "create",
@@ -197,6 +217,39 @@ async def seed_permissions(db: AsyncSession):
             db.add(permission)
 
             created += 1
+
+        # Seed module wildcard
+        wc_code = f"{module}.*"
+        existing_wc = await db.scalar(
+            select(Permission).where(
+                Permission.code == wc_code
+            )
+        )
+        if not existing_wc:
+            permission = Permission(
+                module=module,
+                action="*",
+                code=wc_code,
+                description=f"All permissions for {module}",
+            )
+            db.add(permission)
+            created += 1
+
+    # Ensure global wildcard
+    existing_global = await db.scalar(
+        select(Permission).where(
+            Permission.code == "*"
+        )
+    )
+    if not existing_global:
+        permission = Permission(
+            module="*",
+            action="*",
+            code="*",
+            description="Global wildcard permission",
+        )
+        db.add(permission)
+        created += 1
 
     await db.commit()
 
