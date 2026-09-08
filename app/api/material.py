@@ -1,3 +1,4 @@
+from app.utils.helpers import AppError
 from app.utils.helpers import NotFoundError
 from datetime import date
 from typing import Optional, List
@@ -829,7 +830,7 @@ async def get_material_consumption_trend(
                 MaterialTransaction.project_id == project_id,
                 MaterialTransaction.created_at >= cutoff_date,
                 MaterialTransaction.type.in_(
-                    [TransactionType.USAGE, TransactionType.ISSUE]
+                    [TransactionType.USAGE]
                 ),
             )
             .order_by(MaterialTransaction.created_at.asc())
@@ -1011,7 +1012,9 @@ async def material_summary(
 ):
     if project_id is not None:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
 
@@ -1094,7 +1097,10 @@ async def list_suppliers(
         (
             await db.execute(
                 select(Supplier)
-                .where(Supplier.is_deleted == False, Supplier.company_id == current_user.company_id)
+                .where(
+                    Supplier.is_deleted == False,
+                    Supplier.company_id == current_user.company_id,
+                )
                 .order_by(Supplier.id.desc())
                 .offset(skip)
                 .limit(limit)
@@ -1108,6 +1114,7 @@ async def list_suppliers(
 
 
 # ================Get_supplier===============
+
 
 @router.get("/suppliers/{supplier_id}/qr", response_class=StreamingResponse)
 async def generate_supplier_qr(
@@ -1130,14 +1137,11 @@ async def generate_supplier_qr(
 
     headers = {
         "Cache-Control": "no-store",
-        "Content-Disposition": f'inline; filename="supplier_{supplier.id}.png"'
+        "Content-Disposition": f'inline; filename="supplier_{supplier.id}.png"',
     }
 
-    return StreamingResponse(
-        qr_buf,
-        media_type="image/png",
-        headers=headers
-    )
+    return StreamingResponse(qr_buf, media_type="image/png", headers=headers)
+
 
 @router.get("/suppliers/{supplier_id}", response_model=SupplierOut)
 async def get_supplier(
@@ -1477,7 +1481,9 @@ async def get_supplier_materials(
 ):
     if project_id:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
     else:
@@ -1540,7 +1546,9 @@ async def get_material_alerts(
 ):
     if project_id is not None:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
 
@@ -1622,7 +1630,9 @@ async def create_po(
 ):
 
     try:
-        await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=payload.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Project not found")
     if payload.quantity <= 0 or payload.rate <= 0:
@@ -1690,7 +1700,9 @@ async def get_po(
     if not _po or _po.is_deleted:
         raise NotFoundError("PO not found")
     try:
-        await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_po.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("PO not found")
     po = await db.get(PurchaseOrder, id)
@@ -1719,7 +1731,9 @@ async def list_po(
 ):
     if project_id is not None:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
 
@@ -1762,7 +1776,9 @@ async def update_po(
     if not _po or _po.is_deleted:
         raise NotFoundError("PO not found")
     try:
-        await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_po.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("PO not found")
     obj = await db.get(PurchaseOrder, id)
@@ -1826,7 +1842,9 @@ async def delete_po(
     if not _po or _po.is_deleted:
         raise NotFoundError("PO not found")
     try:
-        await assert_project_access(db, project_id=_po.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_po.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("PO not found")
     obj = await db.get(PurchaseOrder, id)
@@ -1925,7 +1943,9 @@ async def get_material_transactions(
     if not _m or _m.is_deleted:
         raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Material not found")
     limit = min(max(limit, 1), 100)
@@ -1991,8 +2011,12 @@ async def create_transfer(
     redis=Depends(get_request_redis),
 ):
     try:
-        await assert_project_access(db, project_id=payload.from_project_id, current_user=current_user)
-        await assert_project_access(db, project_id=payload.to_project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=payload.from_project_id, current_user=current_user
+        )
+        await assert_project_access(
+            db, project_id=payload.to_project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Project not found")
     try:
@@ -2020,13 +2044,19 @@ async def create_transfer(
         from_project = await db.get(Project, payload.from_project_id)
         to_project = await db.get(Project, payload.to_project_id)
 
-        if not from_project or (current_user.company_id is not None and from_project.company_id != current_user.company_id):
+        if not from_project or (
+            current_user.company_id is not None
+            and from_project.company_id != current_user.company_id
+        ):
             raise HTTPException(
                 status_code=404,
                 detail="Source project not found",
             )
 
-        if not to_project or (current_user.company_id is not None and to_project.company_id != current_user.company_id):
+        if not to_project or (
+            current_user.company_id is not None
+            and to_project.company_id != current_user.company_id
+        ):
             raise HTTPException(
                 status_code=404,
                 detail="Destination project not found",
@@ -2113,7 +2143,9 @@ async def list_transfers(
 ):
     if project_id is not None:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
     skip = max(skip, 0)
@@ -2220,8 +2252,12 @@ async def get_transfer(
         raise HTTPException(status_code=404, detail="Transfer not found")
 
     try:
-        await assert_project_access(db, project_id=_tr.from_project_id, current_user=current_user)
-        await assert_project_access(db, project_id=_tr.to_project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_tr.from_project_id, current_user=current_user
+        )
+        await assert_project_access(
+            db, project_id=_tr.to_project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Transfer not found")
 
@@ -2263,9 +2299,7 @@ async def update_transfer_status(
     try:
         # Lock transfer row
         obj = await db.scalar(
-            select(MaterialTransfer)
-            .where(MaterialTransfer.id == id)
-            .with_for_update()
+            select(MaterialTransfer).where(MaterialTransfer.id == id).with_for_update()
         )
 
         if not obj:
@@ -2283,8 +2317,12 @@ async def update_transfer_status(
             raise HTTPException(status_code=404, detail="Transfer not found")
 
         try:
-            await assert_project_access(db, project_id=obj.from_project_id, current_user=current_user)
-            await assert_project_access(db, project_id=obj.to_project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=obj.from_project_id, current_user=current_user
+            )
+            await assert_project_access(
+                db, project_id=obj.to_project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Transfer not found")
 
@@ -2557,6 +2595,7 @@ async def _build_material_out_from_id(db, material_id: int):
         alert_type=alert_type,
     )
 
+
 @router.post("/{material_id}/usage", response_model=MaterialOut)
 async def usage(
     material_id: int,
@@ -2571,7 +2610,9 @@ async def usage(
     if not _m or _m.is_deleted:
         raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Material not found")
     import json
@@ -2585,14 +2626,17 @@ async def usage(
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
         existing = await db.scalar(
-            select(MaterialTransaction)
-            .where(MaterialTransaction.idempotency_key == idempotency_key)
+            select(MaterialTransaction).where(
+                MaterialTransaction.idempotency_key == idempotency_key
+            )
         )
         if existing:
             if existing.request_hash != request_hash:
-                raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key already used with a different request payload.",
+                )
             return await _build_material_out_from_id(db, existing.material_id)
-
 
     obj = await db.scalar(
         select(Material)
@@ -2645,9 +2689,7 @@ async def usage(
     if data.boq_item_id:
 
         boq = await db.scalar(
-            select(BOQ)
-            .where(BOQ.id == data.boq_item_id)
-            .with_for_update()
+            select(BOQ).where(BOQ.id == data.boq_item_id).with_for_update()
         )
 
         if not boq:
@@ -2675,8 +2717,8 @@ async def usage(
 
         transaction = MaterialTransaction(
             material_id=obj.id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
             boq_item_id=data.boq_item_id,
             type=DBTransactionType.USAGE,
             quantity=-qty,
@@ -2758,17 +2800,20 @@ async def usage(
             .where(Material.id == material_id)
         )
 
-
     except IntegrityError:
         await db.rollback()
         if idempotency_key:
             existing = await db.scalar(
-                select(MaterialTransaction)
-                .where(MaterialTransaction.idempotency_key == idempotency_key)
+                select(MaterialTransaction).where(
+                    MaterialTransaction.idempotency_key == idempotency_key
+                )
             )
             if existing:
                 if existing.request_hash != request_hash:
-                    raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                    raise HTTPException(
+                        409,
+                        "Idempotency-Key already used with a different request payload.",
+                    )
                 return await _build_material_out_from_id(db, existing.material_id)
         raise
     except Exception:
@@ -2875,7 +2920,9 @@ async def purchase(
     if not _m or _m.is_deleted:
         raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Material not found")
     import uuid
@@ -2891,12 +2938,16 @@ async def purchase(
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
         existing = await db.scalar(
-            select(MaterialTransaction)
-            .where(MaterialTransaction.idempotency_key == idempotency_key)
+            select(MaterialTransaction).where(
+                MaterialTransaction.idempotency_key == idempotency_key
+            )
         )
         if existing:
             if existing.request_hash != request_hash:
-                raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key already used with a different request payload.",
+                )
             return await _build_material_out_from_id(db, existing.material_id)
 
     from decimal import Decimal, ROUND_HALF_UP
@@ -3079,17 +3130,20 @@ async def purchase(
 
         obj = result.scalar_one()
 
-
     except IntegrityError:
         await db.rollback()
         if idempotency_key:
             existing = await db.scalar(
-                select(MaterialTransaction)
-                .where(MaterialTransaction.idempotency_key == idempotency_key)
+                select(MaterialTransaction).where(
+                    MaterialTransaction.idempotency_key == idempotency_key
+                )
             )
             if existing:
                 if existing.request_hash != request_hash:
-                    raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                    raise HTTPException(
+                        409,
+                        "Idempotency-Key already used with a different request payload.",
+                    )
                 return await _build_material_out_from_id(db, existing.material_id)
         raise
     except Exception:
@@ -3169,10 +3223,15 @@ async def adjust_inventory(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
 
+    _m = await db.get(Material, payload.material_id)
+    if not _m or _m.is_deleted:
+        raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
-        raise NotFoundError("Project not found")
+        raise NotFoundError("Material not found")
     import json
     import hashlib
 
@@ -3184,13 +3243,19 @@ async def adjust_inventory(
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
         existing = await db.scalar(
-            select(MaterialTransaction)
-            .where(MaterialTransaction.idempotency_key == idempotency_key)
+            select(MaterialTransaction).where(
+                MaterialTransaction.idempotency_key == idempotency_key
+            )
         )
         if existing:
             if existing.request_hash != request_hash:
-                raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
-            adj_mat = await db.scalar(select(Material).where(Material.id == existing.material_id))
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key already used with a different request payload.",
+                )
+            adj_mat = await db.scalar(
+                select(Material).where(Material.id == existing.material_id)
+            )
             return InventoryAdjustResponse(
                 material_id=adj_mat.id,
                 material_name=adj_mat.material_name,
@@ -3198,11 +3263,14 @@ async def adjust_inventory(
                 new_stock=float(adj_mat.remaining_stock),
                 difference=float(existing.quantity),
                 avg_rate=float(existing.rate),
-                reason=existing.remarks.split('|')[-1].strip() if existing.remarks else "Idempotent response",
+                reason=(
+                    existing.remarks.split("|")[-1].strip()
+                    if existing.remarks
+                    else "Idempotent response"
+                ),
                 reference_id=existing.reference_id,
-                message="Inventory adjusted successfully"
+                message="Inventory adjusted successfully",
             )
-
 
     material_id = payload.material_id
 
@@ -3365,18 +3433,23 @@ async def adjust_inventory(
         await db.rollback()
         raise
 
-
     except IntegrityError:
         await db.rollback()
         if idempotency_key:
             existing = await db.scalar(
-                select(MaterialTransaction)
-                .where(MaterialTransaction.idempotency_key == idempotency_key)
+                select(MaterialTransaction).where(
+                    MaterialTransaction.idempotency_key == idempotency_key
+                )
             )
             if existing:
                 if existing.request_hash != request_hash:
-                    raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
-                adj_mat = await db.scalar(select(Material).where(Material.id == existing.material_id))
+                    raise HTTPException(
+                        409,
+                        "Idempotency-Key already used with a different request payload.",
+                    )
+                adj_mat = await db.scalar(
+                    select(Material).where(Material.id == existing.material_id)
+                )
             return InventoryAdjustResponse(
                 material_id=adj_mat.id,
                 material_name=adj_mat.material_name,
@@ -3384,9 +3457,13 @@ async def adjust_inventory(
                 new_stock=float(adj_mat.remaining_stock),
                 difference=float(existing.quantity),
                 avg_rate=float(existing.rate),
-                reason=existing.remarks.split('|')[-1].strip() if existing.remarks else "Idempotent response",
+                reason=(
+                    existing.remarks.split("|")[-1].strip()
+                    if existing.remarks
+                    else "Idempotent response"
+                ),
                 reference_id=existing.reference_id,
-                message="Inventory adjusted successfully"
+                message="Inventory adjusted successfully",
             )
         raise
     except Exception:
@@ -3400,8 +3477,8 @@ async def adjust_inventory(
 
     return InventoryAdjustResponse(
         material_id=material.id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
         material_name=material.material_name,
         old_stock=float(old_stock),
         new_stock=float(material.remaining_stock),
@@ -3492,7 +3569,9 @@ async def get_inventory_valuation(
 ):
     if project_id is not None:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
 
@@ -3604,7 +3683,9 @@ async def logs(
 ):
     if project_id:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
     else:
@@ -3689,7 +3770,9 @@ async def material_report(
 ):
     if project_id:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
     else:
@@ -4453,7 +4536,9 @@ async def export_pdf(
 ):
     if project_id:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
     else:
@@ -4524,7 +4609,9 @@ async def export_excel(
 ):
     if project_id:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
     else:
@@ -4584,7 +4671,9 @@ async def price_history(
     if not _m or _m.is_deleted:
         raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Material not found")
     result = await db.execute(
@@ -4632,7 +4721,9 @@ async def create_material(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     try:
-        await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=payload.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Project not found")
     from decimal import Decimal
@@ -4648,12 +4739,16 @@ async def create_material(
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
         existing = await db.scalar(
-            select(MaterialTransaction)
-            .where(MaterialTransaction.idempotency_key == idempotency_key)
+            select(MaterialTransaction).where(
+                MaterialTransaction.idempotency_key == idempotency_key
+            )
         )
         if existing:
             if existing.request_hash != request_hash:
-                raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key already used with a different request payload.",
+                )
             return await _build_material_out_from_id(db, existing.material_id)
 
     import uuid
@@ -4842,26 +4937,28 @@ async def create_material(
         await db.rollback()
         raise
 
-
     except IntegrityError as e:
         await db.rollback()
 
         if idempotency_key:
             existing = await db.scalar(
-                select(MaterialTransaction)
-                .where(MaterialTransaction.idempotency_key == idempotency_key)
+                select(MaterialTransaction).where(
+                    MaterialTransaction.idempotency_key == idempotency_key
+                )
             )
             if existing:
                 if existing.request_hash != request_hash:
-                    raise HTTPException(409, "Idempotency-Key already used with a different request payload.")
+                    raise HTTPException(
+                        409,
+                        "Idempotency-Key already used with a different request payload.",
+                    )
                 return await _build_material_out_from_id(db, existing.material_id)
 
         # If it wasn't the idempotency key, it might be the material unique constraint
         raise HTTPException(
             status_code=400,
-            detail="Material already exists or integrity constraint violated"
+            detail="Material already exists or integrity constraint violated",
         )
-
 
     except Exception:
         await db.rollback()
@@ -4916,7 +5013,9 @@ async def list_materials(
 
     if project_id is not None:
         try:
-            await assert_project_access(db, project_id=project_id, current_user=current_user)
+            await assert_project_access(
+                db, project_id=project_id, current_user=current_user
+            )
         except Exception:
             raise NotFoundError("Project not found")
 
@@ -4974,7 +5073,6 @@ async def list_materials(
 async def download_procurement_report_pdf(
     project_id: int,
     current_user: User = Depends(require_permission("materials.export")),
-
     db: AsyncSession = Depends(get_db_session),
 ):
     await assert_project_access(db, project_id=project_id, current_user=current_user)
@@ -5054,12 +5152,10 @@ async def download_procurement_report_pdf(
 
 # ==============get_material=================
 
+
 async def _get_active_material_or_404(db: AsyncSession, material_id: int):
     obj = await db.scalar(
-        select(Material).where(
-            Material.id == material_id,
-            Material.is_deleted == False
-        )
+        select(Material).where(Material.id == material_id, Material.is_deleted == False)
     )
     if not obj:
         raise HTTPException(status_code=404, detail="Material not found")
@@ -5076,7 +5172,9 @@ async def generate_material_qr(
     if not _m or _m.is_deleted:
         raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Material not found")
     material = await _get_active_material_or_404(db, material_id)
@@ -5085,14 +5183,10 @@ async def generate_material_qr(
 
     headers = {
         "Cache-Control": "no-store",
-        "Content-Disposition": f'inline; filename="material_{material.id}.png"'
+        "Content-Disposition": f'inline; filename="material_{material.id}.png"',
     }
 
-    return StreamingResponse(
-        qr_buf,
-        media_type="image/png",
-        headers=headers
-    )
+    return StreamingResponse(qr_buf, media_type="image/png", headers=headers)
 
 
 @router.get("/{material_id}", response_model=MaterialOut)
@@ -5105,7 +5199,9 @@ async def get_material(
     if not _m or _m.is_deleted:
         raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Material not found")
     result = await db.execute(
@@ -5168,7 +5264,9 @@ async def update_material(
     if not _m or _m.is_deleted:
         raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Material not found")
     obj = await db.scalar(
@@ -5432,7 +5530,9 @@ async def delete_material(
     if not _m or _m.is_deleted:
         raise NotFoundError("Material not found")
     try:
-        await assert_project_access(db, project_id=_m.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=_m.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Material not found")
     obj = await db.scalar(
@@ -5491,7 +5591,9 @@ async def get_ai_material_recommendation(
 ):
 
     try:
-        await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+        await assert_project_access(
+            db, project_id=payload.project_id, current_user=current_user
+        )
     except Exception:
         raise NotFoundError("Project not found")
     version = await get_cache_version(redis, VERSION_KEY)

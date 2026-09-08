@@ -1,10 +1,10 @@
 import json
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 from enum import Enum
 
-from fastapi import File, Form, UploadFile
+from fastapi import File, Form, HTTPException, UploadFile
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -182,8 +182,23 @@ class MilestoneCreate(BaseSchema):
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
-
         return validate_start_end_dates(info.data.get("start_date"), v)
+
+    @field_validator("actual_end_date")
+    def validate_actual_dates(cls, v, info: ValidationInfo):
+        return validate_start_end_dates(info.data.get("actual_start_date"), v)
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "title": "Foundation & Plinth Work",
+                "description": "Excavation, PCC, and plinth beam casting",
+                "start_date": "2026-09-09",
+                "end_date": "2026-10-15",
+                "status": "Planned",
+            }
+        }
+    )
 
 
 class MilestoneUpdate(BaseSchema):
@@ -197,8 +212,23 @@ class MilestoneUpdate(BaseSchema):
 
     @field_validator("end_date")
     def validate_dates(cls, v, info: ValidationInfo):
-
         return validate_start_end_dates(info.data.get("start_date"), v)
+
+    @field_validator("actual_end_date")
+    def validate_actual_dates(cls, v, info: ValidationInfo):
+        return validate_start_end_dates(info.data.get("actual_start_date"), v)
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "title": "Foundation & Plinth Work Updated",
+                "description": "Updated work details",
+                "start_date": "2026-09-09",
+                "end_date": "2026-10-20",
+                "status": "In Progress",
+            }
+        }
+    )
 
 
 class MilestoneOut(BaseSchema):
@@ -522,13 +552,13 @@ class TaskStatusUpdate(BaseSchema):
 
 
 class TaskRequestBase(BaseModel):
-    title: Optional[str] = None
-    category: Optional[str] = None
-    project_id: int
-    priority: Optional[str] = None
-    description: Optional[str] = None
-    attachment_url: Optional[str] = None
-    assigned_to: Optional[int] = None
+    title: str = Field(..., min_length=1, description="Title of the task request")
+    category: str = Field(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)")
+    project_id: int = Field(..., description="Project ID")
+    priority: str = Field(..., description="Priority (LOW, MEDIUM, HIGH)")
+    description: Optional[str] = Field(default=None, description="Detailed description of the task request")
+    attachment_url: Optional[str] = Field(default=None, description="Attachment URL or filename")
+    assigned_to: Optional[int] = Field(default=None, description="User ID of assignee")
 
 
 # =========================================================
@@ -549,13 +579,13 @@ class TaskRequestCreateForm:
 
     def __init__(
         self,
-        project_id: int = Form(...),
-        title: Optional[str] = Form(None),
-        category: Optional[str] = Form(None),
-        priority: Optional[str] = Form(None),
-        description: Optional[str] = Form(None),
-        assigned_to: Optional[int] = Form(None),
-        attachment: UploadFile | None = File(None),
+        project_id: int = Form(..., description="Project ID"),
+        title: str = Form(..., min_length=1, description="Title of the task request"),
+        category: str = Form(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)"),
+        priority: str = Form(..., min_length=1, description="Priority (LOW, MEDIUM, HIGH)"),
+        description: Optional[str] = Form(None, description="Detailed description of the task request"),
+        assigned_to: Optional[int] = Form(None, description="User ID to assign to"),
+        attachment: Optional[UploadFile] = File(None, description="Attachment file"),
     ):
         self.project_id = project_id
         self.title = title
@@ -566,12 +596,28 @@ class TaskRequestCreateForm:
         self.attachment = attachment
 
     def to_schema(self) -> TaskRequestCreate:
+        clean_title = self.title.strip() if self.title else ""
+        if not clean_title:
+            raise HTTPException(status_code=422, detail="Title cannot be empty")
+
+        clean_category = self.category.strip() if self.category else ""
+        if not clean_category:
+            raise HTTPException(status_code=422, detail="Category cannot be empty")
+
+        clean_priority = self.priority.strip() if self.priority else ""
+        if not clean_priority or clean_priority.lower() == "null":
+            raise HTTPException(status_code=422, detail="Priority cannot be empty")
+
+        clean_desc = self.description.strip() if self.description else None
+        if clean_desc in ("", "null", "undefined"):
+            clean_desc = None
+
         return TaskRequestCreate(
             project_id=self.project_id,
-            title=self.title,
-            category=self.category,
-            priority=self.priority,
-            description=self.description,
+            title=clean_title,
+            category=clean_category,
+            priority=clean_priority,
+            description=clean_desc,
             assigned_to=self.assigned_to,
         )
 
@@ -582,14 +628,41 @@ class TaskRequestCreateForm:
 
 
 class TaskRequestUpdate(BaseModel):
-    title: Optional[str] = None
-    category: Optional[str] = None
-    priority: Optional[str] = None
-    description: Optional[str] = None
-    status: Optional[str] = None
-    attachment_url: Optional[str] = None
-    assigned_to: Optional[int] = None
-    is_deleted: Optional[bool] = None
+    title: str = Field(..., min_length=1, description="Title of the task request")
+    category: str = Field(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)")
+    priority: str = Field(..., min_length=1, description="Priority (LOW, MEDIUM, HIGH)")
+    status: str = Field(..., min_length=1, description="Status (PENDING, APPROVED, REJECTED)")
+    description: Optional[str] = Field(default=None, description="Detailed description of the task request")
+    attachment_url: Optional[str] = Field(default=None, description="Attachment URL or filename")
+    assigned_to: Optional[int] = Field(default=None, description="User ID of assignee")
+    is_deleted: Optional[bool] = Field(default=False, description="Soft delete flag")
+
+    @field_validator("title", "category")
+    @classmethod
+    def validate_non_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Field cannot be empty or whitespace only")
+        return v.strip()
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: str) -> str:
+        v_upper = v.strip().upper()
+        if v_upper in ("ACCEPT", "ACCEPTED"):
+            return "APPROVED"
+        if v_upper in ("REJECT",):
+            return "REJECTED"
+        if v_upper not in ("PENDING", "APPROVED", "REJECTED"):
+            raise ValueError("Status must be one of: PENDING, APPROVED, REJECTED")
+        return v_upper
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, v: str) -> str:
+        v_upper = v.strip().upper()
+        if v_upper not in ("LOW", "MEDIUM", "HIGH"):
+            raise ValueError("Priority must be one of: LOW, MEDIUM, HIGH")
+        return v_upper
 
 
 # =========================================================
@@ -868,9 +941,29 @@ class QCCreate(BaseSchema):
 
 class QCOut(QCCreate):
     id: int
+    report_file_url: Optional[str] = None
+    report_file: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_report_file_before(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            val = data.get("report_file_url") or data.get("report_file")
+            data.setdefault("report_file_url", val)
+            data.setdefault("report_file", val)
+        return data
+
+    @model_validator(mode="after")
+    def sync_report_file_after(self) -> "QCOut":
+        val = self.report_file_url or self.report_file
+        if val:
+            if not self.report_file_url:
+                self.report_file_url = val
+            if not self.report_file:
+                self.report_file = val
+        return self
 
 
 # ===================== SAFETY =====================

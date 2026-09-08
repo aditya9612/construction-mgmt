@@ -21,6 +21,7 @@ from app.core.enums import (
     ProjectStatus,
     SkillType,
     TaskPriority,
+    TaskStatus,
     WorkActivityStatus,
 )
 from app.models.boq import BOQ
@@ -71,9 +72,11 @@ from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
     Spacer,
+    Table as PdfTable,
     TableStyle,
 )
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors as pdf_colors
 from sqlalchemy.exc import IntegrityError
 from fastapi import UploadFile, File
 from app.utils.helpers import (
@@ -120,17 +123,34 @@ def compute_project_status(project):
 def compute_milestone_status(milestone):
     today = date.today()
 
-    if milestone.status == MilestoneStatus.COMPLETED or milestone.actual_end_date:
+    if milestone.status == MilestoneStatus.COMPLETED:
+        return "Completed"
+
+    tasks = getattr(milestone, "__dict__", {}).get("tasks", []) or []
+    if tasks and all(getattr(t, "status", None) == TaskStatus.COMPLETED for t in tasks):
+        return "Completed"
+
+    if milestone.status == MilestoneStatus.PLANNED:
+        if milestone.end_date and today > milestone.end_date:
+            return "Delayed"
+        return "Planned"
+
+    if milestone.status == MilestoneStatus.DELAYED:
+        return "Delayed"
+
+    if milestone.status == MilestoneStatus.IN_PROGRESS:
+        if milestone.end_date and today > milestone.end_date:
+            return "Delayed"
+        return "In Progress"
+
+    if milestone.actual_end_date:
         return "Completed"
 
     if milestone.end_date and today > milestone.end_date:
         return "Delayed"
 
-    if milestone.status == MilestoneStatus.IN_PROGRESS or milestone.actual_start_date:
+    if milestone.actual_start_date:
         return "In Progress"
-
-    if milestone.status == MilestoneStatus.DELAYED:
-        return "Delayed"
 
     return "Planned"
 
@@ -214,6 +234,8 @@ async def _get_scoped_milestone(
     )
     if for_update:
         query = query.with_for_update()
+    else:
+        query = query.options(selectinload(m.Milestone.tasks))
     milestone = await db.scalar(query)
     if not milestone:
         raise HTTPException(status_code=404, detail="Milestone not found")
@@ -1289,23 +1311,25 @@ class MilestonesService:
 
         data = payload.model_dump(exclude_unset=True)
 
-        if "status" not in data:
+        if "status" not in data or data["status"] is None:
             data["status"] = MilestoneStatus.PLANNED
 
         from datetime import date
 
-        if (
-            data["status"] == MilestoneStatus.IN_PROGRESS
-            and data.get("actual_start_date") is None
-        ):
-            data["actual_start_date"] = date.today()
-        elif (
-            data["status"] == MilestoneStatus.COMPLETED
-            and data.get("actual_end_date") is None
-        ):
-            data["actual_end_date"] = date.today()
+        if data["status"] == MilestoneStatus.PLANNED:
+            data["actual_start_date"] = None
+            data["actual_end_date"] = None
+        elif data["status"] == MilestoneStatus.IN_PROGRESS:
+            data["actual_end_date"] = None
+            if data.get("actual_start_date") is None:
+                data["actual_start_date"] = date.today()
+        elif data["status"] == MilestoneStatus.COMPLETED:
+            if data.get("actual_end_date") is None:
+                data["actual_end_date"] = date.today()
             if data.get("actual_start_date") is None:
                 data["actual_start_date"] = data.get("start_date") or date.today()
+        elif data["status"] == MilestoneStatus.DELAYED:
+            data["actual_end_date"] = None
 
         try:
             obj = await self.milestones_repo.create_milestone(
@@ -1374,26 +1398,30 @@ class MilestonesService:
 
         from datetime import date
 
-        if "status" in data:
+        if "status" in data and data["status"] is not None:
             if data["status"] == MilestoneStatus.IN_PROGRESS:
+                data["actual_end_date"] = None
                 if (
                     data.get("actual_start_date") is None
                     and obj.actual_start_date is None
                 ):
                     data["actual_start_date"] = date.today()
-                if "actual_end_date" not in data and obj.actual_end_date is not None:
-                    data["actual_end_date"] = None
             elif data["status"] == MilestoneStatus.COMPLETED:
                 if (
                     data.get("actual_end_date") is None
                     and obj.actual_end_date is None
                 ):
                     data["actual_end_date"] = date.today()
+                if (
+                    data.get("actual_start_date") is None
+                    and obj.actual_start_date is None
+                ):
+                    data["actual_start_date"] = obj.start_date or date.today()
             elif data["status"] == MilestoneStatus.PLANNED:
-                if "actual_start_date" not in data and obj.actual_start_date is not None:
-                    data["actual_start_date"] = None
-                if "actual_end_date" not in data and obj.actual_end_date is not None:
-                    data["actual_end_date"] = None
+                data["actual_start_date"] = None
+                data["actual_end_date"] = None
+            elif data["status"] == MilestoneStatus.DELAYED:
+                data["actual_end_date"] = None
 
         try:
             await self.milestones_repo.update_milestone(db, obj=obj, data=data)
@@ -1408,7 +1436,10 @@ class MilestonesService:
             logger.exception(f"Milestone update failed id={milestone_id}")
             raise
 
-        return serialize_milestone(obj)
+        refreshed = await self.milestones_repo.get_milestone(
+            db, project_id=project_id, milestone_id=milestone_id
+        )
+        return serialize_milestone(refreshed or obj)
 
     async def delete_milestone(
         self,
@@ -4257,10 +4288,18 @@ async def create_task_request(
 
     attachment_url = None
 
-    # Temporary file handling
-    if form.attachment:
-        attachment_url = form.attachment.filename
-        # Later replace with actual upload helper
+    if form.attachment and form.attachment.filename and form.attachment.filename.strip():
+        try:
+            os.makedirs("uploads/task_requests", exist_ok=True)
+            safe_filename = form.attachment.filename.replace(" ", "_")
+            unique_name = f"{uuid4().hex[:8]}_{safe_filename}"
+            file_path = os.path.join("uploads/task_requests", unique_name)
+            content = await form.attachment.read()
+            with open(file_path, "wb") as f:
+                f.write(content)
+            attachment_url = f"/uploads/task_requests/{unique_name}"
+        except Exception:
+            attachment_url = form.attachment.filename
 
     data = request.model_dump(exclude={"attachment_url"})
     data["attachment_url"] = attachment_url
@@ -8207,18 +8246,18 @@ def save_qc_file(file: UploadFile) -> str:
 
 
 async def validate_and_save_qc_file(file: UploadFile) -> str:
-    if not file.content_type.startswith("image/"):
-        raise AppError(400, "Only image files allowed")
+    allowed_extensions = {"jpg", "jpeg", "png", "webp", "pdf"}
+    ext = file.filename.split(".")[-1].lower() if file.filename and "." in file.filename else ""
 
-    allowed_extensions = {"jpg", "jpeg", "png", "webp"}
-    ext = file.filename.split(".")[-1].lower()
+    content_type = file.content_type or ""
+    is_valid_type = content_type.startswith("image/") or content_type in ("application/pdf", "application/x-pdf") or ext == "pdf"
 
-    if ext not in allowed_extensions:
-        raise AppError(400, "Invalid file format")
+    if not is_valid_type or ext not in allowed_extensions:
+        raise AppError(400, "Only image (jpg, jpeg, png, webp) and PDF files allowed")
 
     content = await file.read()
-    if len(content) > 5 * 1024 * 1024:
-        raise AppError(400, "File too large")
+    if len(content) > 10 * 1024 * 1024:
+        raise AppError(400, "File too large (max 10MB)")
 
     file.file.seek(0)
 
@@ -8246,7 +8285,7 @@ async def create_qc(
     await assert_task_project(db, payload.task_id, payload.project_id)
 
     file_url = None
-    if report_file:
+    if report_file and report_file.filename and report_file.filename.strip():
         file_url = await validate_and_save_qc_file(report_file)
 
     obj = m.QCRecord(**payload.model_dump(), report_file_url=file_url)

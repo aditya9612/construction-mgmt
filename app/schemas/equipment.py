@@ -356,8 +356,8 @@ class EquipmentMaintenanceCreate(BaseSchema):
 
     next_maintenance_date: Optional[date] = None
 
-    project_id: int = Field(
-        ...,
+    project_id: Optional[int] = Field(
+        None,
         gt=0,
     )
 

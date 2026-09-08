@@ -2553,13 +2553,20 @@ async def create_maintenance(
 
     equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
 
+    effective_project_id = payload.project_id or equipment.project_id
+    if effective_project_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="project_id is required for central equipment maintenance",
+        )
+
     if equipment.project_id is not None:
         await assert_project_access(
             db, project_id=equipment.project_id, current_user=current_user
         )
 
     await assert_project_access(
-        db, project_id=payload.project_id, current_user=current_user
+        db, project_id=effective_project_id, current_user=current_user
     )
 
     today = date.today()
@@ -2573,14 +2580,6 @@ async def create_maintenance(
         raise HTTPException(
             status_code=400,
             detail="Next maintenance date must be after maintenance date",
-        )
-
-    # ================= PROJECT CHECK =================
-
-    if equipment.project_id is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Equipment is currently allocated to a project",
         )
 
     # ================= RENTAL VALIDATION =================
@@ -2638,7 +2637,7 @@ async def create_maintenance(
                 detail="BOQ item not found",
             )
 
-        if boq_item.project_id != payload.project_id:
+        if boq_item.project_id != effective_project_id:
             raise HTTPException(
                 status_code=400,
                 detail="BOQ item does not belong to selected project",
@@ -2648,8 +2647,11 @@ async def create_maintenance(
 
     old_status = equipment.status
 
+    maint_data = payload.model_dump()
+    maint_data["project_id"] = effective_project_id
+
     obj = EquipmentMaintenance(
-        **payload.model_dump(),
+        **maint_data,
         equipment_id=equipment_id,
     )
 

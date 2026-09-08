@@ -241,7 +241,13 @@ async def approve_vendor_bill(
             status_code=400, detail="Only pending bills can be approved or rejected"
         )
 
-    if payload.status not in [
+    status_val = (
+        payload.status.value
+        if hasattr(payload.status, "value")
+        else str(payload.status).strip().upper()
+    )
+
+    if status_val not in [
         VendorBillStatus.APPROVED.value,
         VendorBillStatus.REJECTED.value,
     ]:
@@ -249,7 +255,7 @@ async def approve_vendor_bill(
             status_code=400, detail="Invalid status. Must be APPROVED or REJECTED."
         )
 
-    if payload.status == VendorBillStatus.APPROVED.value and not bill.accrued_journal_id:
+    if status_val == VendorBillStatus.APPROVED.value and not bill.accrued_journal_id:
         # Create Accrual Journal strictly scoped to bill.company_id
         vendor_acc = await db.scalar(
             select(Account).where(
@@ -269,6 +275,17 @@ async def approve_vendor_bill(
                 Account.company_id == bill.company_id,
             )
         )
+
+        # Auto-seed standard accounts for this company if missing
+        if (not vendor_acc or not expense_acc) and bill.company_id:
+            try:
+                from app.utils.accounting import seed_company_chart_of_accounts
+                acc_map = await seed_company_chart_of_accounts(db, bill.company_id)
+                vendor_acc = vendor_acc or acc_map.get("VENDOR_PAYABLE")
+                expense_acc = expense_acc or acc_map.get("EXPENSE") or acc_map.get("GENERAL_EXPENSE")
+                gst_acc = gst_acc or acc_map.get("INPUT_GST")
+            except Exception as e:
+                logger.warning("Failed to auto-seed company chart of accounts: %s", e)
 
         if not vendor_acc:
             raise HTTPException(
@@ -335,7 +352,7 @@ async def approve_vendor_bill(
 
         bill.accrued_journal_id = je.id
 
-    bill.status = payload.status
+    bill.status = status_val
 
     try:
         await db.commit()
@@ -356,11 +373,11 @@ async def approve_vendor_bill(
                     await create_notification(
                         db=notif_db,
                         user_id=member_id,
-                        title=f"Vendor Bill {payload.status.capitalize()}",
-                        message=f"Vendor Bill {bill.bill_number} has been {payload.status.lower()}.",
+                        title=f"Vendor Bill {status_val.capitalize()}",
+                        message=f"Vendor Bill {bill.bill_number} has been {status_val.lower()}.",
                         type=(
                             "SUCCESS"
-                            if payload.status == VendorBillStatus.APPROVED.value
+                            if status_val == VendorBillStatus.APPROVED.value
                             else "WARNING"
                         ),
                     )
@@ -369,7 +386,7 @@ async def approve_vendor_bill(
             logger.error("Failed to create notification for vendor bill approval: %s", e)
 
     return {
-        "message": f"Bill {payload.status.lower()} successfully",
+        "message": f"Bill {status_val.lower()} successfully",
         "status": bill.status,
     }
 
