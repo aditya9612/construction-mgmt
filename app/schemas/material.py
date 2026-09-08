@@ -161,23 +161,56 @@ class MaterialOut(BaseSchema):
     supplier_id: int
     supplier_name: Optional[str] = None
 
-    purchase_rate: Decimal
+    purchase_rate: Decimal = Field(..., examples=[425.00])
     rate_type: RateType
 
-    quantity_purchased: Decimal
-    quantity_used: Decimal
-    remaining_stock: Decimal
+    quantity_purchased: Decimal = Field(..., examples=[150.0])
+    quantity_used: Decimal = Field(..., examples=[40.0])
+    remaining_stock: Decimal = Field(..., examples=[110.0])
 
-    total_amount: float
+    total_amount: float = Field(..., examples=[63750.00])
 
-    payment_given: float
-    payment_pending: float
+    payment_given: float = Field(..., examples=[40000.00])
+    payment_pending: float = Field(..., examples=[23750.00])
 
-    extra_paid: float = 0.0
+    extra_paid: float = Field(default=0.0, examples=[0.0])
 
-    minimum_stock_level: float
+    minimum_stock_level: float = Field(..., examples=[25.0])
 
-    alert_type: str
+    alert_type: str = Field(..., examples=["IN_STOCK"])
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "id": 1,
+                "material_code": "MAT001",
+                "project_id": 1,
+                "material_master_id": 1,
+                "material_master_name": "OPC Cement 53 Grade",
+                "material_master_brand": "Generic Brand",
+                "material_master_specification": "53 Grade Ordinary Portland Cement",
+                "material_master_hsn_code": "25232930",
+                "material_name": "OPC Cement 53 Grade",
+                "category": "Cement",
+                "unit_id": 1,
+                "unit_name": "Bags",
+                "supplier_id": 1,
+                "supplier_name": "ABC Building Materials",
+                "purchase_rate": 425.00,
+                "rate_type": "FIXED",
+                "quantity_purchased": 150.0,
+                "quantity_used": 40.0,
+                "remaining_stock": 110.0,
+                "total_amount": 63750.00,
+                "payment_given": 40000.00,
+                "payment_pending": 23750.00,
+                "extra_paid": 0.0,
+                "minimum_stock_level": 25.0,
+                "alert_type": "IN_STOCK",
+            }
+        },
+    )
 
 
 # ================= PURCHASE =================
@@ -431,6 +464,7 @@ class PurchaseOrderOut(BaseSchema):
     material_id: int
     supplier_id: int
     project_id: int
+    boq_item_id: Optional[int] = None
 
     material_name: str
 
@@ -440,6 +474,7 @@ class PurchaseOrderOut(BaseSchema):
     total_amount: float
 
     status: Optional[str] = "CREATED"
+    created_at: Optional[datetime] = None
 
 
 # ================= TRANSFER =================
@@ -519,6 +554,10 @@ class TransferOut(BaseSchema):
     created_at: Optional[datetime] = None
 
 
+class TransferStatusUpdate(BaseSchema):
+    status: str = Field(..., description="Target status: COMPLETED or CANCELLED", examples=["COMPLETED"])
+
+
 # ================= INVENTORY =================
 class InventoryAdjustRequest(BaseSchema):
 
@@ -557,9 +596,9 @@ class InventoryOut(BaseSchema):
 
     remaining_stock: float
 
-    unit_id: int
+    unit_id: Optional[int] = None
 
-    unit_name: str
+    unit_name: Optional[str] = ""
 
     avg_rate: float
 
@@ -568,12 +607,41 @@ class InventoryOut(BaseSchema):
     project_id: int
 
 
+class ProjectInventoryOut(BaseSchema):
+
+    material_id: int
+
+    material_name: str
+
+    remaining_stock: float
+
+    unit_id: Optional[int] = None
+
+    unit_name: Optional[str] = ""
+
+    avg_rate: float
+
+    total_value: float
+
+    project_id: int
+
+
+class InventoryValuationOut(BaseSchema):
+
+    project_id: Optional[int] = None
+
+    total_value: float
+
+
 # ================= LOG =================
 class MaterialLogOut(BaseSchema):
 
     id: int
-    boq_item_id: Optional[int]
+    boq_item_id: Optional[int] = None
     material_id: int
+    material_name: Optional[str] = None
+    supplier_id: Optional[int] = None
+    supplier_name: Optional[str] = None
 
     type: TransactionType
 

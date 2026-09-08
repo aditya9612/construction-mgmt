@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 import uuid
 import os
 from sqlalchemy.exc import IntegrityError
-from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, Body, status
 from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from reportlab.platypus import SimpleDocTemplate, Table
@@ -134,6 +134,10 @@ from app.schemas.material import (
     PurchaseOrderOut,
     TransferCreate,
     TransferOut,
+    TransferStatusUpdate,
+    InventoryOut,
+    ProjectInventoryOut,
+    InventoryValuationOut,
 )
 
 from app.core.logger import logger
@@ -288,11 +292,13 @@ def build_po_response(po: PurchaseOrder) -> PurchaseOrderOut:
         supplier_id=po.supplier_id,
         project_id=po.project_id,
         material_id=po.material_id,
+        boq_item_id=po.boq_item_id,
         material_name=(po.material_name or "").strip().title(),
         quantity=round(float(po.quantity or 0), 2),
         rate=round(float(po.rate or 0), 2),
         total_amount=round(float(po.total_amount or 0), 2),
         status=po.status,
+        created_at=po.created_at,
     )
 
 
@@ -1962,38 +1968,52 @@ async def get_material_transactions(
         raise HTTPException(403, "Access denied")
 
     result = await db.execute(
-        select(MaterialTransaction)
+        select(
+            MaterialTransaction,
+            Material.material_name,
+            Supplier.id.label("supplier_id"),
+            Supplier.supplier_name,
+        )
+        .join(Material, Material.id == MaterialTransaction.material_id)
+        .outerjoin(Supplier, Supplier.id == Material.supplier_id)
         .where(MaterialTransaction.material_id == material_id)
         .order_by(MaterialTransaction.created_at.desc())
         .offset(offset)
         .limit(limit)
     )
 
-    rows = result.scalars().all()
+    rows = result.all()
 
     data = []
 
     for r in rows:
-        quantity = float(r.quantity or 0)
-        total_amount = float(r.total_amount or 0)
+        tx = r[0]
+        mat_name = r[1]
+        supp_id = r[2]
+        supp_name = r[3]
+        quantity = float(tx.quantity or 0)
+        total_amount = float(tx.total_amount or 0)
 
         avg_rate = abs(total_amount / quantity) if quantity != 0 else 0
 
         data.append(
             MaterialLogOut(
-                id=r.id,
-                boq_item_id=r.boq_item_id,
-                material_id=r.material_id,
-                type=r.type,
+                id=tx.id,
+                boq_item_id=tx.boq_item_id,
+                material_id=tx.material_id,
+                material_name=(mat_name or "").strip().title() if mat_name else None,
+                supplier_id=supp_id,
+                supplier_name=supp_name,
+                type=tx.type,
                 quantity=round(quantity, 3),
-                rate=round(float(r.rate or 0), 2),
+                rate=round(float(tx.rate or 0), 2),
                 avg_rate=round(avg_rate, 2),
                 total_amount=round(total_amount, 2),
-                amount_paid=float(r.amount_paid or 0),
-                payment_pending=float(r.payment_pending or 0),
-                issue_type=r.issue_type,
-                project_id=r.project_id,
-                created_at=r.created_at,
+                amount_paid=float(tx.amount_paid or 0),
+                payment_pending=float(tx.payment_pending or 0),
+                issue_type=tx.issue_type,
+                project_id=tx.project_id,
+                created_at=tx.created_at,
             )
         )
 
@@ -2003,7 +2023,7 @@ async def get_material_transactions(
 # ================= TRANSFERS =================
 
 
-@router.post("/transfers", response_model=TransferOut)
+@router.post("/transfers", response_model=TransferOut, status_code=status.HTTP_201_CREATED)
 async def create_transfer(
     payload: TransferCreate,
     db: AsyncSession = Depends(get_db_session),
@@ -2283,18 +2303,37 @@ VALID_STATUS = {"COMPLETED", "CANCELLED"}
 @router.put("/transfers/{id}", response_model=TransferOut)
 async def update_transfer_status(
     id: int,
-    status: str,
+    payload: Optional[TransferStatusUpdate] = Body(None),
+    status: Optional[str] = Query(None, description="Legacy query parameter for status"),
     current_user: User = Depends(require_permission("inventory.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    status = status.upper().strip()
+    final_status = None
+    if payload is not None and payload.status:
+        body_status = payload.status.upper().strip()
+        if status:
+            query_status = status.upper().strip()
+            if body_status != query_status:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Conflicting status provided in body ('{body_status}') and query ('{query_status}')",
+                )
+        final_status = body_status
+    elif status:
+        final_status = status.upper().strip()
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be provided in request body or query parameter",
+        )
 
-    if status not in VALID_STATUS:
+    if final_status not in VALID_STATUS:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid status. Allowed: {', '.join(sorted(VALID_STATUS))}",
         )
+    status = final_status
 
     try:
         # Lock transfer row
@@ -3493,7 +3532,7 @@ async def adjust_inventory(
 # ===============get_all_inventory===========================
 
 
-@router.get("/inventory")
+@router.get("/inventory", response_model=List[InventoryOut])
 async def get_all_inventory(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("inventory.view")),
@@ -3558,7 +3597,7 @@ async def get_all_inventory(
 # ==================get_inventory_valuation=======================
 
 
-@router.get("/inventory/valuation")
+@router.get("/inventory/valuation", response_model=InventoryValuationOut)
 async def get_inventory_valuation(
     project_id: Optional[int] = Query(
         None,
@@ -3620,7 +3659,7 @@ async def get_inventory_valuation(
 # ======================================================
 
 
-@router.get("/inventory/{project_id}")
+@router.get("/inventory/{project_id}", response_model=List[ProjectInventoryOut])
 async def get_project_inventory(
     project_id: int,
     skip: int = 0,
@@ -3634,9 +3673,13 @@ async def get_project_inventory(
             Material.id,
             Material.material_name,
             Material.remaining_stock,
+            Material.unit_id,
+            Unit.name.label("unit_name"),
+            Material.project_id,
             Material.total_amount,
             Material.quantity_purchased,
         )
+        .outerjoin(Unit, Unit.id == Material.unit_id)
         .where(Material.project_id == project_id, Material.is_deleted == False)
         .offset(skip)
         .limit(limit)
@@ -3660,8 +3703,11 @@ async def get_project_inventory(
                 "material_id": r.id,
                 "material_name": (r.material_name or "").strip().title(),
                 "remaining_stock": float(remaining),
+                "unit_id": r.unit_id,
+                "unit_name": r.unit_name or "",
                 "avg_rate": float(avg_rate.quantize(Decimal("0.01"))),
                 "total_value": float(total_value.quantize(Decimal("0.01"))),
+                "project_id": r.project_id,
             }
         )
 
@@ -3699,7 +3745,16 @@ async def logs(
     ):
         raise HTTPException(403, "Access denied")
 
-    query = select(MaterialTransaction)
+    query = (
+        select(
+            MaterialTransaction,
+            Material.material_name,
+            Supplier.id.label("supplier_id"),
+            Supplier.supplier_name,
+        )
+        .join(Material, Material.id == MaterialTransaction.material_id)
+        .outerjoin(Supplier, Supplier.id == Material.supplier_id)
+    )
 
     if material_id is not None:
         query = query.where(MaterialTransaction.material_id == material_id)
@@ -3721,30 +3776,37 @@ async def logs(
     )
 
     result = await db.execute(query)
-    rows = result.scalars().all()
+    rows = result.all()
 
     logs = []
 
     for r in rows:
-        quantity = r.quantity or Decimal("0")
-        total_amount = r.total_amount or Decimal("0")
-        rate = r.rate or Decimal("0")
+        tx = r[0]
+        mat_name = r[1]
+        supp_id = r[2]
+        supp_name = r[3]
+        quantity = tx.quantity or Decimal("0")
+        total_amount = tx.total_amount or Decimal("0")
+        rate = tx.rate or Decimal("0")
 
         logs.append(
             MaterialLogOut(
-                id=r.id,
-                material_id=r.material_id,
-                boq_item_id=r.boq_item_id,
-                type=r.type.value,
+                id=tx.id,
+                material_id=tx.material_id,
+                material_name=(mat_name or "").strip().title() if mat_name else None,
+                supplier_id=supp_id,
+                supplier_name=supp_name,
+                boq_item_id=tx.boq_item_id,
+                type=tx.type.value if hasattr(tx.type, "value") else tx.type,
                 quantity=float(round(quantity, 3)),
                 rate=float(round(rate, 2)),
                 avg_rate=float(round(rate, 2)),
                 total_amount=float(round(total_amount, 2)),
-                amount_paid=float(r.amount_paid or 0),
-                payment_pending=float(r.payment_pending or 0),
-                issue_type=r.issue_type,
-                project_id=r.project_id,
-                created_at=r.created_at,
+                amount_paid=float(tx.amount_paid or 0),
+                payment_pending=float(tx.payment_pending or 0),
+                issue_type=tx.issue_type,
+                project_id=tx.project_id,
+                created_at=tx.created_at,
             )
         )
 
@@ -3879,14 +3941,14 @@ async def material_report(
                 supplier_id=m.supplier_id,
                 supplier_name=(m.supplier.supplier_name if m.supplier else None),
                 project_id=m.project_id,
-                total_purchased=float(purchased),
-                total_used=float(used),
-                remaining_stock=float(remaining),
-                avg_rate=float(avg_rate),
-                stock_value=float(stock_value),
-                payment_given=float(m.payment_given or 0),
-                payment_pending=float(m.payment_pending or 0),
-                minimum_stock_level=float(m.minimum_stock_level or 0),
+                total_purchased=float(purchased.quantize(Decimal("0.001"))),
+                total_used=float(used.quantize(Decimal("0.001"))),
+                remaining_stock=float(remaining.quantize(Decimal("0.001"))),
+                avg_rate=float(avg_rate.quantize(Decimal("0.01"))),
+                stock_value=float(stock_value.quantize(Decimal("0.01"))),
+                payment_given=float(Decimal(str(m.payment_given or 0)).quantize(Decimal("0.01"))),
+                payment_pending=float(Decimal(str(m.payment_pending or 0)).quantize(Decimal("0.01"))),
+                minimum_stock_level=float(Decimal(str(m.minimum_stock_level or 0)).quantize(Decimal("0.001"))),
                 alert_type=alert_type,
             )
         )
@@ -3894,12 +3956,12 @@ async def material_report(
     return MaterialReportResponse(
         summary=MaterialReportSummary(
             total_materials=len(report_rows),
-            total_purchased=float(total_purchased),
-            total_used=float(total_used),
-            total_remaining=float(total_remaining),
-            total_stock_value=float(total_stock_value),
-            total_payment_given=float(total_payment_given),
-            total_payment_pending=float(total_payment_pending),
+            total_purchased=float(total_purchased.quantize(Decimal("0.001"))),
+            total_used=float(total_used.quantize(Decimal("0.001"))),
+            total_remaining=float(total_remaining.quantize(Decimal("0.001"))),
+            total_stock_value=float(total_stock_value.quantize(Decimal("0.01"))),
+            total_payment_given=float(total_payment_given.quantize(Decimal("0.01"))),
+            total_payment_pending=float(total_payment_pending.quantize(Decimal("0.01"))),
             in_stock_count=in_stock_count,
             low_stock_count=low_stock_count,
             out_of_stock_count=out_of_stock_count,
@@ -4712,7 +4774,7 @@ async def price_history(
 # ================= MATERIALS - DYNAMIC ROUTES =================
 
 
-@router.post("", response_model=MaterialOut)
+@router.post("", response_model=MaterialOut, status_code=status.HTTP_201_CREATED)
 async def create_material(
     payload: MaterialCreate,
     db: AsyncSession = Depends(get_db_session),

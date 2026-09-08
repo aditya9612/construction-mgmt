@@ -210,7 +210,7 @@ async def test_material_transfer_2step_workflow():
             "quantity": 25.0,
         }
         resp = await ac.post("/api/v1/materials/transfers", json=create_payload)
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code in [200, 201], resp.text
         tr_data = resp.json()
         transfer_id = tr_data["id"]
         assert tr_data["status"] == "PENDING"
@@ -333,7 +333,7 @@ async def test_material_transfer_cancellation():
                 "quantity": 10.0,
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code in [200, 201], resp.text
         tr_id = resp.json()["id"]
 
         # 2. Cancel transfer
@@ -374,7 +374,7 @@ async def test_material_transfer_invalid_transitions():
                 "quantity": 5.0,
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code in [200, 201], resp.text
         tr_id = resp.json()["id"]
 
         # Reject PENDING -> PENDING
@@ -469,7 +469,7 @@ async def test_material_transfer_tenant_isolation_idor():
                 "quantity": 5.0,
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code in [200, 201], resp.text
         tr_id = resp.json()["id"]
 
         # 2. Company A tries to transfer to Company B project -> Blocked
