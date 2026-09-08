@@ -20,7 +20,7 @@ from app.models.settings import CompanySettings
 
 
 def create_styled_table(data, col_widths, highlight_last_row=False):
-    table = Table(data, colWidths=col_widths)
+    table = Table(data, colWidths=col_widths, hAlign='LEFT')
 
     style = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
@@ -52,6 +52,27 @@ def create_styled_table(data, col_widths, highlight_last_row=False):
     table.setStyle(TableStyle(style))
     return table
 
+
+
+from reportlab.platypus.flowables import Flowable
+
+class AbsoluteFooter(Flowable):
+    def __init__(self, table, x, y, width):
+        Flowable.__init__(self)
+        self.table = table
+        self.x = x
+        self.y = y
+        self.doc_width = width
+        
+    def wrap(self, availWidth, availHeight):
+        return (0, 0)
+        
+    def draw(self):
+        self.canv.saveState()
+        abs_x, abs_y = self.canv.absolutePosition(0, 0)
+        self.table.wrapOn(self.canv, self.doc_width, 80)
+        self.table.drawOn(self.canv, self.x - abs_x, self.y - abs_y)
+        self.canv.restoreState()
 
 def generate_dummy_quotation_pdf(
     data: dict, company_settings: CompanySettings | None = None
@@ -403,23 +424,20 @@ def generate_dummy_quotation_pdf(
     )
 
     # Render PDF
-    def draw_header_footer(canvas, doc):
+    def draw_first_page(canvas, doc):
         canvas.saveState()
-        
-        # Draw Header
+        # Draw Header only on first page
         header_table.wrapOn(canvas, doc.width, doc.topMargin)
         header_table.drawOn(canvas, doc.leftMargin, A4[1] - 90)
-
-        # Draw Footer
-        x = doc.leftMargin
-        y = 15
-        footer_table.wrapOn(canvas, doc.width, 80)
-        footer_table.drawOn(canvas, x, y)
-
         canvas.restoreState()
 
+    def draw_later_pages(canvas, doc):
+        pass # No header, no footer by default
 
-    doc.build(elements, onFirstPage=draw_header_footer, onLaterPages=draw_header_footer)
+    # Append absolute footer so it only renders on the last page
+    elements.append(AbsoluteFooter(footer_table, doc.leftMargin, 15, doc.width))
+
+    doc.build(elements, onFirstPage=draw_first_page, onLaterPages=draw_later_pages)
     
     buffer.seek(0)
     return buffer

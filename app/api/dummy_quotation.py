@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import delete, select, func
 from sqlalchemy.orm import selectinload
 from typing import List, Optional
 from datetime import datetime
@@ -313,8 +313,71 @@ async def update_dummy_quotation(
     quotation = await get_dummy_quotation_or_404(quotation_id, db, current_user)
     
     update_data = payload.model_dump(exclude_unset=True)
+    
+    # Extract items if present
+    items_in = update_data.pop("items", None)
+    
     for key, value in update_data.items():
         setattr(quotation, key, value)
+        
+    # If items are provided, replace them completely
+    if items_in is not None:
+        # Delete existing items (cascade will delete measurements)
+        await db.execute(
+            delete(DummyQuotationItem).where(DummyQuotationItem.dummy_quotation_id == quotation.id)
+        )
+        await db.flush()
+        
+        new_subtotal = 0.0
+        
+        for item_data in items_in:
+            db_item = DummyQuotationItem(
+                dummy_quotation_id=quotation.id,
+                title=item_data["title"],
+                description=item_data.get("description"),
+                unit=item_data.get("unit"),
+                rate=item_data["rate"],
+            )
+            db.add(db_item)
+            await db.flush()
+            
+            item_qty = 0.0
+            item_amount = 0.0
+            
+            measurements = item_data.get("measurements", [])
+            if measurements:
+                for m in measurements:
+                    calc = calculate_dummy_item_measurements(
+                        m.get("unit") or "ft", 
+                        m.get("length") or 0, 
+                        m.get("width") or 0, 
+                        m.get("height") or 0, 
+                        item_data["rate"]
+                    )
+                    db_measurement = DummyMeasurementDetail(
+                        dummy_quotation_item_id=db_item.id,
+                        length=m.get("length"),
+                        width=m.get("width"),
+                        height=m.get("height"),
+                        unit=m.get("unit"),
+                        cubic_feet=calc["cubic_feet"],
+                        cubic_meter=calc["cubic_meter"],
+                        brass=calc["brass"],
+                        quantity=calc["quantity"],
+                        formula_used=calc["formula"]
+                    )
+                    db.add(db_measurement)
+                    item_qty += calc["quantity"]
+                    item_amount += calc["amount"]
+            else:
+                item_qty = 0.0
+                item_amount = item_qty * item_data["rate"]
+                
+            db_item.quantity = round(item_qty, 2)
+            db_item.amount = round(item_amount, 2)
+            new_subtotal += db_item.amount
+            
+        quotation.subtotal = new_subtotal
         
     totals = calculate_dummy_totals(quotation.subtotal, quotation.cgst_percent, quotation.sgst_percent, quotation.gst_percent)
     
@@ -378,6 +441,7 @@ async def preview_dummy_quotation_pdf_endpoint(
 @router.get("/{quotation_id}/pdf", response_class=StreamingResponse)
 async def get_dummy_quotation_pdf(
     quotation_id: int,
+    download: bool = True,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_active_user)
 ):
@@ -394,8 +458,10 @@ async def get_dummy_quotation_pdf(
     
     safe_filename = quotation.dummy_quotation_no.replace("/", "-").replace("\\", "-")
     
+    disposition = "attachment" if download else "inline"
+    
     return StreamingResponse(
         pdf_buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{safe_filename}.pdf"'}
+        headers={"Content-Disposition": f'{disposition}; filename="{safe_filename}.pdf"'}
     )

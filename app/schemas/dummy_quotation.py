@@ -83,6 +83,8 @@ class UpdateDummyQuotation(BaseModel):
     sgst_percent: Optional[float] = Field(None, ge=0, le=100)
     
     notes: Optional[str] = None
+    
+    items: Optional[List[DummyQuotationItemCreate]] = None
 
 
 class DummyQuotationOut(BaseModel):
