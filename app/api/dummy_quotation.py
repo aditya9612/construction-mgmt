@@ -108,6 +108,7 @@ async def get_dummy_quotation_or_404(quotation_id: int, db: AsyncSession, curren
             selectinload(DummyQuotation.items).selectinload(DummyQuotationItem.measurements)
         )
         .where(DummyQuotation.id == quotation_id)
+        .execution_options(populate_existing=True)
     )
     quotation = result.scalars().first()
     if not quotation:
