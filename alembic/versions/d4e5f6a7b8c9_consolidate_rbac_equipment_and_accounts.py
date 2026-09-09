@@ -1,7 +1,7 @@
 """Consolidate RBAC models, enums, equipment multi-tenancy, rental completion, and accounts seed
 
 Revision ID: d4e5f6a7b8c9
-Revises: c1d2e3f4a5b6
+Revises: 356b0eaf0ef0
 Create Date: 2026-09-08 21:20:00.000000
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = 'd4e5f6a7b8c9'
-down_revision = 'c1d2e3f4a5b6'
+down_revision = '356b0eaf0ef0'
 branch_labels = None
 depends_on = None
 
