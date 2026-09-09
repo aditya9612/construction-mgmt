@@ -1,4 +1,4 @@
-from _pytest import logging
+import logging
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from sqlalchemy import select, func
 
