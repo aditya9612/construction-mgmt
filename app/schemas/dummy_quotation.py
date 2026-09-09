@@ -35,6 +35,7 @@ class DummyQuotationItemCreate(BaseModel):
     title: str = Field(..., min_length=1)
     description: Optional[str] = None
     unit: Optional[str] = None
+    quantity: float = 1.0
     rate: float = Field(0, ge=0)
     measurements: List[DummyMeasurementCreate] = []
 

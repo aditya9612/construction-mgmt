@@ -43,8 +43,22 @@ def calculate_dummy_item_measurements(unit: str, length: float, width: float, he
     elif unit_lower in ["cft", "ft3", "cubic feet"]:
         quantity = cubic_ft
         formula = "cubic_feet"
+    elif unit_lower in ["sqft", "sq.ft", "square feet"]:
+        quantity = (length or 0) * (width or 0)
+        formula = "sqft"
+    elif unit_lower in ["sqm", "sq.m", "square meter", "sq. meter"]:
+        quantity = (length or 0) * (width or 0) * 0.092903
+        formula = "sqm"
+    elif unit_lower in ["rft", "running feet"]:
+        quantity = length or 0
+        formula = "rft"
+    elif unit_lower in ["rm", "running meter"]:
+        quantity = (length or 0) * 0.3048
+        formula = "rm"
+    elif unit_lower in ["nos", "no", "numbers", "lumpsum", "ls"]:
+        quantity = length or 0
+        formula = "fixed"
     else:
-        # Default fallback if unknown, just use cubic feet or 0
         quantity = cubic_ft if cubic_ft > 0 else 1
         formula = "custom"
         
@@ -147,8 +161,8 @@ async def preview_dummy_quotation(
                     "formula_used": calc["formula"]
                 })
         else:
-            # If no measurements, default to 0.0
-            item_qty = 0.0
+            # If no measurements, fallback to item quantity
+            item_qty = getattr(item_in, "quantity", 1.0)
             item_amount = item_qty * item_in.rate
             
         preview_items.append({
@@ -248,7 +262,7 @@ async def create_dummy_quotation(
                 item_qty += calc["quantity"]
                 item_amount += calc["amount"]
         else:
-            item_qty = 0.0
+            item_qty = getattr(item_in, "quantity", 1.0)
             item_amount = item_qty * item_in.rate
             
         db_item.quantity = round(item_qty, 2)
@@ -370,7 +384,7 @@ async def update_dummy_quotation(
                     item_qty += calc["quantity"]
                     item_amount += calc["amount"]
             else:
-                item_qty = 0.0
+                item_qty = item_data.get("quantity", 1.0)
                 item_amount = item_qty * item_data["rate"]
                 
             db_item.quantity = round(item_qty, 2)

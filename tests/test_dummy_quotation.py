@@ -51,10 +51,10 @@ def test_create_dummy_quotation_minimal():
         assert resp.status_code == 201, resp.text
         data = resp.json()
         assert "dummy_quotation_no" in data
-        assert data["items"][0]["quantity"] == 0.0
-        assert data["items"][0]["amount"] == 0.0
-        assert data["subtotal"] == 0.0
-        assert data["grand_total"] == 0.0
+        assert data["items"][0]["quantity"] == 1.0
+        assert data["items"][0]["amount"] == 100.0
+        assert data["subtotal"] == 100.0
+        assert data["grand_total"] == 100.0
         assert len(data["items"]) == 1
 
 
@@ -142,7 +142,7 @@ def test_preview_does_not_insert_db_row():
         data = resp.json()
         assert data["dummy_quotation_no"] == "PREVIEW"
         assert data["client_name"] == "Preview Client"
-        assert data["grand_total"] == 0.0
+        assert data["grand_total"] == 500.0
         assert data["id"] == 0
         # Verify preview did NOT create a real row: querying that id=0 must 404
         check = tc.get("/api/v1/dummy-quotations/0")
@@ -171,7 +171,7 @@ def test_crud_create_get_update_delete():
         upd = upd_resp.json()
         assert upd["client_name"] == "Updated Name"
         assert upd["cgst_percent"] == 10.0
-        assert upd["cgst_amount"] == 0.0   # 10% of subtotal 0
+        assert upd["cgst_amount"] == 1.0
 
         # DELETE
         del_resp = tc.delete(f"/api/v1/dummy-quotations/{q_id}")
