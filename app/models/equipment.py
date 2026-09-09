@@ -393,6 +393,13 @@ class EquipmentRental(Base, TimestampMixin):
         index=True,
     )
 
+    is_completed: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("0"),
+        nullable=False,
+    )
+
     equipment: Mapped["Equipment"] = relationship(
         back_populates="rentals",
         lazy="selectin",

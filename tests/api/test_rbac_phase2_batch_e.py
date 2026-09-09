@@ -85,6 +85,7 @@ async def setup_batch_e_data():
 
         # 5. Equipment A (Company A, Project A)
         eq_a = Equipment(
+            company_id=comp_a.id,
             project_id=proj_a.id,
             equipment_name=f"Excavator A {uid}",
             equipment_code=f"EQ-A-{uid}",
@@ -97,6 +98,7 @@ async def setup_batch_e_data():
         )
         # Equipment B (Company B, Project B)
         eq_b = Equipment(
+            company_id=comp_b.id,
             project_id=proj_b.id,
             equipment_name=f"Crane B {uid}",
             equipment_code=f"EQ-B-{uid}",
@@ -109,6 +111,7 @@ async def setup_batch_e_data():
         )
         # Unallocated Equipment B (Created by Company B, currently unallocated project_id=None)
         eq_b_unalloc = Equipment(
+            company_id=comp_b.id,
             project_id=None,
             equipment_name=f"Bulldozer B Unalloc {uid}",
             equipment_code=f"EQ-B-UN-{uid}",

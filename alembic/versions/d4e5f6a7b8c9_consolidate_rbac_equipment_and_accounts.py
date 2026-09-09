@@ -1,4 +1,4 @@
-"""Consolidate RBAC models, enums, equipment multi-tenancy, and accounts seed
+"""Consolidate RBAC models, enums, equipment multi-tenancy, rental completion, and accounts seed
 
 Revision ID: d4e5f6a7b8c9
 Revises: c1d2e3f4a5b6
@@ -49,13 +49,17 @@ STANDARD_SYSTEM_ACCOUNTS = [
 
 def upgrade() -> None:
     bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    existing_tables = set(inspector.get_table_names())
+    try:
+        inspector = sa.inspect(bind)
+        existing_tables = set(inspector.get_table_names())
+    except Exception:
+        inspector = None
+        existing_tables = set()
 
     # ---------------------------------------------------------
     # 1. Create roles table
     # ---------------------------------------------------------
-    if 'roles' not in existing_tables:
+    if not inspector or 'roles' not in existing_tables:
         op.create_table(
             'roles',
             sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
@@ -76,7 +80,7 @@ def upgrade() -> None:
     # ---------------------------------------------------------
     # 2. Create user_permission_overrides table
     # ---------------------------------------------------------
-    if 'user_permission_overrides' not in existing_tables:
+    if not inspector or 'user_permission_overrides' not in existing_tables:
         op.create_table(
             'user_permission_overrides',
             sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
@@ -95,9 +99,9 @@ def upgrade() -> None:
     # ---------------------------------------------------------
     # 3. Update role_permissions: add role_id and FK to roles
     # ---------------------------------------------------------
-    if 'role_permissions' in existing_tables:
-        rp_cols = {c['name'] for c in inspector.get_columns('role_permissions')}
-        if 'role_id' not in rp_cols:
+    if not inspector or 'role_permissions' in existing_tables:
+        rp_cols = {c['name'] for c in inspector.get_columns('role_permissions')} if inspector else set()
+        if not inspector or 'role_id' not in rp_cols:
             op.add_column('role_permissions', sa.Column('role_id', sa.Integer(), nullable=True))
             op.create_foreign_key(
                 'fk_role_permissions_role_id',
@@ -166,8 +170,8 @@ def upgrade() -> None:
     # ---------------------------------------------------------
     # 8. Equipment Multi-Tenancy Column, FK, and Indexes
     # ---------------------------------------------------------
-    eq_cols = [c["name"] for c in inspector.get_columns("equipment")]
-    if "company_id" not in eq_cols:
+    eq_cols = [c["name"] for c in inspector.get_columns("equipment")] if inspector else []
+    if not inspector or "company_id" not in eq_cols:
         op.add_column(
             "equipment",
             sa.Column("company_id", sa.Integer(), nullable=True)
@@ -196,18 +200,48 @@ def upgrade() -> None:
     """))
 
     # ---------------------------------------------------------
-    # 10. Accounts Table: Multi-Tenant Constraint (company_id, code)
+    # 10. Equipment Rental: is_completed Column
     # ---------------------------------------------------------
-    acc_indexes = inspector.get_indexes("accounts")
-    for idx in acc_indexes:
-        if idx["name"] == "code" or (idx["column_names"] == ["code"] and idx.get("unique")):
-            try:
-                op.drop_index(idx["name"], table_name="accounts")
-            except Exception:
-                pass
+    if not inspector or 'equipment_rental' in existing_tables:
+        rental_cols = {c['name'] for c in inspector.get_columns('equipment_rental')} if inspector else set()
+        if not inspector or 'is_completed' not in rental_cols:
+            op.add_column(
+                'equipment_rental',
+                sa.Column(
+                    'is_completed',
+                    sa.Boolean(),
+                    server_default=sa.text('0'),
+                    nullable=False,
+                )
+            )
 
-    acc_uniques = [u["name"] for u in inspector.get_unique_constraints("accounts")]
-    if "uq_accounts_company_code" not in acc_uniques:
+        # Ensure all existing rental records have valid boolean (0)
+        op.execute(sa.text("""
+            UPDATE equipment_rental
+            SET is_completed = 0
+            WHERE is_completed IS NULL;
+        """))
+
+    # ---------------------------------------------------------
+    # 11. Accounts Table: Multi-Tenant Constraint (company_id, code)
+    # ---------------------------------------------------------
+    if inspector:
+        acc_indexes = inspector.get_indexes("accounts")
+        for idx in acc_indexes:
+            if idx["name"] == "code" or (idx["column_names"] == ["code"] and idx.get("unique")):
+                try:
+                    op.drop_index(idx["name"], table_name="accounts")
+                except Exception:
+                    pass
+
+        acc_uniques = [u["name"] for u in inspector.get_unique_constraints("accounts")]
+        if "uq_accounts_company_code" not in acc_uniques:
+            op.create_unique_constraint(
+                "uq_accounts_company_code",
+                "accounts",
+                ["company_id", "code"],
+            )
+    else:
         op.create_unique_constraint(
             "uq_accounts_company_code",
             "accounts",
@@ -215,7 +249,7 @@ def upgrade() -> None:
         )
 
     # ---------------------------------------------------------
-    # 11. Seed Standard Chart of Accounts for All Companies (Set-based)
+    # 12. Seed Standard Chart of Accounts for All Companies (Set-based)
     # ---------------------------------------------------------
     template_rows = " UNION ALL ".join([
         f"SELECT '{acc['name']}' as name, '{acc['code']}' as code, '{acc['type']}' as type"
@@ -253,8 +287,12 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    existing_tables = set(inspector.get_table_names())
+    try:
+        inspector = sa.inspect(bind)
+        existing_tables = set(inspector.get_table_names())
+    except Exception:
+        inspector = None
+        existing_tables = set()
 
     # ---------------------------------------------------------
     # 1. Accounts table: revert multi-tenant unique constraint
@@ -262,31 +300,48 @@ def downgrade() -> None:
     # MySQL will raise Error 1062 (Duplicate entry), failing loudly
     # rather than silently pretending success.
     # ---------------------------------------------------------
-    acc_uniques = [u["name"] for u in inspector.get_unique_constraints("accounts")]
-    if "uq_accounts_company_code" in acc_uniques:
+    if inspector:
+        acc_uniques = [u["name"] for u in inspector.get_unique_constraints("accounts")]
+        if "uq_accounts_company_code" in acc_uniques:
+            op.drop_constraint("uq_accounts_company_code", "accounts", type_="unique")
+    else:
         op.drop_constraint("uq_accounts_company_code", "accounts", type_="unique")
 
     op.create_unique_constraint("code", "accounts", ["code"])
 
     # ---------------------------------------------------------
-    # 2. Revert Equipment Multi-Tenancy
+    # 2. Revert Equipment Rental: is_completed Column
     # ---------------------------------------------------------
-    eq_indexes = [idx["name"] for idx in inspector.get_indexes("equipment")]
-    if "ix_equipment_company_project" in eq_indexes:
+    if not inspector or 'equipment_rental' in existing_tables:
+        rental_cols = {c['name'] for c in inspector.get_columns('equipment_rental')} if inspector else {'is_completed'}
+        if 'is_completed' in rental_cols:
+            op.drop_column('equipment_rental', 'is_completed')
+
+    # ---------------------------------------------------------
+    # 3. Revert Equipment Multi-Tenancy
+    # ---------------------------------------------------------
+    if inspector:
+        eq_indexes = [idx["name"] for idx in inspector.get_indexes("equipment")]
+        if "ix_equipment_company_project" in eq_indexes:
+            op.drop_index("ix_equipment_company_project", table_name="equipment")
+        if "ix_equipment_company_id" in eq_indexes:
+            op.drop_index("ix_equipment_company_id", table_name="equipment")
+
+        eq_fks = [fk["name"] for fk in inspector.get_foreign_keys("equipment")]
+        if "fk_equipment_company_id" in eq_fks:
+            op.drop_constraint("fk_equipment_company_id", "equipment", type_="foreignkey")
+
+        eq_cols = [c["name"] for c in inspector.get_columns("equipment")]
+        if "company_id" in eq_cols:
+            op.drop_column("equipment", "company_id")
+    else:
         op.drop_index("ix_equipment_company_project", table_name="equipment")
-    if "ix_equipment_company_id" in eq_indexes:
         op.drop_index("ix_equipment_company_id", table_name="equipment")
-
-    eq_fks = [fk["name"] for fk in inspector.get_foreign_keys("equipment")]
-    if "fk_equipment_company_id" in eq_fks:
         op.drop_constraint("fk_equipment_company_id", "equipment", type_="foreignkey")
-
-    eq_cols = [c["name"] for c in inspector.get_columns("equipment")]
-    if "company_id" in eq_cols:
         op.drop_column("equipment", "company_id")
 
     # ---------------------------------------------------------
-    # 3. Revert labour_payroll.status ENUM
+    # 4. Revert labour_payroll.status ENUM
     # Under MySQL strict mode, if rows exist with status 'DRAFT' or 'LOCKED',
     # MySQL will reject the column modification (error 1265) to prevent
     # silent truncation or corruption of active business records.
@@ -301,7 +356,7 @@ def downgrade() -> None:
     )
 
     # ---------------------------------------------------------
-    # 4. Revert invoices.status ENUM
+    # 5. Revert invoices.status ENUM
     # ---------------------------------------------------------
     op.alter_column(
         'invoices',
@@ -315,7 +370,7 @@ def downgrade() -> None:
     )
 
     # ---------------------------------------------------------
-    # 5. Revert equipment.status ENUM
+    # 6. Revert equipment.status ENUM
     # ---------------------------------------------------------
     op.alter_column(
         'equipment',
@@ -327,7 +382,7 @@ def downgrade() -> None:
     )
 
     # ---------------------------------------------------------
-    # 6. Revert equipment.condition ENUM
+    # 7. Revert equipment.condition ENUM
     # ---------------------------------------------------------
     op.alter_column(
         'equipment',
@@ -339,27 +394,34 @@ def downgrade() -> None:
     )
 
     # ---------------------------------------------------------
-    # 7. Revert role_permissions: drop FK, index, and role_id
+    # 8. Revert role_permissions: drop FK, index, and role_id
     # ---------------------------------------------------------
-    if 'role_permissions' in existing_tables:
-        rp_cols = {c['name'] for c in inspector.get_columns('role_permissions')}
-        if 'role_id' in rp_cols:
+    if not inspector or 'role_permissions' in existing_tables:
+        if inspector:
+            rp_cols = {c['name'] for c in inspector.get_columns('role_permissions')}
+            if 'role_id' in rp_cols:
+                op.drop_index(op.f('ix_role_permissions_role_id'), table_name='role_permissions')
+                op.drop_constraint('fk_role_permissions_role_id', 'role_permissions', type_='foreignkey')
+                op.drop_column('role_permissions', 'role_id')
+        else:
             op.drop_index(op.f('ix_role_permissions_role_id'), table_name='role_permissions')
             op.drop_constraint('fk_role_permissions_role_id', 'role_permissions', type_='foreignkey')
             op.drop_column('role_permissions', 'role_id')
 
     # ---------------------------------------------------------
-    # 8. Drop user_permission_overrides table
+    # 9. Drop user_permission_overrides table
     # ---------------------------------------------------------
-    if 'user_permission_overrides' in existing_tables:
-        op.drop_index(op.f('ix_user_permission_overrides_user_id'), table_name='user_permission_overrides')
-        op.drop_index(op.f('ix_user_permission_overrides_permission_id'), table_name='user_permission_overrides')
+    if not inspector or 'user_permission_overrides' in existing_tables:
+        if not inspector:
+            op.drop_index(op.f('ix_user_permission_overrides_user_id'), table_name='user_permission_overrides')
+            op.drop_index(op.f('ix_user_permission_overrides_permission_id'), table_name='user_permission_overrides')
         op.drop_table('user_permission_overrides')
 
     # ---------------------------------------------------------
-    # 9. Drop roles table
+    # 10. Drop roles table
     # ---------------------------------------------------------
-    if 'roles' in existing_tables:
-        op.drop_index(op.f('ix_roles_name'), table_name='roles')
-        op.drop_index(op.f('ix_roles_company_id'), table_name='roles')
+    if not inspector or 'roles' in existing_tables:
+        if not inspector:
+            op.drop_index(op.f('ix_roles_name'), table_name='roles')
+            op.drop_index(op.f('ix_roles_company_id'), table_name='roles')
         op.drop_table('roles')

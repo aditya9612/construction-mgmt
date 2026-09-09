@@ -386,10 +386,16 @@ async def get_effective_user_permissions(
 
     # 3. Handle wildcard with revocations (if explicit wildcard was granted)
     if "*" in effective_permissions and revoked_permissions:
-        all_perms_res = await db.execute(select(Permission.code))
+        all_perms_res = await db.execute(
+            select(Permission.code).where(~Permission.code.contains("*"))
+        )
         all_codes = set(all_perms_res.scalars().all())
         effective_permissions = (effective_permissions | all_codes) - revoked_permissions
         effective_permissions.discard("*")
+        for rev in revoked_permissions:
+            if "." in rev:
+                mod = rev.split(".")[0]
+                effective_permissions.discard(f"{mod}.*")
 
     return effective_permissions
 

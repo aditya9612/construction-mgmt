@@ -463,3 +463,33 @@ def test_superadmin_regression(seed_p1_test_data):
     data_transfer = resp_transfer.json()
     assert data_transfer.get("items") == []
     assert data_transfer.get("meta", {}).get("total") == 0
+
+
+def test_unallocated_equipment_rental_listing(seed_p1_test_data):
+    """
+    Test 8: Verifies that creating a rental on unallocated equipment (project_id=None)
+    with project_id=None is properly listed in GET /api/v1/equipment/rental for that company.
+    """
+    data = seed_p1_test_data
+    override_user(data["user_a"])
+
+    eq_id = data["central_eq_a"].id
+    payload = {
+        "start_date": str(date.today() + timedelta(days=10)),
+        "end_date": str(date.today() + timedelta(days=15)),
+        "rental_cost": 12000.0,
+        "client_name": "Test External Client A",
+        "notes": "External rental without project",
+        "project_id": None,
+        "boq_item_id": None,
+    }
+
+    create_resp = client.post(f"/api/v1/equipment/{eq_id}/rental", json=payload)
+    assert create_resp.status_code == 201, create_resp.text
+    created_id = create_resp.json()["id"]
+
+    list_resp = client.get("/api/v1/equipment/rental?limit=50&offset=0")
+    assert list_resp.status_code == 200
+    rental_ids = [r["id"] for r in list_resp.json()]
+    assert created_id in rental_ids, f"Rental {created_id} should be in listing: {rental_ids}"
+

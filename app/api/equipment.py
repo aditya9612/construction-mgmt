@@ -299,6 +299,7 @@ async def calculate_equipment_status(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed.is_(False),
                 EquipmentRental.start_date <= today,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -318,6 +319,7 @@ async def calculate_equipment_status(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed.is_(False),
                 EquipmentRental.start_date > today,
             )
         )
@@ -365,6 +367,7 @@ async def recalculate_equipment_status(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed.is_(False),
                 EquipmentRental.start_date <= today,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -388,6 +391,7 @@ async def recalculate_equipment_status(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed.is_(False),
                 EquipmentRental.start_date > today,
             )
         )
@@ -1020,6 +1024,7 @@ async def availability_report(
         (
             await db.execute(
                 select(EquipmentRental.equipment_id).where(
+                    EquipmentRental.is_completed.is_(False),
                     EquipmentRental.start_date <= today,
                     or_(
                         EquipmentRental.end_date.is_(None),
@@ -1181,6 +1186,7 @@ async def allocate_equipment(
             select(
                 exists().where(
                     EquipmentRental.equipment_id == equipment_id,
+                    EquipmentRental.is_completed.is_(False),
                     or_(
                         # Active rental
                         and_(
@@ -1427,6 +1433,7 @@ async def deallocate_equipment(
             select(
                 exists().where(
                     EquipmentRental.equipment_id == equipment_id,
+                    EquipmentRental.is_completed == False,
                     EquipmentRental.start_date > today,
                 )
             )
@@ -1623,13 +1630,13 @@ async def list_equipment(
     redis=Depends(get_request_redis),
 ):
     is_super = _is_super_admin(current_user)
-    if not is_super and current_user.company_id is None:
+    target_company_id = company_id if is_super else current_user.company_id
+
+    if current_user.company_id is None and target_company_id is None:
         return PaginatedResponse[EquipmentOut](
             items=[],
             meta=PaginationMeta(total=0, limit=limit, offset=offset),
         )
-
-    target_company_id = company_id if is_super else current_user.company_id
 
     if project_id:
         await assert_project_access(db, project_id=project_id, current_user=current_user)
@@ -1759,6 +1766,7 @@ async def soft_delete_equipment(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment_id,
+                EquipmentRental.is_completed == False,
                 or_(
                     # Future rental
                     EquipmentRental.start_date > today,
@@ -2013,6 +2021,7 @@ async def create_usage(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment_id,
+                EquipmentRental.is_completed == False,
                 EquipmentRental.start_date <= payload.usage_date,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -2588,6 +2597,7 @@ async def create_maintenance(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment_id,
+                EquipmentRental.is_completed == False,
                 EquipmentRental.start_date <= payload.maintenance_date,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -3616,6 +3626,7 @@ async def list_rental(
         .outerjoin(Project, Project.id == EquipmentRental.project_id)
         .where(
             or_(
+                Equipment.company_id == current_user.company_id,
                 Project.company_id == current_user.company_id,
                 Equipment.project_id.in_(
                     select(Project.id).where(
@@ -3652,16 +3663,25 @@ async def list_rental(
             )
 
         if normalized == "UPCOMING":
-            stmt = stmt.where(EquipmentRental.start_date > today)
+            stmt = stmt.where(
+                EquipmentRental.is_completed == False,
+                EquipmentRental.start_date > today,
+            )
 
         elif normalized == "COMPLETED":
             stmt = stmt.where(
-                EquipmentRental.end_date.isnot(None),
-                EquipmentRental.end_date < today,
+                or_(
+                    EquipmentRental.is_completed == True,
+                    and_(
+                        EquipmentRental.end_date.isnot(None),
+                        EquipmentRental.end_date < today,
+                    ),
+                )
             )
 
         else:  # ACTIVE
             stmt = stmt.where(
+                EquipmentRental.is_completed == False,
                 EquipmentRental.start_date <= today,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -3694,11 +3714,11 @@ async def list_rental(
             notes=rental.notes,
             created_at=rental.created_at,
             status=(
-                "UPCOMING"
-                if rental.start_date > today
+                "COMPLETED"
+                if rental.is_completed or ((rental.end_date or rental.start_date) < today)
                 else (
-                    "COMPLETED"
-                    if (rental.end_date or rental.start_date) < today
+                    "UPCOMING"
+                    if rental.start_date > today
                     else "ACTIVE"
                 )
             ),
@@ -3712,6 +3732,7 @@ async def list_rental(
                 ),
                 2,
             ),
+            is_completed=rental.is_completed,
         )
         for rental in rentals
     ]
@@ -3770,11 +3791,11 @@ async def get_rental(
     duration = (end_date - rental.start_date).days + 1
 
     # Rental Status
-    if rental.start_date > today:
-        rental_status = "UPCOMING"
-
-    elif end_date < today:
+    if rental.is_completed or end_date < today:
         rental_status = "COMPLETED"
+
+    elif rental.start_date > today:
+        rental_status = "UPCOMING"
 
     else:
         rental_status = "ACTIVE"
@@ -3795,6 +3816,7 @@ async def get_rental(
         status=rental_status,
         duration=duration,
         per_day_cost=round(per_day_cost, 2),
+        is_completed=rental.is_completed,
     )
 
 
@@ -3921,20 +3943,15 @@ async def update_rental(
     # ================= BOQ COST UPDATE =================
 
     if old_boq_item_id:
-
         old_boq = await db.get(
             BOQ,
             old_boq_item_id,
         )
-
         await db.flush()
-        await recalculate_boq_actuals(db, old_boq_id)
+        await recalculate_boq_actuals(db, old_boq_item_id)
 
     if rental.boq_item_id:
         new_boq = await db.get(BOQ, rental.boq_item_id)
-        if new_boq:
-            await recalculate_boq_actuals(db, rental.boq_item_id)
-
         if not new_boq:
             raise HTTPException(
                 status_code=404,
@@ -3948,6 +3965,9 @@ async def update_rental(
                 status_code=400,
                 detail="BOQ item does not belong to project",
             )
+
+        await db.flush()
+        await recalculate_boq_actuals(db, rental.boq_item_id)
 
 
     # ================= STATUS =================
@@ -4179,13 +4199,19 @@ async def complete_rental(
 
     # ================= VALIDATIONS =================
 
+    if rental.is_completed:
+        raise HTTPException(
+            status_code=400,
+            detail="Rental already completed",
+        )
+
     if rental.start_date > today:
         raise HTTPException(
             status_code=400,
             detail="Upcoming rental cannot be completed",
         )
 
-    if rental.end_date and rental.end_date <= today:
+    if rental.end_date and rental.end_date < today:
         raise HTTPException(
             status_code=400,
             detail="Rental already completed",
@@ -4196,7 +4222,9 @@ async def complete_rental(
 
     # ================= COMPLETE RENTAL =================
 
-    rental.end_date = today
+    rental.is_completed = True
+    if not rental.end_date or rental.end_date > today:
+        rental.end_date = today
 
     await db.flush()
 
@@ -4216,10 +4244,12 @@ async def complete_rental(
         old_values={
             "status": old_status.value if old_status else None,
             "end_date": str(old_end_date) if old_end_date else None,
+            "is_completed": False,
         },
         new_values={
             "status": equipment.status.value,
             "end_date": str(rental.end_date),
+            "is_completed": True,
         },
         user_id=current_user.id,
         request=request,
@@ -4266,6 +4296,7 @@ async def complete_rental(
         status="COMPLETED",
         duration=duration,
         per_day_cost=per_day_cost,
+        is_completed=rental.is_completed,
     )
 
 
@@ -5223,6 +5254,7 @@ async def transfer_equipment(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed == False,
                 EquipmentRental.start_date <= today,
                 or_(
                     EquipmentRental.end_date.is_(None),

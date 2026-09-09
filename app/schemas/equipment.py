@@ -713,6 +713,8 @@ class EquipmentRentalOut(BaseSchema):
 
     boq_item_id: Optional[int]
 
+    is_completed: bool = False
+
     model_config = ConfigDict(
         from_attributes=True,
         json_encoders={Decimal: lambda v: round(float(v), 2)},
@@ -763,9 +765,12 @@ class EquipmentPurchaseCreate(BaseSchema):
         max_length=100,
     )
 
-    quantity: Union[Decimal, int] = Field(
+    quantity: Union[int, Decimal] = Field(
         ...,
         gt=0,
+        examples=[1],
+        json_schema_extra={"example": 1},
+        description="Number of units purchased",
     )
 
     unit_price: Decimal = Field(
@@ -843,9 +848,12 @@ class EquipmentPurchaseUpdate(BaseSchema):
         max_length=100,
     )
 
-    quantity: Optional[Union[Decimal, int]] = Field(
+    quantity: Optional[Union[int, Decimal]] = Field(
         None,
         gt=0,
+        examples=[1],
+        json_schema_extra={"example": 1},
+        description="Number of units purchased",
     )
 
     unit_price: Optional[Decimal] = Field(
@@ -922,7 +930,7 @@ class EquipmentPurchaseOut(BaseSchema):
 
     invoice_number: str
 
-    quantity: Union[Decimal, int]
+    quantity: Union[int, Decimal] = Field(..., examples=[1], json_schema_extra={"example": 1})
 
     unit_price: float
 
