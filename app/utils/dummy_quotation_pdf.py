@@ -253,7 +253,12 @@ def generate_dummy_quotation_pdf(
     cgst_amount = data.get("cgst_amount", 0)
     sgst_percent = data.get("sgst_percent", 0)
     sgst_amount = data.get("sgst_amount", 0)
+    discount_amount = data.get("discount_amount", 0)
+    tds_percent = data.get("tds_percent", 0)
+    tds_amount = data.get("tds_amount", 0)
     grand_total = data.get("grand_total", 0)
+    advance_paid = data.get("advance_paid", 0)
+    balance_due = data.get("balance_due", 0)
 
     total_data = [
         ["Description", "Amount"],
@@ -262,8 +267,18 @@ def generate_dummy_quotation_pdf(
     if cgst_amount > 0 or sgst_amount > 0:
         total_data.append([f"CGST ({cgst_percent:.1f}%)", f"{cgst_amount:.2f}"])
         total_data.append([f"SGST ({sgst_percent:.1f}%)", f"{sgst_amount:.2f}"])
+        
+    if discount_amount > 0:
+        total_data.append(["Discount", f"-{discount_amount:.2f}"])
+    
+    if tds_amount > 0:
+        total_data.append([f"TDS ({tds_percent:.1f}%)", f"-{tds_amount:.2f}"])
     
     total_data.append(["Grand Total", f"{grand_total:.2f}"])
+    
+    if advance_paid > 0:
+        total_data.append(["Advance Paid", f"-{advance_paid:.2f}"])
+        total_data.append(["Balance Due", f"{balance_due:.2f}"])
 
     elements.append(
         KeepTogether(
