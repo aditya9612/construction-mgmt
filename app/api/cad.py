@@ -170,13 +170,13 @@ async def csv_to_dxf(file_path: str, db: AsyncSession, company_id: Optional[int]
 
 
 # -------------------- API --------------------
-from app.core.dependencies import get_current_active_user
+from app.core.dependencies import get_current_active_user, require_permission
 from app.models.user import User
 
 @router.post("/csv-to-dxf")
 async def convert(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("drawings.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if not file.filename.lower().endswith(".csv"):
@@ -209,7 +209,7 @@ async def convert(
 
 @router.get("/logs", response_model=list[CADConversionOut])
 async def logs(
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("drawings.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     query = select(CADConversion)

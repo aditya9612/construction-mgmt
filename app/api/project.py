@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import date, datetime
-from decimal import ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import mimetypes
 import pathlib, re, io, os, uuid
@@ -21,6 +21,7 @@ from app.core.enums import (
     ProjectStatus,
     SkillType,
     TaskPriority,
+    TaskStatus,
     WorkActivityStatus,
 )
 from app.models.boq import BOQ
@@ -34,7 +35,7 @@ from app.models.approval import Approval
 from app.models.labour import Labour
 from app.models.user import UserAttendance, ActivityLog
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
-from fastapi import APIRouter, Depends, Query, Request, Form, status
+from fastapi import APIRouter, Depends, Query, Request, Form, status, HTTPException
 from app.cache.redis import (
     bump_cache_version,
     cache_get_json,
@@ -47,7 +48,9 @@ from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
     require_roles,
+    require_permission,
 )
+from app.utils.common import assert_project_access, assert_task_project
 import shutil
 import uuid
 import os
@@ -69,9 +72,11 @@ from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
     Spacer,
+    Table as PdfTable,
     TableStyle,
 )
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors as pdf_colors
 from sqlalchemy.exc import IntegrityError
 from fastapi import UploadFile, File
 from app.utils.helpers import (
@@ -118,7 +123,27 @@ def compute_project_status(project):
 def compute_milestone_status(milestone):
     today = date.today()
 
-    if milestone.status == MilestoneStatus.COMPLETED or milestone.actual_end_date:
+    if milestone.status == MilestoneStatus.COMPLETED:
+        return "Completed"
+
+    tasks = getattr(milestone, "__dict__", {}).get("tasks", []) or []
+    if tasks and all(getattr(t, "status", None) == TaskStatus.COMPLETED for t in tasks):
+        return "Completed"
+
+    if milestone.status == MilestoneStatus.PLANNED:
+        if milestone.end_date and today > milestone.end_date:
+            return "Delayed"
+        return "Planned"
+
+    if milestone.status == MilestoneStatus.DELAYED:
+        return "Delayed"
+
+    if milestone.status == MilestoneStatus.IN_PROGRESS:
+        if milestone.end_date and today > milestone.end_date:
+            return "Delayed"
+        return "In Progress"
+
+    if milestone.actual_end_date:
         return "Completed"
 
     if milestone.end_date and today > milestone.end_date:
@@ -157,6 +182,214 @@ def get_pagination(
     search: Optional[str] = Query(None),
 ) -> PaginationParams:
     return PaginationParams(limit=limit, offset=offset, search=search).normalized()
+
+
+def _check_batch_y_tenant_access(current_user: User) -> None:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if not is_sa and getattr(current_user, "company_id", None) is None:
+        raise HTTPException(
+            status_code=403,
+            detail="User does not belong to any tenant company",
+        )
+
+
+async def _get_scoped_project(
+    db: AsyncSession,
+    project_id: int,
+    current_user: User,
+    *,
+    for_update: bool = False,
+    load_relations: bool = True,
+) -> m.Project:
+    _check_batch_y_tenant_access(current_user)
+    query = select(m.Project).where(m.Project.id == project_id)
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(m.Project.company_id == current_user.company_id)
+    if load_relations:
+        query = query.options(
+            selectinload(m.Project.milestones).selectinload(m.Milestone.tasks),
+            selectinload(m.Project.tasks),
+        )
+    if for_update:
+        query = query.with_for_update()
+    project = await db.scalar(query)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+async def _get_scoped_milestone(
+    db: AsyncSession,
+    project_id: int,
+    milestone_id: int,
+    current_user: User,
+    *,
+    for_update: bool = False,
+) -> m.Milestone:
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
+    query = select(m.Milestone).where(
+        m.Milestone.id == milestone_id,
+        m.Milestone.project_id == project_id,
+    )
+    if for_update:
+        query = query.with_for_update()
+    else:
+        query = query.options(selectinload(m.Milestone.tasks))
+    milestone = await db.scalar(query)
+    if not milestone:
+        raise HTTPException(status_code=404, detail="Milestone not found")
+    return milestone
+
+
+async def _get_scoped_task(
+    db: AsyncSession,
+    project_id: int,
+    task_id: int,
+    current_user: User,
+    *,
+    for_update: bool = False,
+) -> m.Task:
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
+    query = (
+        select(m.Task)
+        .options(selectinload(m.Task.assignments).joinedload(m.TaskAssignment.user))
+        .where(
+            m.Task.id == task_id,
+            m.Task.project_id == project_id,
+        )
+    )
+    if for_update:
+        query = query.with_for_update()
+    task = await db.scalar(query)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+async def _get_scoped_task_request(
+    db: AsyncSession,
+    request_id: int,
+    current_user: User,
+    *,
+    for_update: bool = False,
+) -> m.TaskRequest:
+    _check_batch_y_tenant_access(current_user)
+    query = (
+        select(m.TaskRequest)
+        .join(m.Project, m.TaskRequest.project_id == m.Project.id)
+        .where(
+            m.TaskRequest.id == request_id,
+            m.TaskRequest.is_deleted == False,
+        )
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(m.Project.company_id == current_user.company_id)
+    if for_update:
+        query = query.with_for_update()
+    req = await db.scalar(query)
+    if not req:
+        raise HTTPException(status_code=404, detail="Task request not found")
+    return req
+
+
+async def _get_scoped_issue(
+    db: AsyncSession,
+    issue_id: int,
+    current_user: User,
+    *,
+    for_update: bool = False,
+) -> m.Issue:
+    _check_batch_y_tenant_access(current_user)
+    query = (
+        select(m.Issue)
+        .join(m.Project, m.Issue.project_id == m.Project.id)
+        .where(m.Issue.id == issue_id)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(m.Project.company_id == current_user.company_id)
+    if for_update:
+        query = query.with_for_update()
+    issue = await db.scalar(query)
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue not found")
+    return issue
+
+
+async def _get_scoped_dsr(
+    db: AsyncSession,
+    dsr_id: int,
+    current_user: User,
+    *,
+    for_update: bool = False,
+    load_relations: bool = False,
+) -> m.DailySiteReport:
+    _check_batch_y_tenant_access(current_user)
+    query = (
+        select(m.DailySiteReport)
+        .join(m.Project, m.DailySiteReport.project_id == m.Project.id)
+        .where(m.DailySiteReport.id == dsr_id)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(m.Project.company_id == current_user.company_id)
+    if load_relations:
+        query = query.options(
+            selectinload(m.DailySiteReport.contractor),
+            selectinload(m.DailySiteReport.created_by),
+        )
+    if for_update:
+        query = query.with_for_update()
+    dsr = await db.scalar(query)
+    if not dsr:
+        raise HTTPException(status_code=404, detail="DSR not found")
+    return dsr
+
+
+async def _get_scoped_site_request(
+    db: AsyncSession,
+    request_id: int,
+    current_user: User,
+    *,
+    for_update: bool = False,
+) -> m.SiteRequest:
+    _check_batch_y_tenant_access(current_user)
+    query = (
+        select(m.SiteRequest)
+        .join(m.Project, m.SiteRequest.project_id == m.Project.id)
+        .where(m.SiteRequest.id == request_id)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(m.Project.company_id == current_user.company_id)
+    if for_update:
+        query = query.with_for_update()
+    req = await db.scalar(query)
+    if not req:
+        raise HTTPException(status_code=404, detail="Site request not found")
+    return req
+
+
+async def _get_scoped_site_photo(
+    db: AsyncSession,
+    photo_id: int,
+    current_user: User,
+    *,
+    for_update: bool = False,
+) -> m.SitePhoto:
+    _check_batch_y_tenant_access(current_user)
+    query = (
+        select(m.SitePhoto)
+        .join(m.Project, m.SitePhoto.project_id == m.Project.id)
+        .where(m.SitePhoto.id == photo_id)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(m.Project.company_id == current_user.company_id)
+    if for_update:
+        query = query.with_for_update()
+    photo = await db.scalar(query)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Site photo not found")
+    return photo
+
 
 
 router = APIRouter(
@@ -601,13 +834,6 @@ class ProjectsService:
         self.projects_repo = projects_repo
         self.tasks_repo = tasks_repo
 
-    def _assert_project_mutation_role(self, current_user: User) -> None:
-        if current_user.role not in (
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-        ):
-            raise PermissionDeniedError("Insufficient permissions")
-
     async def _compute_completion_percentage_by_project_ids(
         self, db: AsyncSession, project_ids: list[int]
     ) -> dict[int, float]:
@@ -627,9 +853,7 @@ class ProjectsService:
     async def create_project(
         self, db: AsyncSession, current_user: User, payload: s.ProjectCreate
     ) -> s.ProjectOut:
-        self._assert_project_mutation_role(current_user)
-        if not current_user.company_id and not current_user.is_super_admin:
-            raise ForbiddenError("User does not belong to any tenant company.")
+        _check_batch_y_tenant_access(current_user)
 
         if current_user.company_id:
             from app.services.entitlement import get_entitlement_service
@@ -639,7 +863,11 @@ class ProjectsService:
         data = payload.model_dump(exclude_unset=True)
         if "status" not in data:
             data["status"] = s.ProjectStatus.PLANNED
-        owner = await db.scalar(select(Owner).where(Owner.id == payload.owner_id))
+
+        owner_query = select(Owner).where(Owner.id == payload.owner_id)
+        if getattr(current_user, "is_super_admin", False) is not True:
+            owner_query = owner_query.where(Owner.company_id == current_user.company_id)
+        owner = await db.scalar(owner_query)
         if not owner:
             raise NotFoundError("Owner not found")
 
@@ -693,9 +921,8 @@ class ProjectsService:
                     await db.flush()
                     break
                 except Exception as inner_exc:
-                    await db.rollback()
-                    logger.warning(f"Fallback project creation failed: {inner_exc}")
-                    continue
+                    logger.exception(f"Fallback project creation failed: {inner_exc}")
+                    raise
         else:
             raise AppError(status_code=400, message="Could not create project due to conflicting data.")
 
@@ -739,20 +966,13 @@ class ProjectsService:
         search: Optional[str] = None,
         status: Optional[s.ProjectStatus] = None,
     ) -> PaginatedResponse[s.ProjectOut]:
+        _check_batch_y_tenant_access(current_user)
 
-        if current_user.role in (
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-        ):
-            base_query = select(m.Project)
-        else:
-            base_query = (
-                select(m.Project)
-                .join(m.ProjectMember, m.ProjectMember.project_id == m.Project.id)
-                .where(m.ProjectMember.user_id == current_user.id)
-            )
-
-        base_query = base_query.where(m.Project.company_id == current_user.company_id)
+        base_query = select(m.Project)
+        if getattr(current_user, "is_super_admin", False) is not True:
+            base_query = base_query.where(m.Project.company_id == current_user.company_id)
+        elif not current_user.company_id:
+            base_query = base_query.where(m.Project.company_id == None)
 
         if search:
             base_query = base_query.where(
@@ -842,15 +1062,7 @@ class ProjectsService:
         project_id: int,
         current_user: User,
     ) -> s.ProjectOut:
-        obj = await self.projects_repo.get_project(db, project_id=project_id)
-        if obj is None:
-            raise NotFoundError("Project not found")
-
-        await assert_project_access(
-            db,
-            project_id=obj.id,
-            current_user=current_user,
-        )
+        obj = await _get_scoped_project(db, project_id, current_user)
 
         completion_map = await self._compute_completion_percentage_by_project_ids(
             db, [obj.id]
@@ -896,10 +1108,7 @@ class ProjectsService:
         project_id: int,
         payload: s.ProjectUpdate,
     ) -> s.ProjectOut:
-        self._assert_project_mutation_role(current_user)
-        obj = await self.projects_repo.get_project(db, project_id=project_id)
-        if obj is None:
-            raise NotFoundError("Project not found")
+        obj = await _get_scoped_project(db, project_id, current_user, for_update=True)
         data = payload.model_dump(exclude_unset=True)
         if "project_name" in data and data["project_name"] is None:
             raise ValidationError("project_name cannot be null")
@@ -951,10 +1160,7 @@ class ProjectsService:
     async def delete_project(
         self, db: AsyncSession, current_user: User, *, project_id: int
     ) -> None:
-        self._assert_project_mutation_role(current_user)
-        obj = await self.projects_repo.get_project(db, project_id=project_id)
-        if obj is None:
-            raise NotFoundError("Project not found")
+        obj = await _get_scoped_project(db, project_id, current_user, for_update=True)
         try:
             await self.projects_repo.delete_project(db, obj)
         except Exception:
@@ -972,13 +1178,6 @@ class ProjectMembersService:
         self.projects_repo = projects_repo
         self.members_repo = members_repo
 
-    def _assert_member_mutation_role(self, current_user: User) -> None:
-        if current_user.role not in (
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-        ):
-            raise PermissionDeniedError("Insufficient permissions")
-
     async def assign_member(
         self,
         db: AsyncSession,
@@ -987,19 +1186,12 @@ class ProjectMembersService:
         project_id: int,
         user_id: int,
     ) -> s.ProjectMemberOut:
+        project = await _get_scoped_project(db, project_id, current_user, for_update=True)
 
-        from app.utils.common import assert_project_access
-
-        await assert_project_access(
-            db, project_id=project_id, current_user=current_user
-        )
-        self._assert_member_mutation_role(current_user)
-
-        project = await self.projects_repo.get_project(db, project_id=project_id)
-        if project is None:
-            raise NotFoundError("Project not found")
-
-        user = await db.scalar(select(User).where(User.id == user_id))
+        user_query = select(User).where(User.id == user_id)
+        if getattr(current_user, "is_super_admin", False) is not True:
+            user_query = user_query.where(User.company_id == current_user.company_id)
+        user = await db.scalar(user_query)
         if user is None:
             raise NotFoundError("User not found")
 
@@ -1060,9 +1252,7 @@ class ProjectMembersService:
         limit: int,
         offset: int,
     ) -> PaginatedResponse[s.ProjectMemberOut]:
-        project = await self.projects_repo.get_project(db, project_id=project_id)
-        if project is None:
-            raise NotFoundError("Project not found")
+        project = await _get_scoped_project(db, project_id, current_user)
 
         users, total = await self.members_repo.list_members(
             db, project_id=project_id, limit=limit, offset=offset
@@ -1089,16 +1279,7 @@ class ProjectMembersService:
         project_id: int,
         user_id: int,
     ) -> None:
-        from app.utils.common import assert_project_access
-
-        await assert_project_access(
-            db, project_id=project_id, current_user=current_user
-        )
-        self._assert_member_mutation_role(current_user)
-
-        project = await self.projects_repo.get_project(db, project_id=project_id)
-        if project is None:
-            raise NotFoundError("Project not found")
+        project = await _get_scoped_project(db, project_id, current_user, for_update=True)
 
         existing = await self.members_repo.get_member(
             db, project_id=project_id, user_id=user_id
@@ -1118,13 +1299,6 @@ class MilestonesService:
         self.projects_repo = projects_repo
         self.milestones_repo = milestones_repo
 
-    def _assert_milestone_mutation_role(self, current_user: User) -> None:
-        if current_user.role not in (
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-        ):
-            raise PermissionDeniedError("Insufficient permissions")
-
     async def create_milestone(
         self,
         db: AsyncSession,
@@ -1133,16 +1307,29 @@ class MilestonesService:
         project_id: int,
         payload: s.MilestoneCreate,
     ) -> s.MilestoneOut:
-        self._assert_milestone_mutation_role(current_user)
-        project = await self.projects_repo.get_project(db, project_id=project_id)
-        if project is None:
-            raise NotFoundError("Project not found")
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        project = await _get_scoped_project(db, project_id, current_user)
 
         data = payload.model_dump(exclude_unset=True)
 
-        if "status" not in data:
+        if "status" not in data or data["status"] is None:
             data["status"] = MilestoneStatus.PLANNED
+
+        from datetime import date
+
+        if data["status"] == MilestoneStatus.PLANNED:
+            data["actual_start_date"] = None
+            data["actual_end_date"] = None
+        elif data["status"] == MilestoneStatus.IN_PROGRESS:
+            data["actual_end_date"] = None
+            if data.get("actual_start_date") is None:
+                data["actual_start_date"] = date.today()
+        elif data["status"] == MilestoneStatus.COMPLETED:
+            if data.get("actual_end_date") is None:
+                data["actual_end_date"] = date.today()
+            if data.get("actual_start_date") is None:
+                data["actual_start_date"] = data.get("start_date") or date.today()
+        elif data["status"] == MilestoneStatus.DELAYED:
+            data["actual_end_date"] = None
 
         try:
             obj = await self.milestones_repo.create_milestone(
@@ -1168,11 +1355,7 @@ class MilestonesService:
         project_id: int,
         pagination: PaginationParams,
     ) -> PaginatedResponse[s.MilestoneOut]:
-
-        project = await self.projects_repo.get_project(db, project_id=project_id)
-        if project is None:
-            raise NotFoundError("Project not found")
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        project = await _get_scoped_project(db, project_id, current_user)
 
         rows, total = await self.milestones_repo.list_milestones(
             db,
@@ -1195,12 +1378,7 @@ class MilestonesService:
     async def get_milestone(
         self, db: AsyncSession, current_user: User, *, project_id: int, milestone_id: int
     ) -> s.MilestoneOut:
-        obj = await self.milestones_repo.get_milestone(
-            db, project_id=project_id, milestone_id=milestone_id
-        )
-        if obj is None:
-            raise NotFoundError("Milestone not found")
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        obj = await _get_scoped_milestone(db, project_id, milestone_id, current_user)
         return serialize_milestone(obj)
 
     async def update_milestone(
@@ -1212,13 +1390,7 @@ class MilestonesService:
         milestone_id: int,
         payload: s.MilestoneUpdate,
     ) -> s.MilestoneOut:
-        self._assert_milestone_mutation_role(current_user)
-        obj = await self.milestones_repo.get_milestone(
-            db, project_id=project_id, milestone_id=milestone_id
-        )
-        if obj is None:
-            raise NotFoundError("Milestone not found")
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        obj = await _get_scoped_milestone(db, project_id, milestone_id, current_user, for_update=True)
 
         data = payload.model_dump(exclude_unset=True)
         if "title" in data and data["title"] is None:
@@ -1226,19 +1398,30 @@ class MilestonesService:
 
         from datetime import date
 
-        if "status" in data:
-            if (
-                data["status"] == MilestoneStatus.IN_PROGRESS
-                and data.get("actual_start_date") is None
-                and obj.actual_start_date is None
-            ):
-                data["actual_start_date"] = date.today()
-            if (
-                data["status"] == MilestoneStatus.COMPLETED
-                and data.get("actual_end_date") is None
-                and obj.actual_end_date is None
-            ):
-                data["actual_end_date"] = date.today()
+        if "status" in data and data["status"] is not None:
+            if data["status"] == MilestoneStatus.IN_PROGRESS:
+                data["actual_end_date"] = None
+                if (
+                    data.get("actual_start_date") is None
+                    and obj.actual_start_date is None
+                ):
+                    data["actual_start_date"] = date.today()
+            elif data["status"] == MilestoneStatus.COMPLETED:
+                if (
+                    data.get("actual_end_date") is None
+                    and obj.actual_end_date is None
+                ):
+                    data["actual_end_date"] = date.today()
+                if (
+                    data.get("actual_start_date") is None
+                    and obj.actual_start_date is None
+                ):
+                    data["actual_start_date"] = obj.start_date or date.today()
+            elif data["status"] == MilestoneStatus.PLANNED:
+                data["actual_start_date"] = None
+                data["actual_end_date"] = None
+            elif data["status"] == MilestoneStatus.DELAYED:
+                data["actual_end_date"] = None
 
         try:
             await self.milestones_repo.update_milestone(db, obj=obj, data=data)
@@ -1253,7 +1436,10 @@ class MilestonesService:
             logger.exception(f"Milestone update failed id={milestone_id}")
             raise
 
-        return serialize_milestone(obj)
+        refreshed = await self.milestones_repo.get_milestone(
+            db, project_id=project_id, milestone_id=milestone_id
+        )
+        return serialize_milestone(refreshed or obj)
 
     async def delete_milestone(
         self,
@@ -1263,13 +1449,7 @@ class MilestonesService:
         project_id: int,
         milestone_id: int,
     ) -> None:
-        self._assert_milestone_mutation_role(current_user)
-        obj = await self.milestones_repo.get_milestone(
-            db, project_id=project_id, milestone_id=milestone_id
-        )
-        if obj is None:
-            raise NotFoundError("Milestone not found")
-        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        obj = await _get_scoped_milestone(db, project_id, milestone_id, current_user, for_update=True)
         try:
             await self.milestones_repo.delete_milestone(db, obj=obj)
         except Exception:
@@ -1293,14 +1473,6 @@ class TasksService:
         self.progress_repo = progress_repo
         self.comments_repo = comments_repo
 
-    def _assert_task_mutation_role(self, current_user: User) -> None:
-        if current_user.role not in (
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-            UserRole.SITE_ENGINEER.value,
-        ):
-            raise PermissionDeniedError("Insufficient permissions")
-
     def _is_delayed(self, *, task: m.Task, current_date: date) -> bool:
         if task.end_date is None:
             return False
@@ -1316,6 +1488,9 @@ class TasksService:
         project_id: int,
         task: m.Task,
     ) -> None:
+        if getattr(current_user, "is_super_admin", False) is True:
+            return
+
         if current_user.role in (
             UserRole.ADMIN.value,
             UserRole.PROJECT_MANAGER.value,
@@ -1382,18 +1557,10 @@ class TasksService:
         audio_instruction_url: Optional[str] = None,
         instruction_image_url: Optional[str] = None,
     ) -> s.TaskOut:
+        project = await _get_scoped_project(db, project_id, current_user)
 
-        self._assert_task_mutation_role(current_user)
-
-        project = await self.projects_repo.get_project(db, project_id=project_id)
-        if project is None:
-            raise NotFoundError("Project not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        if payload.milestone_id is not None:
+            await _get_scoped_milestone(db, project_id, payload.milestone_id, current_user)
 
         # =========================
         # MASTER DATA VALIDATION
@@ -1445,7 +1612,10 @@ class TasksService:
 
         # Validate all users
         for uid in final_user_ids_list:
-            assigned_user = await db.scalar(select(User).where(User.id == uid))
+            user_query = select(User).where(User.id == uid)
+            if getattr(current_user, "is_super_admin", False) is not True:
+                user_query = user_query.where(User.company_id == current_user.company_id)
+            assigned_user = await db.scalar(user_query)
             if assigned_user is None:
                 raise NotFoundError(f"User {uid} not found")
 
@@ -1459,8 +1629,6 @@ class TasksService:
                 raise ValidationError(f"User {uid} not part of project")
 
         data["created_by_user_id"] = current_user.id
-
-        # We no longer populate assigned_user_id
 
         # 1. Create ONE Task
         try:
@@ -1517,16 +1685,7 @@ class TasksService:
         search: Optional[str] = None,
         view: Optional[str] = None,
     ) -> PaginatedResponse[s.TaskOut]:
-
-        project = await self.projects_repo.get_project(db, project_id=project_id)
-        if project is None:
-            raise NotFoundError("Project not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        project = await _get_scoped_project(db, project_id, current_user)
 
         from sqlalchemy.orm import selectinload, joinedload
 
@@ -1605,27 +1764,8 @@ class TasksService:
         project_id: int,
         task_id: int,
     ) -> s.TaskOut:
-
-        project = await self.projects_repo.get_project(db, project_id=project_id)
-        if project is None:
-            raise NotFoundError("Project not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
-
-        obj = await self.tasks_repo.get_task(
-            db,
-            project_id=project_id,
-            task_id=task_id,
-        )
-        if obj is None:
-            raise NotFoundError("Task not found")
-
+        obj = await _get_scoped_task(db, project_id, task_id, current_user)
         is_delayed = self._is_delayed(task=obj, current_date=date.today())
-
         return self._task_to_out(task=obj, is_delayed=is_delayed)
 
     async def update_task(
@@ -1641,38 +1781,27 @@ class TasksService:
         remove_audio: bool = False,
         remove_image: bool = False,
     ) -> s.TaskOut:
-        self._assert_task_mutation_role(current_user)
-
-        obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
-        if obj is None:
-            raise NotFoundError("Task not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        obj = await _get_scoped_task(db, project_id, task_id, current_user, for_update=True)
 
         data = payload.model_dump(exclude_unset=True)
+
+        if data.get("milestone_id") is not None:
+            await _get_scoped_milestone(db, project_id, data["milestone_id"], current_user)
 
         # =====================================
         # MEDIA FILES
         # =====================================
 
         if audio_instruction_url:
-
             data["audio_instruction_url"] = audio_instruction_url
 
         if instruction_image_url:
-
             data["instruction_image_url"] = instruction_image_url
 
         if remove_audio:
-
             data["audio_instruction_url"] = None
 
         if remove_image:
-
             data["instruction_image_url"] = None
 
         if "priority" in data:
@@ -1712,7 +1841,10 @@ class TasksService:
                 raise ValidationError("assigned_user_ids cannot be empty")
 
             for uid in final_user_ids_list:
-                assigned_user = await db.scalar(select(User).where(User.id == uid))
+                user_query = select(User).where(User.id == uid)
+                if getattr(current_user, "is_super_admin", False) is not True:
+                    user_query = user_query.where(User.company_id == current_user.company_id)
+                assigned_user = await db.scalar(user_query)
                 if assigned_user is None:
                     raise NotFoundError(f"User {uid} not found")
 
@@ -1801,21 +1933,15 @@ class TasksService:
         task_id: int,
         new_user_id: int,
     ):
-        obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
-        if not obj:
-            raise NotFoundError("Task not found")
+        obj = await _get_scoped_task(db, project_id, task_id, current_user, for_update=True)
 
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
-
-        new_user = await db.scalar(select(User).where(User.id == new_user_id))
+        user_query = select(User).where(User.id == new_user_id)
+        if getattr(current_user, "is_super_admin", False) is not True:
+            user_query = user_query.where(User.company_id == current_user.company_id)
+        new_user = await db.scalar(user_query)
         if not new_user:
             raise NotFoundError("User not found")
 
-        #  FIX: ensure user belongs to project
         is_member = await db.scalar(
             select(m.ProjectMember).where(
                 m.ProjectMember.project_id == project_id,
@@ -1859,16 +1985,7 @@ class TasksService:
         task_id: int,
         status: s.TaskStatus,
     ):
-        obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
-        if not obj:
-            raise NotFoundError("Task not found")
-
-        #  FIX: access check
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        obj = await _get_scoped_task(db, project_id, task_id, current_user, for_update=True)
 
         await self.tasks_repo.update_task(
             db,
@@ -1907,16 +2024,7 @@ class TasksService:
         project_id: int,
         task_id: int,
     ) -> None:
-        self._assert_task_mutation_role(current_user)
-        obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
-        if obj is None:
-            raise NotFoundError("Task not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        obj = await _get_scoped_task(db, project_id, task_id, current_user, for_update=True)
         try:
             await self.tasks_repo.delete_task(db, obj=obj)
         except Exception:
@@ -1933,15 +2041,7 @@ class TasksService:
         task_id: int,
         payload: s.TaskProgressUpdate,
     ) -> s.TaskProgressOut:
-        obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
-        if obj is None:
-            raise NotFoundError("Task not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        obj = await _get_scoped_task(db, project_id, task_id, current_user, for_update=True)
 
         await self._assert_progress_or_comment_auth(
             db, current_user=current_user, project_id=project_id, task=obj
@@ -1984,20 +2084,7 @@ class TasksService:
         limit: int,
         offset: int,
     ) -> PaginatedResponse[s.TaskProgressOut]:
-
-        obj = await self.tasks_repo.get_task(
-            db,
-            project_id=project_id,
-            task_id=task_id,
-        )
-        if obj is None:
-            raise NotFoundError("Task not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        obj = await _get_scoped_task(db, project_id, task_id, current_user)
 
         rows, total = await self.progress_repo.list_progress_history(
             db,
@@ -2030,15 +2117,7 @@ class TasksService:
         task_id: int,
         payload: s.CommentCreate,
     ) -> s.CommentOut:
-        obj = await self.tasks_repo.get_task(db, project_id=project_id, task_id=task_id)
-        if obj is None:
-            raise NotFoundError("Task not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        obj = await _get_scoped_task(db, project_id, task_id, current_user)
 
         await self._assert_progress_or_comment_auth(
             db,
@@ -2071,20 +2150,7 @@ class TasksService:
         limit: int,
         offset: int,
     ) -> PaginatedResponse[s.CommentOut]:
-
-        obj = await self.tasks_repo.get_task(
-            db,
-            project_id=project_id,
-            task_id=task_id,
-        )
-        if obj is None:
-            raise NotFoundError("Task not found")
-
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
-        )
+        obj = await _get_scoped_task(db, project_id, task_id, current_user)
 
         rows, total = await self.comments_repo.list_comments(
             db,
@@ -2119,10 +2185,9 @@ class SchedulingService:
         project_id: int,
         start_date: date,
         end_date: date,
+        current_user: User,
     ):
-        project = await self.projects_repo.get_project(db, project_id)
-        if not project:
-            raise NotFoundError("Project not found")
+        project = await _get_scoped_project(db, project_id, current_user, for_update=True)
 
         if end_date < start_date:
             raise ValidationError("End date cannot be before start date")
@@ -2144,10 +2209,8 @@ class SchedulingService:
             "end_date": end_date,
         }
 
-    async def get_schedule(self, db: AsyncSession, *, project_id: int):
-        project = await self.projects_repo.get_project(db, project_id)
-        if not project:
-            raise NotFoundError("Project not found")
+    async def get_schedule(self, db: AsyncSession, *, project_id: int, current_user: User):
+        project = await _get_scoped_project(db, project_id, current_user)
 
         return {
             "project_id": project_id,
@@ -2167,25 +2230,16 @@ class AlertsService:
         current_user: User,
         pagination: PaginationParams,
     ):
+        _check_batch_y_tenant_access(current_user)
         today = date.today()
 
-        if current_user.role in (
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-        ):
-            base_query = select(m.Project).where(
-                m.Project.end_date < today,
-                m.Project.status != s.ProjectStatus.COMPLETED,
-            )
-        else:
-            base_query = (
-                select(m.Project)
-                .join(m.ProjectMember, m.ProjectMember.project_id == m.Project.id)
-                .where(
-                    m.ProjectMember.user_id == current_user.id,
-                    m.Project.end_date < today,
-                    m.Project.status != s.ProjectStatus.COMPLETED,
-                )
+        base_query = select(m.Project).where(
+            m.Project.end_date < today,
+            m.Project.status != s.ProjectStatus.COMPLETED,
+        )
+        if getattr(current_user, "is_super_admin", False) is not True:
+            base_query = base_query.where(
+                m.Project.company_id == current_user.company_id
             )
 
         base_query = base_query.distinct()
@@ -2228,34 +2282,23 @@ class AlertsService:
         current_user: User,
         pagination: PaginationParams,
     ):
+        _check_batch_y_tenant_access(current_user)
         today = date.today()
 
-        if current_user.company_id is None:
-            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=pagination.limit, offset=pagination.offset))
+        base_query = (
+            select(m.Task)
+            .join(m.Project, m.Task.project_id == m.Project.id)
+            .where(
+                m.Task.end_date < today,
+                m.Task.status != s.TaskStatus.COMPLETED,
+            )
+        )
+        if getattr(current_user, "is_super_admin", False) is not True:
+            base_query = base_query.where(
+                m.Project.company_id == current_user.company_id
+            )
 
-        if current_user.role in (
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-        ):
-            base_query = (
-                select(m.Task)
-                .join(m.Project, m.Task.project_id == m.Project.id)
-                .where(
-                    m.Task.end_date < today,
-                    m.Task.status != s.TaskStatus.COMPLETED,
-                    m.Project.company_id == current_user.company_id
-                )
-            )
-        else:
-            base_query = (
-                select(m.Task)
-                .join(m.ProjectMember, m.ProjectMember.project_id == m.Task.project_id)
-                .where(
-                    m.ProjectMember.user_id == current_user.id,
-                    m.Task.end_date < today,
-                    m.Task.status != s.TaskStatus.COMPLETED,
-                )
-            )
+        base_query = base_query.distinct()
 
         count_query = select(func.count()).select_from(
             base_query.order_by(None).subquery()
@@ -2269,6 +2312,26 @@ class AlertsService:
         )
 
         rows = (await db.execute(query)).scalars().all()
+
+        items = [
+            {
+                "task_id": t.id,
+                "project_id": t.project_id,
+                "title": t.title,
+                "end_date": t.end_date,
+                "status": "Delayed",
+            }
+            for t in rows
+        ]
+
+        return PaginatedResponse(
+            items=items,
+            meta=PaginationMeta(
+                total=int(total or 0),
+                limit=pagination.limit,
+                offset=pagination.offset,
+            ),
+        )
 
         items = [
             {
@@ -3186,28 +3249,34 @@ def get_reports_service():
 
 @router.get("/module-summary", response_model=s.ProjectsModuleResponse)
 async def projects_module_summary(
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _check_batch_y_tenant_access(current_user)
     today = date.today()
 
     # 1. Summary
-    total = await db.scalar(select(func.count(m.Project.id)))
-    ongoing = await db.scalar(
-        select(func.count(m.Project.id)).where(
-            m.Project.status == ProjectStatus.ONGOING.value
-        )
+    q_total = select(func.count(m.Project.id))
+    q_ongoing = select(func.count(m.Project.id)).where(
+        m.Project.status == ProjectStatus.ONGOING.value
     )
-    completed = await db.scalar(
-        select(func.count(m.Project.id)).where(
-            m.Project.status == ProjectStatus.COMPLETED.value
-        )
+    q_completed = select(func.count(m.Project.id)).where(
+        m.Project.status == ProjectStatus.COMPLETED.value
     )
-    delayed = await db.scalar(
-        select(func.count(m.Project.id)).where(
-            m.Project.status == ProjectStatus.ONGOING.value, m.Project.end_date < today
-        )
+    q_delayed = select(func.count(m.Project.id)).where(
+        m.Project.status == ProjectStatus.ONGOING.value, m.Project.end_date < today
     )
+
+    if getattr(current_user, "is_super_admin", False) is not True:
+        q_total = q_total.where(m.Project.company_id == current_user.company_id)
+        q_ongoing = q_ongoing.where(m.Project.company_id == current_user.company_id)
+        q_completed = q_completed.where(m.Project.company_id == current_user.company_id)
+        q_delayed = q_delayed.where(m.Project.company_id == current_user.company_id)
+
+    total = await db.scalar(q_total)
+    ongoing = await db.scalar(q_ongoing)
+    completed = await db.scalar(q_completed)
+    delayed = await db.scalar(q_delayed)
 
     summary = s.ProjectsModuleSummary(
         total_projects=total or 0,
@@ -3220,13 +3289,16 @@ async def projects_module_summary(
     activities = []
 
     # a. Task Progress
-    task_p = await db.execute(
+    q_task_p = (
         select(m.TaskProgress, m.Task.title, m.Project.project_name, User.full_name)
         .join(m.Task, m.TaskProgress.task_id == m.Task.id)
         .join(m.Project, m.Task.project_id == m.Project.id)
         .join(User, m.TaskProgress.created_by_user_id == User.id)
-        .order_by(m.TaskProgress.created_at.desc())
-        .limit(5)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        q_task_p = q_task_p.where(m.Project.company_id == current_user.company_id)
+    task_p = await db.execute(
+        q_task_p.order_by(m.TaskProgress.created_at.desc()).limit(5)
     )
     for row in task_p.all():
         activities.append(
@@ -3240,11 +3312,14 @@ async def projects_module_summary(
         )
 
     # b. Invoices
-    invoices = await db.execute(
+    q_invoices = (
         select(Invoice, m.Project.project_name)
         .join(m.Project, Invoice.project_id == m.Project.id)
-        .order_by(Invoice.created_at.desc())
-        .limit(5)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        q_invoices = q_invoices.where(m.Project.company_id == current_user.company_id)
+    invoices = await db.execute(
+        q_invoices.order_by(Invoice.created_at.desc()).limit(5)
     )
     for row in invoices.all():
         activities.append(
@@ -3258,11 +3333,14 @@ async def projects_module_summary(
         )
 
     # c. Site Photos
-    photos = await db.execute(
+    q_photos = (
         select(m.SitePhoto, m.Project.project_name)
         .join(m.Project, m.SitePhoto.project_id == m.Project.id)
-        .order_by(m.SitePhoto.created_at.desc())
-        .limit(5)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        q_photos = q_photos.where(m.Project.company_id == current_user.company_id)
+    photos = await db.execute(
+        q_photos.order_by(m.SitePhoto.created_at.desc()).limit(5)
     )
     for row in photos.all():
         activities.append(
@@ -3276,11 +3354,14 @@ async def projects_module_summary(
         )
 
     # d. Issues
-    issues = await db.execute(
+    q_issues = (
         select(m.Issue, m.Project.project_name)
         .join(m.Project, m.Issue.project_id == m.Project.id)
-        .order_by(m.Issue.created_at.desc())
-        .limit(5)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        q_issues = q_issues.where(m.Project.company_id == current_user.company_id)
+    issues = await db.execute(
+        q_issues.order_by(m.Issue.created_at.desc()).limit(5)
     )
     for row in issues.all():
         activities.append(
@@ -3302,7 +3383,7 @@ async def projects_module_summary(
 @router.post("", response_model=s.ProjectOut)
 async def create_project(
     payload: s.ProjectCreate,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("projects.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectsService = Depends(get_projects_service),
@@ -3328,24 +3409,18 @@ async def create_project(
 
 @router.get("/calendar", response_model=s.PMCalendarOut)
 async def get_pm_calendar(
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # Get all project IDs this user has access to
-    from app.models.project import ProjectMember, Task, Milestone
-    from app.models.approval import Approval
+    _check_batch_y_tenant_access(current_user)
 
-    project_ids = []
-    if current_user.role != UserRole.ADMIN:
-        memberships = await db.scalars(
-            select(ProjectMember.project_id).where(
-                ProjectMember.user_id == current_user.id
-            )
-        )
-        project_ids = list(memberships.all())
-    else:
-        projs = await db.scalars(select(m.Project.id))
-        project_ids = list(projs.all())
+    from app.models.project import Task, Milestone
+
+    proj_query = select(m.Project.id)
+    if getattr(current_user, "is_super_admin", False) is not True:
+        proj_query = proj_query.where(m.Project.company_id == current_user.company_id)
+    projs = await db.scalars(proj_query)
+    project_ids = list(projs.all())
 
     events = []
 
@@ -3378,10 +3453,10 @@ async def get_pm_calendar(
 )
 async def get_project_resource_summary(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
     from app.models.labour import LabourProject
     from app.models.equipment import Equipment
@@ -3413,16 +3488,12 @@ async def get_project_resource_summary(
 @router.get("/{project_id}/health-score", response_model=s.ProjectHealthScoreOut)
 async def get_project_health_score(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    project = await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
     from app.models.project import Issue
-
-    project = await db.get(m.Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found")
 
     score = 100
     if (
@@ -3461,7 +3532,7 @@ async def list_projects(
     offset: int = Query(0, ge=0),
     search: Optional[str] = None,
     status: Optional[s.ProjectStatus] = None,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectsService = Depends(get_projects_service),
@@ -3491,35 +3562,36 @@ async def set_project_schedule(
     project_id: int,
     start_date: date,
     end_date: date,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("projects.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: SchedulingService = Depends(get_scheduling_service),
 ):
-
     result = await service.set_schedule(
-        db, project_id=project_id, start_date=start_date, end_date=end_date
+        db,
+        project_id=project_id,
+        start_date=start_date,
+        end_date=end_date,
+        current_user=current_user,
     )
-
     await bump_cache_version(redis, VERSION_KEY)
-
     return result
 
 
 @router.get("/{project_id}/schedule")
 async def get_project_schedule(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
     service: SchedulingService = Depends(get_scheduling_service),
 ):
-    return await service.get_schedule(db, project_id=project_id)
+    return await service.get_schedule(db, project_id=project_id, current_user=current_user)
 
 
 @router.get("/{project_id}/progress")
 async def get_project_progress(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
     service: ProjectsService = Depends(get_projects_service),
 ):
@@ -3540,7 +3612,7 @@ async def get_project_progress(
 async def get_project_alerts(
     pagination: PaginationParams = Depends(get_pagination),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     service: AlertsService = Depends(get_alerts_service),
 ):
     return await service.get_project_alerts(db, current_user, pagination)
@@ -3550,7 +3622,7 @@ async def get_project_alerts(
 async def get_task_alerts(
     pagination: PaginationParams = Depends(get_pagination),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("tasks.view")),
     service: AlertsService = Depends(get_alerts_service),
 ):
     return await service.get_task_alerts(db, current_user, pagination)
@@ -3564,7 +3636,7 @@ async def get_task_alerts(
 async def assign_project_member(
     project_id: int,
     user_id: int,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("projects.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectMembersService = Depends(get_project_members_service),
@@ -3594,7 +3666,7 @@ async def list_project_members(
     project_id: int,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
     service: ProjectMembersService = Depends(get_project_members_service),
 ):
@@ -3607,7 +3679,7 @@ async def list_project_members(
 async def remove_project_member(
     project_id: int,
     user_id: int,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("projects.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectMembersService = Depends(get_project_members_service),
@@ -3635,14 +3707,10 @@ async def get_project_logs(
     project_id: int,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
     from app.models.project import ActivityHistory, WorkActivity
     from app.models.boq import BOQAudit, BOQ
@@ -3719,11 +3787,10 @@ async def get_project_logs(
 @router.get("/{project_id}/photos")
 async def get_project_photos(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    #  Access check
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
     result = await db.execute(
         select(m.SitePhoto)
@@ -3752,22 +3819,10 @@ async def get_project_photos(
 async def create_or_update_ot_policy(
     project_id: int,
     payload: s.ProjectOTPolicyCreate,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("projects.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-
-    # CHECK PROJECT
-    project = await db.scalar(select(m.Project).where(m.Project.id == project_id))
-
-    if not project:
-        raise NotFoundError("Project not found")
-
-    # ACCESS CHECK
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    project = await _get_scoped_project(db, project_id, current_user, for_update=True, load_relations=False)
 
     # EXISTING POLICY
     policy = await db.scalar(
@@ -3778,15 +3833,12 @@ async def create_or_update_ot_policy(
 
     # UPDATE
     if policy:
-
         for k, v in data.items():
             setattr(policy, k, v)
 
     # CREATE
     else:
-
         policy = m.ProjectOTPolicy(project_id=project_id, **data)
-
         db.add(policy)
 
     await db.flush()
@@ -3811,7 +3863,7 @@ tasks_router = APIRouter(
 async def create_milestone(
     project_id: int,
     payload: s.MilestoneCreate,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("milestones.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: MilestonesService = Depends(get_milestones_service),
@@ -3823,15 +3875,11 @@ async def create_milestone(
             db, current_user, project_id=project_id, payload=payload
         )
         await bump_cache_version(redis, VERSION_KEY)
-
+    except (AppError, HTTPException):
+        raise
     except Exception as e:
-        # This will print the complete error and stack trace in server logs
-        logger.exception(
-            f"Milestone creation failed project_id={project_id}. Error: {repr(e)}"
-        )
-
-        # This will return the actual error message in the API response
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Milestone creation failed project_id={project_id}")
+        raise HTTPException(status_code=500, detail="Failed to create milestone")
 
     logger.info(f"Milestone created id={out.id}")
 
@@ -3845,7 +3893,7 @@ async def create_milestone(
 async def list_milestones(
     project_id: int,
     pagination: PaginationParams = Depends(get_pagination),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("milestones.view")),
     db: AsyncSession = Depends(get_db_session),
     service: MilestonesService = Depends(get_milestones_service),
 ):
@@ -3863,7 +3911,7 @@ async def list_milestones(
 async def get_milestone(
     project_id: int,
     milestone_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("milestones.view")),
     db: AsyncSession = Depends(get_db_session),
     service: MilestonesService = Depends(get_milestones_service),
 ):
@@ -3879,7 +3927,7 @@ async def update_milestone(
     project_id: int,
     milestone_id: int,
     payload: s.MilestoneUpdate,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("milestones.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: MilestonesService = Depends(get_milestones_service),
@@ -3908,7 +3956,7 @@ async def update_milestone(
 async def delete_milestone(
     project_id: int,
     milestone_id: int,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("milestones.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: MilestonesService = Depends(get_milestones_service),
@@ -3947,12 +3995,11 @@ async def create_task(
     payload: s.TaskCreateForm = Depends(),
     audio_file: Optional[UploadFile] = File(None),
     instruction_image: Optional[UploadFile] = File(None),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("tasks.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
 ):
-
     logger.info(f"Creating task project_id={project_id}")
 
     task_payload = payload.to_schema()
@@ -3986,7 +4033,6 @@ async def create_task(
         instruction_image_url = instruction_image_url.replace("\\", "/")
 
     try:
-
         out = await service.create_task(
             db,
             current_user,
@@ -3998,9 +4044,7 @@ async def create_task(
         await bump_cache_version(redis, VERSION_KEY)
 
     except Exception:
-
         logger.exception(f"Task creation failed project_id={project_id}")
-
         raise
 
     if isinstance(out, list):
@@ -4020,7 +4064,7 @@ async def list_tasks(
     view: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("tasks.view")),
     db: AsyncSession = Depends(get_db_session),
     service: TasksService = Depends(get_tasks_service),
 ):
@@ -4041,11 +4085,10 @@ async def list_tasks(
 async def get_task(
     project_id: int,
     task_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("tasks.view")),
     db: AsyncSession = Depends(get_db_session),
     service: TasksService = Depends(get_tasks_service),
 ):
-
     return await service.get_task(
         db, current_user, project_id=project_id, task_id=task_id
     )
@@ -4058,12 +4101,11 @@ async def update_task(
     payload: s.TaskUpdateForm = Depends(),
     audio_file: Optional[UploadFile] = File(None),
     instruction_image: Optional[UploadFile] = File(None),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("tasks.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
 ):
-
     logger.info(f"Updating task id={task_id}")
 
     task_payload = payload.to_schema()
@@ -4096,7 +4138,6 @@ async def update_task(
         instruction_image_url = instruction_image_url.replace("\\", "/")
 
     try:
-
         out = await service.update_task(
             db,
             current_user,
@@ -4112,9 +4153,7 @@ async def update_task(
         await bump_cache_version(redis, VERSION_KEY)
 
     except Exception:
-
         logger.exception(f"Task update failed id={task_id}")
-
         raise
 
     logger.info(f"Task updated id={task_id}")
@@ -4127,7 +4166,7 @@ async def update_status(
     project_id: int,
     task_id: int,
     payload: s.TaskStatusUpdate,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("tasks.edit")),
     db: AsyncSession = Depends(get_db_session),
     service: TasksService = Depends(get_tasks_service),
 ):
@@ -4145,7 +4184,7 @@ async def pass_task(
     project_id: int,
     task_id: int,
     payload: s.TaskPass,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("tasks.edit")),
     db: AsyncSession = Depends(get_db_session),
     service: TasksService = Depends(get_tasks_service),
 ):
@@ -4162,7 +4201,7 @@ async def pass_task(
 async def delete_task(
     project_id: int,
     task_id: int,
-    current_user: User = Depends(require_roles(TASK_DELETE_ROLES)),
+    current_user: User = Depends(require_permission("tasks.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
@@ -4190,7 +4229,7 @@ async def update_task_progress(
     project_id: int,
     task_id: int,
     payload: s.TaskProgressUpdate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("tasks.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
@@ -4220,11 +4259,10 @@ async def list_task_progress_history(
     task_id: int,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("tasks.view")),
     db: AsyncSession = Depends(get_db_session),
     service: TasksService = Depends(get_tasks_service),
 ):
-
     return await service.list_task_progress_history(
         db,
         current_user,
@@ -4243,17 +4281,25 @@ async def list_task_progress_history(
 async def create_task_request(
     form: s.TaskRequestCreateForm = Depends(),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
+    current_user: User = Depends(require_permission("tasks.create")),
 ):
     request = form.to_schema()
-    await assert_project_access(db, project_id=request.project_id, current_user=current_user)
+    await _get_scoped_project(db, project_id=request.project_id, current_user=current_user, load_relations=False)
 
     attachment_url = None
 
-    # Temporary file handling
-    if form.attachment:
-        attachment_url = form.attachment.filename
-        # Later replace with actual upload helper
+    if form.attachment and form.attachment.filename and form.attachment.filename.strip():
+        try:
+            os.makedirs("uploads/task_requests", exist_ok=True)
+            safe_filename = form.attachment.filename.replace(" ", "_")
+            unique_name = f"{uuid4().hex[:8]}_{safe_filename}"
+            file_path = os.path.join("uploads/task_requests", unique_name)
+            content = await form.attachment.read()
+            with open(file_path, "wb") as f:
+                f.write(content)
+            attachment_url = f"/uploads/task_requests/{unique_name}"
+        except Exception:
+            attachment_url = form.attachment.filename
 
     data = request.model_dump(exclude={"attachment_url"})
     data["attachment_url"] = attachment_url
@@ -4265,33 +4311,6 @@ async def create_task_request(
     await db.refresh(db_obj)
 
     return db_obj
-
-
-@tasks_router.get("/task-requests", response_model=List[s.TaskRequestResponse])
-async def get_task_requests(
-    project_id: int = Query(None, description="Filter by project ID"),
-    status: str = Query(None, description="Filter by status"),
-    priority: str = Query(None, description="Filter by priority"),
-    skip: int = Query(0, ge=0, description="Pagination skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Pagination limit"),
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
-):
-    if current_user.company_id is None:
-        return []
-    query = select(m.TaskRequest).join(m.Project, m.TaskRequest.project_id == m.Project.id).where(m.TaskRequest.is_deleted == False, m.Project.company_id == current_user.company_id)
-    if project_id:
-        query = query.where(m.TaskRequest.project_id == project_id)
-    if status:
-        query = query.where(m.TaskRequest.status == status)
-    if priority:
-        query = query.where(m.TaskRequest.priority == priority)
-
-    query = query.offset(skip).limit(limit)
-
-    result = await db.execute(query)
-    task_requests = result.scalars().all()
-    return list(task_requests)
 
 
 @tasks_router.get(
@@ -4306,11 +4325,15 @@ async def list_task_requests(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
+    current_user: User = Depends(require_permission("tasks.view")),
 ):
-    if current_user.company_id is None:
-        return s.PaginatedResponse(items=[], meta=s.PaginationMeta(page=page, page_size=page_size, total=0, total_pages=0))
-    query = select(m.TaskRequest).join(m.Project, m.TaskRequest.project_id == m.Project.id).where(m.TaskRequest.is_deleted == False, m.Project.company_id == current_user.company_id)
+    _check_batch_y_tenant_access(current_user)
+
+    query = select(m.TaskRequest).join(m.Project, m.TaskRequest.project_id == m.Project.id).where(m.TaskRequest.is_deleted == False)
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(m.Project.company_id == current_user.company_id)
+    elif not current_user.company_id:
+        query = query.where(m.Project.company_id == None)
 
     # Filters
     if project_id:
@@ -4339,13 +4362,12 @@ async def list_task_requests(
     result = await db.execute(query)
     records = result.scalars().all()
 
-    return s.PaginatedResponse(
+    return PaginatedResponse(
         items=records,
-        meta=s.PaginationMeta(
-            page=page,
-            page_size=page_size,
+        meta=PaginationMeta(
             total=total or 0,
-            total_pages=((total or 0) + page_size - 1) // page_size,
+            limit=page_size,
+            offset=offset,
         ),
     )
 
@@ -4355,18 +4377,9 @@ async def update_task_request(
     request_id: int,
     request: s.TaskRequestUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
+    current_user: User = Depends(require_permission("tasks.edit")),
 ):
-    result = await db.execute(
-        select(m.TaskRequest).where(
-            m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False
-        )
-    )
-    db_obj = result.scalar_one_or_none()
-
-    if not db_obj:
-        raise HTTPException(status_code=404, detail="Task request not found")
-    await assert_project_access(db, project_id=db_obj.project_id, current_user=current_user)
+    db_obj = await _get_scoped_task_request(db, request_id, current_user, for_update=True)
 
     update_data = request.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -4381,19 +4394,9 @@ async def update_task_request(
 async def delete_task_request(
     request_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_REQUEST_ROLES)),
+    current_user: User = Depends(require_permission("tasks.delete")),
 ):
-    result = await db.execute(
-        select(m.TaskRequest).where(
-            m.TaskRequest.id == request_id, m.TaskRequest.is_deleted == False
-        )
-    )
-    db_obj = result.scalar_one_or_none()
-
-    if not db_obj:
-        raise HTTPException(status_code=404, detail="Task request not found")
-
-    await assert_project_access(db, project_id=db_obj.project_id, current_user=current_user)
+    db_obj = await _get_scoped_task_request(db, request_id, current_user, for_update=True)
 
     # Soft delete
     db_obj.is_deleted = True
@@ -4409,7 +4412,7 @@ async def create_comment(
     project_id: int,
     task_id: int,
     payload: s.CommentCreate,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("tasks.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
@@ -4443,7 +4446,7 @@ async def list_comments(
     task_id: int,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("tasks.view")),
     db: AsyncSession = Depends(get_db_session),
     service: TasksService = Depends(get_tasks_service),
 ):
@@ -4460,19 +4463,10 @@ async def list_comments(
 @router.get("/{project_id}/profit-loss")
 async def project_profit_loss(
     project_id: int,
-    current_user: User = Depends(require_roles(FINANCIAL_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-
-    project = await db.get(m.Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found")
-
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    project = await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
     total_expense = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
@@ -4511,7 +4505,7 @@ async def create_dsr(
     request: Request,
     payload: s.DSRCreate = Depends(),
     photos: Optional[UploadFile] = File(None),
-    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("dsr.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -4519,15 +4513,16 @@ async def create_dsr(
         f"Creating DSR project_id={payload.project_id} date={payload.report_date}"
     )
 
-    project = await db.get(m.Project, payload.project_id)
-    if not project:
-        raise NotFoundError("Project not found")
+    project = await _get_scoped_project(db, payload.project_id, current_user, load_relations=False)
 
-    await assert_project_access(
-        db,
-        project_id=payload.project_id,
-        current_user=current_user,
-    )
+    # Validate photo file if provided before processing DSR
+    if photos and photos.filename:
+        if not photos.content_type or not photos.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
+        safe_name = pathlib.Path(photos.filename or "file").name
+        ext = pathlib.Path(safe_name).suffix.lower().replace(".", "")
+        if ext not in {"jpg", "jpeg", "png"}:
+            raise HTTPException(status_code=400, detail="Invalid photo extension")
 
     existing = await db.scalar(
         select(m.DailySiteReport).where(
@@ -4541,13 +4536,13 @@ async def create_dsr(
 
     # Contractor validation
     contractor = None
-
     if payload.contractor_id:
-        contractor = await db.get(
-            Contractor,
-            payload.contractor_id,
+        contractor = await db.scalar(
+            select(Contractor).where(
+                Contractor.id == payload.contractor_id,
+                Contractor.company_id == current_user.company_id,
+            )
         )
-
         if not contractor:
             raise HTTPException(
                 status_code=404,
@@ -4586,9 +4581,7 @@ async def create_dsr(
     total_labour = skilled + unskilled
 
     data = payload.model_dump()
-
     data["created_by_id"] = current_user.id
-
     data["total_labour"] = total_labour
     data["skilled_labour"] = skilled
     data["unskilled_labour"] = unskilled
@@ -4598,13 +4591,10 @@ async def create_dsr(
             data["business_id"] = await generate_business_id(
                 db, m.DailySiteReport, "business_id", "DSR"
             )
-
             obj = m.DailySiteReport(**data)
-
             db.add(obj)
             await db.flush()
             break
-
         except IntegrityError:
             await db.rollback()
             continue
@@ -4612,42 +4602,38 @@ async def create_dsr(
         raise Exception("Failed to generate unique DSR ID")
 
     # Handle Photos
-    if photos:
+    if photos and photos.filename:
         upload_dir = "uploads/dsr"
         os.makedirs(upload_dir, exist_ok=True)
 
-        file = photos
-        if file.content_type and file.content_type.startswith("image/"):
-            content = await file.read()
-            if len(content) <= 5 * 1024 * 1024:
-                try:
-                    img = Image.open(io.BytesIO(content))
-                    img.verify()
+        content = await photos.read()
+        if len(content) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Photo file too large")
 
-                    safe_name = pathlib.Path(file.filename or "file").name
-                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_name)
+        try:
+            img = Image.open(io.BytesIO(content))
+            img.verify()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Corrupted image file")
 
-                    ext = pathlib.Path(safe_name).suffix.lower().replace(".", "")
-                    if ext in {"jpg", "jpeg", "png"}:
-                        filename = f"{uuid.uuid4()}_{safe_name}"
-                        path = os.path.join(upload_dir, filename).replace("\\", "/")
+        safe_name = pathlib.Path(photos.filename or "file").name
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", safe_name)
+        ext = pathlib.Path(safe_name).suffix.lower().replace(".", "")
+        filename = f"{uuid.uuid4()}_{safe_name}"
+        path = os.path.join(upload_dir, filename).replace("\\", "/")
 
-                        def _save_dsr():
-                            with open(path, "wb") as f:
-                                f.write(content)
+        def _save_dsr():
+            with open(path, "wb") as f:
+                f.write(content)
 
-                        await run_in_threadpool(_save_dsr)
-
-                        photo = m.DSRPhoto(dsr_id=obj.id, file_url=path)
-                        db.add(photo)
-                except Exception:
-                    pass
+        await run_in_threadpool(_save_dsr)
+        photo = m.DSRPhoto(dsr_id=obj.id, file_url=path)
+        db.add(photo)
 
     try:
         await db.flush()
         await db.refresh(obj)
 
-        # Reload with relationships to avoid async lazy-loading issue
         result = await db.execute(
             select(m.DailySiteReport)
             .options(
@@ -4656,31 +4642,24 @@ async def create_dsr(
             )
             .where(m.DailySiteReport.id == obj.id)
         )
-
         obj = result.scalar_one()
-
         await bump_cache_version(redis, "cache_version:dsr")
-
     except Exception:
         await db.rollback()
         logger.exception("DSR creation failed")
         raise
 
     dsr_out = s.DSROut.model_validate(obj)
-
     if obj.contractor:
         dsr_out.contractor_name = obj.contractor.name
-
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
 
-    # Add photo URLs to output
     base_url = str(request.base_url).rstrip("/")
     result_photos = await db.execute(
         select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == obj.id)
     )
     dsr_out.photos = [f"{base_url}/{p.file_url}" for p in result_photos.scalars().all()]
-
     return dsr_out
 
 
@@ -4692,81 +4671,63 @@ async def get_project_dsr(
     project_id: int,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    current_user: User = Depends(require_permission("dsr.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     logger.info(f"Fetching DSR for project_id={project_id}")
+    project = await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
-    try:
-        project = await db.get(m.Project, project_id)
-        if not project:
-            raise NotFoundError("Project not found")
+    version = await get_cache_version(redis, "cache_version:dsr")
+    cache_key = f"cache:dsr:list:{version}:{project_id}:{limit}:{offset}"
 
-        await assert_project_access(
-            db,
-            project_id=project_id,
-            current_user=current_user,
+    cached = await cache_get_json(redis, cache_key)
+    if cached:
+        return PaginatedResponse[s.DSROut].model_validate(cached)
+
+    query = (
+        select(m.DailySiteReport)
+        .options(
+            selectinload(m.DailySiteReport.contractor),
+            selectinload(m.DailySiteReport.created_by),
         )
+        .where(m.DailySiteReport.project_id == project_id)
+        .order_by(m.DailySiteReport.report_date.desc())
+        .limit(limit)
+        .offset(offset)
+    )
 
-        version = await get_cache_version(redis, "cache_version:dsr")
-        cache_key = f"cache:dsr:list:{version}:{project_id}:{limit}:{offset}"
+    count_query = (
+        select(func.count())
+        .select_from(m.DailySiteReport)
+        .where(m.DailySiteReport.project_id == project_id)
+    )
 
-        cached = await cache_get_json(redis, cache_key)
-        if cached:
-            return PaginatedResponse[s.DSROut].model_validate(cached)
+    total = await db.scalar(count_query)
+    rows = (await db.execute(query)).scalars().all()
 
-        query = (
-            select(m.DailySiteReport)
-            .options(
-                selectinload(m.DailySiteReport.contractor),
-                selectinload(m.DailySiteReport.created_by),
-            )
-            .where(m.DailySiteReport.project_id == project_id)
-            .order_by(m.DailySiteReport.report_date.desc())
-            .limit(limit)
-            .offset(offset)
-        )
+    items = []
+    for row in rows:
+        dsr = s.DSROut.model_validate(row, from_attributes=True)
+        if row.contractor:
+            dsr.contractor_name = row.contractor.name
+        if row.created_by:
+            dsr.created_by_name = row.created_by.full_name
+        items.append(dsr.model_dump())
 
-        count_query = (
-            select(func.count())
-            .select_from(m.DailySiteReport)
-            .where(m.DailySiteReport.project_id == project_id)
-        )
+    meta = PaginationMeta(
+        total=int(total or 0),
+        limit=limit,
+        offset=offset,
+    )
 
-        total = await db.scalar(count_query)
-        rows = (await db.execute(query)).scalars().all()
+    result = {
+        "items": items,
+        "meta": meta.model_dump(),
+    }
 
-        items = []
-        for row in rows:
-            dsr = s.DSROut.model_validate(row, from_attributes=True)
-
-            if row.contractor:
-                dsr.contractor_name = row.contractor.name
-
-            if row.created_by:
-                dsr.created_by_name = row.created_by.full_name
-
-            items.append(dsr.model_dump())
-
-        meta = PaginationMeta(
-            total=int(total or 0),
-            limit=limit,
-            offset=offset,
-        )
-
-        result = {
-            "items": items,
-            "meta": meta.model_dump(),
-        }
-
-        await cache_set_json(redis, cache_key, result)
-
-        return PaginatedResponse[s.DSROut].model_validate(result)
-
-    except Exception as e:
-        traceback.print_exc()
-        raise DataIntegrityError("Data integrity issue")
+    await cache_set_json(redis, cache_key, result)
+    return PaginatedResponse[s.DSROut].model_validate(result)
 
 
 # =========================
@@ -4776,7 +4737,7 @@ async def get_project_dsr(
 async def get_dsr(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    current_user: User = Depends(require_permission("dsr.view")),
     redis=Depends(get_request_redis),
 ):
     logger.info(f"Fetching DSR id={id}")
@@ -4788,36 +4749,15 @@ async def get_dsr(
     if cached:
         return s.DSROut.model_validate(cached)
 
-    result = await db.execute(
-        select(m.DailySiteReport)
-        .options(
-            selectinload(m.DailySiteReport.contractor),
-            selectinload(m.DailySiteReport.created_by),
-        )
-        .where(m.DailySiteReport.id == id)
-    )
-
-    obj = result.scalar_one_or_none()
-
-    if not obj:
-        raise NotFoundError("DSR not found")
-
-    await assert_project_access(
-        db,
-        project_id=obj.project_id,
-        current_user=current_user,
-    )
-
+    obj = await _get_scoped_dsr(db, id, current_user, load_relations=True)
     dsr_out = s.DSROut.model_validate(obj, from_attributes=True)
 
     if obj.contractor:
         dsr_out.contractor_name = obj.contractor.name
-
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
 
     await cache_set_json(redis, cache_key, dsr_out.model_dump())
-
     return dsr_out
 
 
@@ -4828,34 +4768,25 @@ async def get_dsr(
 async def update_dsr(
     id: int,
     payload: s.DSRUpdate,
-    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("dsr.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     logger.info(f"Updating DSR id={id}")
-
-    result = await db.execute(
-        select(m.DailySiteReport)
-        .options(
-            selectinload(m.DailySiteReport.contractor),
-            selectinload(m.DailySiteReport.created_by),
-        )
-        .where(m.DailySiteReport.id == id)
-    )
-
-    obj = result.scalar_one_or_none()
-
-    if not obj:
-        raise NotFoundError("DSR not found")
+    obj = await _get_scoped_dsr(db, id, current_user, for_update=True, load_relations=True)
 
     if obj.status == "Approved":
         raise ValidationError("Cannot update approved DSR")
 
-    await assert_project_access(
-        db,
-        project_id=obj.project_id,
-        current_user=current_user,
-    )
+    if payload.contractor_id:
+        contractor = await db.scalar(
+            select(Contractor).where(
+                Contractor.id == payload.contractor_id,
+                Contractor.company_id == current_user.company_id,
+            )
+        )
+        if not contractor:
+            raise HTTPException(status_code=404, detail="Contractor not found")
 
     if payload.report_date:
         existing = await db.scalar(
@@ -4869,7 +4800,6 @@ async def update_dsr(
             raise BadRequestError("DSR already exists for this date")
 
     update_data = payload.model_dump(exclude_unset=True)
-
     for k, v in update_data.items():
         if k not in ["project_id", "created_by_id"]:
             setattr(obj, k, v)
@@ -4885,10 +4815,8 @@ async def update_dsr(
     await bump_cache_version(redis, "cache_version:dsr")
 
     dsr_out = s.DSROut.model_validate(obj, from_attributes=True)
-
     if obj.contractor:
         dsr_out.contractor_name = obj.contractor.name
-
     if obj.created_by:
         dsr_out.created_by_name = obj.created_by.full_name
 
@@ -4898,10 +4826,10 @@ async def update_dsr(
 @dsr_router.get("/project/{project_id}/map")
 async def get_dsr_map_points(
     project_id: int,
-    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    current_user: User = Depends(require_permission("dsr.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
     result = await db.execute(
         select(
             m.DailySiteReport.latitude,
@@ -4913,9 +4841,7 @@ async def get_dsr_map_points(
             m.DailySiteReport.longitude.isnot(None),
         )
     )
-
     rows = result.all()
-
     return [
         {
             "lat": r[0],
@@ -4931,11 +4857,13 @@ async def labour_trend(
     project_id: int,
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    current_user: User = Depends(require_permission("dsr.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if start_date and end_date and end_date < start_date:
         raise BadRequestError("end_date cannot be before start_date")
+
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
     query = select(
         m.DailySiteReport.report_date,
@@ -4944,7 +4872,6 @@ async def labour_trend(
 
     if start_date:
         query = query.where(m.DailySiteReport.report_date >= start_date)
-
     if end_date:
         query = query.where(m.DailySiteReport.report_date <= end_date)
 
@@ -4954,7 +4881,6 @@ async def labour_trend(
 
     result = await db.execute(query)
     rows = result.all()
-
     return [
         {
             "date": r[0],
@@ -4969,17 +4895,13 @@ async def contractor_analytics(
     project_id: int,
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    current_user: User = Depends(require_permission("dsr.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if start_date and end_date and end_date < start_date:
         raise BadRequestError("end_date cannot be before start_date")
 
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
     query = (
         select(
@@ -4995,15 +4917,12 @@ async def contractor_analytics(
 
     if start_date:
         query = query.where(m.DailySiteReport.report_date >= start_date)
-
     if end_date:
         query = query.where(m.DailySiteReport.report_date <= end_date)
 
     query = query.group_by(Contractor.name)
-
     result = await db.execute(query)
     rows = result.all()
-
     return [
         {
             "contractor": r[0] or "Unknown",
@@ -5016,65 +4935,51 @@ async def contractor_analytics(
 @dsr_router.delete("/{id}")
 async def delete_dsr(
     id: int,
-    current_user: User = Depends(require_roles(DSR_DELETE_ROLES)),
+    current_user: User = Depends(require_permission("dsr.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     logger.info(f"Deleting DSR id={id}")
+    obj = await _get_scoped_dsr(db, id, current_user, for_update=True)
 
-    obj = await db.get(m.DailySiteReport, id)
-
-    if not obj:
-        logger.warning(f"DSR not found id={id}")
-        raise NotFoundError("DSR not found")
-    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    if obj.status == "Approved":
+        raise ValidationError("Cannot delete approved DSR")
 
     try:
         await db.delete(obj)
         await db.flush()
-
         await bump_cache_version(redis, "cache_version:dsr")
-
     except Exception:
         await db.rollback()
         logger.exception(f"DSR delete failed id={id}")
         raise
 
     logger.info(f"DSR deleted id={id}")
-
     return {"success": True, "message": "DSR deleted successfully"}
 
 
 @dsr_router.get("/{dsr_id}/photos")
 async def get_dsr_photos(
     dsr_id: int,
-    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    current_user: User = Depends(require_permission("dsr.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    dsr = await db.get(m.DailySiteReport, dsr_id)
-    if not dsr:
-        raise NotFoundError("DSR not found")
-    await assert_project_access(db, project_id=dsr.project_id, current_user=current_user)
-
+    await _get_scoped_dsr(db, dsr_id, current_user)
     result = await db.execute(select(m.DSRPhoto).where(m.DSRPhoto.dsr_id == dsr_id))
     rows = result.scalars().all()
-
     return [{"id": p.id, "url": p.file_url} for p in rows]
 
 
 @dsr_router.delete("/photo/{photo_id}")
 async def delete_dsr_photo(
     photo_id: int,
-    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("dsr.delete")),
     db: AsyncSession = Depends(get_db_session),
 ):
     obj = await db.get(m.DSRPhoto, photo_id)
-
     if not obj:
         raise NotFoundError("Photo not found")
-    dsr = await db.get(m.DailySiteReport, obj.dsr_id)
-    if dsr:
-        await assert_project_access(db, project_id=dsr.project_id, current_user=current_user)
+    await _get_scoped_dsr(db, obj.dsr_id, current_user, for_update=True)
 
     try:
         await db.delete(obj)
@@ -5092,16 +4997,11 @@ async def export_dsr_excel(
     start_date: Optional[date] = Query(default=None),
     end_date: Optional[date] = Query(default=None),
     contractor_name: Optional[str] = Query(default=None),
-    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
+    current_user: User = Depends(require_permission("dsr.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Exporting DSR Excel project_id={project_id}")
-
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
+    project = await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
     query = (
         select(m.DailySiteReport, Contractor.name, User.full_name)
@@ -5114,28 +5014,20 @@ async def export_dsr_excel(
 
     if start_date:
         query = query.where(m.DailySiteReport.report_date >= start_date)
-
     if end_date:
         query = query.where(m.DailySiteReport.report_date <= end_date)
-
     if contractor_name:
         contractor_name = contractor_name.strip()
         query = query.where(Contractor.name.ilike(f"%{contractor_name}%"))
 
     query = query.order_by(m.DailySiteReport.report_date.desc())
-
     result = await db.execute(query)
-    rows = result.all()  # ❗ NOT scalars()
+    rows = result.all()
 
     if not rows:
         raise NotFoundError("No DSR data found")
 
-    project_result = await db.execute(
-        select(m.Project).where(m.Project.id == project_id)
-    )
-    project = project_result.scalars().first()
     project_name = project.project_name if project else str(project_id)
-
     wb = Workbook()
     ws = wb.active
     ws.title = "DSR Report"
@@ -5157,12 +5049,12 @@ async def export_dsr_excel(
     ]
     ws.append(headers)
 
-    for r, contractor_name, created_by_name in rows:
+    for r, c_name, u_name in rows:
         ws.append(
             [
                 str(r.report_date),
                 project_name,
-                contractor_name,
+                c_name,
                 r.weather,
                 r.work_done,
                 r.work_planned,
@@ -5172,7 +5064,7 @@ async def export_dsr_excel(
                 r.material_used,
                 r.issues,
                 r.remarks,
-                created_by_name,
+                u_name,
             ]
         )
 
@@ -5192,25 +5084,14 @@ async def export_dsr_excel(
 @dsr_router.put("/{id}/submit")
 async def submit_dsr(
     id: int,
-    current_user: User = Depends(require_roles(DSR_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("dsr.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.DailySiteReport, id)
-
-    if not obj:
-        raise NotFoundError("DSR not found")
-
-    await assert_project_access(
-        db,
-        project_id=obj.project_id,
-        current_user=current_user,
-    )
-
+    obj = await _get_scoped_dsr(db, id, current_user, for_update=True)
     if obj.status != "Draft":
         raise ValidationError("Only draft DSR can be submitted")
 
     obj.status = "Submitted"
-
     db.add(
         ActivityLog(
             action="SUBMIT_DSR",
@@ -5220,34 +5101,24 @@ async def submit_dsr(
             details={"message": f"Daily Site Report submitted for {obj.report_date}"},
         )
     )
-
     await db.flush()
-
     return {"message": "DSR submitted successfully"}
 
 
 @dsr_router.put("/{id}/approve")
 async def approve_dsr(
     id: int,
-    current_user: User = Depends(require_roles(DSR_APPROVE_ROLES)),
+    current_user: User = Depends(require_permission("dsr.approve")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.DailySiteReport, id)
-
-    if not obj:
-        raise NotFoundError("DSR not found")
-
-    await assert_project_access(
-        db,
-        project_id=obj.project_id,
-        current_user=current_user,
-    )
-
+    obj = await _get_scoped_dsr(db, id, current_user, for_update=True)
     if obj.status != "Submitted":
         raise ValidationError("DSR must be submitted before approval")
 
-    obj.status = "Approved"
+    if obj.created_by_id == current_user.id and getattr(current_user, "is_super_admin", False) is not True:
+        raise HTTPException(status_code=400, detail="Cannot approve your own DSR")
 
+    obj.status = "Approved"
     db.add(
         ActivityLog(
             action="APPROVE_DSR",
@@ -5257,35 +5128,22 @@ async def approve_dsr(
             details={"message": f"Daily Site Report approved for {obj.report_date}"},
         )
     )
-
     await db.commit()
     await db.refresh(obj)
-
     return {"message": "DSR approved successfully"}
 
 
 @dsr_router.put("/{id}/reject")
 async def reject_dsr(
     id: int,
-    current_user: User = Depends(require_roles(DSR_APPROVE_ROLES)),
+    current_user: User = Depends(require_permission("dsr.approve")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.DailySiteReport, id)
-
-    if not obj:
-        raise NotFoundError("DSR not found")
-
-    await assert_project_access(
-        db,
-        project_id=obj.project_id,
-        current_user=current_user,
-    )
-
+    obj = await _get_scoped_dsr(db, id, current_user, for_update=True)
     if obj.status != "Submitted":
         raise ValidationError("Only submitted DSR can be rejected")
 
     obj.status = "Draft"
-
     db.add(
         ActivityLog(
             action="REJECT_DSR",
@@ -5295,13 +5153,49 @@ async def reject_dsr(
             details={"message": f"Daily Site Report rejected for {obj.report_date}"},
         )
     )
-
     await db.commit()
     await db.refresh(obj)
-
     return {"message": "DSR rejected and moved to draft"}
 
 
+@dsr_router.get("/project/{project_id}/analytics/issues")
+async def issue_analytics(
+    project_id: int,
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    current_user: User = Depends(require_permission("dsr.view")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    if start_date and end_date and end_date < start_date:
+        raise BadRequestError("end_date cannot be before start_date")
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
+
+    base_query = select(m.DailySiteReport).where(
+        m.DailySiteReport.project_id == project_id
+    )
+
+    if start_date:
+        base_query = base_query.where(m.DailySiteReport.report_date >= start_date)
+
+    if end_date:
+        base_query = base_query.where(m.DailySiteReport.report_date <= end_date)
+
+    total = await db.scalar(select(func.count()).select_from(base_query.subquery()))
+    issues = await db.scalar(
+        select(func.count()).select_from(
+            base_query.where(m.DailySiteReport.issues.isnot(None)).subquery()
+        )
+    )
+
+    return {
+        "total_reports": int(total or 0),
+        "reports_with_issues": int(issues or 0),
+    }
+
+
+# =========================
+# ISSUES ROUTER
+# =========================
 issues_router = APIRouter(
     prefix="/issues",
     tags=["Issues"],
@@ -5313,24 +5207,28 @@ issues_router = APIRouter(
 async def create_issue(
     payload: s.IssueCreate,
     redis=Depends(get_request_redis),
-    current_user: User = Depends(require_roles(ISSUE_CREATE_ROLES)),
+    current_user: User = Depends(require_permission("issues.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Issue create start project_id={payload.project_id}")
 
-    project = await db.get(m.Project, payload.project_id)
-    if not project:
-        logger.warning(f"Project not found id={payload.project_id}")
-        raise NotFoundError("Project not found")
-
-    await assert_project_access(
-        db, project_id=payload.project_id, current_user=current_user
-    )
+    project = await _get_scoped_project(db, payload.project_id, current_user, load_relations=False)
 
     if not payload.title or not payload.title.strip():
         raise ValidationError("title is required")
 
     title = payload.title.strip()
+
+    assigned_to_val = getattr(payload, "assigned_to", None)
+    if assigned_to_val:
+        assigned_user = await db.scalar(
+            select(User).where(
+                User.id == assigned_to_val,
+                User.company_id == current_user.company_id,
+            )
+        )
+        if not assigned_user:
+            raise HTTPException(status_code=404, detail="Assigned user not found")
 
     existing = await db.scalar(
         select(m.Issue).where(
@@ -5351,7 +5249,6 @@ async def create_issue(
                 )
 
                 obj = m.Issue(**data)
-
                 db.add(obj)
                 await db.flush()
 
@@ -5386,7 +5283,6 @@ async def create_issue(
                         )
 
                 break
-
             except IntegrityError:
                 await db.rollback()
                 continue
@@ -5398,16 +5294,13 @@ async def create_issue(
     except IntegrityError:
         await db.rollback()
         raise ConflictError("Issue with this title already exists in this project")
-
     except Exception:
         await db.rollback()
         logger.exception("Issue creation failed")
         raise
 
     logger.info(f"Issue created id={obj.id}")
-
     await bump_cache_version(redis, VERSION_KEY)
-
     return s.IssueOut.model_validate(obj)
 
 
@@ -5417,32 +5310,26 @@ async def list_issues(
     status: Optional[s.IssueStatus] = Query(None),
     priority: Optional[s.IssuePriority] = Query(None),
     assigned_to: Optional[int] = Query(None),
-    project_id: Optional[int] = Query(None),  # Added
+    project_id: Optional[int] = Query(None),
     category: Optional[s.IssueCategory] = Query(None),
     search: Optional[str] = Query(None),
     sort_by: Optional[str] = Query("id"),
     order: Optional[str] = Query("desc"),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("issues.view")),
 ):
+    _check_batch_y_tenant_access(current_user)
     pagination = pagination.normalized()
-    if current_user.company_id is None:
-        return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=pagination.limit, offset=pagination.offset))
 
-    if current_user.role in (
-        UserRole.ADMIN.value,
-        UserRole.PROJECT_MANAGER.value,
-    ):
-        base_query = select(m.Issue).join(m.Project, m.Issue.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
-    else:
-        subquery = select(m.ProjectMember.project_id).where(
-            m.ProjectMember.user_id == current_user.id
-        )
+    base_query = (
+        select(m.Issue)
+        .join(m.Project, m.Issue.project_id == m.Project.id)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        base_query = base_query.where(m.Project.company_id == current_user.company_id)
 
-        base_query = select(m.Issue).where(m.Issue.project_id.in_(subquery))
-
-    # Project Filter
     if project_id is not None:
+        await _get_scoped_project(db, project_id, current_user, load_relations=False)
         base_query = base_query.where(m.Issue.project_id == project_id)
 
     if status is not None:
@@ -5472,25 +5359,18 @@ async def list_issues(
         "reported_date": m.Issue.reported_date,
         "status": m.Issue.status,
     }
+    sort_column = sort_mapping.get(sort_by, m.Issue.id)
 
-    sort_column = sort_mapping.get(
-        sort_by,
-        m.Issue.id,
-    )
-
-    if order.lower() == "asc":
+    if order and order.lower() == "asc":
         base_query = base_query.order_by(sort_column.asc())
     else:
         base_query = base_query.order_by(sort_column.desc())
 
     count_query = select(func.count()).select_from(base_query.order_by(None).subquery())
-
     total = await db.scalar(count_query)
 
     query = base_query.offset(pagination.offset).limit(pagination.limit)
-
     rows = (await db.execute(query)).scalars().all()
-
     items = [s.IssueOut.model_validate(row) for row in rows]
 
     return PaginatedResponse(
@@ -5509,15 +5389,10 @@ async def list_issues(
 async def get_issues_by_project(
     project_id: int,
     pagination: PaginationParams = Depends(),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("issues.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(
-        db,
-        project_id=project_id,
-        current_user=current_user,
-    )
-
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
     pagination = pagination.normalized()
 
     total = await db.scalar(
@@ -5535,7 +5410,6 @@ async def get_issues_by_project(
     )
 
     rows = (await db.execute(query)).scalars().all()
-
     items = [s.IssueOut.model_validate(row) for row in rows]
 
     return PaginatedResponse(
@@ -5552,17 +5426,9 @@ async def get_issues_by_project(
 async def get_issue(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("issues.view")),
 ):
-    obj = await db.get(m.Issue, id)
-
-    if not obj:
-        raise NotFoundError("Issue not found")
-
-    await assert_project_access(
-        db, project_id=obj.project_id, current_user=current_user
-    )
-
+    obj = await _get_scoped_issue(db, id, current_user)
     return s.IssueOut.model_validate(obj)
 
 
@@ -5570,27 +5436,17 @@ async def get_issue(
 async def update_issue(
     id: int,
     payload: s.IssueUpdate,
-    current_user: User = Depends(require_roles(ISSUE_UPDATE_ROLES)),
+    current_user: User = Depends(require_permission("issues.edit")),
     redis=Depends(get_request_redis),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Updating issue id={id}")
-
-    obj = await db.get(m.Issue, id)
-
-    if not obj:
-        logger.warning(f"Issue not found id={id}")
-        raise NotFoundError("Issue not found")
-
-    await assert_project_access(
-        db, project_id=obj.project_id, current_user=current_user
-    )
+    obj = await _get_scoped_issue(db, id, current_user, for_update=True)
 
     data = payload.model_dump(exclude_unset=True)
 
     if "title" in data and data["title"]:
         title = data["title"].strip()
-
         existing = await db.scalar(
             select(m.Issue).where(
                 m.Issue.project_id == obj.project_id,
@@ -5600,13 +5456,17 @@ async def update_issue(
         )
         if existing:
             raise ConflictError("Issue with same title already exists in this project")
-
         data["title"] = title
 
     if "assigned_to" in data and data["assigned_to"] is not None:
-        user = await db.scalar(select(User).where(User.id == data["assigned_to"]))
+        user = await db.scalar(
+            select(User).where(
+                User.id == data["assigned_to"],
+                User.company_id == current_user.company_id,
+            )
+        )
         if not user:
-            raise NotFoundError("Assigned user not found")
+            raise HTTPException(status_code=404, detail="Assigned user not found")
 
         is_member = await db.scalar(
             select(func.count())
@@ -5627,55 +5487,29 @@ async def update_issue(
 
     try:
         await db.flush()
-
     except IntegrityError:
         await db.rollback()
         raise ConflictError("Issue with this title already exists in this project")
-
     except Exception:
         await db.rollback()
         logger.exception(f"Issue update failed id={id}")
         raise
 
     await db.refresh(obj)
-
     logger.info(f"Issue updated id={id}")
-
     await bump_cache_version(redis, VERSION_KEY)
-
     return s.IssueOut.model_validate(obj)
 
 
 @issues_router.delete("/{id}")
 async def delete_issue(
     id: int,
-    current_user: User = Depends(require_roles(ISSUE_DELETE_ROLES)),
+    current_user: User = Depends(require_permission("issues.delete")),
     redis=Depends(get_request_redis),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Deleting issue id={id}")
-
-    obj = await db.get(m.Issue, id)
-
-    if not obj:
-        logger.warning(f"Issue not found id={id}")
-        raise NotFoundError("Issue not found")
-
-    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
-    if current_user.role not in (
-        UserRole.ADMIN.value,
-        UserRole.PROJECT_MANAGER.value,
-    ):
-        is_member = await db.scalar(
-            select(func.count())
-            .select_from(m.ProjectMember)
-            .where(
-                m.ProjectMember.project_id == obj.project_id,
-                m.ProjectMember.user_id == current_user.id,
-            )
-        )
-        if not is_member:
-            raise PermissionDeniedError("User is not part of this project")
+    obj = await _get_scoped_issue(db, id, current_user, for_update=True)
 
     try:
         await db.delete(obj)
@@ -5686,88 +5520,216 @@ async def delete_issue(
         raise
 
     logger.info(f"Issue deleted id={id}")
-
     await bump_cache_version(redis, VERSION_KEY)
-
     return {"success": True, "message": "Issue deleted successfully"}
 
 
-@issues_router.get(
-    "/project/{project_id}", response_model=PaginatedResponse[s.IssueOut]
-)
-async def issues_by_project(
-    project_id: int,
-    pagination: PaginationParams = Depends(),
-    current_user: User = Depends(require_roles(READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-    pagination = pagination.normalized()
-
-    total = await db.scalar(
-        select(func.count()).where(m.Issue.project_id == project_id)
-    )
-
-    query = (
-        select(m.Issue)
-        .where(m.Issue.project_id == project_id)
-        .order_by(m.Issue.id.desc())
-        .offset(pagination.offset)
-        .limit(pagination.limit)
-    )
-
-    rows = (await db.execute(query)).scalars().all()
-
-    items = [s.IssueOut.model_validate(r) for r in rows]
-
-    return PaginatedResponse(
-        items=items,
-        meta=PaginationMeta(
-            total=int(total or 0),
-            limit=pagination.limit,
-            offset=pagination.offset,
-        ),
-    )
+# ==========================================================
+# Batch X: Work Progress RBAC & Tenant Scoping Helpers
+# ==========================================================
 
 
-@dsr_router.get("/project/{project_id}/analytics/issues")
-async def issue_analytics(
-    project_id: int,
-    start_date: Optional[date] = Query(None),
-    end_date: Optional[date] = Query(None),
-    current_user: User = Depends(require_roles(DSR_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session),
-):
-    if start_date and end_date and end_date < start_date:
-        raise BadRequestError("end_date cannot be before start_date")
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-
-    base_query = select(m.DailySiteReport).where(
-        m.DailySiteReport.project_id == project_id
-    )
-
-    if start_date:
-        base_query = base_query.where(m.DailySiteReport.report_date >= start_date)
-
-    if end_date:
-        base_query = base_query.where(m.DailySiteReport.report_date <= end_date)
-
-    total = await db.scalar(select(func.count()).select_from(base_query.subquery()))
-
-    issues = await db.scalar(
-        select(func.count()).select_from(
-            base_query.where(m.DailySiteReport.issues.isnot(None)).subquery()
+def _check_batch_x_wp_tenant_access(current_user: User) -> bool:
+    """Check tenant access for Batch X Work Progress routes.
+    
+    Returns True if Super Admin, False if regular tenant user.
+    Raises HTTPException(403) if non-SA user has company_id is None.
+    """
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and getattr(current_user, "company_id", None) is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not belong to any tenant company",
         )
-    )
+    return is_sa
 
-    return {
-        "total_reports": int(total or 0),
-        "reports_with_issues": int(issues or 0),
-    }
+
+async def _get_scoped_project_for_wp(
+    db: AsyncSession,
+    project_id: int,
+    current_user: User,
+) -> m.Project:
+    """Retrieve project scoped to current tenant (or cross-company if SA).
+    
+    Returns 404 if not found or belongs to another tenant.
+    """
+    is_sa = _check_batch_x_wp_tenant_access(current_user)
+    stmt = select(m.Project).where(m.Project.id == project_id)
+    if not is_sa:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    result = await db.execute(stmt)
+    project = result.scalars().first()
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+    return project
+
+
+async def _get_scoped_work_activity(
+    db: AsyncSession,
+    activity_id: int,
+    current_user: User,
+    for_update: bool = False,
+    load_relations: bool = False,
+) -> m.WorkActivity:
+    """Retrieve work activity scoped to current tenant via Project.
+    
+    Returns 404 if not found or belongs to another tenant.
+    """
+    is_sa = _check_batch_x_wp_tenant_access(current_user)
+    stmt = (
+        select(m.WorkActivity)
+        .join(m.Project, m.Project.id == m.WorkActivity.project_id)
+        .where(m.WorkActivity.id == activity_id)
+    )
+    if not is_sa:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    if load_relations:
+        stmt = stmt.options(
+            selectinload(m.WorkActivity.project),
+            selectinload(m.WorkActivity.work_order),
+            selectinload(m.WorkActivity.boq_item),
+            selectinload(m.WorkActivity.engineer),
+        )
+    if for_update:
+        stmt = stmt.with_for_update()
+    result = await db.execute(stmt)
+    activity = result.scalar_one_or_none()
+    if not activity:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Work activity not found",
+        )
+    return activity
+
+
+async def _get_scoped_daily_entry(
+    db: AsyncSession,
+    entry_id: int,
+    current_user: User,
+    for_update: bool = False,
+) -> m.DailyProgressEntry:
+    """Retrieve daily progress entry scoped to current tenant via WorkActivity -> Project.
+    
+    Returns 404 if not found or belongs to another tenant.
+    """
+    is_sa = _check_batch_x_wp_tenant_access(current_user)
+    stmt = (
+        select(m.DailyProgressEntry)
+        .join(m.WorkActivity, m.WorkActivity.id == m.DailyProgressEntry.activity_id)
+        .join(m.Project, m.Project.id == m.WorkActivity.project_id)
+        .where(m.DailyProgressEntry.id == entry_id)
+        .options(selectinload(m.DailyProgressEntry.activity))
+    )
+    if not is_sa:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    result = await db.execute(stmt)
+    entry = result.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Daily progress entry not found",
+        )
+    return entry
+
+
+async def _validate_scoped_engineer(
+    db: AsyncSession,
+    engineer_id: int,
+    project_id: int,
+    current_user: User,
+) -> User:
+    """Validate engineer exists, belongs to tenant (or SA), is active, is SITE_ENGINEER, and assigned to project."""
+    is_sa = _check_batch_x_wp_tenant_access(current_user)
+    stmt = select(User).where(User.id == engineer_id)
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+    res = await db.execute(stmt)
+    engineer = res.scalar_one_or_none()
+    if not engineer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Engineer not found",
+        )
+    if engineer.role != UserRole.SITE_ENGINEER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Selected user is not a Site Engineer",
+        )
+    if not engineer.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Engineer is inactive",
+        )
+    member_stmt = select(m.ProjectMember).where(
+        m.ProjectMember.project_id == project_id,
+        m.ProjectMember.user_id == engineer.id,
+    )
+    member_result = await db.execute(member_stmt)
+    if not member_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Engineer is not assigned to this project",
+        )
+    return engineer
+
+
+async def _validate_scoped_work_order(
+    db: AsyncSession,
+    work_order_id: int,
+    project_id: int,
+    current_user: User,
+) -> WorkOrder:
+    """Validate work order exists and belongs to project and tenant."""
+    is_sa = _check_batch_x_wp_tenant_access(current_user)
+    stmt = (
+        select(WorkOrder)
+        .join(m.Project, m.Project.id == WorkOrder.project_id)
+        .where(WorkOrder.id == work_order_id)
+    )
+    if not is_sa:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    res = await db.execute(stmt)
+    wo = res.scalar_one_or_none()
+    if not wo or wo.project_id != project_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Work order not found",
+        )
+    return wo
+
+
+async def _validate_scoped_boq(
+    db: AsyncSession,
+    boq_item_id: int,
+    project_id: int,
+    current_user: User,
+) -> BOQ:
+    """Validate BOQ exists and belongs to project and tenant."""
+    is_sa = _check_batch_x_wp_tenant_access(current_user)
+    stmt = (
+        select(BOQ)
+        .join(m.Project, m.Project.id == BOQ.project_id)
+        .where(BOQ.id == boq_item_id)
+    )
+    if not is_sa:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    res = await db.execute(stmt)
+    boq = res.scalar_one_or_none()
+    if not boq or boq.project_id != project_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BOQ item not found",
+        )
+    return boq
 
 
 # ==========================================================
-# work-progress
+# work-progress router
 # ==========================================================
 work_progress_router = APIRouter(
     prefix="/work-progress",
@@ -5820,31 +5782,40 @@ async def create_activity_log(
     db.add(log)
 
 
-def update_activity_status(activity):
-
-    if (
-        activity.end_date
-        and activity.end_date < date.today()
-        and activity.completion_percentage < Decimal("100")
-    ):
-
-        activity.status = WorkActivityStatus.DELAY
-
-    elif activity.completion_percentage >= Decimal("100"):
-
-        activity.status = WorkActivityStatus.COMPLETED
-
-    elif activity.completion_percentage > Decimal("0"):
-
-        activity.status = WorkActivityStatus.ON_TRACK
-
+def calculate_activity_status(activity) -> WorkActivityStatus:
+    """Pure, side-effect-free status resolver for WorkActivity.
+    
+    Evaluates business status based on completion_percentage and schedule end_date.
+    If completion_percentage is NULL (unset/no progress), it is treated as no progress
+    for status determination (DELAY if past deadline, else NOT_STARTED), without
+    mutating any attribute on activity.
+    """
+    raw_pct = getattr(activity, "completion_percentage", None)
+    if raw_pct is None:
+        pct = Decimal("0.00")
+    elif isinstance(raw_pct, Decimal):
+        pct = raw_pct
     else:
+        pct = Decimal(str(raw_pct))
 
-        activity.status = WorkActivityStatus.NOT_STARTED
+    end_date = getattr(activity, "end_date", None)
+    if pct >= Decimal("100"):
+        return WorkActivityStatus.COMPLETED
+    elif end_date and end_date < date.today() and pct < Decimal("100"):
+        return WorkActivityStatus.DELAY
+    elif pct > Decimal("0"):
+        return WorkActivityStatus.ON_TRACK
+    else:
+        return WorkActivityStatus.NOT_STARTED
+
+
+def update_activity_status(activity):
+    """Mutates activity.status on the ORM object for write/persistence workflows."""
+    activity.status = calculate_activity_status(activity)
 
 
 # ======================================================
-# create_activity
+# 1. create_activity
 # ======================================================
 
 
@@ -5854,176 +5825,37 @@ def update_activity_status(activity):
 )
 async def create_activity(
     data: s.WorkActivityCreate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_progress.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
 
     try:
-
-        # =====================================
-        # PROJECT ACCESS
-        # =====================================
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=data.project_id,
-        )
-
-        # =====================================
-        # VALIDATE PROJECT
-        # =====================================
-
-        project = await db.get(
-            m.Project,
-            data.project_id,
-        )
-
-        if not project:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Project not found",
-            )
-            # =====================================
-        # VALIDATE BOQ ITEM
-        # =====================================
-
-        boq = await db.get(
-            BOQ,
-            data.boq_item_id,
-        )
-
-        if not boq:
-
-            raise HTTPException(
-                status_code=404,
-                detail="BOQ item not found",
-            )
-
-        # =====================================
-        # CHECK BOQ BELONGS TO PROJECT
-        # =====================================
-
-        if boq.project_id != data.project_id:
-
-            raise HTTPException(
-                status_code=400,
-                detail="BOQ item does not belong to this project",
-            )
-
-        # =====================================
-        # VALIDATE WORK ORDER (OPTIONAL)
-        # =====================================
+        project = await _get_scoped_project_for_wp(db, data.project_id, current_user)
+        boq = await _validate_scoped_boq(db, data.boq_item_id, data.project_id, current_user)
 
         work_order = None
-
         if data.work_order_id is not None:
+            work_order = await _validate_scoped_work_order(db, data.work_order_id, data.project_id, current_user)
 
-            work_order = await db.get(
-                WorkOrder,
-                data.work_order_id,
-            )
-
-            if not work_order:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Work order not found",
-                )
-
-            if work_order.project_id != data.project_id:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Work order does not belong to this project",
-                )
-
-        # =====================================
-        # DUPLICATE ACTIVITY CHECK
-        # =====================================
+        if data.engineer_id is not None:
+            await _validate_scoped_engineer(db, data.engineer_id, data.project_id, current_user)
 
         duplicate_stmt = select(m.WorkActivity).where(
             m.WorkActivity.project_id == data.project_id,
             m.WorkActivity.boq_item_id == data.boq_item_id,
         )
-
         duplicate_result = await db.execute(duplicate_stmt)
-
         existing_activity = duplicate_result.scalars().first()
-
         if existing_activity:
-
             raise HTTPException(
                 status_code=400,
                 detail="Activity already exists for this BOQ item",
             )
 
-        # =====================================
-        # VALIDATE ENGINEER
-        # =====================================
-
-        if data.engineer_id is not None:
-
-            engineer = await db.get(
-                User,
-                data.engineer_id,
-            )
-
-            if not engineer:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Engineer not found",
-                )
-
-            # =====================================
-            # CHECK ENGINEER ROLE
-            # =====================================
-
-            if engineer.role != UserRole.SITE_ENGINEER:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Selected user is not a Site Engineer",
-                )
-
-            # =====================================
-            # CHECK ENGINEER ACTIVE
-            # =====================================
-
-            if not engineer.is_active:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Engineer is inactive",
-                )
-
-            # =====================================
-            # CHECK PROJECT ASSIGNMENT
-            # =====================================
-
-            member_stmt = select(m.ProjectMember).where(
-                m.ProjectMember.project_id == data.project_id,
-                m.ProjectMember.user_id == data.engineer_id,
-            )
-
-            member_result = await db.execute(member_stmt)
-
-            member = member_result.scalar_one_or_none()
-
-            if not member:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Engineer is not assigned to this project",
-                )
-
         activity = m.WorkActivity(
             project_id=data.project_id,
             boq_item_id=data.boq_item_id,
             work_order_id=data.work_order_id,
-            # Snapshot from BOQ
             activity_name=boq.item_name,
             discipline=boq.category,
             planned_quantity=boq.quantity,
@@ -6039,23 +5871,9 @@ async def create_activity(
             completion_percentage=Decimal("0.00"),
         )
 
-        # =====================================
-        # UPDATE STATUS
-        # =====================================
-
         update_activity_status(activity)
-
-        # =====================================
-        # SAVE ACTIVITY
-        # =====================================
-
         db.add(activity)
-
         await db.flush()
-
-        # =====================================
-        # CREATE AUDIT LOG
-        # =====================================
 
         await create_activity_log(
             db=db,
@@ -6075,63 +5893,28 @@ async def create_activity(
             remarks="Work Activity Created",
         )
 
-        # =====================================
-        # COMMIT
-        # =====================================
-
         await db.commit()
-
-        # =====================================
-        # REFRESH
-        # =====================================
-
         await db.refresh(activity)
-
-        # =====================================
-        # RESPONSE
-        # =====================================
 
         return s.WorkActivityCreateResponse(
             message="Work Activity created successfully",
             data=activity,
         )
 
-        # =====================================
-    # HTTP EXCEPTION
-    # =====================================
-
     except HTTPException:
-
         await db.rollback()
-
         raise
 
-    # =====================================
-    # DATABASE ERROR
-    # =====================================
-
     except IntegrityError:
-
         await db.rollback()
-
         raise HTTPException(
             status_code=400,
             detail="Duplicate or invalid database record",
         )
 
-    # =====================================
-    # UNKNOWN ERROR
-    # =====================================
-
     except Exception as e:
-
         await db.rollback()
-
-        logger.exception(
-            "Failed to create work activity: %s",
-            str(e),
-        )
-
+        logger.exception("Failed to create work activity: %s", str(e))
         raise HTTPException(
             status_code=500,
             detail="Failed to create work activity",
@@ -6139,7 +5922,7 @@ async def create_activity(
 
 
 # =========================================================
-# LIST ACTIVITIES
+# 2. LIST ACTIVITIES
 # =========================================================
 
 
@@ -6155,65 +5938,12 @@ async def list_activities(
     search: str | None = Query(default=None, max_length=100),
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("work_progress.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
 
     try:
-
-        # =====================================================
-        # PROJECT VALIDATION & ACCESS
-        # =====================================================
-
-        project = await db.get(
-            m.Project,
-            project_id,
-        )
-
-        if not project:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Project not found",
-            )
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=project_id,
-        )
-
-        # =====================================================
-        # REALTIME STATUS REFRESH
-        # =====================================================
-
-        refresh_stmt = select(m.WorkActivity).where(
-            m.WorkActivity.project_id == project_id
-        )
-
-        refresh_result = await db.execute(refresh_stmt)
-
-        refresh_activities = refresh_result.scalars().all()
-
-        status_changed = False
-
-        for activity in refresh_activities:
-
-            old_status = activity.status
-
-            update_activity_status(activity)
-
-            if old_status != activity.status:
-
-                status_changed = True
-
-        if status_changed:
-
-            await db.commit()
-
-        # =====================================================
-        # BASE QUERY
-        # =====================================================
+        await _get_scoped_project_for_wp(db, project_id, current_user)
 
         stmt = select(m.WorkActivity).options(
             selectinload(m.WorkActivity.project),
@@ -6221,83 +5951,24 @@ async def list_activities(
             selectinload(m.WorkActivity.boq_item),
             selectinload(m.WorkActivity.engineer),
         )
-
         count_stmt = select(func.count()).select_from(m.WorkActivity)
-
         filters = [
             m.WorkActivity.project_id == project_id,
         ]
 
-        # =====================================================
-        # WORK ORDER FILTER
-        # =====================================================
-
         if work_order_id is not None:
-
-            work_order = await db.get(
-                WorkOrder,
-                work_order_id,
-            )
-
-            if not work_order:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Work order not found",
-                )
-
-            if work_order.project_id != project_id:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Work order does not belong to this project",
-                )
-
+            await _validate_scoped_work_order(db, work_order_id, project_id, current_user)
             filters.append(m.WorkActivity.work_order_id == work_order_id)
 
-        # =====================================================
-        # ENGINEER FILTER
-        # =====================================================
-
         if engineer_id is not None:
-
-            engineer = await db.get(
-                User,
-                engineer_id,
-            )
-
-            if not engineer:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Engineer not found",
-                )
-
-            if engineer.role != UserRole.SITE_ENGINEER:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Selected user is not a Site Engineer",
-                )
-
+            await _validate_scoped_engineer(db, engineer_id, project_id, current_user)
             filters.append(m.WorkActivity.engineer_id == engineer_id)
 
-        # =====================================================
-        # STATUS FILTER
-        # =====================================================
-
         if status is not None:
-
             filters.append(m.WorkActivity.status == status)
 
-        # =====================================================
-        # SEARCH FILTER
-        # =====================================================
-
         if search:
-
             search = search.strip()
-
             filters.append(
                 or_(
                     m.WorkActivity.activity_name.ilike(f"%{search}%"),
@@ -6305,90 +5976,43 @@ async def list_activities(
                 )
             )
 
-        # =====================================================
-        # APPLY FILTERS
-        # =====================================================
-
         stmt = stmt.where(*filters)
-
         count_stmt = count_stmt.where(*filters)
-
-        # =====================================================
-        # ORDERING
-        # =====================================================
-
         stmt = stmt.order_by(m.WorkActivity.created_at.desc())
-
-        # =====================================================
-        # PAGINATION
-        # =====================================================
-
         stmt = stmt.offset(offset).limit(limit)
 
-        # =====================================================
-        # EXECUTE QUERY
-        # =====================================================
-
         result = await db.execute(stmt)
-
         activities = result.scalars().unique().all()
-
-        # =====================================================
-        # TOTAL COUNT
-        # =====================================================
-
         total_result = await db.execute(count_stmt)
-
         total_count = total_result.scalar() or 0
 
-        # =====================================================
-        # RESPONSE
-        # =====================================================
+        response_data = []
+        for act in activities:
+            act_out = s.WorkActivityResponse.model_validate(act)
+            act_out.status = calculate_activity_status(act)
+            response_data.append(act_out)
 
         return s.WorkActivityListResponse(
             success=True,
             limit=limit,
             offset=offset,
-            page_count=len(activities),
+            page_count=len(response_data),
             total_count=total_count,
-            data=activities,
+            data=response_data,
         )
-
-        # =====================================================
-    # HTTP EXCEPTION
-    # =====================================================
 
     except HTTPException:
-
         raise
 
-    # =====================================================
-    # DATABASE ERROR
-    # =====================================================
-
     except IntegrityError as e:
-
-        logger.exception(
-            "Database error while listing work activities: %s",
-            str(e),
-        )
-
+        logger.exception("Database error while listing work activities: %s", str(e))
         raise HTTPException(
             status_code=500,
             detail="Database error occurred",
         )
 
-    # =====================================================
-    # UNKNOWN ERROR
-    # =====================================================
-
     except Exception as e:
-
-        logger.exception(
-            "Failed to list work activities: %s",
-            str(e),
-        )
-
+        logger.exception("Failed to list work activities: %s", str(e))
         raise HTTPException(
             status_code=500,
             detail="Something went wrong",
@@ -6406,91 +6030,32 @@ async def list_activities(
 )
 async def get_activity(
     activity_id: int = Path(..., gt=0),
-    current_user: User = Depends(
-        require_roles(READ_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # FETCH ACTIVITY
-        # =====================================================
-
-        stmt = (
-            select(m.WorkActivity)
-            .where(m.WorkActivity.id == activity_id)
-            .options(
-                selectinload(m.WorkActivity.project),
-                selectinload(m.WorkActivity.work_order),
-                selectinload(m.WorkActivity.boq_item),
-                selectinload(m.WorkActivity.engineer),
-            )
-        )
-
-        result = await db.execute(stmt)
-
-        activity = result.scalar_one_or_none()
-
-        if activity is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Work activity not found",
-            )
-
-        # =====================================================
-        # PROJECT ACCESS
-        # =====================================================
-
-        await assert_project_access(
+        activity = await _get_scoped_work_activity(
             db=db,
+            activity_id=activity_id,
             current_user=current_user,
-            project_id=activity.project_id,
+            load_relations=True,
         )
-
-        # =====================================================
-        # RETURN RESPONSE
-        # =====================================================
-
-        return activity
-
-    # =====================================================
-    # HTTP EXCEPTION
-    # =====================================================
+        act_out = s.WorkActivityResponse.model_validate(activity)
+        act_out.status = calculate_activity_status(activity)
+        return act_out
 
     except HTTPException:
         raise
 
-    # =====================================================
-    # DATABASE ERROR
-    # =====================================================
-
     except IntegrityError as e:
-
-        logger.exception(
-            "Database error while fetching work activity %s",
-            activity_id,
-            exc_info=e,
-        )
-
+        logger.exception("Database error while fetching work activity %s", activity_id, exc_info=e)
         raise HTTPException(
             status_code=500,
             detail="Database error occurred",
         )
 
-    # =====================================================
-    # UNKNOWN ERROR
-    # =====================================================
-
     except Exception as e:
-
-        logger.exception(
-            "Failed to fetch work activity %s",
-            activity_id,
-            exc_info=e,
-        )
-
+        logger.exception("Failed to fetch work activity %s", activity_id, exc_info=e)
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch work activity",
@@ -6498,8 +6063,8 @@ async def get_activity(
 
 
 # =========================================================
-# UPDATE ACTIVITY
-# ========================================================
+# 4. UPDATE ACTIVITY
+# =========================================================
 
 
 @work_progress_router.put(
@@ -6509,66 +6074,28 @@ async def get_activity(
 async def update_activity(
     activity_id: int = Path(..., gt=0),
     data: s.WorkActivityUpdate = Body(...),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("work_progress.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
 
     try:
-
-        # =====================================
-        # FETCH ACTIVITY
-        # =====================================
-
-        stmt = (
-            select(m.WorkActivity)
-            .where(m.WorkActivity.id == activity_id)
-            .options(
-                selectinload(m.WorkActivity.project),
-                selectinload(m.WorkActivity.work_order),
-            )
-        )
-
-        result = await db.execute(stmt)
-
-        activity = result.scalar_one_or_none()
-
-        if activity is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Work activity not found",
-            )
-
-        # =====================================
-        # PROJECT ACCESS
-        # =====================================
-
-        await assert_project_access(
+        activity = await _get_scoped_work_activity(
             db=db,
+            activity_id=activity_id,
             current_user=current_user,
-            project_id=activity.project_id,
+            load_relations=True,
         )
-
-        # =====================================
-        # DATE VALIDATION
-        # =====================================
 
         start_date = (
             data.start_date if data.start_date is not None else activity.start_date
         )
-
         end_date = data.end_date if data.end_date is not None else activity.end_date
 
         if end_date < start_date:
-
             raise HTTPException(
                 status_code=400,
                 detail="End date cannot be before start date",
             )
-
-        # =====================================
-        # STORE OLD VALUES
-        # =====================================
 
         old_data = {
             "engineer_id": activity.engineer_id,
@@ -6578,109 +6105,21 @@ async def update_activity(
             "status": activity.status.value,
         }
 
-        # =====================================
-        # VALIDATE WORK ORDER (OPTIONAL)
-        # =====================================
-
         if data.work_order_id is not None:
-
-            work_order = await db.get(
-                WorkOrder,
-                data.work_order_id,
-            )
-
-            if not work_order:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Work order not found",
-                )
-
-            if work_order.project_id != activity.project_id:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Work order does not belong to this project",
-                )
-
-        # =====================================
-        # VALIDATE ENGINEER (OPTIONAL)
-        # =====================================
+            await _validate_scoped_work_order(db, data.work_order_id, activity.project_id, current_user)
 
         if data.engineer_id is not None:
-
-            engineer = await db.get(
-                User,
-                data.engineer_id,
-            )
-
-            if not engineer:
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Engineer not found",
-                )
-
-            if engineer.role != UserRole.SITE_ENGINEER:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Selected user is not a Site Engineer",
-                )
-
-            if not engineer.is_active:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Engineer is inactive",
-                )
-
-            member_stmt = select(m.ProjectMember).where(
-                m.ProjectMember.project_id == activity.project_id,
-                m.ProjectMember.user_id == engineer.id,
-            )
-
-            member_result = await db.execute(member_stmt)
-
-            member = member_result.scalar_one_or_none()
-
-            if not member:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Engineer is not assigned to this project",
-                )
-
-        # =====================================
-        # UPDATE EDITABLE FIELDS
-        #
-        # FIX (ERROR): was `exclude_unset=True, exclude_none=True`.
-        # exclude_none dropped explicit `{"engineer_id": null}` /
-        # `{"work_order_id": null}` payloads, making it impossible
-        # to ever unassign an engineer or unlink a work order via
-        # this endpoint. Dropping exclude_none restores that
-        # ability while exclude_unset still ensures fields the
-        # client didn't send are left untouched.
-        # =====================================
+            await _validate_scoped_engineer(db, data.engineer_id, activity.project_id, current_user)
 
         update_data = data.model_dump(
             exclude_unset=True,
         )
-
-        # =====================================
-        # FIX (WARNING): guard against lowering planned_quantity
-        # below what has already been completed. Previously this
-        # only surfaced as a generic 400 "Database integrity error"
-        # once the DB CheckConstraint (total_completed <=
-        # planned_quantity) was hit.
-        # =====================================
 
         if (
             "planned_quantity" in update_data
             and update_data["planned_quantity"] is not None
             and update_data["planned_quantity"] < activity.total_completed
         ):
-
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -6691,16 +6130,11 @@ async def update_activity(
             )
 
         for field, value in update_data.items():
-
             setattr(
                 activity,
                 field,
                 value,
             )
-
-            # =====================================
-        # RECALCULATE PROGRESS
-        # =====================================
 
         activity.remaining_quantity = max(
             Decimal("0.00"),
@@ -6711,32 +6145,20 @@ async def update_activity(
         )
 
         if activity.planned_quantity > Decimal("0"):
-
             completion = (
                 (activity.total_completed / activity.planned_quantity) * Decimal("100")
             ).quantize(
                 Decimal("0.01"),
                 rounding=ROUND_HALF_UP,
             )
-
             activity.completion_percentage = min(
                 completion,
                 Decimal("100.00"),
             )
-
         else:
-
             activity.completion_percentage = Decimal("0.00")
 
-        # =====================================
-        # UPDATE STATUS
-        # =====================================
-
         update_activity_status(activity)
-
-        # =====================================
-        # STORE NEW VALUES
-        # =====================================
 
         new_data = {
             "engineer_id": activity.engineer_id,
@@ -6746,28 +6168,14 @@ async def update_activity(
             "status": activity.status.value,
         }
 
-        # =====================================
-        # REMOVE UNCHANGED FIELDS
-        # =====================================
-
         changed_old = {}
-
         changed_new = {}
-
         for key in new_data:
-
             if old_data.get(key) != new_data.get(key):
-
                 changed_old[key] = old_data.get(key)
-
                 changed_new[key] = new_data.get(key)
 
-        # =====================================
-        # AUDIT LOG
-        # =====================================
-
         if changed_new:
-
             await create_activity_log(
                 db=db,
                 activity_id=activity.id,
@@ -6778,70 +6186,37 @@ async def update_activity(
                 remarks="Work Activity Updated",
             )
 
-        # =====================================
-        # SAVE CHANGES
-        # =====================================
-
         await db.commit()
-
-        # =====================================
-        # REFRESH OBJECT
-        # =====================================
-
         await db.refresh(activity)
-
-        # =====================================
-        # RESPONSE
-        # =====================================
 
         return s.WorkActivityUpdateResponse(
             message="Work Activity updated successfully",
             data=activity,
         )
 
-    # =====================================
-    # HTTP EXCEPTIONS
-    # =====================================
-
     except HTTPException:
-
         await db.rollback()
-
         raise
 
-    # =====================================
-    # DATABASE ERRORS
-    # =====================================
-
     except IntegrityError as e:
-
         await db.rollback()
-
         logger.exception(
             "Database error while updating activity %s: %s",
             activity_id,
             str(e),
         )
-
         raise HTTPException(
             status_code=400,
             detail="Database integrity error",
         )
 
-    # =====================================
-    # UNKNOWN ERRORS
-    # =====================================
-
     except Exception as e:
-
         await db.rollback()
-
         logger.exception(
             "Failed to update activity %s: %s",
             activity_id,
             str(e),
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to update work activity",
@@ -6859,79 +6234,26 @@ async def update_activity(
 )
 async def delete_activity(
     activity_id: int = Path(..., gt=0),
-    current_user: User = Depends(
-        require_roles(TASK_DELETE_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.delete")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================
-        # FETCH ACTIVITY
-        #
-        # FIX (CRITICAL): the model defines these relationships as
-        # `progress_entries` and `history_logs` (see WorkActivity
-        # model) — the previous code referenced
-        # `daily_progress_entries` / `history`, which don't exist
-        # and raised AttributeError before the handler could even
-        # run its business checks. No model change needed — just
-        # using the relationship names that already exist.
-        # =====================================
-
-        stmt = (
-            select(m.WorkActivity)
-            .where(
-                m.WorkActivity.id == activity_id,
-            )
-            .options(
-                selectinload(m.WorkActivity.progress_entries),
-                selectinload(m.WorkActivity.history_logs),
-            )
-        )
-
-        result = await db.execute(stmt)
-
-        activity = result.scalar_one_or_none()
-
-        if activity is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Work activity not found",
-            )
-
-        # =====================================
-        # PROJECT ACCESS
-        # =====================================
-
-        await assert_project_access(
+        activity = await _get_scoped_work_activity(
             db=db,
+            activity_id=activity_id,
             current_user=current_user,
-            project_id=activity.project_id,
         )
-
-        # =====================================
-        # CHECK DAILY PROGRESS
-        # =====================================
 
         progress_stmt = select(m.DailyProgressEntry.id).where(
             m.DailyProgressEntry.activity_id == activity.id,
         )
-
         progress_result = await db.execute(progress_stmt)
 
         if progress_result.scalar_one_or_none():
-
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "Cannot delete activity because " "daily progress records exist."
-                ),
+                detail="Cannot delete activity because daily progress records exist.",
             )
-
-        # =====================================
-        # CREATE DELETE AUDIT LOG
-        # =====================================
 
         await create_activity_log(
             db=db,
@@ -6954,67 +6276,42 @@ async def delete_activity(
 
         await db.flush()
 
-        # =====================================
-        # DELETE HISTORY
-        # =====================================
-
         await db.execute(
             delete(m.ActivityHistory).where(
                 m.ActivityHistory.activity_id == activity.id,
             )
         )
 
-        # =====================================
-        # DELETE ACTIVITY
-        # =====================================
-
         await db.delete(activity)
-
-        # =====================================
-        # COMMIT
-        # =====================================
-
         await db.commit()
-
-        # =====================================
-        # RESPONSE
-        # =====================================
 
         return s.WorkActivityDeleteResponse(
             message="Work Activity deleted successfully",
         )
 
     except HTTPException:
-
         await db.rollback()
-
         raise
 
     except IntegrityError as e:
-
         await db.rollback()
-
         logger.exception(
             "Database integrity error while deleting activity %s",
             activity_id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=400,
             detail="Unable to delete work activity",
         )
 
     except Exception as e:
-
         await db.rollback()
-
         logger.exception(
             "Failed to delete work activity %s",
             activity_id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to delete work activity",
@@ -7032,127 +6329,68 @@ async def delete_activity(
 )
 async def add_daily_progress(
     data: s.DailyProgressCreate,
-    current_user: User = Depends(
-        require_roles(TASK_WRITE_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # VALIDATE INPUT
-        # =====================================================
-
         if data.activity_id <= 0:
-
             raise HTTPException(
                 status_code=400,
                 detail="Invalid activity ID",
             )
 
         if data.today_progress <= Decimal("0"):
-
             raise HTTPException(
                 status_code=400,
                 detail="Today's progress must be greater than zero",
             )
 
         if data.remarks:
-
             data.remarks = data.remarks.strip()
 
-        # =====================================================
-        # FETCH ACTIVITY (LOCK ROW)
-        # =====================================================
-
-        stmt = (
-            select(m.WorkActivity)
-            .where(
-                m.WorkActivity.id == data.activity_id,
-            )
-            .with_for_update()
-        )
-
-        result = await db.execute(stmt)
-
-        activity = result.scalar_one_or_none()
-
-        if activity is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Work activity not found",
-            )
-
-        # =====================================================
-        # PROJECT ACCESS
-        # =====================================================
-
-        await assert_project_access(
+        activity = await _get_scoped_work_activity(
             db=db,
+            activity_id=data.activity_id,
             current_user=current_user,
-            project_id=activity.project_id,
+            for_update=True,
         )
-
-        # =====================================================
-        # VALIDATE ENTRY DATE
-        # =====================================================
 
         if data.entry_date > date.today():
-
             raise HTTPException(
                 status_code=400,
                 detail="Progress date cannot be in the future",
             )
 
         if data.entry_date < activity.start_date:
-
             raise HTTPException(
                 status_code=400,
                 detail="Progress date cannot be before activity start date",
             )
 
         if activity.end_date and data.entry_date > activity.end_date:
-
             raise HTTPException(
                 status_code=400,
                 detail="Progress date cannot be after activity end date",
             )
 
-        # =====================================================
-        # ACTIVITY STATUS CHECK
-        # =====================================================
-
         if activity.status == WorkActivityStatus.COMPLETED:
-
             raise HTTPException(
                 status_code=400,
                 detail="Activity is already completed",
             )
 
-        # =====================================================
-        # CHECK DUPLICATE ENTRY
-        # =====================================================
-
         duplicate_stmt = select(m.DailyProgressEntry).where(
             m.DailyProgressEntry.activity_id == data.activity_id,
             m.DailyProgressEntry.entry_date == data.entry_date,
         )
-
         duplicate_result = await db.execute(duplicate_stmt)
-
         duplicate_entry = duplicate_result.scalar_one_or_none()
 
         if duplicate_entry:
-
             raise HTTPException(
                 status_code=400,
                 detail="Progress entry already exists for this date",
             )
-
-        # =====================================================
-        # STORE OLD VALUES
-        # =====================================================
 
         old_data = {
             "total_completed": str(activity.total_completed),
@@ -7161,24 +6399,12 @@ async def add_daily_progress(
             "status": activity.status.value,
         }
 
-        # =====================================================
-        # DECIMAL CALCULATIONS
-        # =====================================================
-
         current_completed = Decimal(str(activity.total_completed or 0))
-
         planned_quantity = Decimal(str(activity.planned_quantity or 0))
-
         today_progress = Decimal(str(data.today_progress))
-
         remaining_quantity = planned_quantity - current_completed
 
-        # =====================================================
-        # VALIDATE REMAINING QUANTITY
-        # =====================================================
-
         if today_progress > remaining_quantity:
-
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -7187,41 +6413,29 @@ async def add_daily_progress(
                 ),
             )
 
-        # =====================================================
-        # CALCULATE NEW VALUES
-        # =====================================================
-
         new_completed = (current_completed + today_progress).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
-
         new_remaining = (planned_quantity - new_completed).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
 
         if planned_quantity > 0:
-
             completion_percentage = (
                 (new_completed / planned_quantity) * Decimal("100")
             ).quantize(
                 Decimal("0.01"),
                 rounding=ROUND_HALF_UP,
             )
-
         else:
-
             completion_percentage = Decimal("0.00")
 
         completion_percentage = min(
             completion_percentage,
             Decimal("100.00"),
         )
-
-        # =====================================================
-        # CREATE DAILY PROGRESS ENTRY
-        # =====================================================
 
         progress_entry = m.DailyProgressEntry(
             activity_id=activity.id,
@@ -7230,34 +6444,20 @@ async def add_daily_progress(
             remarks=data.remarks,
             created_by=current_user.id,
         )
-
         db.add(progress_entry)
 
-        # =====================================================
-        # UPDATE ACTIVITY
-        # =====================================================
-
         activity.total_completed = new_completed
-
         activity.remaining_quantity = new_remaining
-
         activity.completion_percentage = completion_percentage
-
         update_activity_status(activity)
 
-        # =====================================================
-        # UPDATE WORK ORDER COMPLETED QUANTITY
-        # =====================================================
-
+        work_order = None
         if activity.work_order_id:
-
             work_order = await db.get(
                 WorkOrder,
                 activity.work_order_id,
             )
-
             if work_order:
-
                 total_stmt = select(
                     func.coalesce(
                         func.sum(m.WorkActivity.total_completed),
@@ -7266,19 +6466,13 @@ async def add_daily_progress(
                 ).where(
                     m.WorkActivity.work_order_id == activity.work_order_id,
                 )
-
                 total_result = await db.execute(total_stmt)
-
                 work_order.completed_quantity = Decimal(
                     str(total_result.scalar_one())
                 ).quantize(
                     Decimal("0.01"),
                     rounding=ROUND_HALF_UP,
                 )
-
-        # =====================================================
-        # STORE NEW VALUES
-        # =====================================================
 
         new_data = {
             "today_progress": str(today_progress),
@@ -7287,10 +6481,6 @@ async def add_daily_progress(
             "completion_percentage": str(activity.completion_percentage),
             "status": activity.status.value,
         }
-
-        # =====================================================
-        # CREATE AUDIT LOG
-        # =====================================================
 
         await create_activity_log(
             db=db,
@@ -7306,45 +6496,13 @@ async def add_daily_progress(
             ),
         )
 
-        logger.info(
-            "Before commit -> completed=%s remaining=%s percentage=%s",
-            activity.total_completed,
-            activity.remaining_quantity,
-            activity.completion_percentage,
-        )
-
         await db.flush()
-
-        # =====================================================
-        # SAVE CHANGES
-        # =====================================================
-
         await db.commit()
-
-        await db.refresh(activity)
-
-        logger.info(
-            "After refresh -> completed=%s remaining=%s percentage=%s",
-            activity.total_completed,
-            activity.remaining_quantity,
-            activity.completion_percentage,
-        )
-
-        # =====================================================
-        # REFRESH OBJECTS
-        # =====================================================
-
         await db.refresh(progress_entry)
-
         await db.refresh(activity)
 
-        if activity.work_order_id:
-
+        if activity.work_order_id and work_order:
             await db.refresh(work_order)
-
-        # =====================================================
-        # RESPONSE
-        # =====================================================
 
         return s.DailyProgressWithActivityResponse(
             message="Daily progress added successfully",
@@ -7352,26 +6510,17 @@ async def add_daily_progress(
             activity=activity,
         )
 
-    # =====================================================
-    # EXCEPTION HANDLING
-    # =====================================================
-
     except HTTPException:
-
         await db.rollback()
-
         raise
 
     except IntegrityError as e:
-
         await db.rollback()
-
         logger.exception(
-            "Integrity error while adding daily progress " "for activity %s",
+            "Integrity error while adding daily progress for activity %s",
             data.activity_id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=400,
             detail=(
@@ -7381,15 +6530,12 @@ async def add_daily_progress(
         )
 
     except Exception as e:
-
         await db.rollback()
-
         logger.exception(
-            "Failed to add daily progress " "for activity %s",
+            "Failed to add daily progress for activity %s",
             data.activity_id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to add daily progress",
@@ -7414,42 +6560,17 @@ async def list_daily_entries(
     to_date: date | None = None,
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("work_progress.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # VALIDATE PROJECT ACCESS
-        # =====================================================
-
-        project = await db.get(m.Project, project_id)
-
-        if project is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Project not found",
-            )
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=project_id,
-        )
-
-        # =====================================================
-        # VALIDATE DATE RANGE
-        # =====================================================
+        await _get_scoped_project_for_wp(db, project_id, current_user)
 
         if from_date and to_date and from_date > to_date:
             raise HTTPException(
                 status_code=400,
                 detail="From date cannot be greater than To date",
             )
-
-        # =====================================================
-        # BASE QUERY
-        # =====================================================
 
         stmt = (
             select(m.DailyProgressEntry)
@@ -7482,106 +6603,52 @@ async def list_daily_entries(
             m.WorkActivity.project_id == project_id,
         ]
 
-        # =====================================================
-        # ACTIVITY FILTER
-        # =====================================================
-
         if activity_id is not None:
-
-            activity = await db.get(
-                m.WorkActivity,
-                activity_id,
-            )
-
-            if activity is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Work activity not found",
-                )
-
-            if activity.project_id != project_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Activity does not belong to this project",
-                )
-
-            filters.append(
-                m.DailyProgressEntry.activity_id == activity_id,
-            )
-
-        # =====================================================
-        # WORK ORDER FILTER
-        # =====================================================
+            await _get_scoped_work_activity(db, activity_id, current_user)
+            filters.append(m.DailyProgressEntry.activity_id == activity_id)
 
         if work_order_id is not None:
-            filters.append(
-                m.WorkActivity.work_order_id == work_order_id,
-            )
-
-        # =====================================================
-        # ENGINEER FILTER
-        # =====================================================
+            await _validate_scoped_work_order(db, work_order_id, project_id, current_user)
+            filters.append(m.WorkActivity.work_order_id == work_order_id)
 
         if engineer_id is not None:
-            filters.append(
-                m.WorkActivity.engineer_id == engineer_id,
-            )
-
-        # =====================================================
-        # DATE FILTER
-        # =====================================================
+            await _validate_scoped_engineer(db, engineer_id, project_id, current_user)
+            filters.append(m.WorkActivity.engineer_id == engineer_id)
 
         if from_date:
-            filters.append(
-                m.DailyProgressEntry.entry_date >= from_date,
-            )
+            filters.append(m.DailyProgressEntry.entry_date >= from_date)
 
         if to_date:
-            filters.append(
-                m.DailyProgressEntry.entry_date <= to_date,
-            )
+            filters.append(m.DailyProgressEntry.entry_date <= to_date)
 
-        stmt = stmt.where(*filters)
-        count_stmt = count_stmt.where(*filters)
-
-        stmt = stmt.order_by(
+        stmt = stmt.where(*filters).order_by(
             m.DailyProgressEntry.entry_date.desc(),
-            m.DailyProgressEntry.id.desc(),
+            m.DailyProgressEntry.created_at.desc(),
         )
 
+        count_stmt = count_stmt.where(*filters)
         stmt = stmt.offset(offset).limit(limit)
 
         result = await db.execute(stmt)
         entries = result.scalars().all()
 
         total_result = await db.execute(count_stmt)
-        total_count = total_result.scalar_one()
-
-        # =====================================================
-        # RESPONSE
-        # =====================================================
+        total_count = total_result.scalar() or 0
 
         return s.DailyProgressListResponse(
             success=True,
-            message="Daily progress fetched successfully",
+            limit=limit,
+            offset=offset,
+            page_count=len(entries),
+            total_count=total_count,
             data=entries,
-            pagination=s.PaginationMeta(
-                total=total_count,
-                limit=limit,
-                offset=offset,
-            ),
         )
 
     except HTTPException:
         raise
 
     except Exception as e:
-
-        logger.exception(
-            "Failed to fetch daily progress entries: %s",
-            str(e),
-        )
-
+        logger.exception("Failed to list daily progress entries: %s", str(e))
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch daily progress entries",
@@ -7600,149 +6667,72 @@ async def list_daily_entries(
 async def update_daily_entry(
     data: s.DailyProgressUpdate,
     id: int = Path(..., gt=0),
-    current_user: User = Depends(
-        require_roles(TASK_WRITE_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # VALIDATE INPUT
-        # =====================================================
-
         if data.today_progress is not None and data.today_progress <= Decimal("0"):
-
             raise HTTPException(
                 status_code=400,
                 detail="Today's progress must be greater than zero",
             )
 
         if data.remarks is not None:
-
             data.remarks = data.remarks.strip()
 
-        # =====================================================
-        # FETCH DAILY ENTRY (LOCK ROW)
-        # =====================================================
-
-        stmt = (
-            select(m.DailyProgressEntry)
-            .where(
-                m.DailyProgressEntry.id == id,
-            )
-            .options(selectinload(m.DailyProgressEntry.activity))
-            .with_for_update()
-        )
-
-        result = await db.execute(stmt)
-
-        entry = result.scalar_one_or_none()
-
-        if entry is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Daily progress entry not found",
-            )
-
+        entry = await _get_scoped_daily_entry(db, id, current_user, for_update=True)
         activity = entry.activity
 
         if activity is None:
-
             raise HTTPException(
                 status_code=404,
                 detail="Work activity not found",
             )
 
-        # =====================================================
-        # LOCK ACTIVITY
-        # =====================================================
-
         activity_result = await db.execute(
             select(m.WorkActivity)
-            .where(
-                m.WorkActivity.id == activity.id,
-            )
+            .where(m.WorkActivity.id == activity.id)
             .with_for_update()
         )
-
         activity = activity_result.scalar_one()
 
-        # =====================================================
-        # PROJECT ACCESS
-        # =====================================================
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=activity.project_id,
-        )
-
-        # =====================================================
-        # COMPLETED ACTIVITY CHECK
-        # =====================================================
-
         if activity.status == WorkActivityStatus.COMPLETED:
-
             raise HTTPException(
                 status_code=400,
                 detail="Completed activity cannot be updated",
             )
 
-        # =====================================================
-        # VALIDATE ENTRY DATE
-        #
-        # NOTE: this now works correctly because DailyProgressUpdate
-        # includes `entry_date` (see schemas.py fix). Previously
-        # `data.entry_date` raised AttributeError immediately.
-        # =====================================================
-
         if data.entry_date is not None:
-
             if data.entry_date > date.today():
-
                 raise HTTPException(
                     status_code=400,
                     detail="Progress date cannot be in the future",
                 )
 
             if data.entry_date < activity.start_date:
-
                 raise HTTPException(
                     status_code=400,
-                    detail=("Progress date cannot be before " "activity start date"),
+                    detail="Progress date cannot be before activity start date",
                 )
 
             if activity.end_date and data.entry_date > activity.end_date:
-
                 raise HTTPException(
                     status_code=400,
-                    detail=("Progress date cannot be after " "activity end date"),
+                    detail="Progress date cannot be after activity end date",
                 )
-
-            # =================================================
-            # DUPLICATE DATE CHECK
-            # =================================================
 
             duplicate_stmt = select(m.DailyProgressEntry).where(
                 m.DailyProgressEntry.activity_id == activity.id,
                 m.DailyProgressEntry.entry_date == data.entry_date,
                 m.DailyProgressEntry.id != entry.id,
             )
-
             duplicate_result = await db.execute(duplicate_stmt)
 
             if duplicate_result.scalar_one_or_none():
-
                 raise HTTPException(
                     status_code=400,
-                    detail=("Progress entry already exists " "for this date"),
+                    detail="Progress entry already exists for this date",
                 )
-
-        # =====================================================
-        # STORE OLD VALUES
-        # =====================================================
 
         old_data = {
             "entry_date": (str(entry.entry_date)),
@@ -7752,53 +6742,30 @@ async def update_daily_entry(
             "completion_percentage": str(activity.completion_percentage),
             "status": activity.status.value,
         }
-        # =====================================================
-        # STORE OLD DECIMAL VALUES
-        # =====================================================
 
         old_progress = Decimal(str(entry.today_progress or 0))
-
         current_total = Decimal(str(activity.total_completed or 0))
-
         planned_quantity = Decimal(str(activity.planned_quantity or 0))
-
-        # =====================================================
-        # UPDATE DAILY ENTRY
-        # =====================================================
 
         update_data = data.model_dump(
             exclude_unset=True,
         )
 
         for field, value in update_data.items():
-
             setattr(entry, field, value)
 
-        # =====================================================
-        # NEW DECIMAL VALUES
-        # =====================================================
-
         new_progress = Decimal(str(entry.today_progress or 0))
-
         difference = new_progress - old_progress
-
         updated_total = current_total + difference
 
-        # =====================================================
-        # VALIDATE TOTAL
-        # =====================================================
-
         if updated_total < Decimal("0"):
-
             raise HTTPException(
                 status_code=400,
                 detail="Invalid progress calculation",
             )
 
         if updated_total > planned_quantity:
-
             remaining = planned_quantity - current_total + old_progress
-
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -7806,26 +6773,16 @@ async def update_daily_entry(
                 ),
             )
 
-        # =====================================================
-        # UPDATE ACTIVITY TOTALS
-        # =====================================================
-
         activity.total_completed = updated_total.quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
-
         activity.remaining_quantity = (planned_quantity - updated_total).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
 
-        # =====================================================
-        # COMPLETION %
-        # =====================================================
-
         if planned_quantity > 0:
-
             activity.completion_percentage = min(
                 ((updated_total / planned_quantity) * Decimal("100")).quantize(
                     Decimal("0.01"),
@@ -7833,32 +6790,18 @@ async def update_daily_entry(
                 ),
                 Decimal("100.00"),
             )
-
         else:
-
             activity.completion_percentage = Decimal("0.00")
-
-        # =====================================================
-        # UPDATE ACTIVITY STATUS
-        # =====================================================
 
         update_activity_status(activity)
 
-        # =====================================================
-        # UPDATE WORK ORDER PROGRESS
-        # =====================================================
-
         work_order = None
-
         if activity.work_order_id:
-
             work_order = await db.get(
                 WorkOrder,
                 activity.work_order_id,
             )
-
             if work_order:
-
                 total_stmt = select(
                     func.coalesce(
                         func.sum(m.WorkActivity.total_completed),
@@ -7867,19 +6810,13 @@ async def update_daily_entry(
                 ).where(
                     m.WorkActivity.work_order_id == activity.work_order_id,
                 )
-
                 total_result = await db.execute(total_stmt)
-
                 work_order.completed_quantity = Decimal(
                     str(total_result.scalar_one())
                 ).quantize(
                     Decimal("0.01"),
                     rounding=ROUND_HALF_UP,
                 )
-
-        # =====================================================
-        # STORE NEW VALUES
-        # =====================================================
 
         new_data = {
             "entry_date": str(entry.entry_date),
@@ -7890,10 +6827,6 @@ async def update_daily_entry(
             "status": activity.status.value,
         }
 
-        # =====================================================
-        # CREATE AUDIT LOG
-        # =====================================================
-
         await create_activity_log(
             db=db,
             activity_id=activity.id,
@@ -7901,30 +6834,15 @@ async def update_daily_entry(
             changed_by=current_user.id,
             old_value=old_data,
             new_value=new_data,
-            remarks=(f"Updated daily progress for " f"{entry.entry_date}"),
+            remarks=f"Updated daily progress for {entry.entry_date}",
         )
 
-        # =====================================================
-        # COMMIT TRANSACTION
-        # =====================================================
-
         await db.commit()
-
-        # =====================================================
-        # REFRESH OBJECTS
-        # =====================================================
-
         await db.refresh(entry)
-
         await db.refresh(activity)
 
         if work_order:
-
             await db.refresh(work_order)
-
-        # =====================================================
-        # RESPONSE
-        # =====================================================
 
         return s.DailyProgressWithActivityResponse(
             message="Daily progress updated successfully",
@@ -7932,49 +6850,29 @@ async def update_daily_entry(
             activity=activity,
         )
 
-    # =====================================================
-    # HTTP EXCEPTION
-    # =====================================================
-
     except HTTPException:
-
         await db.rollback()
-
         raise
 
-    # =====================================================
-    # DATABASE ERROR
-    # =====================================================
-
     except IntegrityError as e:
-
         await db.rollback()
-
         logger.exception(
-            "Integrity error while updating daily progress " "entry %s",
+            "Integrity error while updating daily progress entry %s",
             id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=400,
-            detail=("A progress entry already exists " "for the selected date."),
+            detail="A progress entry already exists for the selected date.",
         )
 
-    # =====================================================
-    # UNEXPECTED ERROR
-    # =====================================================
-
     except Exception as e:
-
         await db.rollback()
-
         logger.exception(
             "Failed to update daily progress entry %s",
             id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to update daily progress",
@@ -7992,49 +6890,18 @@ async def update_daily_entry(
 )
 async def delete_daily_entry(
     id: int = Path(..., gt=0),
-    current_user: User = Depends(
-        require_roles(TASK_DELETE_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.delete")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # FETCH DAILY ENTRY (LOCK ROW)
-        # =====================================================
-
-        stmt = (
-            select(m.DailyProgressEntry)
-            .where(
-                m.DailyProgressEntry.id == id,
-            )
-            .options(selectinload(m.DailyProgressEntry.activity))
-            .with_for_update()
-        )
-
-        result = await db.execute(stmt)
-
-        entry = result.scalar_one_or_none()
-
-        if entry is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Daily progress entry not found",
-            )
-
+        entry = await _get_scoped_daily_entry(db, id, current_user, for_update=True)
         activity = entry.activity
 
         if activity is None:
-
             raise HTTPException(
                 status_code=404,
                 detail="Work activity not found",
             )
-
-        # =====================================================
-        # LOCK ACTIVITY
-        # =====================================================
 
         activity_result = await db.execute(
             select(m.WorkActivity)
@@ -8043,22 +6910,7 @@ async def delete_daily_entry(
             )
             .with_for_update()
         )
-
         activity = activity_result.scalar_one()
-
-        # =====================================================
-        # PROJECT ACCESS
-        # =====================================================
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=activity.project_id,
-        )
-
-        # =====================================================
-        # STORE OLD VALUES
-        # =====================================================
 
         old_data = {
             "entry_date": str(entry.entry_date),
@@ -8069,42 +6921,24 @@ async def delete_daily_entry(
             "status": activity.status.value,
         }
 
-        # =====================================================
-        # DECIMAL VALUES
-        # =====================================================
-
         today_progress = Decimal(str(entry.today_progress))
-
         current_total = Decimal(str(activity.total_completed))
-
         planned_quantity = Decimal(str(activity.planned_quantity))
-
         updated_total = current_total - today_progress
 
         if updated_total < Decimal("0"):
-
             updated_total = Decimal("0")
-
-            # =====================================================
-        # UPDATE ACTIVITY TOTALS
-        # =====================================================
 
         activity.total_completed = updated_total.quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
-
         activity.remaining_quantity = (planned_quantity - updated_total).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
 
-        # =====================================================
-        # RECALCULATE COMPLETION %
-        # =====================================================
-
         if planned_quantity > 0:
-
             activity.completion_percentage = min(
                 ((updated_total / planned_quantity) * Decimal("100")).quantize(
                     Decimal("0.01"),
@@ -8112,38 +6946,19 @@ async def delete_daily_entry(
                 ),
                 Decimal("100.00"),
             )
-
         else:
-
             activity.completion_percentage = Decimal("0.00")
 
-        # =====================================================
-        # UPDATE ACTIVITY STATUS
-        # =====================================================
-
         update_activity_status(activity)
-
-        # =====================================================
-        # DELETE DAILY ENTRY
-        # =====================================================
-
         await db.delete(entry)
 
-        # =====================================================
-        # RECALCULATE WORK ORDER
-        # =====================================================
-
         work_order = None
-
         if activity.work_order_id:
-
             work_order = await db.get(
                 WorkOrder,
                 activity.work_order_id,
             )
-
             if work_order:
-
                 total_stmt = select(
                     func.coalesce(
                         func.sum(m.WorkActivity.total_completed),
@@ -8152,19 +6967,13 @@ async def delete_daily_entry(
                 ).where(
                     m.WorkActivity.work_order_id == activity.work_order_id,
                 )
-
                 total_result = await db.execute(total_stmt)
-
                 work_order.completed_quantity = Decimal(
                     str(total_result.scalar_one())
                 ).quantize(
                     Decimal("0.01"),
                     rounding=ROUND_HALF_UP,
                 )
-
-        # =====================================================
-        # STORE NEW VALUES
-        # =====================================================
 
         new_data = {
             "entry_date": str(entry.entry_date),
@@ -8175,10 +6984,6 @@ async def delete_daily_entry(
             "status": activity.status.value,
         }
 
-        # =====================================================
-        # CREATE AUDIT LOG
-        # =====================================================
-
         await create_activity_log(
             db=db,
             activity_id=activity.id,
@@ -8186,81 +6991,42 @@ async def delete_daily_entry(
             changed_by=current_user.id,
             old_value=old_data,
             new_value=new_data,
-            remarks=(f"Deleted daily progress entry " f"dated {entry.entry_date}"),
+            remarks=f"Deleted daily progress entry dated {entry.entry_date}",
         )
 
-        # =====================================================
-        # COMMIT TRANSACTION
-        # =====================================================
-
         await db.commit()
-
-        # =====================================================
-        # REFRESH ACTIVITY
-        # =====================================================
-
         await db.refresh(activity)
 
         if work_order:
-
             await db.refresh(work_order)
-
-        # =====================================================
-        # RESPONSE
-        #
-        # NOTE: this now works correctly because
-        # DailyProgressDeleteResponse.success defaults to True
-        # (see schemas.py fix). Previously `success` was required
-        # with no default and this call raised a ValidationError.
-        # =====================================================
 
         return s.DailyProgressDeleteResponse(
             message="Daily progress deleted successfully",
         )
 
-    # =====================================================
-    # HTTP EXCEPTION
-    # =====================================================
-
     except HTTPException:
-
         await db.rollback()
-
         raise
 
-    # =====================================================
-    # DATABASE ERROR
-    # =====================================================
-
     except IntegrityError as e:
-
         await db.rollback()
-
         logger.exception(
-            "Integrity error while deleting daily progress " "entry %s",
+            "Integrity error while deleting daily progress entry %s",
             id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=400,
             detail="Unable to delete daily progress entry",
         )
 
-    # =====================================================
-    # UNEXPECTED ERROR
-    # =====================================================
-
     except Exception as e:
-
         await db.rollback()
-
         logger.exception(
             "Failed to delete daily progress entry %s",
             id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to delete daily progress entry",
@@ -8268,7 +7034,7 @@ async def delete_daily_entry(
 
 
 # =========================================================
-# 10. PROJECT SUMMARY
+# 10. PROJECT SUMMARY (WORK ORDER)
 # =========================================================
 
 
@@ -8278,19 +7044,15 @@ async def delete_daily_entry(
 )
 async def get_work_order_progress_summary(
     work_order_id: int = Path(..., gt=0),
-    current_user: User = Depends(
-        require_roles(READ_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # FETCH WORK ORDER
-        # =====================================================
+        is_sa = _check_batch_x_wp_tenant_access(current_user)
 
         stmt = (
             select(WorkOrder)
+            .join(m.Project, m.Project.id == WorkOrder.project_id)
             .where(
                 WorkOrder.id == work_order_id,
             )
@@ -8300,33 +7062,17 @@ async def get_work_order_progress_summary(
                 )
             )
         )
+        if not is_sa:
+            stmt = stmt.where(m.Project.company_id == current_user.company_id)
 
-        result = await db.execute(
-            stmt,
-        )
-
+        result = await db.execute(stmt)
         work_order = result.scalar_one_or_none()
 
         if work_order is None:
-
             raise HTTPException(
                 status_code=404,
                 detail="Work order not found",
             )
-
-        # =====================================================
-        # PROJECT ACCESS
-        # =====================================================
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=work_order.project_id,
-        )
-
-        # =====================================================
-        # FETCH ALL ACTIVITIES
-        # =====================================================
 
         activity_stmt = (
             select(
@@ -8335,215 +7081,85 @@ async def get_work_order_progress_summary(
             .where(
                 m.WorkActivity.work_order_id == work_order_id,
             )
-            .with_for_update()
         )
-
-        activity_result = await db.execute(
-            activity_stmt,
-        )
-
+        activity_result = await db.execute(activity_stmt)
         activities = activity_result.scalars().all()
 
-        # =====================================================
-        # REFRESH ACTIVITY STATUS
-        # =====================================================
+        total_activities = len(activities)
+        completed_activities = 0
+        on_track_activities = 0
+        delayed_activities = 0
+        not_started_activities = 0
+        planned_quantity = Decimal("0.00")
+        completed_quantity = Decimal("0.00")
+        remaining_quantity = Decimal("0.00")
+        total_completion_pct = Decimal("0.00")
 
-        status_changed = False
+        for act in activities:
+            st = calculate_activity_status(act)
+            if st == WorkActivityStatus.COMPLETED:
+                completed_activities += 1
+            elif st == WorkActivityStatus.ON_TRACK:
+                on_track_activities += 1
+            elif st == WorkActivityStatus.DELAY:
+                delayed_activities += 1
+            else:
+                not_started_activities += 1
 
-        for activity in activities:
+            if act.planned_quantity:
+                planned_quantity += act.planned_quantity
+            if act.total_completed:
+                completed_quantity += act.total_completed
+            if act.remaining_quantity:
+                remaining_quantity += act.remaining_quantity
+            if act.completion_percentage:
+                total_completion_pct += act.completion_percentage
 
-            previous_status = activity.status
-
-            update_activity_status(
-                activity,
+        average_progress = (
+            (total_completion_pct / Decimal(total_activities)).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
             )
-
-            if previous_status != activity.status:
-
-                status_changed = True
-
-        if status_changed:
-
-            await db.commit()
-
-            # =====================================================
-        # WORK ORDER SUMMARY (SINGLE AGGREGATE QUERY)
-        # =====================================================
-
-        summary_stmt = select(
-            func.count(
-                m.WorkActivity.id,
-            ).label(
-                "total_activities",
-            ),
-            func.sum(
-                case(
-                    (
-                        m.WorkActivity.status == WorkActivityStatus.COMPLETED,
-                        1,
-                    ),
-                    else_=0,
-                )
-            ).label(
-                "completed_activities",
-            ),
-            func.sum(
-                case(
-                    (
-                        m.WorkActivity.status == WorkActivityStatus.ON_TRACK,
-                        1,
-                    ),
-                    else_=0,
-                )
-            ).label(
-                "on_track_activities",
-            ),
-            func.sum(
-                case(
-                    (
-                        m.WorkActivity.status == WorkActivityStatus.DELAY,
-                        1,
-                    ),
-                    else_=0,
-                )
-            ).label(
-                "delayed_activities",
-            ),
-            func.sum(
-                case(
-                    (
-                        m.WorkActivity.status == WorkActivityStatus.NOT_STARTED,
-                        1,
-                    ),
-                    else_=0,
-                )
-            ).label(
-                "not_started_activities",
-            ),
-            func.coalesce(
-                func.sum(
-                    m.WorkActivity.planned_quantity,
-                ),
-                Decimal("0"),
-            ).label(
-                "planned_quantity",
-            ),
-            func.coalesce(
-                func.sum(
-                    m.WorkActivity.total_completed,
-                ),
-                Decimal("0"),
-            ).label(
-                "completed_quantity",
-            ),
-            func.coalesce(
-                func.sum(
-                    m.WorkActivity.remaining_quantity,
-                ),
-                Decimal("0"),
-            ).label(
-                "remaining_quantity",
-            ),
-            func.avg(
-                m.WorkActivity.completion_percentage,
-            ).label(
-                "average_progress",
-            ),
-        ).where(
-            m.WorkActivity.work_order_id == work_order_id,
+            if total_activities > 0
+            else Decimal("0.00")
         )
 
-        summary_result = await db.execute(
-            summary_stmt,
-        )
-
-        summary = summary_result.one()
-
-        total_activities = summary.total_activities or 0
-
-        completed_activities = summary.completed_activities or 0
-
-        on_track_activities = summary.on_track_activities or 0
-
-        delayed_activities = summary.delayed_activities or 0
-
-        not_started_activities = summary.not_started_activities or 0
-
-        planned_quantity = Decimal(str(summary.planned_quantity or 0)).quantize(
+        planned_quantity = planned_quantity.quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
-
-        completed_quantity = Decimal(str(summary.completed_quantity or 0)).quantize(
+        completed_quantity = completed_quantity.quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
-
-        remaining_quantity = Decimal(str(summary.remaining_quantity or 0)).quantize(
+        remaining_quantity = remaining_quantity.quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
-
-        average_progress = Decimal(str(summary.average_progress or 0)).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_HALF_UP,
-        )
-
-        # =====================================================
-        # WORK ORDER COMPLETION %
-        # =====================================================
 
         completion_percentage = Decimal("0.00")
-
         if planned_quantity > 0:
-
             completion_percentage = (
                 (completed_quantity / planned_quantity) * Decimal("100")
             ).quantize(
                 Decimal("0.01"),
                 rounding=ROUND_HALF_UP,
             )
-
             completion_percentage = min(
                 completion_percentage,
                 Decimal("100.00"),
             )
 
-            # =====================================================
-        # WORK ORDER STATUS
-        # =====================================================
-
         if total_activities == 0:
-
             work_order_status = WorkActivityStatus.NOT_STARTED
-
         elif completion_percentage >= Decimal("100.00"):
-
             work_order_status = WorkActivityStatus.COMPLETED
-
         elif delayed_activities > 0:
-
             work_order_status = WorkActivityStatus.DELAY
-
         elif completed_quantity > Decimal("0"):
-
             work_order_status = WorkActivityStatus.ON_TRACK
-
         else:
-
             work_order_status = WorkActivityStatus.NOT_STARTED
-
-        # =====================================================
-        # RESPONSE
-        #
-        # NOTE: this now works correctly because
-        # WorkOrderProgressSummary / WorkOrderActivitySummary /
-        # WorkOrderProgressSummaryResponse in schemas.py have been
-        # rewritten to match exactly what is constructed here.
-        # Previously WorkOrderActivitySummary didn't exist at all
-        # and the response schema didn't declare work_order=/
-        # activities= kwargs.
-        # =====================================================
 
         return s.WorkOrderProgressSummaryResponse(
             message="Work order progress fetched successfully",
@@ -8567,26 +7183,15 @@ async def get_work_order_progress_summary(
             ),
         )
 
-    # =====================================================
-    # HTTP EXCEPTION
-    # =====================================================
-
     except HTTPException:
-
         raise
 
-    # =====================================================
-    # UNEXPECTED ERROR
-    # =====================================================
-
     except Exception as e:
-
         logger.exception(
-            "Failed to fetch work order progress summary " "for work order %s",
+            "Failed to fetch work order progress summary for work order %s",
             work_order_id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch work order progress summary",
@@ -8596,6 +7201,8 @@ async def get_work_order_progress_summary(
 # =========================================================
 # 11. SITE ENGINEER TODAY PROGRESS
 # =========================================================
+
+
 @work_progress_router.get(
     "/site-engineer/today-progress",
     response_model=s.TodayProgressResponse,
@@ -8604,16 +7211,27 @@ async def today_progress(
     engineer_id: int | None = Query(default=None, gt=0),
     limit: int = Query(default=10, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("work_progress.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
+        is_sa = _check_batch_x_wp_tenant_access(current_user)
+
+        if engineer_id is not None and not is_sa:
+            eng_stmt = select(User).where(User.id == engineer_id, User.company_id == current_user.company_id)
+            eng_res = await db.execute(eng_stmt)
+            if not eng_res.scalar_one_or_none():
+                raise HTTPException(status_code=404, detail="Engineer not found")
 
         stmt = (
             select(m.DailyProgressEntry)
             .join(
                 m.WorkActivity,
                 m.WorkActivity.id == m.DailyProgressEntry.activity_id,
+            )
+            .join(
+                m.Project,
+                m.Project.id == m.WorkActivity.project_id,
             )
             .options(
                 selectinload(m.DailyProgressEntry.activity),
@@ -8630,17 +7248,25 @@ async def today_progress(
                 m.WorkActivity,
                 m.WorkActivity.id == m.DailyProgressEntry.activity_id,
             )
+            .join(
+                m.Project,
+                m.Project.id == m.WorkActivity.project_id,
+            )
             .where(
                 m.DailyProgressEntry.entry_date == date.today(),
             )
         )
+
+        # Non-Super Admin: MUST scope to Project.company_id == current_user.company_id
+        if not is_sa:
+            stmt = stmt.where(m.Project.company_id == current_user.company_id)
+            count_stmt = count_stmt.where(m.Project.company_id == current_user.company_id)
 
         # Site Engineer -> only own entries
         if current_user.role == UserRole.SITE_ENGINEER:
             stmt = stmt.where(
                 m.WorkActivity.engineer_id == current_user.id,
             )
-
             count_stmt = count_stmt.where(
                 m.WorkActivity.engineer_id == current_user.id,
             )
@@ -8650,7 +7276,6 @@ async def today_progress(
             stmt = stmt.where(
                 m.WorkActivity.engineer_id == engineer_id,
             )
-
             count_stmt = count_stmt.where(
                 m.WorkActivity.engineer_id == engineer_id,
             )
@@ -8689,7 +7314,6 @@ async def today_progress(
             "Failed to fetch today's progress",
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch today's progress",
@@ -8712,65 +7336,31 @@ async def get_work_progress_history(
     to_date: date | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    current_user: User = Depends(
-        require_roles(READ_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # VALIDATE DATE RANGE
-        # =====================================================
+        _check_batch_x_wp_tenant_access(current_user)
 
         if from_date and to_date and from_date > to_date:
-
             raise HTTPException(
                 status_code=400,
                 detail="from_date cannot be greater than to_date",
             )
 
-        # =====================================================
-        # VALIDATE PARAMS
-        # =====================================================
-
         if not activity_id and not project_id:
-
             raise HTTPException(
                 status_code=400,
                 detail="Must provide either activity_id or project_id",
             )
 
-        # =====================================================
-        # PROJECT ACCESS
-        # =====================================================
+        if project_id:
+            await _get_scoped_project_for_wp(db, project_id, current_user)
 
-        target_project_id = project_id
-
-        if activity_id and not target_project_id:
-            activity_stmt = select(m.WorkActivity).where(m.WorkActivity.id == activity_id)
-            activity_result = await db.execute(activity_stmt)
-            activity = activity_result.scalar_one_or_none()
-            if not activity:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Work activity not found",
-                )
-            target_project_id = activity.project_id
-
-        if target_project_id:
-            await assert_project_access(
-                db=db,
-                current_user=current_user,
-                project_id=target_project_id,
-            )
-
-        # =====================================================
-        # BUILD FILTERS
-        # =====================================================
+        if activity_id:
+            await _get_scoped_work_activity(db, activity_id, current_user)
 
         filters = []
-
         if activity_id:
             filters.append(m.DailyProgressEntry.activity_id == activity_id)
 
@@ -8782,10 +7372,6 @@ async def get_work_progress_history(
 
         if to_date:
             filters.append(m.DailyProgressEntry.entry_date <= to_date)
-
-        # =====================================================
-        # BASE QUERY
-        # =====================================================
 
         history_stmt = (
             select(
@@ -8808,48 +7394,25 @@ async def get_work_progress_history(
             .where(*filters)
         )
 
-        # =====================================================
-        # APPLY PAGINATION
-        # =====================================================
-
         history_stmt = history_stmt.offset(offset).limit(limit)
-
-        # =====================================================
-        # EXECUTE QUERIES
-        # =====================================================
-
-        history_result = await db.execute(
-            history_stmt,
-        )
-
+        history_result = await db.execute(history_stmt)
         progress_entries = history_result.all()
 
-        total_result = await db.execute(
-            count_stmt,
-        )
-
+        total_result = await db.execute(count_stmt)
         total_count = total_result.scalar() or 0
-
-        # =====================================================
-        # RUNNING TOTAL
-        # =====================================================
 
         running_totals = {}
         history_items = []
 
         for progress, activity in progress_entries:
-            
             if activity.id not in running_totals:
                 running_totals[activity.id] = Decimal("0.00")
 
-            today_progress = Decimal(str(progress.today_progress or 0))
-
-            running_totals[activity.id] += today_progress
+            today_progress_val = Decimal(str(progress.today_progress or 0))
+            running_totals[activity.id] += today_progress_val
 
             remaining_quantity = Decimal(str(activity.planned_quantity)) - running_totals[activity.id]
-
             if remaining_quantity < Decimal("0"):
-
                 remaining_quantity = Decimal("0.00")
 
             history_items.append(
@@ -8872,10 +7435,6 @@ async def get_work_progress_history(
                 )
             )
 
-        # =====================================================
-        # PAGINATION
-        # =====================================================
-
         pagination = s.PaginationResponse(
             total=total_count,
             limit=limit,
@@ -8883,36 +7442,21 @@ async def get_work_progress_history(
             page_count=len(history_items),
         )
 
-        # =====================================================
-        # RESPONSE
-        # =====================================================
-
         return s.WorkProgressHistoryResponse(
             message="Work progress history fetched successfully",
             history=history_items,
             pagination=pagination,
         )
 
-    # =====================================================
-    # HTTP EXCEPTION
-    # =====================================================
-
     except HTTPException:
-
         raise
 
-    # =====================================================
-    # UNEXPECTED ERROR
-    # =====================================================
-
     except Exception as e:
-
         logger.exception(
             "Failed to fetch progress history for activity %s",
             activity_id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch activity progress history",
@@ -8931,42 +7475,11 @@ async def get_work_progress_history(
 )
 async def project_progress_summary(
     project_id: int = Path(..., gt=0),
-    current_user: User = Depends(
-        require_roles(READ_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # VALIDATE PROJECT
-        # =====================================================
-
-        project = await db.get(
-            m.Project,
-            project_id,
-        )
-
-        if project is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Project not found",
-            )
-
-        # =====================================================
-        # PROJECT ACCESS
-        # =====================================================
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=project_id,
-        )
-
-        # =====================================================
-        # PROJECT SUMMARY QUERY
-        # =====================================================
+        project = await _get_scoped_project_for_wp(db, project_id, current_user)
 
         summary_stmt = select(
             func.count(m.WorkActivity.id).label("total_activities"),
@@ -9039,7 +7552,6 @@ async def project_progress_summary(
         )
 
         result = await db.execute(summary_stmt)
-
         (
             total_activities,
             completed_activities,
@@ -9052,23 +7564,12 @@ async def project_progress_summary(
             average_progress,
         ) = result.one()
 
-        # =====================================================
-        # CALCULATE OVERALL PROGRESS
-        # =====================================================
-
         if planned_quantity > Decimal("0"):
-
             overall_progress = (
                 (completed_quantity / planned_quantity) * Decimal("100")
             ).quantize(Decimal("0.01"))
-
         else:
-
             overall_progress = Decimal("0.00")
-
-        # =====================================================
-        # RESPONSE
-        # =====================================================
 
         project_info = s.ProjectInfoResponse(
             id=project.id,
@@ -9111,43 +7612,26 @@ async def project_progress_summary(
             summary=summary,
         )
 
-    # =====================================================
-    # HTTP EXCEPTION
-    # =====================================================
-
     except HTTPException:
-
         raise
 
-    # =====================================================
-    # DATABASE ERROR
-    # =====================================================
-
     except IntegrityError as e:
-
         logger.exception(
-            "Database error while fetching " "project progress summary %s",
+            "Database error while fetching project progress summary %s",
             project_id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Database error occurred",
         )
 
-    # =====================================================
-    # UNKNOWN ERROR
-    # =====================================================
-
     except Exception as e:
-
         logger.exception(
             "Failed to fetch project summary %s : %s",
             project_id,
             str(e),
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch project progress summary",
@@ -9170,38 +7654,11 @@ async def get_delayed_activities(
     work_order_id: int | None = Query(None),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(
-        require_roles(READ_ROLES),
-    ),
+    current_user: User = Depends(require_permission("work_progress.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================================
-        # VALIDATE PROJECT
-        # =====================================================
-
-        project = await db.get(m.Project, project_id)
-
-        if project is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Project not found",
-            )
-
-        # =====================================================
-        # ACCESS VALIDATION
-        # =====================================================
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=project_id,
-        )
-
-        # =====================================================
-        # FILTERS
-        # =====================================================
+        await _get_scoped_project_for_wp(db, project_id, current_user)
 
         filters = [
             m.WorkActivity.project_id == project_id,
@@ -9215,24 +7672,15 @@ async def get_delayed_activities(
         ]
 
         if engineer_id:
-
+            await _validate_scoped_engineer(db, engineer_id, project_id, current_user)
             filters.append(m.WorkActivity.engineer_id == engineer_id)
 
         if work_order_id:
-
+            await _validate_scoped_work_order(db, work_order_id, project_id, current_user)
             filters.append(m.WorkActivity.work_order_id == work_order_id)
 
-        # =====================================================
-        # TOTAL COUNT
-        # =====================================================
-
         count_stmt = select(func.count(m.WorkActivity.id)).where(*filters)
-
         total_count = await db.scalar(count_stmt)
-
-        # =====================================================
-        # FETCH ACTIVITIES
-        # =====================================================
 
         stmt = (
             select(m.WorkActivity)
@@ -9250,17 +7698,10 @@ async def get_delayed_activities(
         )
 
         result = await db.execute(stmt)
-
         activities = result.scalars().all()
 
         delayed_list = []
-
-        # =====================================================
-        # PREPARE RESPONSE
-        # =====================================================
-
         for activity in activities:
-
             delayed_days = (
                 max(
                     0,
@@ -9296,10 +7737,6 @@ async def get_delayed_activities(
                 )
             )
 
-        # ==============================
-        # OUTSIDE THE LOOP
-        # ==============================
-
         page_count = len(delayed_list)
 
         return s.DelayedActivityListResponse(
@@ -9312,42 +7749,26 @@ async def get_delayed_activities(
             data=delayed_list,
         )
 
-    # =====================================================
-    # HTTP EXCEPTION
-    # =====================================================
-
     except HTTPException:
         raise
 
-    # =====================================================
-    # DATABASE ERROR
-    # =====================================================
-
     except IntegrityError as e:
-
         logger.exception(
             "Database error while fetching delayed activities for project %s",
             project_id,
             exc_info=e,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Database error occurred",
         )
 
-    # =====================================================
-    # UNKNOWN ERROR
-    # =====================================================
-
     except Exception as e:
-
         logger.exception(
             "Failed to fetch delayed activities for project %s: %s",
             project_id,
             str(e),
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch delayed activities",
@@ -9358,87 +7779,25 @@ async def get_delayed_activities(
 # 15. work progress pdf report
 # ==================================
 
-import io
-from decimal import Decimal
-from datetime import datetime
-
-from fastapi import Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
-
-from sqlalchemy import select
-
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    Table as PdfTable,
-    TableStyle,
-    PageBreak,
-)
-
-from reportlab.lib import colors as pdf_colors
-from reportlab.lib.styles import getSampleStyleSheet
-
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.utils import get_column_letter
-
 
 @work_progress_router.get("/reports/pdf")
 async def work_progress_pdf_report(
     project_id: int = Query(..., gt=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("work_progress.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
 
     try:
-
-        # ==================================
-        # VALIDATE PROJECT
-        # ==================================
-
-        project_result = await db.execute(
-            select(m.Project).where(m.Project.id == project_id)
-        )
-
-        project = project_result.scalars().first()
-
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
-
-        # ==================================
-        # PROJECT ACCESS
-        #
-        # FIX (CRITICAL / SECURITY): this was completely missing.
-        # Any user with READ_ROLES could download the full activity
-        # report for ANY project_id, regardless of whether they were
-        # a member of that project — a cross-tenant data leak.
-        # ==================================
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=project_id,
-        )
-
-        # ==================================
-        # GET ACTIVITIES
-        # ==================================
+        project = await _get_scoped_project_for_wp(db, project_id, current_user)
 
         activity_result = await db.execute(
             select(m.WorkActivity)
             .where(m.WorkActivity.project_id == project_id)
             .order_by(m.WorkActivity.created_at.desc())
         )
-
         activities = activity_result.scalars().all()
 
-        # ==================================
-        # PDF BUFFER
-        # ==================================
-
         buffer = io.BytesIO()
-
         doc = SimpleDocTemplate(
             buffer,
             rightMargin=20,
@@ -9446,14 +7805,8 @@ async def work_progress_pdf_report(
             topMargin=20,
             bottomMargin=20,
         )
-
         styles = getSampleStyleSheet()
-
         elements = []
-
-        # ==================================
-        # PROJECT NAME SAFE
-        # ==================================
 
         project_name = (
             getattr(project, "project_name", None)
@@ -9462,58 +7815,33 @@ async def work_progress_pdf_report(
             or f"Project-{project.id}"
         )
 
-        # ==================================
-        # HEADER
-        # ==================================
-
         elements.append(Paragraph("WORK PROGRESS REPORT", styles["Title"]))
-
         elements.append(Spacer(1, 10))
-
         elements.append(Paragraph(f"Project : {project_name}", styles["Heading2"]))
-
         elements.append(Paragraph(f"Project ID : {project.id}", styles["Normal"]))
-
         elements.append(
             Paragraph(
                 f"Generated On : {datetime.now().strftime('%d-%m-%Y %H:%M')}",
                 styles["Normal"],
             )
         )
-
         elements.append(Spacer(1, 20))
 
-        # ==================================
-        # TABLE HEADER
-        # ==================================
-
         table_data = [["Activity", "Planned", "Completed", "Remaining", "%", "Status"]]
-
         total_planned = Decimal("0")
         total_completed = Decimal("0")
-
         delayed_activities = []
 
-        # ==================================
-        # LOOP
-        # ==================================
-
         for activity in activities:
-
             planned_qty = Decimal(str(activity.planned_quantity or 0))
-
             completed_qty = Decimal(str(activity.total_completed or 0))
-
             remaining_qty = Decimal(str(activity.remaining_quantity or 0))
-
             completion_pct = Decimal(str(activity.completion_percentage or 0))
-
             status_value = (
                 activity.status.value
                 if hasattr(activity.status, "value")
                 else str(activity.status or "UNKNOWN")
             )
-
             total_planned += planned_qty
             total_completed += completed_qty
 
@@ -9528,18 +7856,10 @@ async def work_progress_pdf_report(
                 ]
             )
 
-            # FIX (minor): compare against the enum's value instead of a
-            # bare "DELAY" magic string, so a rename/typo in
-            # WorkActivityStatus can't silently break this filter.
             if status_value == WorkActivityStatus.DELAY.value:
                 delayed_activities.append(activity)
 
-        # ==================================
-        # MAIN TABLE
-        # ==================================
-
         table = PdfTable(table_data)
-
         table.setStyle(
             TableStyle(
                 [
@@ -9579,35 +7899,24 @@ async def work_progress_pdf_report(
         )
 
         elements.append(table)
-
         elements.append(Spacer(1, 20))
 
-        # ==================================
-        # SUMMARY
-        # ==================================
-
         overall_completion = Decimal("0")
-
         if total_planned > 0:
-
             overall_completion = (
                 (total_completed / total_planned) * Decimal("100")
             ).quantize(Decimal("0.01"))
 
         elements.append(Paragraph("PROJECT SUMMARY", styles["Heading2"]))
-
         elements.append(
             Paragraph(f"Total Activities : {len(activities)}", styles["Normal"])
         )
-
         elements.append(
             Paragraph(f"Total Planned Quantity : {total_planned}", styles["Normal"])
         )
-
         elements.append(
             Paragraph(f"Total Completed Quantity : {total_completed}", styles["Normal"])
         )
-
         elements.append(
             Paragraph(
                 f"Overall Completion : {overall_completion}%",
@@ -9615,12 +7924,7 @@ async def work_progress_pdf_report(
             )
         )
 
-        # ==================================
-        # DELAY PAGE
-        # ==================================
-
         elements.append(PageBreak())
-
         elements.append(Paragraph("DELAYED ACTIVITIES", styles["Heading1"]))
 
         delay_table = [
@@ -9632,7 +7936,6 @@ async def work_progress_pdf_report(
         ]
 
         for item in delayed_activities:
-
             delay_table.append(
                 [
                     str(item.activity_name),
@@ -9642,9 +7945,7 @@ async def work_progress_pdf_report(
             )
 
         if len(delay_table) > 1:
-
             dt = PdfTable(delay_table)
-
             dt.setStyle(
                 TableStyle(
                     [
@@ -9670,19 +7971,11 @@ async def work_progress_pdf_report(
                     ]
                 )
             )
-
             elements.append(dt)
-
         else:
-
             elements.append(Paragraph("No delayed activities found.", styles["Normal"]))
 
-        # ==================================
-        # BUILD PDF
-        # ==================================
-
         doc.build(elements)
-
         buffer.seek(0)
 
         return StreamingResponse(
@@ -9697,16 +7990,10 @@ async def work_progress_pdf_report(
         raise
 
     except Exception as e:
-
-        # FIX: don't leak internal exception details (type/message) back
-        # to the client, and log via the standard logger (consistent
-        # with every other endpoint in this router) instead of a bare
-        # traceback.print_exc() to stdout.
         logger.exception(
             "Failed to generate PDF report for project %s",
             project_id,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to generate work progress PDF report",
@@ -9721,44 +8008,11 @@ async def work_progress_pdf_report(
 @work_progress_router.get("/reports/excel")
 async def work_progress_excel_report(
     project_id: int = Query(..., gt=0),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("work_progress.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-
-        # =====================================
-        # GET PROJECT
-        # =====================================
-
-        project_result = await db.execute(
-            select(m.Project).where(m.Project.id == project_id)
-        )
-
-        project = project_result.scalars().first()
-
-        if not project:
-            raise HTTPException(
-                status_code=404,
-                detail="Project not found",
-            )
-
-        # =====================================
-        # PROJECT ACCESS
-        #
-        # FIX (CRITICAL / SECURITY): same gap as the PDF endpoint —
-        # missing entirely before. Any READ_ROLES user could export
-        # the Excel report for any project_id with no ownership check.
-        # =====================================
-
-        await assert_project_access(
-            db=db,
-            current_user=current_user,
-            project_id=project_id,
-        )
-
-        # =====================================
-        # PROJECT NAME SAFE
-        # =====================================
+        project = await _get_scoped_project_for_wp(db, project_id, current_user)
 
         project_name = (
             getattr(project, "project_name", None)
@@ -9767,28 +8021,14 @@ async def work_progress_excel_report(
             or f"Project-{project.id}"
         )
 
-        # =====================================
-        # GET ACTIVITIES
-        # =====================================
-
         result = await db.execute(
             select(m.WorkActivity)
             .where(m.WorkActivity.project_id == project_id)
             .order_by(m.WorkActivity.created_at.desc())
         )
-
         activities = result.scalars().all()
 
-        # =====================================
-        # WORKBOOK
-        # =====================================
-
         wb = Workbook()
-
-        # =====================================
-        # SHEET 1 : ACTIVITIES
-        # =====================================
-
         ws = wb.active
         ws.title = "Activities"
 
@@ -9815,21 +8055,17 @@ async def work_progress_excel_report(
         )
 
         for col_num, header in enumerate(headers, start=1):
-
             cell = ws.cell(
                 row=1,
                 column=col_num,
             )
-
             cell.value = header
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
 
         row = 2
-
         for activity in activities:
-
             status_value = (
                 activity.status.value
                 if hasattr(activity.status, "value")
@@ -9884,22 +8120,11 @@ async def work_progress_excel_report(
 
             row += 1
 
-        # =====================================
-        # SHEET 2 : SUMMARY
-        # =====================================
-
         summary_sheet = wb.create_sheet(title="Summary")
-
         total_activities = len(activities)
-
         total_planned = sum(float(x.planned_quantity or 0) for x in activities)
-
         total_completed = sum(float(x.total_completed or 0) for x in activities)
-
         total_remaining = sum(float(x.remaining_quantity or 0) for x in activities)
-
-        # FIX (minor): compare against the enum's value instead of a
-        # bare "DELAY" magic string, matching the PDF endpoint fix.
         total_delayed = len(
             [
                 x
@@ -9912,7 +8137,6 @@ async def work_progress_excel_report(
         )
 
         completion_percentage = 0
-
         if total_planned > 0:
             completion_percentage = round(
                 (total_completed / total_planned) * 100,
@@ -9920,27 +8144,15 @@ async def work_progress_excel_report(
             )
 
         summary_sheet.append(["Project Name", project_name])
-
         summary_sheet.append(["Project ID", project.id])
-
         summary_sheet.append(["Total Activities", total_activities])
-
         summary_sheet.append(["Total Planned Qty", total_planned])
-
         summary_sheet.append(["Total Completed Qty", total_completed])
-
         summary_sheet.append(["Total Remaining Qty", total_remaining])
-
         summary_sheet.append(["Completion %", completion_percentage])
-
         summary_sheet.append(["Delayed Activities", total_delayed])
 
-        # =====================================
-        # SHEET 3 : DELAY REPORT
-        # =====================================
-
         delay_sheet = wb.create_sheet(title="Delayed Activities")
-
         delay_sheet.append(
             [
                 "Activity",
@@ -9951,7 +8163,6 @@ async def work_progress_excel_report(
         )
 
         for item in activities:
-
             status_value = (
                 item.status.value
                 if hasattr(item.status, "value")
@@ -9959,7 +8170,6 @@ async def work_progress_excel_report(
             )
 
             if status_value == WorkActivityStatus.DELAY.value:
-
                 delay_sheet.append(
                     [
                         item.activity_name or "",
@@ -9969,47 +8179,24 @@ async def work_progress_excel_report(
                     ]
                 )
 
-        # =====================================
-        # AUTO WIDTH ALL SHEETS
-        # =====================================
-
         for sheet in wb.worksheets:
-
             for column in sheet.columns:
-
                 max_length = 0
-
                 column_letter = get_column_letter(column[0].column)
-
                 for cell in column:
-
                     try:
-
                         if cell.value:
-
                             max_length = max(
                                 max_length,
                                 len(str(cell.value)),
                             )
-
                     except Exception:
                         pass
-
                 sheet.column_dimensions[column_letter].width = max_length + 5
 
-        # =====================================
-        # SAVE EXCEL
-        # =====================================
-
         output = io.BytesIO()
-
         wb.save(output)
-
         output.seek(0)
-
-        # =====================================
-        # RESPONSE
-        # =====================================
 
         return StreamingResponse(
             output,
@@ -10025,18 +8212,15 @@ async def work_progress_excel_report(
         raise
 
     except Exception as e:
-
-        # FIX: same as PDF endpoint — no raw exception details in the
-        # response, use the standard logger instead of print_exc().
         logger.exception(
             "Failed to generate Excel report for project %s",
             project_id,
         )
-
         raise HTTPException(
             status_code=500,
             detail="Failed to generate work progress Excel report",
         )
+
 
 
 # ===================== QC =====================
@@ -10062,18 +8246,18 @@ def save_qc_file(file: UploadFile) -> str:
 
 
 async def validate_and_save_qc_file(file: UploadFile) -> str:
-    if not file.content_type.startswith("image/"):
-        raise AppError(400, "Only image files allowed")
+    allowed_extensions = {"jpg", "jpeg", "png", "webp", "pdf"}
+    ext = file.filename.split(".")[-1].lower() if file.filename and "." in file.filename else ""
 
-    allowed_extensions = {"jpg", "jpeg", "png", "webp"}
-    ext = file.filename.split(".")[-1].lower()
+    content_type = file.content_type or ""
+    is_valid_type = content_type.startswith("image/") or content_type in ("application/pdf", "application/x-pdf") or ext == "pdf"
 
-    if ext not in allowed_extensions:
-        raise AppError(400, "Invalid file format")
+    if not is_valid_type or ext not in allowed_extensions:
+        raise AppError(400, "Only image (jpg, jpeg, png, webp) and PDF files allowed")
 
     content = await file.read()
-    if len(content) > 5 * 1024 * 1024:
-        raise AppError(400, "File too large")
+    if len(content) > 10 * 1024 * 1024:
+        raise AppError(400, "File too large (max 10MB)")
 
     file.file.seek(0)
 
@@ -10087,21 +8271,27 @@ qc_router = APIRouter(prefix="/qc", tags=["QC"])
 async def create_qc(
     payload: s.QCCreate = Depends(),
     report_file: Optional[UploadFile] = File(None),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("qc.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    file_url = None
+    if current_user.company_id is None and not current_user.is_super_admin:
+        raise HTTPException(status_code=403, detail="User without company cannot create QC records")
 
-    if report_file:
+    try:
+        await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    await assert_task_project(db, payload.task_id, payload.project_id)
+
+    file_url = None
+    if report_file and report_file.filename and report_file.filename.strip():
         file_url = await validate_and_save_qc_file(report_file)
 
     obj = m.QCRecord(**payload.model_dump(), report_file_url=file_url)
-    await assert_task_project(db, payload.task_id, payload.project_id)
-
     db.add(obj)
     await db.commit()
     await db.refresh(obj)
-
     return obj
 
 
@@ -10109,9 +8299,16 @@ async def create_qc(
 async def get_qc(
     qc_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("qc.view")),
 ):
-    return await db.scalar(select(m.QCRecord).where(m.QCRecord.id == qc_id))
+    obj = await db.get(m.QCRecord, qc_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="QC record not found")
+    try:
+        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="QC record not found")
+    return obj
 
 
 @qc_router.get("", response_model=PaginatedResponse[s.QCOut])
@@ -10121,13 +8318,27 @@ async def list_qc(
     status: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("qc.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    query = select(m.QCRecord)
+    if project_id is not None:
+        try:
+            await assert_project_access(db, project_id=project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Project not found")
+        query = select(m.QCRecord).where(m.QCRecord.project_id == project_id)
+    else:
+        if current_user.company_id is not None:
+            query = (
+                select(m.QCRecord)
+                .join(m.Project, m.QCRecord.project_id == m.Project.id)
+                .where(m.Project.company_id == current_user.company_id)
+            )
+        elif current_user.is_super_admin:
+            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+        else:
+            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
 
-    if project_id:
-        query = query.where(m.QCRecord.project_id == project_id)
     if task_id:
         query = query.where(m.QCRecord.task_id == task_id)
     if status:
@@ -10146,9 +8357,25 @@ async def update_qc(
     qc_id: int,
     data: s.QCCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("qc.edit")),
 ):
     obj = await db.get(m.QCRecord, qc_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="QC record not found")
+    try:
+        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="QC record not found")
+
+    if data.project_id != obj.project_id:
+        try:
+            await assert_project_access(db, project_id=data.project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Target project not found")
+
+    if data.task_id:
+        await assert_task_project(db, data.task_id, data.project_id)
+
     for k, v in data.dict().items():
         setattr(obj, k, v)
 
@@ -10161,9 +8388,16 @@ async def update_qc(
 async def delete_qc(
     qc_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("qc.delete")),
 ):
     obj = await db.get(m.QCRecord, qc_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="QC record not found")
+    try:
+        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="QC record not found")
+
     await db.delete(obj)
     await db.commit()
     return {"message": "QC deleted"}
@@ -10178,8 +8412,16 @@ safety_router = APIRouter(prefix="/safety", tags=["Safety"])
 async def create_incident(
     data: s.SafetyCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("safety.create")),
 ):
+    if current_user.company_id is None and not current_user.is_super_admin:
+        raise HTTPException(status_code=403, detail="User without company cannot log safety incidents")
+
+    try:
+        await assert_project_access(db, project_id=data.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Project not found")
+
     await assert_task_project(db, data.task_id, data.project_id)
     obj = m.SafetyIncident(**data.dict())
     db.add(obj)
@@ -10192,15 +8434,15 @@ async def create_incident(
 async def get_incident(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("safety.view")),
 ):
-    incident = await db.scalar(
-        select(m.SafetyIncident).where(m.SafetyIncident.id == id)
-    )
-
+    incident = await db.get(m.SafetyIncident, id)
     if not incident:
         raise HTTPException(status_code=404, detail="Safety incident not found")
-
+    try:
+        await assert_project_access(db, project_id=incident.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Safety incident not found")
     return incident
 
 
@@ -10210,13 +8452,27 @@ async def list_incidents(
     violation_type: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("safety.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    query = select(m.SafetyIncident)
+    if project_id is not None:
+        try:
+            await assert_project_access(db, project_id=project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Project not found")
+        query = select(m.SafetyIncident).where(m.SafetyIncident.project_id == project_id)
+    else:
+        if current_user.company_id is not None:
+            query = (
+                select(m.SafetyIncident)
+                .join(m.Project, m.SafetyIncident.project_id == m.Project.id)
+                .where(m.Project.company_id == current_user.company_id)
+            )
+        elif current_user.is_super_admin:
+            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+        else:
+            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
 
-    if project_id:
-        query = query.where(m.SafetyIncident.project_id == project_id)
     if violation_type:
         query = query.where(m.SafetyIncident.violation_type == violation_type)
 
@@ -10233,9 +8489,25 @@ async def update_incident(
     id: int,
     data: s.SafetyCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("safety.edit")),
 ):
     obj = await db.get(m.SafetyIncident, id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Safety incident not found")
+    try:
+        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Safety incident not found")
+
+    if data.project_id != obj.project_id:
+        try:
+            await assert_project_access(db, project_id=data.project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Target project not found")
+
+    if data.task_id:
+        await assert_task_project(db, data.task_id, data.project_id)
+
     for k, v in data.dict().items():
         setattr(obj, k, v)
 
@@ -10248,9 +8520,16 @@ async def update_incident(
 async def delete_incident(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("safety.delete")),
 ):
     obj = await db.get(m.SafetyIncident, id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Safety incident not found")
+    try:
+        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Safety incident not found")
+
     await db.delete(obj)
     await db.commit()
     return {"message": "Incident deleted"}
@@ -10266,33 +8545,50 @@ async def list_logs(
     project_id: Optional[int] = None,
     limit: int = 20,
     offset: int = 0,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("checklists.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    query = select(m.ChecklistLog)
-
-    if project_id:
-        query = query.where(m.ChecklistLog.project_id == project_id)
+    if project_id is not None:
+        try:
+            await assert_project_access(db, project_id=project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Project not found")
+        query = select(m.ChecklistLog).where(m.ChecklistLog.project_id == project_id)
+    else:
+        if current_user.company_id is not None:
+            query = (
+                select(m.ChecklistLog)
+                .join(m.Project, m.ChecklistLog.project_id == m.Project.id)
+                .where(m.Project.company_id == current_user.company_id)
+            )
+        elif current_user.is_super_admin:
+            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+        else:
+            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
 
     count = await db.scalar(select(func.count()).select_from(query.subquery()))
     rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
-
-    items = [s.ChecklistLogOut.model_validate(x) for x in rows]  # ✅ FIX
+    items = [s.ChecklistLogOut.model_validate(x) for x in rows]
 
     return PaginatedResponse(
         items=items, meta=PaginationMeta(total=count, limit=limit, offset=offset)
     )
 
 
-# =====================================================
-
-
 @checklist_router.post("")
 async def create_checklist(
     data: s.ChecklistCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("checklists.create")),
 ):
+    if current_user.company_id is None and not current_user.is_super_admin:
+        raise HTTPException(status_code=403, detail="User without company cannot create checklists")
+
+    try:
+        await assert_project_access(db, project_id=data.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Project not found")
+
     obj = m.Checklist(**data.dict())
     db.add(obj)
     await db.commit()
@@ -10300,24 +8596,20 @@ async def create_checklist(
     return obj
 
 
-# =============================================
-
-
 @checklist_router.get("/{id}")
 async def get_checklist(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("checklists.view")),
 ):
     checklist = await db.get(m.Checklist, id)
-
     if not checklist:
         raise HTTPException(status_code=404, detail="Checklist not found")
-
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Checklist not found")
     return checklist
-
-
-# =============================================
 
 
 @checklist_router.put("/{id}")
@@ -10325,11 +8617,14 @@ async def update_checklist(
     id: int,
     data: s.ChecklistUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("checklists.edit")),
 ):
     checklist = await db.get(m.Checklist, id)
-
     if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
         raise HTTPException(status_code=404, detail="Checklist not found")
 
     for key, value in data.dict(exclude_unset=True).items():
@@ -10337,43 +8632,40 @@ async def update_checklist(
 
     await db.commit()
     await db.refresh(checklist)
-
     return checklist
-
-
-# =============================================
 
 
 @checklist_router.delete("/{id}")
 async def delete_checklist(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("checklists.delete")),
 ):
     checklist = await db.get(m.Checklist, id)
-
     if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
         raise HTTPException(status_code=404, detail="Checklist not found")
 
     await db.delete(checklist)
-
     await db.commit()
-
     return {"message": "Checklist deleted successfully"}
-
-
-# =============================================
 
 
 @checklist_router.post("/items")
 async def add_item(
     data: s.ChecklistItemCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("checklists.edit")),
 ):
     checklist = await db.get(m.Checklist, data.checklist_id)
-
     if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
         raise HTTPException(status_code=404, detail="Checklist not found")
 
     existing = await db.scalar(
@@ -10382,32 +8674,28 @@ async def add_item(
             m.ChecklistItem.item == data.item,
         )
     )
-
     if existing:
         raise HTTPException(status_code=400, detail="Checklist item already exists")
 
     obj = m.ChecklistItem(checklist_id=data.checklist_id, item=data.item)
-
     db.add(obj)
-
     await db.commit()
     await db.refresh(obj)
-
     return obj
-
-
-# =============================================
 
 
 @checklist_router.get("/{id}/items")
 async def get_items(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("checklists.view")),
 ):
     checklist = await db.get(m.Checklist, id)
-
     if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
         raise HTTPException(status_code=404, detail="Checklist not found")
 
     result = await db.execute(
@@ -10415,11 +8703,7 @@ async def get_items(
         .where(m.ChecklistItem.checklist_id == id)
         .order_by(m.ChecklistItem.id)
     )
-
     return result.scalars().all()
-
-
-# =============================================
 
 
 @checklist_router.put("/items/{item_id}")
@@ -10427,11 +8711,17 @@ async def update_item(
     item_id: int,
     data: s.ChecklistItemUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("checklists.edit")),
 ):
     item = await db.get(m.ChecklistItem, item_id)
-
     if not item:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+    checklist = await db.get(m.Checklist, item.checklist_id)
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
         raise HTTPException(status_code=404, detail="Checklist item not found")
 
     for key, value in data.dict(exclude_unset=True).items():
@@ -10439,66 +8729,78 @@ async def update_item(
 
     await db.commit()
     await db.refresh(item)
-
     return item
-
-
-# =============================================
 
 
 @checklist_router.get("/items/{checklist_id}")
 async def list_items(
     checklist_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("checklists.view")),
 ):
     checklist = await db.get(m.Checklist, checklist_id)
-
     if not checklist:
-        raise HTTPException(404, "Checklist not found")
+        raise HTTPException(status_code=404, detail="Checklist not found")
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Checklist not found")
 
     result = await db.execute(
         select(m.ChecklistItem)
         .where(m.ChecklistItem.checklist_id == checklist_id)
         .order_by(m.ChecklistItem.id)
     )
-
     return result.scalars().all()
-
-
-# ==========================================
 
 
 @checklist_router.delete("/items/{item_id}")
 async def delete_item(
     item_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("checklists.delete")),
 ):
     item = await db.get(m.ChecklistItem, item_id)
-
     if not item:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+    checklist = await db.get(m.Checklist, item.checklist_id)
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
         raise HTTPException(status_code=404, detail="Checklist item not found")
 
     await db.delete(item)
-
     await db.commit()
-
     return {"message": "Checklist item deleted"}
-
-
-# =============================================
 
 
 @checklist_router.get("")
 async def list_checklists(
+    project_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("checklists.view")),
 ):
-    return (await db.execute(select(m.Checklist))).scalars().all()
+    if project_id is not None:
+        try:
+            await assert_project_access(db, project_id=project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Project not found")
+        query = select(m.Checklist).where(m.Checklist.project_id == project_id)
+    else:
+        if current_user.company_id is not None:
+            query = (
+                select(m.Checklist)
+                .join(m.Project, m.Checklist.project_id == m.Project.id)
+                .where(m.Project.company_id == current_user.company_id)
+            )
+        elif current_user.is_super_admin:
+            return []
+        else:
+            return []
 
-
-# =============================================
+    return (await db.execute(query)).scalars().all()
 
 
 @checklist_router.post("/{id}/execute")
@@ -10506,15 +8808,23 @@ async def execute_checklist(
     id: int,
     data: s.ChecklistLogCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("checklists.create")),
 ):
     checklist = await db.scalar(
         select(m.Checklist)
         .options(selectinload(m.Checklist.items))
         .where(m.Checklist.id == id)
     )
-
     if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    # P1-3: Verify execution project matches checklist project
+    if data.project_id != checklist.project_id:
+        raise HTTPException(status_code=400, detail="Checklist does not belong to specified project")
+
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
         raise HTTPException(status_code=404, detail="Checklist not found")
 
     if not checklist.items:
@@ -10527,12 +8837,9 @@ async def execute_checklist(
         status=data.status,
         executed_by=current_user.id,
     )
-
     db.add(log)
-
     await db.commit()
     await db.refresh(log)
-
     return log
 
 
@@ -10558,12 +8865,16 @@ async def upload_photo(
     activity_tag: Optional[str] = Form(None),
     location_tag: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("site_photos.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    #  Validate file type
-    await assert_task_project(db, task_id, project_id)
-    ext = file.filename.split(".")[-1].lower()
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
+    if task_id:
+        await _get_scoped_task(db, project_id, task_id, current_user)
+    if dsr_id:
+        await _get_scoped_dsr(db, dsr_id, current_user)
+
+    ext = file.filename.split(".")[-1].lower() if file.filename else ""
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, "Invalid file type")
 
@@ -10614,9 +8925,10 @@ async def list_photos(
     location_tag: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("site_photos.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
     query = select(m.SitePhoto).where(m.SitePhoto.project_id == project_id)
 
     if activity_tag:
@@ -10642,18 +8954,18 @@ async def list_photos(
 async def delete_photo(
     photo_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("site_photos.delete")),
 ):
-    obj = await db.get(m.SitePhoto, photo_id)
-
-    if not obj:
-        raise HTTPException(404, "Photo not found")
+    obj = await _get_scoped_site_photo(db, photo_id, current_user, for_update=True)
 
     #  Delete file from disk
     if obj.photo_url:
-        file_path = obj.photo_url.replace("/uploads/", "uploads/")
+        file_path = obj.photo_url.replace("/uploads/", "uploads/").lstrip("/")
         if os.path.exists(file_path):
-            os.remove(file_path)
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
     await db.delete(obj)
     await db.commit()
@@ -10675,7 +8987,7 @@ async def create_folder(
     data: s.DrawingFolderCreate,
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(DRAWING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("drawings.create")),
 ):
     obj = m.DrawingDocument(
         project_id=project_id,
@@ -10708,7 +9020,7 @@ async def upload_drawing(
     remarks: Optional[str] = Form(None),
     parent_id: Optional[int] = Form(None),
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(DRAWING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("drawings.upload")),
     db: AsyncSession = Depends(get_db_session),
 ):
     os.makedirs("uploads/drawings", exist_ok=True)
@@ -10824,7 +9136,7 @@ async def upload_drawing(
 async def update_drawing(
     id: int,
     payload: s.DrawingUpdate,
-    current_user: User = Depends(require_roles(DRAWING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("drawings.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     obj = await db.get(m.DrawingDocument, id)
@@ -10855,7 +9167,7 @@ async def update_drawing(
 @drawing_router.get("/{id}/approval-history")
 async def get_drawing_approval_history(
     id: int,
-    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    current_user: User = Depends(require_permission("drawings.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     drawing = await db.get(m.DrawingDocument, id)
@@ -10901,7 +9213,7 @@ async def list_drawings(
     is_folder: Optional[bool] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    current_user: User = Depends(require_permission("drawings.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     stmt = select(m.DrawingDocument).where(m.DrawingDocument.project_id == project_id)
@@ -10957,7 +9269,7 @@ async def list_drawings(
 @drawing_router.get("/{project_id}/versions", response_model=list[s.DrawingOut])
 async def get_versions(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    current_user: User = Depends(require_permission("drawings.view")),
     project_id: Optional[int] = None,
     parent_id: Optional[int] = Query(None),
     skip: int = 0,
@@ -10994,7 +9306,7 @@ async def get_versions(
 @drawing_router.get("/{project_id}/latest", response_model=list[s.DrawingOut])
 async def get_latest(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    current_user: User = Depends(require_permission("drawings.view")),
     project_id: Optional[int] = None,
     parent_id: Optional[int] = Query(None),
 ):
@@ -11031,7 +9343,7 @@ async def get_latest(
 async def delete_drawing(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(DRAWING_DELETE_ROLES)),
+    current_user: User = Depends(require_permission("drawings.delete")),
 ):
     obj = await db.get(m.DrawingDocument, id)
 
@@ -11062,7 +9374,7 @@ async def delete_drawing(
 async def download_document(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    current_user: User = Depends(require_permission("drawings.download")),
 ):
     doc = await db.get(m.DrawingDocument, id)
 
@@ -11086,7 +9398,7 @@ async def download_document(
 async def view_document(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(DRAWING_READ_ROLES)),
+    current_user: User = Depends(require_permission("drawings.view")),
 ):
     doc = await db.get(m.DrawingDocument, id)
 
@@ -11115,11 +9427,13 @@ site_request_router = APIRouter(prefix="/site-requests", tags=["Site Requests"])
 @site_request_router.post("", response_model=s.SiteRequestOut)
 async def create_request(
     payload: s.SiteRequestCreate,
-    current_user: User = Depends(require_roles(TASK_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("site_requests.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await _get_scoped_project(db, payload.project_id, current_user, load_relations=False)
+    data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
     obj = m.SiteRequest(
-        **payload.dict(),
+        **data,
         requested_by=current_user.id,
         status="Pending",
     )
@@ -11133,9 +9447,10 @@ async def create_request(
 @site_request_router.get("", response_model=list[s.SiteRequestOut])
 async def list_requests(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("site_requests.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
     result = await db.execute(
         select(m.SiteRequest)
         .where(m.SiteRequest.project_id == project_id)
@@ -11147,10 +9462,10 @@ async def list_requests(
 @site_request_router.put("/{id}/approve")
 async def approve_request(
     id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("site_requests.approve")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.SiteRequest, id)
+    obj = await _get_scoped_site_request(db, id, current_user, for_update=True)
     obj.status = "Approved"
     obj.approved_by = current_user.id
 
@@ -11161,10 +9476,10 @@ async def approve_request(
 @site_request_router.put("/{id}/reject")
 async def reject_request(
     id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("site_requests.approve")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.SiteRequest, id)
+    obj = await _get_scoped_site_request(db, id, current_user, for_update=True)
     obj.status = "Rejected"
     obj.approved_by = current_user.id
 
@@ -11180,7 +9495,7 @@ router.include_router(tasks_router)
 @router.get("/{project_id}/qr", response_class=StreamingResponse)
 async def generate_project_qr(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
     service: ProjectsService = Depends(get_projects_service),
 ):
@@ -11203,7 +9518,7 @@ async def generate_project_qr(
 @router.get("/{project_id}", response_model=s.ProjectOut)
 async def get_project(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectsService = Depends(get_projects_service),
@@ -11231,7 +9546,7 @@ async def get_project(
 async def update_project(
     project_id: int,
     payload: s.ProjectUpdate,
-    current_user: User = Depends(require_roles(PROJECT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("projects.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectsService = Depends(get_projects_service),
@@ -11255,7 +9570,7 @@ async def update_project(
 @router.delete("/{project_id}", status_code=200)
 async def delete_project(
     project_id: int,
-    current_user: User = Depends(require_roles(PROJECT_DELETE_ROLES)),
+    current_user: User = Depends(require_permission("projects.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectsService = Depends(get_projects_service),
@@ -11280,19 +9595,11 @@ from app.schemas import gantt as s_gantt
 @router.get("/{project_id}/gantt", response_model=s_gantt.GanttResponseSchema)
 async def get_project_gantt(
     project_id: int,
-    current_user: User = Depends(require_roles(READ_ROLES)),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
     service: ProjectsService = Depends(get_projects_service),
 ):
-    obj = await service.projects_repo.get_project(db, project_id=project_id)
-    if obj is None:
-        raise NotFoundError("Project not found")
-
-    await assert_project_access(
-        db,
-        project_id=obj.id,
-        current_user=current_user,
-    )
+    obj = await _get_scoped_project(db, project_id, current_user, load_relations=True)
 
     gantt_items = []
     for mstone in obj.milestones:

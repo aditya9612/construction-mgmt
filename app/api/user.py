@@ -12,6 +12,7 @@ from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.user import ROLES, ActivityLog, User, UserAuditLog, UserRole
 from app.schemas.base import PaginationMeta, PaginatedResponse
 from app.schemas.user import UserAuditOut, UserOut, UserCreatePayload, UserUpdatePayload
+from app.services.rbac_audit import record_rbac_audit
 from app.utils.helpers import AppError, ConflictError, NotFoundError
 from app.core.logger import logger
 from fastapi import Depends, File, Request, UploadFile, Query, APIRouter
@@ -273,6 +274,18 @@ async def create_user(
             performed_by=creator_id,
         )
 
+        # Record RBAC audit for user role assignment
+        await record_rbac_audit(
+            db=db,
+            actor=current_user,
+            action="USER_ROLE_ASSIGN",
+            target_type="USER",
+            target_id=str(user.id),
+            company_id=user.company_id,
+            old_value=None,
+            new_value={"role": user.role},
+        )
+
         logger.info(f"User created successfully id={user.id} role={user.role}")
 
         return UserOut.model_validate(user)
@@ -500,13 +513,25 @@ async def update_role_status(
             )
         )
 
-    # Fetch all non-deleted users with this role
-    result = await db.execute(
-        select(User).where(
-            User.role == role,
-            User.is_deleted == False
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    # P0-2 invariant: non-Super Admin users with company_id=None must be rejected with 403
+    if not is_sa and current_user.company_id is None:
+        raise AppError(
+            status_code=403,
+            message="User does not belong to any company."
         )
+
+    # Fetch all non-deleted users with this role, excluding Super Admin users
+    stmt = select(User).where(
+        User.role == role,
+        User.is_deleted == False,
+        User.is_super_admin == False,
     )
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    result = await db.execute(stmt)
     users = result.scalars().all()
 
     if not users:
@@ -634,14 +659,25 @@ async def update_user(
                 raise ConflictError("Email already registered")
 
         # ------------------------
-        # ROLE
+        # ROLE & PRIVILEGE ESCALATION CHECK
         # ------------------------
+        old_role = user.role
+        role_changed = False
         if "role" in data:
             try:
                 # data["role"] = UserRole(data["role"])
                 data["role"] = UserRole(data["role"]).value
+                if data["role"] == UserRole.ADMIN.value and not getattr(current_user, "is_super_admin", False):
+                    raise AppError(
+                        403,
+                        "Cannot assign Admin role via this endpoint. Super Admins must use /superadmin/companies/{id}/admin"
+                    )
+                role_changed = data["role"] != old_role
             except ValueError:
                 raise AppError(422, f"Invalid role. Use one of: {ROLES}")
+
+        # Defense-in-depth: strip any unauthorized privileged flags
+        data.pop("is_super_admin", None)
 
         # ------------------------
         # FINAL SAFETY CHECK
@@ -672,7 +708,7 @@ async def update_user(
         await db.flush()
 
         # ------------------------
-        # ACTIVITY LOG
+        # ACTIVITY LOG & RBAC AUDIT LOG
         # ------------------------
         await log_activity(
             db,
@@ -682,6 +718,18 @@ async def update_user(
             performed_by=current_user.id,
             details={"fields_updated": updated_fields},
         )
+
+        if role_changed:
+            await record_rbac_audit(
+                db=db,
+                actor=current_user,
+                action="USER_ROLE_CHANGE",
+                target_type="USER",
+                target_id=str(user.id),
+                company_id=user.company_id,
+                old_value={"role": old_role},
+                new_value={"role": user.role},
+            )
 
         # ------------------------
         # CLEAN OLD IMAGE
@@ -781,6 +829,28 @@ async def get_user_audit_logs(
 ):
     logger.info(f"Fetching audit logs for user id={user_id}")
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if not is_sa:
+        target_user = await db.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.company_id == current_user.company_id,
+                User.is_deleted == False,
+            )
+        )
+        if target_user is None:
+            raise NotFoundError("User not found")
+    else:
+        target_user = await db.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.is_deleted == False,
+            )
+        )
+        if target_user is None:
+            raise NotFoundError("User not found")
+
     query = select(UserAuditLog).where(UserAuditLog.user_id == user_id)
 
     # filter by date range
@@ -811,6 +881,28 @@ async def get_grouped_audit_logs(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if not is_sa:
+        target_user = await db.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.company_id == current_user.company_id,
+                User.is_deleted == False,
+            )
+        )
+        if target_user is None:
+            raise NotFoundError("User not found")
+    else:
+        target_user = await db.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.is_deleted == False,
+            )
+        )
+        if target_user is None:
+            raise NotFoundError("User not found")
+
     result = await db.execute(
         select(UserAuditLog)
         .where(UserAuditLog.user_id == user_id)

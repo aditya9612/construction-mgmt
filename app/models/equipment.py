@@ -53,12 +53,24 @@ class Equipment(Base, TimestampMixin):
             "project_id",
             "condition",
         ),
+        Index(
+            "ix_equipment_company_project",
+            "company_id",
+            "project_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
         Integer,
         primary_key=True,
         autoincrement=True,
+    )
+
+    company_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
     )
 
     project_id: Mapped[Optional[int]] = mapped_column(
@@ -379,6 +391,13 @@ class EquipmentRental(Base, TimestampMixin):
         ForeignKey("boq_items.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
+    )
+
+    is_completed: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("0"),
+        nullable=False,
     )
 
     equipment: Mapped["Equipment"] = relationship(

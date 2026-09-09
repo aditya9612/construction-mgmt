@@ -9,9 +9,9 @@ from app.cache.redis import cache_get_json, cache_set_json
 from app.core.logger import logger
 from app.core.security import decode_access_token
 from app.db.session import get_db_session
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, ROLES
 from app.core.request_context import set_current_user_id
-from app.models.rbac import Permission, RolePermission
+from app.models.rbac import Permission, RolePermission, Role, UserPermissionOverride
 from app.models.company import Company
 
 security = HTTPBearer()
@@ -166,6 +166,7 @@ async def get_current_user(
 
 async def get_current_active_user(
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
 ) -> User:
     if not current_user.is_active:
         raise HTTPException(
@@ -174,6 +175,27 @@ async def get_current_active_user(
 
     #  SET USER ID IN CONTEXT
     set_current_user_id(current_user.id)
+
+    # P0-1: Super Admin immediately returns, never blocked by tenant state
+    if getattr(current_user, "is_super_admin", False) is True:
+        return current_user
+
+    # Normal user must belong to a company
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not belong to any company.",
+        )
+
+    # Normal user company must exist and be active
+    company = await db.scalar(
+        select(Company).where(Company.id == current_user.company_id)
+    )
+    if not company or not company.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Company is inactive or not found.",
+        )
 
     return current_user
 
@@ -242,12 +264,268 @@ async def require_tenant_admin(
 from fastapi import Depends
 
 
-def require_roles(allowed_roles: Iterable[str]):
-    allowed = list(allowed_roles)
+async def get_effective_user_permissions(
+    db: AsyncSession,
+    user: User,
+) -> set[str]:
+    """
+    Resolves the effective permission codes for the given user from the database.
+
+    Admin-Driven Authorization Model:
+    1. Admin (Super Admin or Tenant Admin where user.role == 'Admin'):
+       - Dynamically resolves ALL permissions available in the permissions catalog (permissions table).
+       - Does NOT rely on a hardcoded permission list or static assignments.
+       - Honors negative user-level overrides (UserPermissionOverride.is_granted == False) if specified.
+    2. Non-Admin Roles (Client, Labour, SiteEngineer, Contractor, Accountant, ProjectManager, Custom Roles):
+       - Start with ZERO implicit permissions (permissions = []).
+       - Effective permissions derive strictly from permissions explicitly assigned by an Admin
+         to this company's role (RolePermission.role_id == company_role.id).
+       - Built-in non-admin roles NEVER inherit global/system fallback permissions.
+       - Applies user-level overrides (is_granted=True adds, is_granted=False removes).
+    """
+    is_admin = (
+        getattr(user, "is_super_admin", False) is True
+        or user.role == UserRole.ADMIN.value
+        or user.role == "Admin"
+    )
+
+    # =========================================================================
+    # A. ADMIN ROLE: Dynamic Full Permission Access from Permissions Catalog
+    # =========================================================================
+    if is_admin:
+        catalog_res = await db.execute(
+            select(Permission.code).where(Permission.code != "*")
+        )
+        effective_permissions: set[str] = set(catalog_res.scalars().all())
+
+        # Check for user-level explicit revocations on this admin user
+        override_res = await db.execute(
+            select(Permission.code)
+            .join(UserPermissionOverride, UserPermissionOverride.permission_id == Permission.id)
+            .where(
+                UserPermissionOverride.user_id == user.id,
+                UserPermissionOverride.is_granted == False,
+            )
+        )
+        revoked = set(override_res.scalars().all())
+        effective_permissions -= revoked
+        for rev in revoked:
+            if "." in rev:
+                mod = rev.split(".")[0]
+                effective_permissions.discard(f"{mod}.*")
+        return effective_permissions
+
+    # =========================================================================
+    # B. NON-ADMIN ROLES: Zero Implicit Access -> Explicit Company Assignments
+    # =========================================================================
+    company_id = user.company_id
+    effective_permissions = set()
+
+    # 1. Resolve company-scoped role permissions if user belongs to a company
+    if company_id is not None:
+        company_role = await db.scalar(
+            select(Role).where(
+                Role.name == user.role,
+                Role.company_id == company_id,
+            )
+        )
+        if company_role is not None:
+            if user.role not in ROLES:
+                res = await db.execute(
+                    select(Permission.code)
+                    .join(RolePermission, RolePermission.permission_id == Permission.id)
+                    .where(
+                        (RolePermission.role_id == company_role.id)
+                        | (
+                            (RolePermission.role == user.role)
+                            & RolePermission.role_id.is_(None)
+                        )
+                    )
+                )
+            else:
+                res = await db.execute(
+                    select(Permission.code)
+                    .join(RolePermission, RolePermission.permission_id == Permission.id)
+                    .where(RolePermission.role_id == company_role.id)
+                )
+            effective_permissions = set(res.scalars().all())
+        elif user.role not in ROLES:
+            # Fallback only for ad-hoc custom/test roles created directly with role_id is None
+            res = await db.execute(
+                select(Permission.code)
+                .join(RolePermission, RolePermission.permission_id == Permission.id)
+                .where(
+                    RolePermission.role == user.role,
+                    RolePermission.role_id.is_(None),
+                )
+            )
+            effective_permissions = set(res.scalars().all())
+    elif user.role not in ROLES:
+        # Fallback for un-scoped standalone test/custom roles created with role_id is None
+        res = await db.execute(
+            select(Permission.code)
+            .join(RolePermission, RolePermission.permission_id == Permission.id)
+            .where(
+                RolePermission.role == user.role,
+                RolePermission.role_id.is_(None),
+            )
+        )
+        effective_permissions = set(res.scalars().all())
+
+    # 2. Query user permission overrides
+    override_res = await db.execute(
+        select(Permission.code, UserPermissionOverride.is_granted)
+        .join(UserPermissionOverride, UserPermissionOverride.permission_id == Permission.id)
+        .where(UserPermissionOverride.user_id == user.id)
+    )
+    overrides = override_res.all()
+    revoked_permissions: set[str] = set()
+
+    for code, is_granted in overrides:
+        if is_granted:
+            effective_permissions.add(code)
+        else:
+            effective_permissions.discard(code)
+            revoked_permissions.add(code)
+
+    # 3. Handle wildcards with revocations (expand wildcards so negative override prunes only target action)
+    if revoked_permissions:
+        # Case A: Global wildcard expansion
+        if "*" in effective_permissions:
+            all_perms_res = await db.execute(
+                select(Permission.code).where(~Permission.code.contains("*"))
+            )
+            all_codes = set(all_perms_res.scalars().all())
+            effective_permissions.update(all_codes)
+            effective_permissions.discard("*")
+
+        # Case B: Module-level wildcard expansion for any revoked module
+        for rev in revoked_permissions:
+            if "." in rev:
+                mod = rev.split(".")[0]
+                mod_wc = f"{mod}.*"
+                if mod_wc in effective_permissions:
+                    mod_perms_res = await db.execute(
+                        select(Permission.code).where(
+                            Permission.module == mod,
+                            ~Permission.code.contains("*"),
+                        )
+                    )
+                    mod_codes = set(mod_perms_res.scalars().all())
+                    effective_permissions.update(mod_codes)
+                    effective_permissions.discard(mod_wc)
+
+        # Subtract all revoked permissions
+        effective_permissions -= revoked_permissions
+
+        # Ensure no wildcard remains for any module that has revocations
+        effective_permissions.discard("*")
+        for rev in revoked_permissions:
+            if "." in rev:
+                mod = rev.split(".")[0]
+                effective_permissions.discard(f"{mod}.*")
+
+    return effective_permissions
+
+
+def has_permission(effective_permissions: set[str], required: str) -> bool:
+    """
+    Checks if the required permission is satisfied by the effective permissions set.
+    Supports exact match, global wildcard '*', and module-level wildcard 'module.*'.
+    """
+    if "*" in effective_permissions:
+        return True
+    if required in effective_permissions:
+        return True
+    module = required.split(".")[0] if "." in required else required
+    if f"{module}.*" in effective_permissions:
+        return True
+    return False
+
+
+def require_permission(permission: str):
+    """
+    FastAPI dependency factory enforcing a single granular permission.
+    Evaluates Super Admin bypass and database-driven effective permissions.
+    """
+    async def _dependency(
+        current_user: User = Depends(get_current_active_user),
+        db: AsyncSession = Depends(get_db_session),
+    ) -> User:
+        if getattr(current_user, "is_super_admin", False) is True:
+            return current_user
+
+        effective_perms = await get_effective_user_permissions(db, current_user)
+
+        if not has_permission(effective_perms, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "message": "Insufficient permissions",
+                    "required": [permission],
+                    "missing": [permission],
+                },
+            )
+        return current_user
+
+    _dependency.__name__ = f"require_permission_{permission.replace('.', '_')}"
+    return _dependency
+
+
+def require_permissions(required_permissions: list[str]):
+    """
+    FastAPI dependency factory enforcing multiple permissions (all must be satisfied).
+    Evaluates Super Admin bypass and database-driven effective permissions.
+    """
+    async def _dependency(
+        current_user: User = Depends(get_current_active_user),
+        db: AsyncSession = Depends(get_db_session),
+    ) -> User:
+        if getattr(current_user, "is_super_admin", False) is True:
+            return current_user
+
+        effective_perms = await get_effective_user_permissions(db, current_user)
+
+        missing = [
+            p for p in required_permissions
+            if not has_permission(effective_perms, p)
+        ]
+
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "message": "Insufficient permissions",
+                    "required": required_permissions,
+                    "missing": missing,
+                },
+            )
+        return current_user
+
+    _dependency.__name__ = "permission_dependency"
+    return _dependency
+
+
+def require_roles(
+    allowed_roles: Optional[Iterable[str]] = None,
+    permission: Optional[str] = None,
+):
+    """
+    Role dependency supporting backward compatibility and permission-first authorization.
+    If `permission` is provided, authorization is determined strictly by the database permission engine.
+    If `permission` is omitted, falls back to role name check for unmigrated routes.
+    """
+    if permission:
+        return require_permission(permission)
+
+    allowed = list(allowed_roles) if allowed_roles else []
 
     async def _dependency(
         current_user: User = Depends(get_current_active_user),
     ) -> User:
+        if current_user.is_super_admin:
+            return current_user
+
         if current_user.role not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -256,60 +534,6 @@ def require_roles(allowed_roles: Iterable[str]):
         return current_user
 
     _dependency.__name__ = "role_dependency"
-    return _dependency
-
-
-def require_permissions(required_permissions: list[str]):
-
-    async def _dependency(
-        current_user: User = Depends(get_current_active_user),
-        db: AsyncSession = Depends(get_db_session),
-    ) -> User:
-
-        # -------------------------------------------------
-        # ADMIN BYPASS
-        # -------------------------------------------------
-
-        if current_user.role == UserRole.ADMIN.value:
-            return current_user
-
-        # -------------------------------------------------
-        # FETCH USER ROLE PERMISSIONS
-        # -------------------------------------------------
-
-        result = await db.execute(
-            select(Permission.code)
-            .join(RolePermission, RolePermission.permission_id == Permission.id)
-            .where(RolePermission.role == current_user.role)
-        )
-
-        user_permissions = set(result.scalars().all())
-
-        # -------------------------------------------------
-        # CHECK REQUIRED PERMISSIONS
-        # -------------------------------------------------
-
-        missing_permissions = [
-            permission
-            for permission in required_permissions
-            if permission not in user_permissions
-        ]
-
-        if missing_permissions:
-
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "message": "Insufficient permissions",
-                    "required": required_permissions,
-                    "missing": missing_permissions,
-                },
-            )
-
-        return current_user
-
-    _dependency.__name__ = "permission_dependency"
-
     return _dependency
 
 

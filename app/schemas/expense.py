@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from datetime import date
 from typing import Optional
 
@@ -30,8 +30,7 @@ class ExpenseUpdate(BaseModel):
 class ExpenseOut(ExpenseBase):
     id: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
         
     boq_item_id: Optional[int]
 

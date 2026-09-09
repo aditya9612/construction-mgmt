@@ -776,6 +776,10 @@ class QCRecord(Base, TimestampMixin):
 
     __table_args__ = (Index("idx_qc_project", "project_id"),)
 
+    @property
+    def report_file(self):
+        return self.report_file_url
+
 
 # ===================== SAFETY =====================
 

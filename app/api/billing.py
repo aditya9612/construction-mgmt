@@ -21,7 +21,8 @@ from app.utils.common import assert_project_access
 
 from app.models.approval import Approval
 from app.models.user import User
-from app.core.dependencies import get_current_active_user, require_roles
+from app.core.dependencies import get_current_active_user, require_roles, require_permission
+from app.core.logger import logger
 
 from app.models.user import UserRole
 
@@ -55,7 +56,7 @@ router = APIRouter(prefix="/billing", tags=["Billing"])
 async def create_ra_bill(
     payload: RABillCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.create")),
 ):
     from app.models.work_order import WorkOrder
     from app.models.final_measurement import FinalMeasurement
@@ -259,7 +260,7 @@ async def list_ra_bills(
     status: Optional[str] = None,
     pagination: PaginationParams = Depends(),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_READ_ROLES)),
+    current_user: User = Depends(require_permission("billing.view")),
 ):
     from app.models.work_order import WorkOrder
     from app.models.project import Project
@@ -360,7 +361,7 @@ async def list_ra_bills(
 async def get_ra_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_READ_ROLES)),
+    current_user: User = Depends(require_permission("billing.view")),
 ):
     from app.models.work_order import WorkOrder
 
@@ -417,7 +418,7 @@ async def update_ra_bill(
     id: int,
     payload: RABillUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.edit")),
 ):
     from app.models.work_order import WorkOrder
 
@@ -508,7 +509,7 @@ async def update_ra_bill(
 async def delete_ra_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.delete")),
 ):
     obj = await db.get(RABill, id)
     if not obj:
@@ -535,7 +536,7 @@ async def delete_ra_bill(
 async def submit_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.edit")),
 ):
     obj = await db.get(RABill, id)
     if not obj:
@@ -557,7 +558,7 @@ async def submit_bill(
 async def approve_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.approve")),
 ):
     obj = await db.get(RABill, id)
     if not obj:
@@ -593,44 +594,40 @@ async def approve_bill(
     db.add(je)
     await db.flush()
 
-    ar_acc = await get_accounts_receivable(db)
-    rev_acc = await get_revenue_account(db)
+    project = await db.get(Project, obj.project_id)
+    company_id = (
+        getattr(project, "company_id", None)
+        or getattr(current_user, "company_id", None)
+    )
 
-    # db.add(JournalLine(entry_id=je.id, account_id=ar_acc.id, debit=obj.net_payable, credit=Decimal(0)))
+    ar_acc = await get_accounts_receivable(db, company_id=company_id)
+    rev_acc = await get_revenue_account(db, company_id=company_id)
+
     db.add(
         JournalLine(
             entry_id=je.id,
             account_id=ar_acc.id,
             debit=obj.total_amount,
-            credit=Decimal(0)
+            credit=Decimal(0),
         )
     )
 
-    # Revenue is gross amount minus GST, wait, the instruction says:
-    # Credit: Project Revenue
-    # Credit: GST Payable if applicable
-    # If net_payable is the total, total_with_gst is the total. Let's look at schema to be sure, or just use net_payable and gross_amount.
-    # Instruction example for invoice: 118000 total, 100000 revenue, 18000 GST.
-    
-    db.add(JournalLine(entry_id=je.id, account_id=rev_acc.id, debit=Decimal(0), credit=obj.gross_amount))
-    
-    # if obj.gst_amount and obj.gst_amount > 0:
-    #     from app.utils.accounting import resolve_tax_accounts
-    #     gst_acc = await resolve_tax_accounts(db, "output_gst")
-    #     db.add(JournalLine(entry_id=je.id, account_id=gst_acc.id, debit=Decimal(0), credit=obj.gst_amount))
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=rev_acc.id,
+            debit=Decimal(0),
+            credit=obj.gross_amount,
+        )
+    )
 
-    gst_amount = (
-        obj.net_amount * obj.gst_percent
-    ) / 100
-
+    gst_amount = (obj.net_amount * obj.gst_percent) / 100
 
     if gst_amount > 0:
-
         from app.utils.accounting import resolve_tax_accounts
 
         gst_acc = await resolve_tax_accounts(
-            db,
-            "output_gst"
+            db, "output_gst", company_id=company_id
         )
 
         db.add(
@@ -638,11 +635,16 @@ async def approve_bill(
                 entry_id=je.id,
                 account_id=gst_acc.id,
                 debit=Decimal(0),
-                credit=gst_amount
+                credit=gst_amount,
             )
         )
 
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("Failed to approve RA bill id=%s: %s", id, exc)
+        raise HTTPException(status_code=500, detail="Failed to approve RA bill")
 
     return {"message": "Approved"}
 
@@ -651,7 +653,7 @@ async def approve_bill(
 async def pay_bill(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(BILLING_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("billing.edit")),
 ):
     obj = await db.get(RABill, id)
     if not obj:

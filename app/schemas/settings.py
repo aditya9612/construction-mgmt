@@ -11,6 +11,7 @@ from app.core.validators import (
 )
 from pydantic import (
     BaseModel,
+    ConfigDict,
     field_validator,
     EmailStr,
     HttpUrl,
@@ -51,8 +52,7 @@ class UserSettingsOut(BaseSchema):
     invoice_format: Optional[str]
     payment_terms: Optional[str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class CompanySettingsUpdate(BaseModel):
 
@@ -223,5 +223,4 @@ class CompanySettingsOut(BaseModel):
     tds_payable_account_id: Optional[int] = None
     retention_payable_account_id: Optional[int] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

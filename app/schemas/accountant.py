@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List
@@ -490,9 +491,32 @@ class VendorBillOut(VendorBillCreate):
     class Config:
         from_attributes = True
 
+class VendorBillApprovalStatus(str, Enum):
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+
 class VendorBillApprovalRequest(BaseModel):
-    status: str # "APPROVED" or "REJECTED"
-    notes: Optional[str] = None
+    status: VendorBillApprovalStatus = Field(
+        ...,
+        description="Approval status: APPROVED or REJECTED",
+        json_schema_extra={"example": "APPROVED"},
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Approval or rejection notes",
+    )
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, v: object) -> object:
+        if isinstance(v, str):
+            v_clean = v.strip().upper()
+            if v_clean in ("OK", "ACCEPT", "ACCEPTED", "APPROVE", "APPROVED"):
+                return VendorBillApprovalStatus.APPROVED
+            if v_clean in ("REJECT", "REJECTED"):
+                return VendorBillApprovalStatus.REJECTED
+        return v
 
 class VendorBillPaymentRequest(BaseModel):
     amount: float

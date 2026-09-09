@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Optional
 from decimal import Decimal
 from datetime import date, datetime
@@ -72,8 +72,7 @@ class InvoiceOut(BaseModel):
     gst_document_url: Optional[str] = None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class LabourInvoiceCreate(BaseModel):

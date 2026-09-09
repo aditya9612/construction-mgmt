@@ -482,6 +482,8 @@ from app.models.master_data import LabourType, MaterialMaster
 from app.models.material import Material
 from app.models.user import User, UserRole, UserAttendance, ActivityLog
 from app.utils.common import assert_project_access
+from app.utils.helpers import NotFoundError
+from app.schemas.report import ProjectFinancialHealthReportDTO
 
 
 from app.core.dependencies import require_feature
@@ -881,6 +883,279 @@ async def procurement_efficiency_report(
         if f.payment_status: csv_builder.add_row(["Payment Status", f.payment_status])
         return csv_builder.build()
     raise HTTPException(status_code=400, detail="Invalid format. Supported: json, pdf, csv")
+
+
+# =====================================================================
+# PROJECT FINANCIAL HEALTH REPORT
+# =====================================================================
+@router.get(
+    "/project-financial-health",
+    response_model=ProjectFinancialHealthReportDTO,
+    responses={
+        200: {
+            "content": {
+                "application/json": {},
+                "application/pdf": {},
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {},
+                "text/csv": {},
+            }
+        }
+    },
+)
+@router.get(
+    "/financial-health",
+    response_model=ProjectFinancialHealthReportDTO,
+    include_in_schema=False,
+)
+async def project_financial_health_report(
+    project_id: int = Query(..., description="Project ID (required)"),
+    date_from: Optional[date] = Query(None, description="Start date filter"),
+    date_to: Optional[date] = Query(None, description="End date filter"),
+    format: str = Query("json", description="Export format: json, pdf, excel, xlsx, csv"),
+    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Generate comprehensive Project Financial Health Report.
+
+    Query parameters:
+    - project_id: int (REQUIRED)
+    - date_from: Optional[date]
+    - date_to: Optional[date]
+    - format: str (default 'json', supports 'json', 'pdf', 'excel', 'xlsx', 'csv')
+    """
+    # 1. Date range validation
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=400,
+            detail="date_from cannot be after date_to",
+        )
+
+    # 2. Format validation
+    fmt = format.lower().strip()
+    if fmt not in ("json", "pdf", "excel", "xlsx", "csv"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid format. Supported: json, pdf, excel, xlsx, csv",
+        )
+
+    # 3. Project lookup & Tenant Isolation / Project Access Check
+    project = await db.get(m.Project, project_id)
+    if not project:
+        raise NotFoundError("Project not found")
+
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
+    # 4. Generate report via ReportService
+    from app.services.report_service import ReportService
+
+    filters = {
+        "project_id": project_id,
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+    report_dto = await ReportService.get_project_financial_health_report(db, filters)
+
+    # 5. Format responses
+    if fmt == "json":
+        return report_dto
+
+    if fmt == "pdf":
+        b = PdfReportBuilder(
+            title="PROJECT FINANCIAL HEALTH REPORT",
+            subtitle=f"Project: {report_dto.summary.project_name} (ID: {project_id})",
+        )
+        b.add_info_table(
+            [
+                (
+                    "Project Name", report_dto.summary.project_name,
+                    "Project ID", str(report_dto.summary.project_id),
+                ),
+                (
+                    "Budget Amount", f"Rs. {report_dto.summary.budget_amount:,.2f}",
+                    "Financial Status", report_dto.summary.financial_health_status,
+                ),
+                (
+                    "Health Score", f"{report_dto.summary.health_score} / 100",
+                    "Profit Margin", f"{report_dto.summary.profit_margin_percent:.2f}%",
+                ),
+            ],
+            heading="PROJECT & HEALTH SUMMARY",
+        )
+        b.add_section_table(
+            "Financial Overview",
+            ["Metric", "Amount"],
+            [
+                ["Budget Amount", f"Rs. {report_dto.summary.budget_amount:,.2f}"],
+                ["Total Revenue (Certified)", f"Rs. {report_dto.summary.total_revenue:,.2f}"],
+                ["Total Expenses", f"Rs. {report_dto.summary.total_expenses:,.2f}"],
+                ["Net Profit", f"Rs. {report_dto.summary.net_profit:,.2f}"],
+                ["Profit Margin", f"{report_dto.summary.profit_margin_percent:.2f}%"],
+                ["Budget Utilization", f"{report_dto.summary.budget_utilization_percent:.2f}%"],
+                ["Health Score", f"{report_dto.summary.health_score} / 100 ({report_dto.summary.financial_health_status})"],
+            ],
+        )
+        b.add_section_table(
+            "Billing Overview",
+            ["Metric", "Value"],
+            [
+                ["Total Billed", f"Rs. {report_dto.billing_overview.total_billed:,.2f}"],
+                ["Total Certified", f"Rs. {report_dto.billing_overview.total_certified:,.2f}"],
+                ["Total Received", f"Rs. {report_dto.billing_overview.total_received:,.2f}"],
+                ["Pending from Client", f"Rs. {report_dto.billing_overview.total_pending_client:,.2f}"],
+                ["Total RA Bills", str(report_dto.billing_overview.ra_bills_count)],
+            ],
+        )
+        status_rows = [
+            [status_name, str(metric.count), f"Rs. {metric.amount:,.2f}"]
+            for status_name, metric in report_dto.billing_overview.status_breakdown.items()
+        ]
+        b.add_section_table("Billing Status Breakdown", ["Status", "Count", "Amount"], status_rows)
+
+        b.add_section_table(
+            "Expenses Overview",
+            ["Source", "Spend Amount"],
+            [
+                ["Vendor Bills Spend", f"Rs. {report_dto.expenses_overview.vendor_bills_spend:,.2f}"],
+                ["Direct Expenses Spend", f"Rs. {report_dto.expenses_overview.direct_expenses_spend:,.2f}"],
+                ["Total Expenses", f"Rs. {report_dto.expenses_overview.total_expenses:,.2f}"],
+            ],
+        )
+        cat_rows = [
+            [c.category, f"Rs. {c.amount:,.2f}", f"{c.percentage:.2f}%"]
+            for c in report_dto.expenses_overview.by_category
+        ]
+        b.add_section_table("Direct Expenses by Category", ["Category", "Amount", "% Share"], cat_rows)
+
+        b.add_section_table(
+            "Pending Payments & Cashflow",
+            ["Metric", "Bills Count", "Amount"],
+            [
+                ["Client Receivables", str(report_dto.pending_payments.receivables.pending_bills_count), f"Rs. {report_dto.pending_payments.receivables.total_receivable:,.2f}"],
+                ["Vendor Payables", str(report_dto.pending_payments.payables.pending_vendor_bills_count), f"Rs. {report_dto.pending_payments.payables.vendor_payables:,.2f}"],
+                ["Net Cashflow Position", "-", f"Rs. {report_dto.pending_payments.net_cashflow_position:,.2f}"],
+            ],
+        )
+
+        recent_b_rows = [
+            [b.bill_number, b.work_description[:30], b.bill_date, f"Rs. {b.total_amount:,.2f}", b.status]
+            for b in report_dto.billing_overview.recent_bills
+        ]
+        b.add_section_table("Recent RA Bills", ["Bill #", "Description", "Date", "Amount", "Status"], recent_b_rows)
+
+        recent_e_rows = [
+            [e.category, e.description[:30], e.expense_date, e.payment_mode, f"Rs. {e.amount:,.2f}"]
+            for e in report_dto.expenses_overview.recent_expenses
+        ]
+        b.add_section_table("Recent Direct Expenses", ["Category", "Description", "Date", "Mode", "Amount"], recent_e_rows)
+
+        stream = b.build()
+        return StreamingResponse(
+            stream,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=financial_health_{project_id}.pdf"},
+        )
+
+    if fmt in ("excel", "xlsx"):
+        eb = ExcelReportBuilder(
+            title="Project Financial Health Report",
+            project_line=f"Project: {report_dto.summary.project_name} (ID: {project_id})",
+        )
+        eb.add_summary_row("Project ID", report_dto.summary.project_id)
+        eb.add_summary_row("Project Name", report_dto.summary.project_name)
+        eb.add_summary_row("Budget Amount", float(report_dto.summary.budget_amount), is_currency=True)
+        eb.add_summary_row("Total Revenue (Certified)", float(report_dto.summary.total_revenue), is_currency=True)
+        eb.add_summary_row("Total Expenses", float(report_dto.summary.total_expenses), is_currency=True)
+        eb.add_summary_row("Net Profit", float(report_dto.summary.net_profit), is_currency=True)
+        eb.add_summary_row("Profit Margin (%)", f"{report_dto.summary.profit_margin_percent:.2f}%")
+        eb.add_summary_row("Budget Utilization (%)", f"{report_dto.summary.budget_utilization_percent:.2f}%")
+        eb.add_summary_row("Financial Health Status", report_dto.summary.financial_health_status)
+        eb.add_summary_row("Health Score (0-100)", report_dto.summary.health_score)
+        eb.build_summary_sheet()
+
+        # Sheet: Billing
+        billing_headers = ["Metric / Bill Number", "Description / Status", "Date", "Amount (Rs.)", "Count / Status"]
+        billing_rows = [
+            ["Total Billed", "All RA Bills", "", float(report_dto.billing_overview.total_billed), report_dto.billing_overview.ra_bills_count],
+            ["Total Certified", "Approved + Paid", "", float(report_dto.billing_overview.total_certified), ""],
+            ["Total Received", "Paid", "", float(report_dto.billing_overview.total_received), ""],
+            ["Pending from Client", "Certified - Received", "", float(report_dto.billing_overview.total_pending_client), ""],
+        ]
+        for s_name, s_metric in report_dto.billing_overview.status_breakdown.items():
+            billing_rows.append([f"Status: {s_name}", "", "", float(s_metric.amount), s_metric.count])
+        for b in report_dto.billing_overview.recent_bills:
+            billing_rows.append([b.bill_number, b.work_description, b.bill_date, float(b.total_amount), b.status])
+        eb.add_data_sheet("Billing", billing_headers, billing_rows, currency_cols=[4], title="Billing Overview & Recent Bills")
+
+        # Sheet: Expenses
+        exp_headers = ["Category / Source", "Description", "Date", "Payment Mode", "Amount (Rs.)", "% Share"]
+        exp_rows = [
+            ["Vendor Bills Spend", "Total Vendor Bills Spend (Excl. Rejected)", "", "", float(report_dto.expenses_overview.vendor_bills_spend), ""],
+            ["Direct Expenses Spend", "Total Direct Expenses Spend", "", "", float(report_dto.expenses_overview.direct_expenses_spend), ""],
+            ["Total Expenses", "Vendor Spend + Direct Expenses", "", "", float(report_dto.expenses_overview.total_expenses), "100.00%"],
+        ]
+        for c in report_dto.expenses_overview.by_category:
+            exp_rows.append([c.category, "Category Total", "", "", float(c.amount), f"{c.percentage:.2f}%"])
+        for e in report_dto.expenses_overview.recent_expenses:
+            exp_rows.append([e.category, e.description, e.expense_date, e.payment_mode, float(e.amount), ""])
+        eb.add_data_sheet("Expenses", exp_headers, exp_rows, currency_cols=[5], title="Expenses Overview & Recent Expenses")
+
+        # Sheet: Cashflow
+        cf_headers = ["Component", "Type", "Pending Bills Count", "Amount (Rs.)"]
+        cf_rows = [
+            ["Client Receivables", "Asset", report_dto.pending_payments.receivables.pending_bills_count, float(report_dto.pending_payments.receivables.total_receivable)],
+            ["Vendor Payables", "Liability", report_dto.pending_payments.payables.pending_vendor_bills_count, float(report_dto.pending_payments.payables.vendor_payables)],
+            ["Net Cashflow Position", "Net (Receivables - Payables)", "", float(report_dto.pending_payments.net_cashflow_position)],
+        ]
+        eb.add_data_sheet("Cashflow", cf_headers, cf_rows, currency_cols=[4], title="Pending Payments & Cashflow Position")
+
+        stream = eb.build()
+        return StreamingResponse(
+            stream,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=financial_health_{project_id}.xlsx"},
+        )
+
+    if fmt == "csv":
+        from app.utils.csv_report_builder import CsvReportBuilder
+
+        csv_builder = CsvReportBuilder(
+            filename=f"financial_health_{project_id}.csv",
+            headers=["Section", "Metric", "Value", "Notes"],
+        )
+        csv_builder.add_row(["Summary", "Project ID", str(report_dto.summary.project_id), ""])
+        csv_builder.add_row(["Summary", "Project Name", report_dto.summary.project_name, ""])
+        csv_builder.add_row(["Summary", "Budget Amount", str(report_dto.summary.budget_amount), ""])
+        csv_builder.add_row(["Summary", "Total Revenue", str(report_dto.summary.total_revenue), "Certified RABills"])
+        csv_builder.add_row(["Summary", "Total Expenses", str(report_dto.summary.total_expenses), "Vendor + Direct Expenses"])
+        csv_builder.add_row(["Summary", "Net Profit", str(report_dto.summary.net_profit), "Revenue - Expenses"])
+        csv_builder.add_row(["Summary", "Profit Margin (%)", str(report_dto.summary.profit_margin_percent), ""])
+        csv_builder.add_row(["Summary", "Budget Utilization (%)", str(report_dto.summary.budget_utilization_percent), ""])
+        csv_builder.add_row(["Summary", "Financial Health Status", report_dto.summary.financial_health_status, ""])
+        csv_builder.add_row(["Summary", "Health Score", str(report_dto.summary.health_score), "0-100 scale"])
+
+        csv_builder.add_row([])
+        csv_builder.add_row(["Billing", "Total Billed", str(report_dto.billing_overview.total_billed), ""])
+        csv_builder.add_row(["Billing", "Total Certified", str(report_dto.billing_overview.total_certified), ""])
+        csv_builder.add_row(["Billing", "Total Received", str(report_dto.billing_overview.total_received), ""])
+        csv_builder.add_row(["Billing", "Pending from Client", str(report_dto.billing_overview.total_pending_client), ""])
+        csv_builder.add_row(["Billing", "RA Bills Count", str(report_dto.billing_overview.ra_bills_count), ""])
+        for s_name, s_met in report_dto.billing_overview.status_breakdown.items():
+            csv_builder.add_row(["Billing Status", s_name, str(s_met.amount), f"Count: {s_met.count}"])
+
+        csv_builder.add_row([])
+        csv_builder.add_row(["Expenses", "Vendor Bills Spend", str(report_dto.expenses_overview.vendor_bills_spend), ""])
+        csv_builder.add_row(["Expenses", "Direct Expenses Spend", str(report_dto.expenses_overview.direct_expenses_spend), ""])
+        csv_builder.add_row(["Expenses", "Total Expenses", str(report_dto.expenses_overview.total_expenses), ""])
+        for c in report_dto.expenses_overview.by_category:
+            csv_builder.add_row(["Expense Category", c.category, str(c.amount), f"{c.percentage:.2f}%"])
+
+        csv_builder.add_row([])
+        csv_builder.add_row(["Cashflow", "Client Receivables", str(report_dto.pending_payments.receivables.total_receivable), f"Pending bills: {report_dto.pending_payments.receivables.pending_bills_count}"])
+        csv_builder.add_row(["Cashflow", "Vendor Payables", str(report_dto.pending_payments.payables.vendor_payables), f"Pending bills: {report_dto.pending_payments.payables.pending_vendor_bills_count}"])
+        csv_builder.add_row(["Cashflow", "Net Cashflow Position", str(report_dto.pending_payments.net_cashflow_position), ""])
+
+        return csv_builder.build()
+
 
 @router.get("/audit/pdf")
 async def export_audit_pdf(

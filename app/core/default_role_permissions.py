@@ -1,240 +1,76 @@
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.rbac import Permission, RolePermission
 from app.models.user import UserRole
 
 
-DEFAULT_ROLE_PERMISSIONS = {
+# =============================================================================
+# ADMIN-DRIVEN ROLE PERMISSION DEFAULTS
+# =============================================================================
+# Under the Admin-driven authorization model:
+# - Admin role has access to ALL permissions available in the permissions catalog.
+# - All other roles (Client, Labour, SiteEngineer, Contractor, Accountant,
+#   ProjectManager, custom roles) have ZERO hardcoded or pre-assigned permissions.
+# - Effective permissions for non-admin roles derive strictly from explicit Admin assignment.
+# =============================================================================
 
-    # =====================================================
-    # ADMIN
-    # =====================================================
-
-    UserRole.ADMIN.value: [
-        "*"
-    ],
-
-    # =====================================================
-    # PROJECT MANAGER
-    # =====================================================
-
-    UserRole.PROJECT_MANAGER.value: [
-
-        "projects.view",
-        "projects.create",
-        "projects.edit",
-        "projects.approve",
-        "projects.export",
-
-        "tasks.view",
-        "tasks.create",
-        "tasks.edit",
-        "tasks.assign",
-
-        "boq.view",
-        "boq.create",
-        "boq.edit",
-        "boq.approve",
-        "boq.export",
-
-        "materials.view",
-
-        "labour.view",
-
-        "attendance.view",
-
-        "billing.view",
-        "billing.approve",
-
-        "reports.view",
-        "reports.export",
-
-        "documents.view",
-        "documents.upload",
-
-
-        # AGREEMENTS
-        "agreements.view",
-        "agreements.create",
-
-
-    ],
-
-    # =====================================================
-    # SITE ENGINEER
-    # =====================================================
-
-    UserRole.SITE_ENGINEER.value: [
-
-        "projects.view",
-
-        "tasks.view",
-        "tasks.edit",
-
-        "materials.view",
-
-        "labour.view",
-
-        "attendance.view",
-        "attendance.manage",
-
-        "documents.view",
-        "documents.upload",
-
-        "reports.view",
-
-        "agreements.view",
-    ],
-
-    # =====================================================
-    # CONTRACTOR
-    # =====================================================
-
-    UserRole.CONTRACTOR.value: [
-
-        "projects.view",
-
-        "tasks.view",
-
-        "labour.view",
-
-        "attendance.view",
-
-        "billing.view",
-
-        "documents.view",
-    ],
-
-    # =====================================================
-    # ACCOUNTANT
-    # =====================================================
-
-    UserRole.ACCOUNTANT.value: [
-
-        "billing.view",
-        "billing.create",
-        "billing.edit",
-        "billing.approve",
-        "billing.export",
-
-        "reports.view",
-        "reports.export",
-
-        "labour.view",
-
-        "attendance.view",
-
-        "agreements.view",
-    ],
-
-    # =====================================================
-    # CLIENT
-    # =====================================================
-
-    UserRole.CLIENT.value: [
-
-        "projects.view",
-
-        "tasks.view",
-
-        "billing.view",
-
-        "reports.view",
-
-        "documents.view",
-
-        "agreements.view",
-    ],
-
-    # =====================================================
-    # LABOUR
-    # =====================================================
-
-    UserRole.LABOUR.value: [
-
-        "attendance.view",
-
-        "tasks.view",
-    ],
+DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
+    UserRole.ADMIN.value: ["*"],
 }
 
 
 async def assign_default_role_permissions(
     db: AsyncSession,
-):
-
+) -> dict:
+    """
+    Initializes system role permissions:
+    1. Ensures all obsolete global non-admin mappings (role_id IS NULL and role != 'Admin')
+       are purged so non-admin roles start with zero implicit permissions.
+    2. Maps Admin to all available catalog permissions for global scope.
+    Non-admin roles (Client, Labour, SiteEngineer, Contractor, Accountant, ProjectManager)
+    receive ZERO default permissions and must be explicitly configured by an Admin.
+    """
     # -----------------------------------------------------
-    # FETCH ALL PERMISSIONS
+    # 1. PURGE OBSOLETE GLOBAL NON-ADMIN MAPPINGS
     # -----------------------------------------------------
-
-    result = await db.execute(
-        select(Permission)
+    await db.execute(
+        delete(RolePermission).where(
+            RolePermission.role_id.is_(None),
+            RolePermission.role != UserRole.ADMIN.value,
+            RolePermission.role != "Admin",
+        )
     )
 
+    # -----------------------------------------------------
+    # 2. FETCH ALL ACTIVE CATALOG PERMISSIONS
+    # -----------------------------------------------------
+    result = await db.execute(select(Permission))
     all_permissions = result.scalars().all()
 
-    permission_map = {
-        p.code: p.id
-        for p in all_permissions
-    }
-
-    created = 0
-
     # -----------------------------------------------------
-    # LOOP ROLES
+    # 3. ENSURE ADMIN GLOBAL MAPPINGS
     # -----------------------------------------------------
-
-    for role, permissions in DEFAULT_ROLE_PERMISSIONS.items():
-
-        # DELETE OLD
-        await db.execute(
-            RolePermission.__table__.delete().where(
-                RolePermission.role == role
-            )
+    await db.execute(
+        delete(RolePermission).where(
+            RolePermission.role_id.is_(None),
+            (RolePermission.role == UserRole.ADMIN.value) | (RolePermission.role == "Admin"),
         )
+    )
 
-        # ADMIN => ALL
-        if "*" in permissions:
-
-            mappings = [
-                RolePermission(
-                    role=role,
-                    permission_id=p.id,
-                )
-                for p in all_permissions
-            ]
-
-            db.add_all(mappings)
-
-            created += len(mappings)
-
-            continue
-
-        # NORMAL ROLE
-        mappings = []
-
-        for code in permissions:
-
-            permission_id = permission_map.get(code)
-
-            if not permission_id:
-                continue
-
-            mappings.append(
-                RolePermission(
-                    role=role,
-                    permission_id=permission_id,
-                )
-            )
-
-        db.add_all(mappings)
-
-        created += len(mappings)
+    admin_mappings = [
+        RolePermission(
+            role=UserRole.ADMIN.value,
+            permission_id=p.id,
+            role_id=None,
+        )
+        for p in all_permissions
+    ]
+    db.add_all(admin_mappings)
 
     await db.commit()
 
     return {
-        "message": "Default role permissions assigned successfully",
-        "created": created,
+        "message": "Role permissions initialized: Admin has full catalog access, non-admin roles require explicit assignment",
+        "admin_permissions_count": len(admin_mappings),
     }

@@ -42,6 +42,7 @@ from app.schemas.user import UserOut
 from app.utils.helpers import AppError, NotFoundError, ConflictError, BadRequestError
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.services.entitlement import get_entitlement_service
+from app.utils.accounting import seed_company_chart_of_accounts
 
 
 class SuperAdminService:
@@ -235,6 +236,10 @@ class SuperAdminService:
             company_name=company.name,
         )
         db.add(settings)
+        await db.flush()
+
+        # Seed Standard Chart of Accounts for new company
+        await seed_company_chart_of_accounts(db, company.id)
 
         # Create default Trial Subscription or assigned Plan
         plan = None

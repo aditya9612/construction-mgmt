@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 from typing import Optional
 from decimal import Decimal
 
@@ -43,6 +43,14 @@ class WorkOrderOut(BaseModel):
     status: str
     quotation_id: Optional[int]
 
-    class Config:
-        from_attributes = True
-        json_encoders = {Decimal: float}
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer(
+        "total_quantity",
+        "completed_quantity",
+        "rate",
+        "total_amount",
+        when_used="json",
+    )
+    def serialize_decimal(self, v: Optional[Decimal]) -> Optional[float]:
+        return float(v) if v is not None else None

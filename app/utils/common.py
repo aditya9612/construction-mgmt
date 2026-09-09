@@ -3,7 +3,7 @@ from sqlalchemy import select, func
 import re
 from app.models import project as m
 from app.models.user import User, UserRole
-from app.utils.helpers import PermissionDeniedError
+from app.utils.helpers import PermissionDeniedError, NotFoundError
 from app.models.contractor import ContractorProject
 from app.models.project import ProjectMember
 from sqlalchemy import select, func
@@ -92,9 +92,9 @@ async def validate_contractor_access(
     from app.models.contractor import Contractor
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
-        raise PermissionDeniedError("Access denied")
+        raise NotFoundError("Contractor not found")
     if current_user.company_id is not None and contractor.company_id != current_user.company_id:
-        raise PermissionDeniedError("Access denied")
+        raise NotFoundError("Contractor not found")
 
     result = await db.execute(
         select(ContractorProject.project_id).where(
@@ -104,6 +104,10 @@ async def validate_contractor_access(
     contractor_project_ids = [r[0] for r in result.all()]
 
     if current_user.role == UserRole.ADMIN.value:
+        return
+
+    # If contractor has no project assignments yet, company-level access suffices
+    if not contractor_project_ids:
         return
 
     result = await db.execute(

@@ -7,7 +7,7 @@ from app.models import alert as m
 from app.schemas import alert as s
 
 from app.models.user import User
-from app.core.dependencies import get_current_active_user
+from app.core.dependencies import get_current_active_user, require_permission
 
 from app.utils.helpers import NotFoundError
 
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/alerts", tags=["Alerts"])
 @router.post("", response_model=s.AlertOut)
 async def create_alert(
     payload: s.AlertCreate,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("alerts.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     obj = m.Alert(**payload.model_dump())

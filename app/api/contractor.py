@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select
 from decimal import Decimal
 from datetime import date
-from app.core.dependencies import get_current_active_user, require_roles
+from app.core.dependencies import get_current_active_user, require_roles, require_permission
 from app.models.user import User, UserRole
 from app.db.session import get_db_session
 from app.models.contractor import Contractor, ContractorProject
@@ -62,7 +62,7 @@ def build_response(contractor: Contractor) -> ContractorOut:
 async def create_contractor(
     data: ContractorCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_CREATE_ROLES)),
+    current_user: User = Depends(require_permission("contractors.create")),
 ):
     logger.info(f"Creating contractor name={data.name}")
 
@@ -94,7 +94,7 @@ async def pending_report(
     limit: int = 20,
     offset: int = 0,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     params = PaginationParams(limit=limit, offset=offset).normalized()
 
@@ -106,8 +106,8 @@ async def pending_report(
 
     if current_user.role != UserRole.ADMIN:
         query = (
-            query.join(ContractorProject)
-            .join(ProjectMember)
+            query.join(ContractorProject, Contractor.id == ContractorProject.contractor_id)
+            .join(ProjectMember, ContractorProject.project_id == ProjectMember.project_id)
             .where(ProjectMember.user_id == current_user.id)
             .distinct()
         )
@@ -140,16 +140,18 @@ async def list_contractors(
     offset: int = 0,
     search: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     params = PaginationParams(limit=limit, offset=offset, search=search).normalized()
 
     query = select(Contractor)
+    if current_user.company_id is not None:
+        query = query.where(Contractor.company_id == current_user.company_id)
 
     if current_user.role != UserRole.ADMIN:
         query = (
-            query.join(ContractorProject)
-            .join(ProjectMember)
+            query.join(ContractorProject, Contractor.id == ContractorProject.contractor_id)
+            .join(ProjectMember, ContractorProject.project_id == ProjectMember.project_id)
             .where(ProjectMember.user_id == current_user.id)
             .distinct()
         )
@@ -169,7 +171,7 @@ async def list_contractors(
 async def get_contractor(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     contractor = await db.get(Contractor, contractor_id)
 
@@ -187,7 +189,7 @@ async def update_contractor(
     contractor_id: int,
     data: ContractorUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User =Depends(require_roles(CONTRACTOR_CREATE_ROLES)),
+    current_user: User = Depends(require_permission("contractors.edit")),
 ):
     logger.info(f"Updating contractor id={contractor_id}")
 
@@ -222,7 +224,7 @@ async def update_contractor(
 @router.delete("/{contractor_id}")
 async def delete_contractor(
     contractor_id: int, db: AsyncSession = Depends(get_db_session),
-    current_user: User =Depends(require_roles(CONTRACTOR_DELETE_ROLES)),
+    current_user: User = Depends(require_permission("contractors.delete")),
 ):
     logger.info(f"Deleting contractor id={contractor_id}")
 
@@ -253,7 +255,7 @@ async def assign_project(
     contractor_id: int,
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_CREATE_ROLES)),
+    current_user: User = Depends(require_permission("contractors.assign")),
 ):
     logger.info(f"Assigning contractor={contractor_id} to project={project_id}")
 
@@ -265,7 +267,13 @@ async def assign_project(
             f"Invalid contractor/project contractor_id={contractor_id} project_id={project_id}"
         )
         raise NotFoundError("Contractor/Project not found")
-    
+
+    if current_user.company_id is not None and contractor.company_id != current_user.company_id:
+        logger.warning(
+            f"Cross-tenant contractor assignment blocked contractor_id={contractor_id} caller_company={current_user.company_id}"
+        )
+        raise NotFoundError("Contractor not found")
+
     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     result = await db.execute(
@@ -297,7 +305,7 @@ async def assign_project(
 async def contractor_payments(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     contractor = await db.get(Contractor, contractor_id)
 
@@ -324,7 +332,7 @@ async def pay_contractor(
     project_id: int,
     amount: Decimal,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_PAYMENT_ROLES)),
+    current_user: User = Depends(require_permission("contractors.edit")),
 ):
     logger.info(
         f"Contractor payment initiated contractor_id={contractor_id} amount={amount}"
@@ -394,7 +402,7 @@ async def pay_contractor(
 async def contractor_projects(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
@@ -423,7 +431,7 @@ async def contractor_projects(
 async def contractor_bills(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
@@ -454,7 +462,7 @@ async def contractor_bills(
 async def contractor_performance(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
@@ -482,7 +490,7 @@ async def contractor_performance(
 async def contractor_ledger(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
@@ -534,7 +542,7 @@ async def contractor_ledger(
 async def contractor_work_summary(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     contractor = await db.get(Contractor, contractor_id)
     if not contractor:
@@ -559,7 +567,7 @@ async def contractor_work_summary(
 async def contractor_dashboard(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(CONTRACTOR_READ_ROLES)),
+    current_user: User = Depends(require_permission("contractors.view")),
 ):
     from app.models.billing import RABill
     from app.utils.common import validate_contractor_access
