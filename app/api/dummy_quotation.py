@@ -74,7 +74,15 @@ def calculate_dummy_item_measurements(unit: str, length: float, width: float, he
     }
 
 
-def calculate_dummy_totals(subtotal: float, cgst_percent: float, sgst_percent: float, gst_percent: float = 0.0):
+def calculate_dummy_totals(
+    subtotal: float,
+    cgst_percent: float,
+    sgst_percent: float,
+    gst_percent: float = 0.0,
+    discount_amount: float = 0.0,
+    tds_percent: float = 0.0,
+    advance_paid: float = 0.0,
+):
     cgst_amount = (subtotal * cgst_percent) / 100
     sgst_amount = (subtotal * sgst_percent) / 100
     # If legacy gst_percent is provided instead
@@ -83,15 +91,19 @@ def calculate_dummy_totals(subtotal: float, cgst_percent: float, sgst_percent: f
         sgst_amount = (subtotal * (gst_percent / 2)) / 100
         cgst_percent = gst_percent / 2
         sgst_percent = gst_percent / 2
-    
-    grand_total = subtotal + cgst_amount + sgst_amount
-    
+
+    tds_amount = (subtotal * tds_percent) / 100
+    grand_total = subtotal + cgst_amount + sgst_amount - discount_amount - tds_amount
+    balance_due = grand_total - advance_paid
+
     return {
         "cgst_percent": cgst_percent,
         "sgst_percent": sgst_percent,
         "cgst_amount": round(cgst_amount, 2),
         "sgst_amount": round(sgst_amount, 2),
-        "grand_total": round(grand_total, 2)
+        "tds_amount": round(tds_amount, 2),
+        "grand_total": round(grand_total, 2),
+        "balance_due": round(balance_due, 2),
     }
 
 async def generate_dummy_quotation_no(db: AsyncSession):
@@ -178,7 +190,15 @@ async def preview_dummy_quotation(
         })
         subtotal += item_amount
         
-    totals = calculate_dummy_totals(subtotal, payload.cgst_percent, payload.sgst_percent, payload.gst_percent)
+    totals = calculate_dummy_totals(
+        subtotal,
+        payload.cgst_percent,
+        payload.sgst_percent,
+        payload.gst_percent,
+        payload.discount_amount,
+        payload.tds_percent,
+        payload.advance_paid,
+    )
     
     return {
         "id": 0,
@@ -195,7 +215,12 @@ async def preview_dummy_quotation(
         "sgst_percent": totals["sgst_percent"],
         "cgst_amount": totals["cgst_amount"],
         "sgst_amount": totals["sgst_amount"],
+        "discount_amount": payload.discount_amount,
+        "tds_percent": payload.tds_percent,
+        "tds_amount": totals["tds_amount"],
         "grand_total": totals["grand_total"],
+        "advance_paid": payload.advance_paid,
+        "balance_due": totals["balance_due"],
         "notes": payload.notes,
         "created_at": datetime.utcnow().isoformat(),
         "items": preview_items
@@ -220,6 +245,9 @@ async def create_dummy_quotation(
         gst_percent=payload.gst_percent,
         cgst_percent=payload.cgst_percent,
         sgst_percent=payload.sgst_percent,
+        discount_amount=payload.discount_amount,
+        tds_percent=payload.tds_percent,
+        advance_paid=payload.advance_paid,
         notes=payload.notes,
     )
     
@@ -270,14 +298,24 @@ async def create_dummy_quotation(
         db_item.amount = round(item_amount, 2)
         subtotal += db_item.amount
         
-    totals = calculate_dummy_totals(subtotal, new_quote.cgst_percent, new_quote.sgst_percent, new_quote.gst_percent)
+    totals = calculate_dummy_totals(
+        subtotal,
+        new_quote.cgst_percent,
+        new_quote.sgst_percent,
+        new_quote.gst_percent,
+        new_quote.discount_amount,
+        new_quote.tds_percent,
+        new_quote.advance_paid,
+    )
     
     new_quote.subtotal = round(subtotal, 2)
     new_quote.cgst_percent = totals["cgst_percent"]
     new_quote.sgst_percent = totals["sgst_percent"]
     new_quote.cgst_amount = totals["cgst_amount"]
     new_quote.sgst_amount = totals["sgst_amount"]
+    new_quote.tds_amount = totals["tds_amount"]
     new_quote.grand_total = totals["grand_total"]
+    new_quote.balance_due = totals["balance_due"]
     
     await db.commit()
     await db.refresh(new_quote)
@@ -394,13 +432,23 @@ async def update_dummy_quotation(
             
         quotation.subtotal = new_subtotal
         
-    totals = calculate_dummy_totals(quotation.subtotal, quotation.cgst_percent, quotation.sgst_percent, quotation.gst_percent)
+    totals = calculate_dummy_totals(
+        quotation.subtotal,
+        quotation.cgst_percent,
+        quotation.sgst_percent,
+        quotation.gst_percent,
+        quotation.discount_amount,
+        quotation.tds_percent,
+        quotation.advance_paid,
+    )
     
     quotation.cgst_percent = totals["cgst_percent"]
     quotation.sgst_percent = totals["sgst_percent"]
     quotation.cgst_amount = totals["cgst_amount"]
     quotation.sgst_amount = totals["sgst_amount"]
+    quotation.tds_amount = totals["tds_amount"]
     quotation.grand_total = totals["grand_total"]
+    quotation.balance_due = totals["balance_due"]
     
     await db.commit()
     return await get_dummy_quotation_or_404(quotation_id, db, current_user)

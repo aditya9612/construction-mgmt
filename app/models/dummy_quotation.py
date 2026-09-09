@@ -38,7 +38,12 @@ class DummyQuotation(Base):
     cgst_amount: Mapped[float] = mapped_column(Float, default=0)
     sgst_amount: Mapped[float] = mapped_column(Float, default=0)
     grand_total: Mapped[float] = mapped_column(Float, default=0)
-    
+    discount_amount: Mapped[float] = mapped_column(Float, default=0)
+    tds_percent: Mapped[float] = mapped_column(Float, default=0)
+    tds_amount: Mapped[float] = mapped_column(Float, default=0)
+    advance_paid: Mapped[float] = mapped_column(Float, default=0)
+    balance_due: Mapped[float] = mapped_column(Float, default=0)
+
     notes: Mapped[str | None] = mapped_column(Text)
     
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
