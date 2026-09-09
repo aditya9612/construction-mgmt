@@ -309,6 +309,10 @@ async def get_effective_user_permissions(
         )
         revoked = set(override_res.scalars().all())
         effective_permissions -= revoked
+        for rev in revoked:
+            if "." in rev:
+                mod = rev.split(".")[0]
+                effective_permissions.discard(f"{mod}.*")
         return effective_permissions
 
     # =========================================================================
@@ -384,13 +388,37 @@ async def get_effective_user_permissions(
             effective_permissions.discard(code)
             revoked_permissions.add(code)
 
-    # 3. Handle wildcard with revocations (if explicit wildcard was granted)
-    if "*" in effective_permissions and revoked_permissions:
-        all_perms_res = await db.execute(
-            select(Permission.code).where(~Permission.code.contains("*"))
-        )
-        all_codes = set(all_perms_res.scalars().all())
-        effective_permissions = (effective_permissions | all_codes) - revoked_permissions
+    # 3. Handle wildcards with revocations (expand wildcards so negative override prunes only target action)
+    if revoked_permissions:
+        # Case A: Global wildcard expansion
+        if "*" in effective_permissions:
+            all_perms_res = await db.execute(
+                select(Permission.code).where(~Permission.code.contains("*"))
+            )
+            all_codes = set(all_perms_res.scalars().all())
+            effective_permissions.update(all_codes)
+            effective_permissions.discard("*")
+
+        # Case B: Module-level wildcard expansion for any revoked module
+        for rev in revoked_permissions:
+            if "." in rev:
+                mod = rev.split(".")[0]
+                mod_wc = f"{mod}.*"
+                if mod_wc in effective_permissions:
+                    mod_perms_res = await db.execute(
+                        select(Permission.code).where(
+                            Permission.module == mod,
+                            ~Permission.code.contains("*"),
+                        )
+                    )
+                    mod_codes = set(mod_perms_res.scalars().all())
+                    effective_permissions.update(mod_codes)
+                    effective_permissions.discard(mod_wc)
+
+        # Subtract all revoked permissions
+        effective_permissions -= revoked_permissions
+
+        # Ensure no wildcard remains for any module that has revocations
         effective_permissions.discard("*")
         for rev in revoked_permissions:
             if "." in rev:

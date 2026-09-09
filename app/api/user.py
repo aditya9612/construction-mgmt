@@ -12,6 +12,7 @@ from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.user import ROLES, ActivityLog, User, UserAuditLog, UserRole
 from app.schemas.base import PaginationMeta, PaginatedResponse
 from app.schemas.user import UserAuditOut, UserOut, UserCreatePayload, UserUpdatePayload
+from app.services.rbac_audit import record_rbac_audit
 from app.utils.helpers import AppError, ConflictError, NotFoundError
 from app.core.logger import logger
 from fastapi import Depends, File, Request, UploadFile, Query, APIRouter
@@ -271,6 +272,18 @@ async def create_user(
             entity="USER",
             entity_id=user.id,
             performed_by=creator_id,
+        )
+
+        # Record RBAC audit for user role assignment
+        await record_rbac_audit(
+            db=db,
+            actor=current_user,
+            action="USER_ROLE_ASSIGN",
+            target_type="USER",
+            target_id=str(user.id),
+            company_id=user.company_id,
+            old_value=None,
+            new_value={"role": user.role},
         )
 
         logger.info(f"User created successfully id={user.id} role={user.role}")
@@ -645,14 +658,25 @@ async def update_user(
                 raise ConflictError("Email already registered")
 
         # ------------------------
-        # ROLE
+        # ROLE & PRIVILEGE ESCALATION CHECK
         # ------------------------
+        old_role = user.role
+        role_changed = False
         if "role" in data:
             try:
                 # data["role"] = UserRole(data["role"])
                 data["role"] = UserRole(data["role"]).value
+                if data["role"] == UserRole.ADMIN.value and not getattr(current_user, "is_super_admin", False):
+                    raise AppError(
+                        403,
+                        "Cannot assign Admin role via this endpoint. Super Admins must use /superadmin/companies/{id}/admin"
+                    )
+                role_changed = data["role"] != old_role
             except ValueError:
                 raise AppError(422, f"Invalid role. Use one of: {ROLES}")
+
+        # Defense-in-depth: strip any unauthorized privileged flags
+        data.pop("is_super_admin", None)
 
         # ------------------------
         # FINAL SAFETY CHECK
@@ -683,7 +707,7 @@ async def update_user(
         await db.flush()
 
         # ------------------------
-        # ACTIVITY LOG
+        # ACTIVITY LOG & RBAC AUDIT LOG
         # ------------------------
         await log_activity(
             db,
@@ -693,6 +717,18 @@ async def update_user(
             performed_by=current_user.id,
             details={"fields_updated": updated_fields},
         )
+
+        if role_changed:
+            await record_rbac_audit(
+                db=db,
+                actor=current_user,
+                action="USER_ROLE_CHANGE",
+                target_type="USER",
+                target_id=str(user.id),
+                company_id=user.company_id,
+                old_value={"role": old_role},
+                new_value={"role": user.role},
+            )
 
         # ------------------------
         # CLEAN OLD IMAGE

@@ -234,3 +234,66 @@ class UserPermissionOverride(Base):
         "Permission",
         back_populates="user_overrides",
     )
+
+
+class RBACAuditLog(Base):
+    __tablename__ = "rbac_audit_logs"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    company_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+        index=True,
+    )
+
+    actor_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+        index=True,
+    )
+
+    action: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        index=True,
+    )
+
+    target_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        index=True,
+    )
+
+    target_id: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        index=True,
+    )
+
+    permission: Mapped[Optional[str]] = mapped_column(
+        String(150),
+        nullable=True,
+    )
+
+    old_value: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    new_value: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )

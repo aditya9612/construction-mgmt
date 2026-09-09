@@ -1,18 +1,20 @@
+from datetime import date, datetime, time
 from collections import defaultdict
 from typing import Any, List, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import model_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.default_role_permissions import assign_default_role_permissions
-from app.core.dependencies import require_roles
+from app.core.dependencies import require_roles, require_super_admin
 from app.core.rbac_seed import seed_permissions
 from app.db.session import get_db_session
-from app.models.rbac import Permission, Role, RolePermission, UserPermissionOverride
+from app.models.rbac import Permission, Role, RolePermission, UserPermissionOverride, RBACAuditLog
 from app.models.user import ROLES, User, UserRole
 from app.schemas.base import BaseSchema
+from app.services.rbac_audit import record_rbac_audit
 
 router = APIRouter(
     prefix="/rbac",
@@ -23,6 +25,26 @@ router = APIRouter(
 # =========================================================
 # SCHEMAS
 # =========================================================
+
+class RBACAuditLogOut(BaseSchema):
+    id: int
+    company_id: Optional[int] = None
+    actor_id: Optional[int] = None
+    action: str
+    target_type: str
+    target_id: Optional[str] = None
+    permission: Optional[str] = None
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    created_at: datetime
+
+
+class RBACAuditLogsResponse(BaseSchema):
+    total: int
+    page: int
+    page_size: int
+    items: List[RBACAuditLogOut]
+
 
 class RolePermissionUpdate(BaseSchema):
     permissions: list[str]
@@ -360,14 +382,29 @@ async def create_role(
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # Check if role already exists for this tenant
+    role_name = payload.name.strip()
+    if not role_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Role name cannot be empty",
+        )
+
+    # Built-in role collision check (case-insensitive)
+    built_in_lower = {r.lower() for r in ROLES}
+    if role_name.lower() in built_in_lower and not current_user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot create custom role matching built-in role name '{role_name}'",
+        )
+
+    # Check if role already exists for this tenant (case-insensitive query)
     existing = await db.scalar(
         select(Role).where(
-            Role.name == payload.name,
+            func.lower(Role.name) == role_name.lower(),
             Role.company_id == current_user.company_id,
         )
     )
-    if existing or (payload.name in ROLES and not current_user.is_super_admin):
+    if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Role with this name already exists for your company",
@@ -375,12 +412,30 @@ async def create_role(
 
     new_role = Role(
         company_id=current_user.company_id if not current_user.is_super_admin else None,
-        name=payload.name,
-        display_name=payload.display_name,
-        description=payload.description,
+        name=role_name,
+        display_name=payload.display_name.strip() if payload.display_name else role_name,
+        description=payload.description.strip() if payload.description else None,
         is_system=False if not current_user.is_super_admin else True,
     )
     db.add(new_role)
+    await db.flush()
+
+    # Transactional audit logging
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="ROLE_CREATE",
+        target_type="ROLE",
+        target_id=new_role.name,
+        company_id=new_role.company_id,
+        new_value={
+            "id": new_role.id,
+            "name": new_role.name,
+            "display_name": new_role.display_name,
+            "is_system": new_role.is_system,
+        },
+    )
+
     await db.commit()
     await db.refresh(new_role)
 
@@ -408,15 +463,18 @@ async def delete_custom_role(
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # 1. Built-in / system roles cannot be deleted
-    if role in ROLES:
+    role_clean = role.strip()
+
+    # 1. Built-in / system roles cannot be deleted (case-insensitive check)
+    built_in_lower = {r.lower() for r in ROLES}
+    if role_clean.lower() in built_in_lower:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot delete built-in system role '{role}'",
         )
 
     # 2. Check if role exists for this company
-    stmt = select(Role).where(Role.name == role)
+    stmt = select(Role).where(func.lower(Role.name) == role_clean.lower())
     if not current_user.is_super_admin:
         stmt = stmt.where(Role.company_id == current_user.company_id)
 
@@ -435,7 +493,7 @@ async def delete_custom_role(
 
     # 3. Check whether users are currently assigned to the role
     user_stmt = select(func.count(User.id)).where(
-        User.role == role,
+        func.lower(User.role) == role_clean.lower(),
         User.is_deleted == False,
     )
     if not current_user.is_super_admin:
@@ -451,6 +509,17 @@ async def delete_custom_role(
     # 4. Safely delete related RolePermission mappings
     await db.execute(
         delete(RolePermission).where(RolePermission.role_id == target_role.id)
+    )
+
+    # Transactional audit logging
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="ROLE_DELETE",
+        target_type="ROLE",
+        target_id=target_role.name,
+        company_id=target_role.company_id,
+        old_value={"id": target_role.id, "name": target_role.name},
     )
 
     # 5. Delete the Role record
@@ -561,10 +630,22 @@ async def add_role_permissions(
 
     if new_mappings:
         db.add_all(new_mappings)
-        await db.commit()
 
     # Re-fetch complete sorted list of permissions
     resulting_permissions = await _fetch_role_permissions_list(db, role, company_role)
+
+    # Transactional audit logging
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="ROLE_PERMISSIONS_ADD",
+        target_type="ROLE",
+        target_id=role,
+        company_id=company_role.company_id if company_role else None,
+        new_value={"added": added_codes, "permissions": resulting_permissions},
+    )
+
+    await db.commit()
 
     return {
         "message": "Permissions added successfully",
@@ -640,9 +721,21 @@ async def update_role_permissions(
         ]
 
     db.add_all(mappings)
-    await db.commit()
 
     resulting_permissions = await _fetch_role_permissions_list(db, role, company_role)
+
+    # Transactional audit logging
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="ROLE_PERMISSIONS_UPDATE",
+        target_type="ROLE",
+        target_id=role,
+        company_id=company_role.company_id if company_role else None,
+        new_value={"permissions": resulting_permissions},
+    )
+
+    await db.commit()
 
     return {
         "message": "Role permissions replaced successfully",
@@ -694,9 +787,23 @@ async def delete_single_role_permission(
             )
         )
 
-    await db.commit()
-
+    # Re-fetch complete sorted list of permissions
     resulting_permissions = await _fetch_role_permissions_list(db, role, company_role)
+
+    # Transactional audit logging
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="ROLE_PERMISSION_DELETE",
+        target_type="ROLE",
+        target_id=role,
+        permission=permission,
+        company_id=company_role.company_id if company_role else None,
+        old_value=permission,
+        new_value={"permissions": resulting_permissions},
+    )
+
+    await db.commit()
 
     return {
         "message": f"Permission '{permission}' removed from role '{role}'",
@@ -759,9 +866,21 @@ async def delete_bulk_role_permissions(
             )
         )
 
-    await db.commit()
-
     resulting_permissions = await _fetch_role_permissions_list(db, role, company_role)
+
+    # Transactional audit logging
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="ROLE_PERMISSIONS_BULK_DELETE",
+        target_type="ROLE",
+        target_id=role,
+        company_id=company_role.company_id if company_role else None,
+        old_value={"removed": perms_to_remove},
+        new_value={"permissions": resulting_permissions},
+    )
+
+    await db.commit()
 
     return {
         "message": f"Permissions removed from role '{role}'",
@@ -799,10 +918,22 @@ async def reset_role_defaults(
             )
             # Delete company-scoped role entry so it falls back cleanly to system defaults
             await db.delete(company_role)
-            await db.commit()
 
     # Re-fetch system default permissions
     default_permissions = await _fetch_role_permissions_list(db, role, company_role=None)
+
+    # Transactional audit logging
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="ROLE_DEFAULTS_RESET",
+        target_type="ROLE",
+        target_id=role,
+        company_id=current_user.company_id,
+        new_value={"permissions": default_permissions},
+    )
+
+    await db.commit()
 
     return {
         "message": f"Role '{role}' permissions reset to system defaults",
@@ -823,19 +954,17 @@ async def get_user_permission_overrides(
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    target_user = await db.scalar(select(User).where(User.id == user_id))
+    # Database-level tenant query filtering (prevents cross-tenant existence leakage)
+    stmt = select(User).where(User.id == user_id, User.is_deleted == False)
+    if not current_user.is_super_admin:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    target_user = await db.scalar(stmt)
     if not target_user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
-
-    if not current_user.is_super_admin:
-        if target_user.company_id != current_user.company_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied to users of another company",
-            )
 
     res = await db.execute(
         select(Permission.code, UserPermissionOverride.is_granted)
@@ -864,26 +993,24 @@ async def update_user_permission_overrides(
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
-    target_user = await db.scalar(select(User).where(User.id == user_id))
+    # Database-level tenant query filtering (prevents cross-tenant existence leakage)
+    stmt = select(User).where(User.id == user_id, User.is_deleted == False)
+    if not current_user.is_super_admin:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    target_user = await db.scalar(stmt)
     if not target_user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
 
-    # Tenant isolation check
-    if not current_user.is_super_admin:
-        if target_user.company_id != current_user.company_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cannot modify permission overrides for a user in another company",
-            )
-        # Self-escalation check
-        if current_user.id == target_user.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admins cannot modify their own permission overrides",
-            )
+    # Self-escalation check
+    if not current_user.is_super_admin and current_user.id == target_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admins cannot modify their own permission overrides",
+        )
 
     # Fetch permissions by code
     perm_codes = [item.permission for item in payload.overrides]
@@ -912,6 +1039,18 @@ async def update_user_permission_overrides(
 
     if new_overrides:
         db.add_all(new_overrides)
+
+    # Transactional audit logging
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="USER_OVERRIDES_UPDATE",
+        target_type="USER_OVERRIDE",
+        target_id=str(user_id),
+        company_id=target_user.company_id,
+        new_value=[{"permission": item.permission, "is_granted": item.is_granted} for item in payload.overrides],
+    )
+
     await db.commit()
 
     return {
@@ -922,24 +1061,121 @@ async def update_user_permission_overrides(
 
 
 # =========================================================
-# SEEDING & DEFAULTS (MAINTENANCE)
+# SEEDING & DEFAULTS (MAINTENANCE) - RESTRICTED TO SUPER ADMIN
 # =========================================================
 
 @router.post("/seed")
 async def seed_rbac_permissions(
-    current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
-    ),
+    current_user: User = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db_session),
 ):
-    return await seed_permissions(db)
+    res = await seed_permissions(db)
+
+    # Transactional audit logging for system maintenance
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="RBAC_SEED",
+        target_type="SYSTEM",
+        target_id="permissions_catalog",
+        company_id=None,
+        new_value=res,
+    )
+
+    await db.commit()
+    return res
 
 
 @router.post("/assign-defaults")
 async def assign_defaults(
-    current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
-    ),
+    current_user: User = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db_session),
 ):
-    return await assign_default_role_permissions(db)
+    res = await assign_default_role_permissions(db)
+
+    # Transactional audit logging for system maintenance
+    await record_rbac_audit(
+        db=db,
+        actor=current_user,
+        action="RBAC_ASSIGN_DEFAULTS",
+        target_type="SYSTEM",
+        target_id="default_role_permissions",
+        company_id=None,
+        new_value=res,
+    )
+
+    await db.commit()
+    return res
+
+
+# =========================================================
+# AUDIT LOGS QUERY API
+# =========================================================
+
+@router.get("/audit-logs", response_model=RBACAuditLogsResponse)
+async def get_rbac_audit_logs(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page (max 100)"),
+    start_date: Optional[date] = Query(None, description="Filter logs on or after this date"),
+    end_date: Optional[date] = Query(None, description="Filter logs on or before this date"),
+    action: Optional[str] = Query(None, description="Filter by action code"),
+    actor_id: Optional[int] = Query(None, description="Filter by actor user ID"),
+    target_type: Optional[str] = Query(None, description="Filter by target type"),
+    company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
+    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Retrieve RBAC audit trail logs with strict multi-tenant isolation.
+    - Tenant Admins can only query their own company's audit records.
+    - Super Admins can query all records or filter by company_id.
+    - Deterministic ordering by newest records first (created_at DESC, id DESC).
+    """
+    query = select(RBACAuditLog)
+
+    # Server-side tenant boundary enforcement
+    if not current_user.is_super_admin:
+        query = query.where(RBACAuditLog.company_id == current_user.company_id)
+    else:
+        if company_id is not None:
+            query = query.where(RBACAuditLog.company_id == company_id)
+
+    if action:
+        query = query.where(RBACAuditLog.action == action.strip())
+
+    if actor_id is not None:
+        query = query.where(RBACAuditLog.actor_id == actor_id)
+
+    if target_type:
+        query = query.where(RBACAuditLog.target_type == target_type.strip())
+
+    if start_date:
+        query = query.where(
+            RBACAuditLog.created_at >= datetime.combine(start_date, time.min)
+        )
+
+    if end_date:
+        query = query.where(
+            RBACAuditLog.created_at <= datetime.combine(end_date, time.max)
+        )
+
+    # Total count for pagination
+    count_stmt = select(func.count()).select_from(query.subquery())
+    total = await db.scalar(count_stmt) or 0
+
+    # Deterministic ordering: newest records first
+    query = query.order_by(RBACAuditLog.created_at.desc(), RBACAuditLog.id.desc())
+
+    # Pagination calculation
+    offset = (page - 1) * page_size
+    query = query.offset(offset).limit(page_size)
+
+    result = await db.execute(query)
+    items = result.scalars().all()
+
+    return RBACAuditLogsResponse(
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=items,
+    )
