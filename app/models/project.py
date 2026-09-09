@@ -1058,13 +1058,13 @@ class SiteRequest(Base, TimestampMixin):
 
     id = Column(Integer, primary_key=True)
 
-    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
 
-    request_type = Column(String(50))  # Material / Work
-    description = Column(Text)
-    quantity = Column(Float)
+    request_type = Column(String(50), nullable=False)  # Material / Labour / Equipment / Work
+    description = Column(Text, nullable=True)
+    quantity = Column(Float, nullable=False)
 
-    requested_by = Column(Integer, ForeignKey("users.id"))
+    requested_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     approved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
     status = Column(String(20), default="Pending")  # Pending / Approved / Rejected

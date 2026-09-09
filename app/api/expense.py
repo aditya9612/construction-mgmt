@@ -1,5 +1,5 @@
 from typing import Optional
-from datetime import date
+from datetime import date, timedelta
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Header
 from sqlalchemy.exc import IntegrityError
 import hashlib
@@ -10,6 +10,7 @@ from app.core.enums import OwnerReferenceType, OwnerTransactionType
 from app.db.session import get_db_session
 from app.models.expense import Expense
 from app.models.project import Project
+from app.models.approval import Approval
 from app.models.owner import OwnerTransaction
 from app.schemas.expense import (
     ExpenseCreate, ExpenseUpdate, ExpenseOut, ExpenseDashboardOut,
@@ -645,7 +646,55 @@ async def get_dashboard(
     indirect_expense = total_expense * 0.2
 
     # Trend (Last 6 months)
-    trend = []
+    six_months_ago = today - timedelta(days=180)
+    trend_q = (
+        select(Expense.expense_date, func.sum(Expense.amount))
+        .join(Project, Expense.project_id == Project.id)
+        .where(Expense.expense_date >= six_months_ago)
+        .group_by(Expense.expense_date)
+        .order_by(Expense.expense_date.asc())
+    )
+    if current_user.company_id is not None:
+        trend_q = trend_q.where(Project.company_id == current_user.company_id)
+
+    trend_res = await db.execute(trend_q)
+    trend_rows = trend_res.all()
+
+    # Fallback if no expenses in last 6 months but older expenses exist
+    if not trend_rows:
+        fallback_q = (
+            select(Expense.expense_date, func.sum(Expense.amount))
+            .join(Project, Expense.project_id == Project.id)
+            .group_by(Expense.expense_date)
+            .order_by(Expense.expense_date.asc())
+            .limit(30)
+        )
+        if current_user.company_id is not None:
+            fallback_q = fallback_q.where(Project.company_id == current_user.company_id)
+        trend_rows = (await db.execute(fallback_q)).all()
+
+    trend = [
+        ExpenseTrendOut(
+            date=row[0] if isinstance(row[0], date) else date.fromisoformat(str(row[0])),
+            amount=round(float(row[1] or 0.0), 2),
+        )
+        for row in trend_rows
+    ]
+
+    # Pending approvals for expenses
+    pending_appr_q = (
+        select(func.count(Approval.id))
+        .join(Expense, Approval.entity_id == Expense.id)
+        .join(Project, Expense.project_id == Project.id)
+        .where(
+            func.lower(Approval.entity_type) == "expense",
+            func.lower(Approval.status) == "pending",
+        )
+    )
+    if current_user.company_id is not None:
+        pending_appr_q = pending_appr_q.where(Project.company_id == current_user.company_id)
+
+    pending_approval_count = int(await db.scalar(pending_appr_q) or 0)
 
     cat_res = await db.execute(cat_q)
     cat_summary = []
@@ -663,7 +712,7 @@ async def get_dashboard(
         project_expense=float(project_expense),
         direct_expense=float(direct_expense),
         indirect_expense=float(indirect_expense),
-        pending_approval_count=0,
+        pending_approval_count=pending_approval_count,
         trend=trend,
         category_summary=cat_summary
     )

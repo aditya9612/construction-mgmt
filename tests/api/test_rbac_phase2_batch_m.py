@@ -848,6 +848,51 @@ async def test_batch_m_business_status_guards():
 
 
 @pytest.mark.asyncio
+async def test_batch_m_update_document_status():
+    """Verify document status can be updated via PUT /api/v1/documents/{id}."""
+    async with setup_batch_m_data() as data:
+        token_a = data["tokens"]["admin_a"]
+        headers_a = {"Authorization": f"Bearer {token_a}"}
+        doc_pending = data["doc_a1_pending"].id
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # 1. Update status from PENDING to APPROVED
+            res = await ac.put(
+                f"/api/v1/documents/{doc_pending}",
+                headers=headers_a,
+                data={"title": "Updated Title", "status": "APPROVED"},
+            )
+            assert res.status_code == 200, res.text
+            assert res.json()["status"] == "APPROVED"
+            assert res.json()["title"] == "Updated Title"
+
+            # 2. Verify status changed in DB
+            async with AsyncSessionLocal() as db:
+                db_doc = await db.get(Document, doc_pending)
+                assert db_doc.status == DocumentStatus.APPROVED
+
+            # 3. Update status from APPROVED to REJECTED
+            res = await ac.put(
+                f"/api/v1/documents/{doc_pending}",
+                headers=headers_a,
+                data={"status": "REJECTED"},
+            )
+            assert res.status_code == 200, res.text
+            assert res.json()["status"] == "REJECTED"
+
+            # 4. Update title on REJECTED document without status -> status remains REJECTED
+            res = await ac.put(
+                f"/api/v1/documents/{doc_pending}",
+                headers=headers_a,
+                data={"title": "Rejected Document Renamed", "status": ""},
+            )
+            assert res.status_code == 200, res.text
+            assert res.json()["status"] == "REJECTED"
+            assert res.json()["title"] == "Rejected Document Renamed"
+
+
+@pytest.mark.asyncio
 async def test_batch_m_safe_physical_file_cleanup_and_path_traversal():
     """Physical file deletion is safe against path traversal and missing files."""
     async with setup_batch_m_data() as data:

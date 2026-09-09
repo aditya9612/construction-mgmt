@@ -875,3 +875,31 @@ async def test_06_tenant_isolation_and_rbac_preservation(client, issue_6_data):
     )
     assert resp_sa_summary.status_code == 200
     assert resp_sa_summary.json()["activities"]["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_07_list_daily_entries(client, issue_6_data):
+    """Verify GET /api/v1/work-progress/daily-entry succeeds with expected schema and pagination."""
+    token = issue_6_data["tokens"]["user_a"]
+    headers = {"Authorization": f"Bearer {token}"}
+    proj_a_id = issue_6_data["proj_a"].id
+
+    resp = await client.get(
+        f"/api/v1/work-progress/daily-entry?project_id={proj_a_id}&limit=10&offset=0",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["success"] is True
+    assert data["message"] == "Daily progress fetched successfully"
+    assert "data" in data
+    assert isinstance(data["data"], list)
+    assert "pagination" in data
+    assert data["pagination"]["limit"] == 10
+    assert data["pagination"]["offset"] == 0
+    assert "total" in data["pagination"]
+    assert data["limit"] == 10
+    assert data["offset"] == 0
+    assert "total_count" in data
+    assert "page_count" in data
+

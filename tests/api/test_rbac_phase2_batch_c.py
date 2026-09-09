@@ -617,6 +617,34 @@ async def test_expense_dashboard_and_allocations_tenant_scoping():
             dash_data = res_dash.json()
             # Comp A expense is 5000, Comp B is 12000. Total must be 5000, not 17000!
             assert dash_data["total_expense"] == float(exp_a.amount)
+            # Verify trend is populated with date and amount
+            assert len(dash_data["trend"]) > 0
+            assert "date" in dash_data["trend"][0]
+            assert dash_data["trend"][0]["amount"] == float(exp_a.amount)
+            # Verify pending approval count initially 0
+            assert dash_data["pending_approval_count"] == 0
+
+            # Add pending approval for Comp A expense
+            from app.models.approval import Approval
+            async with AsyncSessionLocal() as db:
+                appr = Approval(
+                    entity_type="expense",
+                    entity_id=exp_a.id,
+                    status="Pending",
+                    requested_by=data["user_expense"].id,
+                )
+                db.add(appr)
+                await db.commit()
+                appr_id = appr.id
+
+            res_dash_appr = await ac.get("/api/v1/expenses/dashboard", headers=headers_a)
+            assert res_dash_appr.status_code == 200
+            assert res_dash_appr.json()["pending_approval_count"] == 1
+
+            # Clean up approval
+            async with AsyncSessionLocal() as db:
+                await db.execute(delete(Approval).where(Approval.id == appr_id))
+                await db.commit()
 
             # 2. Project allocations should only show Comp A projects
             res_alloc = await ac.get("/api/v1/expenses/project-allocations", headers=headers_a)

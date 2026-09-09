@@ -139,10 +139,21 @@ async def verify_approval_entity_access(
             )
         return entity
 
+    elif entity_type_lower == "expense":
+        from app.models.expense import Expense
+
+        entity = await db.get(Expense, entity_id)
+        if not entity:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Expense not found",
+            )
+        project_id = entity.project_id
+
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported entity type: '{entity_type}'. Supported types are: boq, measurement, purchase_order, document, drawing, bill, journal_entry",
+            detail=f"Unsupported entity type: '{entity_type}'. Supported types are: boq, measurement, purchase_order, document, drawing, bill, journal_entry, expense",
         )
 
     # For project-scoped entities: validate project ownership
@@ -233,6 +244,9 @@ async def create_approval(
     elif entity_type_lower == "drawing":
         entity.approval_status = DocumentStatus.UNDER_REVIEW
         entity.approval_id = obj.id
+
+    elif entity_type_lower == "expense":
+        pass
 
     try:
         await db.commit()
@@ -346,6 +360,9 @@ async def approve(
         entity.approval_status = DocumentStatus.APPROVED
         entity.approval_id = obj.id
 
+    elif entity_type_lower == "expense":
+        pass
+
     obj.status = "Approved"
     obj.approved_by = current_user.id
     obj.remarks = payload.remarks
@@ -455,6 +472,9 @@ async def reject(
     elif entity_type_lower == "drawing":
         entity.approval_status = DocumentStatus.REJECTED
         entity.approval_id = obj.id
+
+    elif entity_type_lower == "expense":
+        pass
 
     obj.status = "Rejected"
     obj.approved_by = current_user.id

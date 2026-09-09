@@ -1144,14 +1144,36 @@ class DrawingFolderOut(BaseSchema):
 
 
 class SiteRequestCreate(BaseSchema):
-    project_id: int
-    request_type: SiteRequestType
-    description: str
-    quantity: float
+    project_id: int = Field(..., gt=0, description="Project ID (mandatory)")
+    request_type: SiteRequestType = Field(..., description="Request type: Material, Labour, Equipment, Work (mandatory)")
+    quantity: float = Field(..., gt=0, description="Quantity requested (mandatory, must be > 0)")
+    description: Optional[str] = Field(default=None, description="Optional description or details")
+
+    @field_validator("request_type", mode="before")
+    def validate_request_type(cls, v):
+        if v is None:
+            raise ValueError("request_type is required")
+        if isinstance(v, SiteRequestType):
+            return v
+        if isinstance(v, str):
+            v_str = v.strip()
+            if not v_str:
+                raise ValueError("request_type cannot be empty")
+            for member in SiteRequestType:
+                if member.value.lower() == v_str.lower():
+                    return member
+            valid_types = [m.value for m in SiteRequestType]
+            raise ValueError(
+                f"Invalid request_type '{v}'. Must be one of {valid_types}"
+            )
+        return v
 
     @field_validator("description")
     def validate_description(cls, v):
-        return validate_non_empty_string(v)
+        if v is None:
+            return None
+        v = v.strip()
+        return v if v else None
 
 
 # ===================== ACTION =====================
@@ -1168,10 +1190,10 @@ class SiteRequestOut(BaseSchema):
     id: int
     project_id: int
     request_type: SiteRequestType
-    description: str
+    description: Optional[str] = None
     quantity: float
     requested_by: int
-    approved_by: Optional[int]
+    approved_by: Optional[int] = None
     status: SiteRequestStatus
 
     class Config:
@@ -1405,9 +1427,13 @@ class DailyProgressResponse(BaseSchema):
 
 class DailyProgressListResponse(BaseSchema):
     success: bool = True
-    message: str
-    data: list[DailyProgressResponse]
-    pagination: PaginationMeta
+    message: str = "Daily progress fetched successfully"
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+    page_count: Optional[int] = None
+    total_count: Optional[int] = None
+    data: list[DailyProgressResponse] = []
+    pagination: Optional[PaginationMeta] = None
 
 
 class TodayProgressResponse(BaseSchema):

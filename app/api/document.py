@@ -380,8 +380,21 @@ async def update_document(
 
     obj, proj_name = row
 
-    if obj.status in [DocumentStatus.UNDER_REVIEW, DocumentStatus.APPROVED]:
-        raise ValidationError(f"Cannot edit document. Current status is {obj.status}")
+    new_status = None
+    if is_real_value(status):
+        if isinstance(status, DocumentStatus):
+            new_status = status
+        elif isinstance(status, str):
+            try:
+                new_status = DocumentStatus(status.strip().upper())
+            except ValueError:
+                raise ValidationError(
+                    f"Invalid document status: '{status}'. Valid statuses are: {[s.value for s in DocumentStatus]}"
+                )
+
+    if not is_sa and obj.status in [DocumentStatus.UNDER_REVIEW, DocumentStatus.APPROVED]:
+        if not (new_status is not None and new_status != obj.status):
+            raise ValidationError(f"Cannot edit document. Current status is {obj.status}")
 
     if is_real_value(title):
         obj.title = title
@@ -394,6 +407,9 @@ async def update_document(
 
     if is_real_value(version):
         obj.version = version
+
+    if new_status is not None:
+        obj.status = new_status
 
     # Replace file if uploaded
     if file is not None:

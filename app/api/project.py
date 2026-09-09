@@ -6637,11 +6637,17 @@ async def list_daily_entries(
 
         return s.DailyProgressListResponse(
             success=True,
+            message="Daily progress fetched successfully",
             limit=limit,
             offset=offset,
             page_count=len(entries),
             total_count=total_count,
             data=entries,
+            pagination=s.PaginationMeta(
+                total=total_count,
+                limit=limit,
+                offset=offset,
+            ),
         )
 
     except HTTPException:
@@ -9432,6 +9438,8 @@ async def create_request(
 ):
     await _get_scoped_project(db, payload.project_id, current_user, load_relations=False)
     data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    if "request_type" in data and hasattr(data["request_type"], "value"):
+        data["request_type"] = data["request_type"].value
     obj = m.SiteRequest(
         **data,
         requested_by=current_user.id,
