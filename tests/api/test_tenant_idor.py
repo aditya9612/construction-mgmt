@@ -281,8 +281,10 @@ def test_milestone_tenant_isolation():
 
 def test_task_request_tenant_isolation():
     override_dependency(company_a_admin)
-    # Company A tries to update Company B's task request (assuming 999 is in B)
-    resp = client.put(f"/api/v1/projects/task-requests/999", json={"title": "Hacked"})
+    resp = client.put(
+        f"/api/v1/projects/task-requests/999",
+        json={"title": "Hacked", "category": "General", "priority": "LOW", "status": "PENDING"},
+    )
     assert resp.status_code in (403, 404)
 
     # Company A tries to list all task requests

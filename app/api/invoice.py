@@ -678,9 +678,15 @@ async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
     db.add(je)
     await db.flush()
 
+    target_company_id = invoice.company_id
+    if target_company_id is None and invoice.project_id:
+        proj = await db.get(Project, invoice.project_id)
+        if proj:
+            target_company_id = proj.company_id
+
     try:
-        ar_acc = await get_accounts_receivable(db)
-        rev_acc = await get_revenue_account(db)
+        ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
+        rev_acc = await get_revenue_account(db, company_id=target_company_id)
     except (ValueError, Exception):
         # AR or Revenue account not configured — skip journal lines
         return
@@ -707,11 +713,11 @@ async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
     )
 
     # CR GST Payable if any
-    if invoice.gst_amount > 0:
+    if invoice.gst_amount > 0 and target_company_id is not None:
         from app.utils.accounting import resolve_tax_accounts
 
         try:
-            gst_acc = await resolve_tax_accounts(db, "output_gst")
+            gst_acc = await resolve_tax_accounts(db, "output_gst", company_id=target_company_id)
             db.add(
                 JournalLine(
                     entry_id=je.id,
@@ -1136,9 +1142,15 @@ async def pay_invoice(
     db.add(je)
     await db.flush()
 
+    target_company_id = invoice.company_id
+    if target_company_id is None and invoice.project_id:
+        proj = await db.get(Project, invoice.project_id)
+        if proj:
+            target_company_id = proj.company_id
+
     try:
-        ar_acc = await get_accounts_receivable(db)
-        cash_acc = await get_primary_cash_account(db)
+        ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
+        cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
         db.add(
             JournalLine(
                 entry_id=je.id, account_id=cash_acc.id, debit=amount, credit=Decimal(0)

@@ -306,6 +306,7 @@ class GSTReturnUpdate(BaseModel):
 
 class GSTReturnOut(GSTReturnCreate):
     id: int
+    company_id: Optional[int] = None
     created_at: datetime
 
     class Config:

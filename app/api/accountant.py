@@ -35,7 +35,10 @@ from app.db.session import get_db_session
 from app.models.billing import RABill
 from app.models.invoice import Invoice, Transaction
 from app.models.user import User
-from app.core.dependencies import require_roles
+from app.core.dependencies import require_permission
+from app.models.project import Project
+from app.models.company import Company
+from app.models.settings import CompanySettings
 
 from app.utils.helpers import NotFoundError, ValidationError
 from app.utils.qr import generate_qr
@@ -49,22 +52,7 @@ from reportlab.lib.pagesizes import A4
 import os
 
 
-ACCOUNTANT_READ_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.ACCOUNTANT,
-    ]
-]
 
-ACCOUNTANT_WRITE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.ACCOUNTANT,
-    ]
-]
 
 
 def generate_offer_pdf(offer):
@@ -283,6 +271,118 @@ def generate_offer_pdf(offer):
     return file_path
 
 
+
+async def _get_scoped_account(db: AsyncSession, account_id: int, current_user: User, for_update: bool = False) -> Account:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(Account).where(Account.id == account_id)
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Account not found")
+        query = query.where(Account.company_id == current_user.company_id)
+    if for_update:
+        query = query.with_for_update()
+    account = await db.scalar(query)
+    if not account:
+        raise NotFoundError("Account not found")
+    return account
+
+
+async def _get_scoped_bank_account(db: AsyncSession, bank_account_id: int, current_user: User, for_update: bool = False) -> BankAccount:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = (
+        select(BankAccount)
+        .join(Account, Account.id == BankAccount.account_id)
+        .where(BankAccount.id == bank_account_id)
+    )
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Bank account not found")
+        query = query.where(Account.company_id == current_user.company_id)
+    if for_update:
+        query = query.with_for_update()
+    bank_acc = await db.scalar(query)
+    if not bank_acc:
+        raise NotFoundError("Bank account not found")
+    return bank_acc
+
+
+async def _get_scoped_fixed_asset(db: AsyncSession, asset_id: int, current_user: User, for_update: bool = False) -> FixedAsset:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(FixedAsset).where(FixedAsset.id == asset_id)
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Asset not found")
+        query = query.join(Project, Project.id == FixedAsset.project_id).where(Project.company_id == current_user.company_id)
+    if for_update:
+        query = query.with_for_update()
+    asset = await db.scalar(query)
+    if not asset:
+        raise NotFoundError("Asset not found")
+    return asset
+
+
+async def _get_scoped_tds_deduction(db: AsyncSession, tds_id: int, current_user: User) -> TDSDeduction:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    tds = await db.get(TDSDeduction, tds_id)
+    if not tds:
+        raise NotFoundError("TDS deduction not found")
+    if is_sa:
+        return tds
+    if current_user.company_id is None:
+        raise NotFoundError("TDS deduction not found")
+
+    if tds.vendor_bill_id is not None:
+        vb = await db.get(VendorBill, tds.vendor_bill_id)
+        if not vb or vb.company_id != current_user.company_id:
+            raise NotFoundError("TDS deduction not found")
+        return tds
+
+    if tds.ra_bill_id is not None:
+        ra = await db.scalar(
+            select(RABill).join(Project, Project.id == RABill.project_id)
+            .where(RABill.id == tds.ra_bill_id, Project.company_id == current_user.company_id)
+        )
+        if not ra:
+            raise NotFoundError("TDS deduction not found")
+        return tds
+
+    if tds.created_by is not None:
+        creator = await db.get(User, tds.created_by)
+        if not creator or creator.company_id != current_user.company_id:
+            raise NotFoundError("TDS deduction not found")
+        return tds
+
+    raise NotFoundError("TDS deduction not found")
+
+
+async def _get_scoped_gst_return(db: AsyncSession, return_id: int, current_user: User) -> GSTReturn:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise NotFoundError("GST return not found")
+    query = select(GSTReturn).where(GSTReturn.id == return_id)
+    if not is_sa:
+        query = query.where(GSTReturn.company_id == current_user.company_id)
+    gst = await db.scalar(query)
+    if not gst:
+        raise NotFoundError("GST return not found")
+    return gst
+
+
+async def _get_scoped_ra_bill(db: AsyncSession, ra_id: int, current_user: User, for_update: bool = False) -> RABill:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(RABill).join(Project, Project.id == RABill.project_id).where(RABill.id == ra_id)
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("RA Bill not found")
+        query = query.where(Project.company_id == current_user.company_id)
+    if for_update:
+        query = query.with_for_update()
+    ra_bill = await db.scalar(query)
+    if not ra_bill:
+        raise NotFoundError("RA Bill not found")
+    return ra_bill
+
+
 router = APIRouter(prefix="/accountant", tags=["Accountant"])
 
 
@@ -290,7 +390,7 @@ router = APIRouter(prefix="/accountant", tags=["Accountant"])
 async def create_account(
     payload: AccountCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
 ):
     from sqlalchemy.exc import IntegrityError as SAIntegrityError
     # Normalize type to lowercase to match AccountType enum values
@@ -336,7 +436,7 @@ async def list_accounts(
     page: int = 1,
     limit: int = 100,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     # Base query
     query = select(Account).where(Account.company_id == current_user.company_id)
@@ -396,7 +496,7 @@ async def list_accounts(
 @router.get("/accounts/tree", response_model=list[AccountTreeOut])
 async def get_accounts_tree(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     accounts = (await db.execute(select(Account).where(Account.company_id == current_user.company_id).order_by(Account.id))).scalars().all()
     
@@ -426,7 +526,7 @@ async def get_accounts_tree(
 @router.get("/accounts/export")
 async def export_accounts(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.export")),
 ):
     import io, csv
     from fastapi.responses import StreamingResponse
@@ -482,7 +582,7 @@ async def export_accounts(
 @router.post("/accounts/import")
 async def import_accounts(
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     import csv
@@ -565,11 +665,9 @@ async def import_accounts(
 async def get_account_detail(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    acc = await db.scalar(select(Account).where(Account.id == id, Account.company_id == current_user.company_id))
-    if not acc:
-        raise NotFoundError("Account not found")
+    acc = await _get_scoped_account(db, id, current_user, for_update=True)
         
     display_name = acc.name.replace(" [Inactive]", "") if acc.name.endswith(" [Inactive]") else acc.name
     acc_status = "Inactive" if acc.name.endswith("[Inactive]") else "Active"
@@ -620,11 +718,9 @@ async def update_account(
     id: int,
     payload: AccountUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.edit")),
 ):
-    acc = await db.scalar(select(Account).where(Account.id == id, Account.company_id == current_user.company_id))
-    if not acc:
-        raise NotFoundError("Account not found")
+    acc = await _get_scoped_account(db, id, current_user, for_update=True)
         
     # Check parent cycle
     if payload.parent_id is not None:
@@ -661,11 +757,9 @@ async def update_account(
 async def delete_account(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.delete")),
 ):
-    acc = await db.scalar(select(Account).where(Account.id == id, Account.company_id == current_user.company_id))
-    if not acc:
-        raise NotFoundError("Account not found")
+    acc = await _get_scoped_account(db, id, current_user, for_update=True)
         
     # Check journal history
     usage_count = await db.scalar(select(func.count(JournalLine.id)).where(JournalLine.account_id == acc.id))
@@ -692,11 +786,9 @@ async def delete_account(
 async def get_account_ledger(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    acc = await db.scalar(select(Account).where(Account.id == id, Account.company_id == current_user.company_id))
-    if not acc:
-        raise NotFoundError("Account not found")
+    acc = await _get_scoped_account(db, id, current_user, for_update=True)
         
     query = (
         select(JournalLine, JournalEntry)
@@ -733,11 +825,20 @@ async def get_account_ledger(
 @router.post("/receipts")
 async def create_receipt(
     payload: ReceiptCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if payload.amount <= 0:
         raise ValidationError("Invalid amount")
+
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Project not found")
+        if payload.project_id:
+            proj = await db.scalar(select(Project).where(Project.id == payload.project_id, Project.company_id == current_user.company_id))
+            if not proj:
+                raise NotFoundError("Project not found")
 
     txn = Transaction(
         project_id=payload.project_id,
@@ -760,35 +861,45 @@ async def create_receipt(
 
 @router.get("/receipts")
 async def list_receipts(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    rows = (
-        (await db.execute(select(Transaction).where(Transaction.type == "receipt")))
-        .scalars()
-        .all()
-    )
-
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(Transaction).where(Transaction.type == "receipt")
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.join(Project, Project.id == Transaction.project_id).where(Project.company_id == current_user.company_id)
+    rows = (await db.execute(query)).scalars().all()
     return rows
 
 
 @router.get("/receipts/summary")
 async def receipt_summary(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    total = await db.scalar(
-        select(func.sum(Transaction.amount)).where(Transaction.type == "receipt")
-    )
-
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(func.sum(Transaction.amount)).where(Transaction.type == "receipt")
+    if not is_sa:
+        if current_user.company_id is None:
+            return {"total_receipts": 0.0}
+        query = query.join(Project, Project.id == Transaction.project_id).where(Project.company_id == current_user.company_id)
+    total = await db.scalar(query)
     return {"total_receipts": float(total or 0)}
 
 @router.get("/payables")
 async def list_payables(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    rows = (await db.execute(select(RABill).order_by(RABill.created_at.desc()))).scalars().all()
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(RABill).order_by(RABill.created_at.desc())
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.join(Project, RABill.project_id == Project.id).where(Project.company_id == current_user.company_id)
+    rows = (await db.execute(query)).scalars().all()
 
     #  fetch all payments in one go
     paid_map = dict(
@@ -835,24 +946,23 @@ async def list_payables(
 async def pay_contractor(
     ra_id: int,
     payload: PayablePaymentRequest,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    ra = await db.get(RABill, ra_id)
-
-    if not ra:
-        raise NotFoundError("RA Bill not found")
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    ra = await _get_scoped_ra_bill(db, ra_id, current_user, for_update=True)
 
     if ra.status not in ["Approved", "Partial", "Paid"]:
         raise ValidationError("Bill must be approved")
 
     paid = await db.scalar(
-        select(func.sum(Transaction.amount)).where(
-            Transaction.linked_to == f"ra:{ra.id}"
+        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+            Transaction.linked_to == f"ra:{ra.id}",
+            Transaction.type == "payment"
         )
     ) or Decimal(0)
 
-    pending = Decimal(ra.total_amount) - paid
+    pending = Decimal(str(ra.total_amount)) - Decimal(str(paid))
 
     if payload.amount <= 0:
         raise ValidationError("Invalid amount")
@@ -863,33 +973,31 @@ async def pay_contractor(
     if req_amount > pending_amount:
         raise ValidationError("Amount exceeds pending")
 
-    #  Get Account IDs (replace with your actual codes)
-    # Try multiple code patterns for contractor payable account
     contractor_acc = None
     for code in ["CONTRACTOR_PAYABLE", "LIA-001", "LIA-CONTRACTOR"]:
-        contractor_acc = await db.scalar(
-            select(Account.id).where(Account.code == code)
-        )
+        q = select(Account.id).where(Account.code == code)
+        if not is_sa and current_user.company_id is not None:
+            q = q.where(Account.company_id == current_user.company_id)
+        contractor_acc = await db.scalar(q)
         if contractor_acc:
             break
     if not contractor_acc:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="Contractor liability account is not configured.")
+        raise ValidationError("Contractor liability account is not configured.")
 
-    # Try multiple code patterns for bank account
     bank_acc = None
     for code in ["BANK", "BANK-001", "CASH-001"]:
-        bank_acc = await db.scalar(
-            select(Account.id).where(Account.code == code)
-        )
+        q = select(Account.id).where(Account.code == code)
+        if not is_sa and current_user.company_id is not None:
+            q = q.where(Account.company_id == current_user.company_id)
+        bank_acc = await db.scalar(q)
         if bank_acc:
             break
     if not bank_acc:
-        # Fall back to any asset account
         from app.core.enums import AccountType as AT
-        bank_acc = await db.scalar(
-            select(Account.id).where(Account.type == AT.ASSET)
-        )
+        q = select(Account.id).where(Account.type == AT.ASSET)
+        if not is_sa and current_user.company_id is not None:
+            q = q.where(Account.company_id == current_user.company_id)
+        bank_acc = await db.scalar(q)
 
     if not contractor_acc or not bank_acc:
         raise ValidationError("Required accounts not configured")
@@ -907,7 +1015,7 @@ async def pay_contractor(
 
     entry = JournalEntry(description=f"Payment for RA {ra.id}")
     db.add(entry)
-    await db.flush()  # get entry.id
+    await db.flush()
 
     db.add_all(
         [
@@ -923,12 +1031,10 @@ async def pay_contractor(
         ]
     )
 
-    new_paid = paid + payload.amount
-    new_pending = Decimal(ra.total_amount) - new_paid
+    new_paid = Decimal(str(paid)) + req_amount
+    new_pending = Decimal(str(ra.total_amount)) - new_paid
 
-    ra.status = "Paid" if new_pending == 0 else "Partial"
-
-    #  IMPORTANT
+    ra.status = "Paid" if new_pending <= 0 else "Partial"
     await db.commit()
 
     return {
@@ -938,22 +1044,33 @@ async def pay_contractor(
         "status": ra.status,
     }
 
-
 @router.get("/transactions")
 async def list_transactions(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    rows = (await db.execute(select(Transaction).order_by(Transaction.created_at.desc()))).scalars().all()
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(Transaction).order_by(Transaction.created_at.desc())
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.join(Project, Project.id == Transaction.project_id).where(Project.company_id == current_user.company_id)
+    rows = (await db.execute(query)).scalars().all()
     return rows
 
 
 @router.get("/payables/summary")
 async def payable_summary(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    rows = (await db.execute(select(RABill).order_by(RABill.created_at.desc()))).scalars().all()
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(RABill).order_by(RABill.created_at.desc())
+    if not is_sa:
+        if current_user.company_id is None:
+            return {"total": "0", "paid": "0", "pending": "0"}
+        query = query.join(Project, RABill.project_id == Project.id).where(Project.company_id == current_user.company_id)
+    rows = (await db.execute(query)).scalars().all()
 
     #  single query for all payments
     paid_map = dict(
@@ -989,7 +1106,7 @@ async def payable_summary(
 
 
 async def cashflow(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     inflow = await db.scalar(
@@ -1012,14 +1129,16 @@ async def cashflow(
 async def payables_by_date(
     start: date,
     end: date,
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    rows = (
-        (await db.execute(select(RABill).where(RABill.bill_date.between(start, end))))
-        .scalars()
-        .all()
-    )
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(RABill).where(RABill.bill_date.between(start, end))
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.join(Project, RABill.project_id == Project.id).where(Project.company_id == current_user.company_id)
+    rows = (await db.execute(query)).scalars().all()
 
     return rows
 
@@ -1037,7 +1156,7 @@ async def payables_by_date(
 async def create_bank_account(
     payload: BankAccountCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
 ):
     # Verify account_id exists and is an ASSET
     account = await db.scalar(select(Account).where(Account.id == payload.account_id, Account.company_id == current_user.company_id))
@@ -1080,7 +1199,7 @@ async def create_bank_account(
 @router.get("/bank-accounts", response_model=list[BankAccountOut])
 async def list_bank_accounts(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     query = (
         select(
@@ -1109,7 +1228,7 @@ async def list_bank_accounts(
 @router.get("/bank-accounts/export")
 async def export_bank_accounts(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(["Admin", "Accountant"])),
+    current_user: User = Depends(require_permission("accountant.export")),
 ):
     import io, csv
     from fastapi.responses import StreamingResponse
@@ -1151,7 +1270,7 @@ async def export_bank_accounts(
 @router.post("/bank-accounts/import")
 async def import_bank_accounts(
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     import csv
@@ -1230,7 +1349,7 @@ async def import_bank_accounts(
 async def get_bank_account(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     query = (
         select(BankAccount, Account.name.label("ledger_name"))
@@ -1262,12 +1381,9 @@ async def update_bank_account(
     id: int,
     payload: BankAccountUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.edit")),
 ):
-    query = select(BankAccount).join(Account).where(BankAccount.id == id, Account.company_id == current_user.company_id)
-    bank_acc = await db.scalar(query)
-    if not bank_acc:
-        raise NotFoundError("Bank account not found")
+    bank_acc = await _get_scoped_bank_account(db, id, current_user, for_update=True)
         
     if payload.account_number and payload.account_number != bank_acc.account_number:
         existing = await db.scalar(select(BankAccount).where(BankAccount.account_number == payload.account_number))
@@ -1315,12 +1431,9 @@ async def get_bank_account_ledger(
     skip: int = 0,
     limit: int = 1000,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    query = select(BankAccount).join(Account).where(BankAccount.id == id, Account.company_id == current_user.company_id)
-    bank_acc = await db.scalar(query)
-    if not bank_acc:
-        raise NotFoundError("Bank account not found")
+    bank_acc = await _get_scoped_bank_account(db, id, current_user, for_update=True)
         
     return await _build_ledger(db, bank_acc.account_id)
 
@@ -1329,12 +1442,15 @@ async def get_cash_book_ledger(
     skip: int = 0,
     limit: int = 1000,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     from app.utils.accounting import get_primary_cash_account
     from fastapi import HTTPException
+    target_company_id = current_user.company_id
+    if target_company_id is None:
+        raise HTTPException(status_code=400, detail="Primary cash account not configured")
     try:
-        cash_acc = await get_primary_cash_account(db)
+        cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Primary cash account not configured")
         
@@ -1343,14 +1459,17 @@ async def get_cash_book_ledger(
 @router.get("/cash-book/export")
 async def export_cash_book(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.export")),
 ):
     import io, csv
     from fastapi.responses import StreamingResponse
     from app.utils.accounting import get_primary_cash_account
     from fastapi import HTTPException
+    target_company_id = current_user.company_id
+    if target_company_id is None:
+        raise HTTPException(status_code=400, detail="Primary cash account not configured")
     try:
-        cash_acc = await get_primary_cash_account(db)
+        cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Primary cash account not configured")
         
@@ -1380,7 +1499,11 @@ async def export_cash_book(
     )
 
 @router.post("/cash-book/import")
-async def import_cash_book(file: UploadFile = File(...)):
+async def import_cash_book(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_permission("accountant.create")),
+    db: AsyncSession = Depends(get_db_session),
+):
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files allowed")
     
@@ -1410,7 +1533,7 @@ async def import_cash_book(file: UploadFile = File(...)):
 async def create_petty_cash_transaction(
     payload: PettyCashTransactionCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
 ):
     from app.utils.accounting import get_petty_cash_account
     from app.utils.common import generate_business_id
@@ -1418,8 +1541,11 @@ async def create_petty_cash_transaction(
     if payload.amount <= Decimal('0'):
         raise ValidationError("Amount must be greater than 0")
 
+    target_company_id = current_user.company_id
+    if target_company_id is None:
+        raise HTTPException(status_code=400, detail="Petty cash account not configured")
     try:
-        cash_acc = await get_petty_cash_account(db)
+        cash_acc = await get_petty_cash_account(db, company_id=target_company_id)
     except ValueError:
         raise ValidationError("Petty cash account not configured")
 
@@ -1507,13 +1633,13 @@ async def get_petty_cash_ledger(
     skip: int = 0,
     limit: int = 1000,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    from app.utils.accounting import get_petty_cash_account
-    from fastapi import HTTPException
-    from app.models.accountant import JournalLine, JournalEntry, PettyCashTransaction
+    target_company_id = current_user.company_id
+    if target_company_id is None:
+        return []
     try:
-        cash_acc = await get_petty_cash_account(db)
+        cash_acc = await get_petty_cash_account(db, company_id=target_company_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Petty cash account not configured")
         
@@ -1556,16 +1682,17 @@ async def get_petty_cash_ledger(
         
     return ledger
 
-async def _build_consolidated_bank_ledger(db: AsyncSession) -> list[dict]:
-    # Gets consolidated ledger across ALL bank accounts
+async def _build_consolidated_bank_ledger(db: AsyncSession, company_id: Optional[int] = None) -> list[dict]:
     query = (
         select(JournalLine, JournalEntry)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
         .join(Account, JournalLine.account_id == Account.id)
         .where(Account.name.ilike("%bank%"))
         .where(JournalEntry.status == "Posted")
-        .order_by(JournalEntry.created_at.asc())
     )
+    if company_id is not None:
+        query = query.where(Account.company_id == company_id)
+    query = query.order_by(JournalEntry.created_at.asc())
     
     results = await db.execute(query)
     
@@ -1588,18 +1715,24 @@ async def _build_consolidated_bank_ledger(db: AsyncSession) -> list[dict]:
 @router.get("/bank-book/ledger")
 async def get_bank_book_ledger(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    return await _build_consolidated_bank_ledger(db)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        return []
+    cid = current_user.company_id if not is_sa else None
+    return await _build_consolidated_bank_ledger(db, company_id=cid)
 
 @router.get("/bank-book/export")
 async def export_bank_book(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.export")),
 ):
     import io, csv
     from fastapi.responses import StreamingResponse
-    ledger = await _build_consolidated_bank_ledger(db)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    cid = current_user.company_id if not is_sa else None
+    ledger = await _build_consolidated_bank_ledger(db, company_id=cid)
     
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -1623,7 +1756,11 @@ async def export_bank_book(
     )
 
 @router.post("/bank-book/import")
-async def import_bank_book(file: UploadFile = File(...)):
+async def import_bank_book(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_permission("accountant.create")),
+    db: AsyncSession = Depends(get_db_session),
+):
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files allowed")
     
@@ -1653,13 +1790,28 @@ async def import_bank_book(file: UploadFile = File(...)):
 async def create_journal_entry(
     payload: JournalEntryCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
 ):
+    if len(payload.lines) < 2:
+        raise ValidationError("Journal entry must contain at least 2 lines")
+
     total_debit = sum(line.debit for line in payload.lines)
     total_credit = sum(line.credit for line in payload.lines)
 
+    if total_debit <= 0:
+        raise ValidationError("Journal total debit must be positive")
+
     if total_debit != total_credit:
         raise ValidationError("Debit and Credit must be equal")
+
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("One or more referenced accounts not found")
+        acc_ids = list({line.account_id for line in payload.lines})
+        valid_accs = (await db.scalars(select(Account.id).where(Account.id.in_(acc_ids), Account.company_id == current_user.company_id))).all()
+        if len(valid_accs) != len(acc_ids):
+            raise NotFoundError("One or more referenced accounts not found")
 
     entry = JournalEntry(description=payload.description)
     db.add(entry)
@@ -1681,7 +1833,6 @@ async def create_journal_entry(
 
     return {"message": "Journal entry created"}
 
-
 from typing import Optional
 from sqlalchemy import func
 from app.schemas.journal import JournalEntryExtendedOut
@@ -1690,9 +1841,10 @@ from app.schemas.journal import JournalEntryExtendedOut
 async def list_journal(
     status: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     from app.models.approval import Approval
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     
     query = (
         select(
@@ -1702,9 +1854,13 @@ async def list_journal(
         )
         .outerjoin(JournalLine, JournalEntry.id == JournalLine.entry_id)
         .outerjoin(Approval, (Approval.entity_type == "journal_entry") & (Approval.entity_id == JournalEntry.id) & (Approval.status == "Pending"))
-        .group_by(JournalEntry.id, Approval.id)
-        .order_by(JournalEntry.created_at.desc())
     )
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.join(Account, JournalLine.account_id == Account.id).where(Account.company_id == current_user.company_id)
+        
+    query = query.group_by(JournalEntry.id, Approval.id).order_by(JournalEntry.created_at.desc())
     
     if status:
         query = query.where(JournalEntry.status == status)
@@ -1725,15 +1881,17 @@ async def list_journal(
 @router.get("/gst/summary", response_model=GSTDashboardOut)
 async def gst_summary(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     from app.utils.accounting import resolve_tax_accounts
     from sqlalchemy import case, extract
     import calendar
     
+    if current_user.company_id is None:
+        raise HTTPException(status_code=400, detail="Company context required to reconcile GST liability")
     try:
-        input_gst_acc = await resolve_tax_accounts(db, 'input_gst')
-        output_gst_acc = await resolve_tax_accounts(db, 'output_gst')
+        input_gst_acc = await resolve_tax_accounts(db, 'input_gst', company_id=current_user.company_id)
+        output_gst_acc = await resolve_tax_accounts(db, 'output_gst', company_id=current_user.company_id)
         
         # Calculate Input GST
         input_gst = await db.scalar(
@@ -1756,10 +1914,19 @@ async def gst_summary(
         input_gst = 0.0
         output_gst = 0.0
 
-    tds_collected = await db.scalar(
-        select(func.sum(TDSDeduction.tds_amount))
-        .where(TDSDeduction.status == "Posted")
-    )
+    tds_q = select(func.sum(TDSDeduction.tds_amount)).where(TDSDeduction.status == "Posted")
+    returns_q = select(GSTReturn).order_by(GSTReturn.created_at.desc())
+    if not is_sa:
+        if current_user.company_id is None:
+            tds_q = tds_q.where(False)
+            returns_q = returns_q.where(False)
+        else:
+            tds_q = tds_q.outerjoin(VendorBill, VendorBill.id == TDSDeduction.vendor_bill_id).where(
+                (VendorBill.company_id == current_user.company_id) | (TDSDeduction.created_by == current_user.id)
+            )
+            returns_q = returns_q.where(GSTReturn.company_id == current_user.company_id)
+
+    tds_collected = await db.scalar(tds_q)
     tds_collected = float(tds_collected or 0.0)
 
     upcoming_return = "GSTR-3B due 20th"
@@ -1768,8 +1935,7 @@ async def gst_summary(
     monthly_trend = []
     
     # Return Status
-    returns = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
-    returns = returns.all()
+    returns = (await db.scalars(returns_q)).all()
     
     return_status = []
     recent_filings = []
@@ -1805,38 +1971,50 @@ async def gst_summary(
 @router.get("/bank/summary")
 async def bank_summary(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     from app.utils.accounting import get_primary_cash_account
-    try:
-        cash_acc = await get_primary_cash_account(db)
-        cash_balance_query = await db.scalar(
-            select(func.sum(JournalLine.debit - JournalLine.credit))
-            .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-            .where(JournalLine.account_id == cash_acc.id)
-            .where(JournalEntry.status == "Posted")
-        )
-        cash_balance = float(cash_balance_query or 0.0)
-    except ValueError:
-        cash_balance = 0.0
+    if current_user.company_id is not None:
+        try:
+            cash_acc = await get_primary_cash_account(db, company_id=current_user.company_id)
+            cash_balance_query = await db.scalar(
+                select(func.sum(JournalLine.debit - JournalLine.credit))
+                .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
+                .where(JournalLine.account_id == cash_acc.id)
+                .where(JournalEntry.status == "Posted")
+            )
+            cash_balance = float(cash_balance_query or 0.0)
+        except ValueError:
+            cash_balance = 0.0
 
-    bank_balance_query = await db.scalar(
+    bank_q = (
         select(func.sum(JournalLine.debit - JournalLine.credit))
         .join(Account, JournalLine.account_id == Account.id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
         .where(Account.name.ilike("%bank%"))
         .where(JournalEntry.status == "Posted")
     )
+    if not is_sa and current_user.company_id is not None:
+        bank_q = bank_q.where(Account.company_id == current_user.company_id)
+    bank_balance_query = await db.scalar(bank_q)
     bank_balance = float(bank_balance_query or 0.0)
 
-    today_deposit_query = await db.scalar(
+    account_cond = Account.name.ilike("%bank%")
+    if cash_acc:
+        account_cond = account_cond | (Account.id == cash_acc.id)
+
+    today_dep_q = (
         select(func.sum(JournalLine.credit))
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
         .join(Account, JournalLine.account_id == Account.id)
         .where(JournalEntry.status == "Posted")
         .where(JournalEntry.entry_date == date.today())
-        .where(Account.name.ilike("%bank%") | (Account.id == cash_acc.id if 'cash_acc' in locals() else False))
+        .where(account_cond)
     )
+    if not is_sa and current_user.company_id is not None:
+        today_dep_q = today_dep_q.where(Account.company_id == current_user.company_id)
+    today_deposit_query = await db.scalar(today_dep_q)
     today_deposit = float(today_deposit_query or 0.0)
 
     today_withdrawal_query = await db.scalar(
@@ -1864,31 +2042,34 @@ async def list_assets(
     purchase_date: Optional[date] = None,
     pagination: PaginationParams = Depends(),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     from app.models.project import Project
     
     pagination = pagination.normalized()
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     
     query = (
         select(FixedAsset, Project.project_name)
         .outerjoin(Project, FixedAsset.project_id == Project.id)
         .order_by(FixedAsset.id.desc())
     )
+    count_query = select(func.count()).select_from(FixedAsset)
+    if not is_sa:
+        if current_user.company_id is None:
+            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=pagination.limit, offset=pagination.offset))
+        query = query.join(Project, FixedAsset.project_id == Project.id).where(Project.company_id == current_user.company_id)
+        count_query = count_query.join(Project, FixedAsset.project_id == Project.id).where(Project.company_id == current_user.company_id)
     
     if project_id:
         query = query.where(FixedAsset.project_id == project_id)
+        count_query = count_query.where(FixedAsset.project_id == project_id)
     if purchase_date:
         query = query.where(FixedAsset.purchase_date == purchase_date)
+        count_query = count_query.where(FixedAsset.purchase_date == purchase_date)
         
     query = query.offset(pagination.offset).limit(pagination.limit)
     rows = (await db.execute(query)).all()
-    
-    count_query = select(func.count()).select_from(FixedAsset)
-    if project_id:
-        count_query = count_query.where(FixedAsset.project_id == project_id)
-    if purchase_date:
-        count_query = count_query.where(FixedAsset.purchase_date == purchase_date)
     total = await db.scalar(count_query)
     
     items = []
@@ -1904,34 +2085,31 @@ async def list_assets(
 async def get_asset(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    from app.models.project import Project
-    
-    query = (
-        select(FixedAsset, Project.project_name)
-        .outerjoin(Project, FixedAsset.project_id == Project.id)
-        .where(FixedAsset.id == id)
-    )
-    row = (await db.execute(query)).first()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="Asset not found")
-        
-    fa = row.FixedAsset
+    fa = await _get_scoped_fixed_asset(db, id, current_user)
+    proj = await db.get(Project, fa.project_id) if fa.project_id else None
     fa_dict = fa.__dict__.copy()
-    fa_dict["project_name"] = row.project_name
+    fa_dict["project_name"] = proj.project_name if proj else None
     return FixedAssetOut.model_validate(fa_dict)
 
 @router.post("/assets")
 async def create_asset(
     payload: AssetCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
 ):
-
     if payload.purchase_value <= 0:
         raise ValidationError("Invalid purchase value")
+
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Project not found")
+        if payload.project_id:
+            proj = await db.scalar(select(Project).where(Project.id == payload.project_id, Project.company_id == current_user.company_id))
+            if not proj:
+                raise NotFoundError("Project not found")
 
     obj = FixedAsset(
         name=payload.name,
@@ -1953,12 +2131,9 @@ async def create_asset(
 async def generate_asset_qr(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.export")),
 ):
-    asset = await db.get(FixedAsset, id)
-
-    if not asset:
-        raise NotFoundError("Asset not found")
+    asset = await _get_scoped_fixed_asset(db, id, current_user)
 
     qr_buf = generate_qr(entity_type="AST", entity_id=asset.id)
 
@@ -1977,19 +2152,20 @@ async def generate_asset_qr(
 async def depreciate_asset(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.edit")),
 ):
-    asset = await db.get(FixedAsset, id)
+    asset = await _get_scoped_fixed_asset(db, id, current_user, for_update=True)
 
-    if not asset:
-        raise NotFoundError("Asset not found")
+    if asset.current_value <= 0:
+        raise ValidationError("Asset is already fully depreciated")
 
     rate = asset.depreciation_rate or 0
+    depreciation = Decimal(str(asset.current_value)) * (Decimal(str(rate)) / Decimal('100'))
+    new_val = Decimal(str(asset.current_value)) - depreciation
+    if new_val < 0:
+        new_val = Decimal('0.00')
 
-    depreciation = asset.current_value * (rate / 100)
-
-    asset.current_value -= depreciation
-
+    asset.current_value = new_val
     await db.commit()
 
     return {
@@ -1998,13 +2174,13 @@ async def depreciate_asset(
         "new_value": float(asset.current_value),
     }
 
-
 @router.get("/reports/trial-balance")
 async def trial_balance(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
-    result = await db.execute(
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = (
         select(
             Account.id,
             Account.name,
@@ -2014,9 +2190,16 @@ async def trial_balance(
         )
         .join(JournalLine, JournalLine.account_id == Account.id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-        .where(JournalEntry.status == "Posted", Account.company_id == current_user.company_id)
-        .group_by(Account.id)
+        .where(JournalEntry.status == "Posted")
     )
+    if not is_sa:
+        if current_user.company_id is None:
+            return {"accounts": [], "total_debit": 0, "total_credit": 0}
+        query = query.where(Account.company_id == current_user.company_id)
+    elif current_user.company_id is not None:
+        query = query.where(Account.company_id == current_user.company_id)
+
+    result = await db.execute(query.group_by(Account.id))
 
     rows = result.all()
 
@@ -2051,9 +2234,18 @@ async def trial_balance(
 @router.get("/reports/balance-sheet")
 async def balance_sheet(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     as_of: date | None = None,
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        return {
+            "assets": {"items": [], "total": 0},
+            "liabilities": {"items": [], "total": 0},
+            "equity": {"items": [], "total": 0},
+            "profit": 0,
+            "is_balanced": True,
+        }
 
     query = (
         select(
@@ -2064,8 +2256,13 @@ async def balance_sheet(
         )
         .join(JournalLine, JournalLine.account_id == Account.id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-        .where(JournalEntry.status == "Posted", Account.company_id == current_user.company_id)
+        .where(JournalEntry.status == "Posted")
     )
+    if not is_sa:
+        query = query.where(Account.company_id == current_user.company_id)
+    elif current_user.company_id is not None:
+        query = query.where(Account.company_id == current_user.company_id)
+
     if as_of:
         query = query.where(func.date(JournalEntry.entry_date) <= as_of)
     query = query.group_by(Account.id)
@@ -2099,22 +2296,29 @@ async def balance_sheet(
             equity.append(item)
             total_equity += balance
 
-
-    income = await db.scalar(
+    income_q = (
         select(func.sum(JournalLine.credit - JournalLine.debit))
         .join(Account, Account.id == JournalLine.account_id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-        .where(Account.type == AccountType.INCOME.value, Account.company_id == current_user.company_id)
+        .where(Account.type == AccountType.INCOME.value)
         .where(JournalEntry.status == "Posted")
     )
-
-    expense = await db.scalar(
+    expense_q = (
         select(func.sum(JournalLine.debit - JournalLine.credit))
         .join(Account, Account.id == JournalLine.account_id)
         .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
-        .where(Account.type == AccountType.EXPENSE.value, Account.company_id == current_user.company_id)
+        .where(Account.type == AccountType.EXPENSE.value)
         .where(JournalEntry.status == "Posted")
     )
+    if not is_sa:
+        income_q = income_q.where(Account.company_id == current_user.company_id)
+        expense_q = expense_q.where(Account.company_id == current_user.company_id)
+    elif current_user.company_id is not None:
+        income_q = income_q.where(Account.company_id == current_user.company_id)
+        expense_q = expense_q.where(Account.company_id == current_user.company_id)
+
+    income = await db.scalar(income_q)
+    expense = await db.scalar(expense_q)
 
     income = float(income or 0)
     expense = float(expense or 0)
@@ -2141,7 +2345,7 @@ async def balance_sheet(
 async def create_offer(
     payload: OfferCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
 ):
     obj = RedevelopmentOffer(**payload.dict())
 
@@ -2155,7 +2359,7 @@ async def create_offer(
 async def generate_offer_letter(
     offer_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
 ):
     offer = await db.get(RedevelopmentOffer, offer_id)
 
@@ -2204,7 +2408,7 @@ Contact:
 async def download_offer_pdf(
     offer_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.export")),
 ):
     offer = await db.get(RedevelopmentOffer, offer_id)
 
@@ -2233,7 +2437,7 @@ async def download_offer_pdf(
 async def import_bank_transactions(
     bank_account_id: int,
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     import csv
@@ -2317,7 +2521,7 @@ async def import_bank_transactions(
 @router.post("/bank/reconciliation/run")
 async def auto_run_bank_reconciliation(
     bank_account_id: int,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.edit")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
@@ -2401,9 +2605,10 @@ async def auto_run_bank_reconciliation(
 @router.post("/bank/transactions", response_model=BankTransactionOut)
 async def create_bank_transaction(
     payload: BankTransactionCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
+    await _get_scoped_bank_account(db, payload.bank_account_id, current_user)
     bt = BankTransaction(**payload.model_dump())
     db.add(bt)
     await db.commit()
@@ -2412,29 +2617,61 @@ async def create_bank_transaction(
 
 @router.get("/bank/reconciliation/pending", response_model=list[BankTransactionOut])
 async def get_pending_reconciliations(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    result = await db.scalars(
-        select(BankTransaction).where(BankTransaction.is_reconciled == 0)
-    )
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(BankTransaction).where(BankTransaction.is_reconciled == 0)
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.join(Account, BankTransaction.bank_account_id == Account.id).where(Account.company_id == current_user.company_id)
+    result = await db.scalars(query)
     return result.all()
 
 @router.post("/bank/reconciliation/{transaction_id}/match/{journal_id}")
 async def match_bank_transaction(
     transaction_id: int,
     journal_id: int,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.edit")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from fastapi import HTTPException
-    
-    bt = await db.get(BankTransaction, transaction_id)
-    je = await db.get(JournalEntry, journal_id)
-    if not bt or not je:
-        raise HTTPException(status_code=404, detail="Transaction or Journal Entry not found")
-        
-    # Validate Amount
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    bt = await db.scalar(
+        select(BankTransaction)
+        .where(BankTransaction.id == transaction_id)
+        .with_for_update()
+    )
+    if not bt:
+        raise NotFoundError("Bank transaction not found")
+
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Bank transaction not found")
+        acc = await db.scalar(select(Account).where(Account.id == bt.bank_account_id, Account.company_id == current_user.company_id))
+        if not acc:
+            raise NotFoundError("Bank transaction not found")
+
+    if bt.is_reconciled == 1:
+        raise ValidationError("Bank transaction is already reconciled")
+
+    je = await db.scalar(
+        select(JournalEntry)
+        .where(JournalEntry.id == journal_id)
+        .with_for_update()
+    )
+    if not je:
+        raise NotFoundError("Journal entry not found")
+
+    conflict = await db.scalar(
+        select(BankTransaction).where(
+            BankTransaction.matched_journal_id == journal_id,
+            BankTransaction.id != bt.id,
+        )
+    )
+    if conflict:
+        raise ValidationError("Journal entry is already matched to another bank transaction")
+
     je_line = await db.scalar(
         select(JournalLine).where(
             JournalLine.entry_id == je.id,
@@ -2442,42 +2679,47 @@ async def match_bank_transaction(
         ).limit(1)
     )
     if not je_line:
-        raise HTTPException(status_code=400, detail="Journal entry does not affect this bank account")
-    
+        raise ValidationError("Journal entry does not affect this bank account")
+
     je_amount = float(je_line.debit) if je_line.debit > 0 else float(je_line.credit)
     if float(bt.amount) != je_amount:
-        raise HTTPException(status_code=400, detail=f"Amount mismatch: Bank {bt.amount} vs Journal {je_amount}")
+        raise ValidationError(f"Amount mismatch: Bank {bt.amount} vs Journal {je_amount}")
 
     bt.is_reconciled = 1
     bt.matched_journal_id = je.id
     await db.commit()
     return {"message": "Matched successfully"}
-
 @router.get("/bank/reconciliation/history", response_model=list[BankTransactionOut])
 async def get_reconciliation_history(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(BankTransaction).where(BankTransaction.is_reconciled == 1)
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.join(Account, BankTransaction.bank_account_id == Account.id).where(Account.company_id == current_user.company_id)
     result = await db.scalars(
-        select(BankTransaction)
-        .where(BankTransaction.is_reconciled == 1)
-        .order_by(BankTransaction.updated_at.desc())
-        .limit(1000)
+        query.order_by(BankTransaction.updated_at.desc()).limit(1000)
     )
     return result.all()
 
 @router.get("/bank/reconciliation/export")
 async def export_reconciliation_csv(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.export")),
     db: AsyncSession = Depends(get_db_session)
 ):
     import io, csv
     
-    result = await db.scalars(
-        select(BankTransaction)
-        .where(BankTransaction.is_reconciled == 1)
-        .order_by(BankTransaction.updated_at.desc())
-    )
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(BankTransaction).where(BankTransaction.is_reconciled == 1)
+    if not is_sa:
+        if current_user.company_id is None:
+            query = query.where(False)
+        else:
+            query = query.join(Account, BankTransaction.bank_account_id == Account.id).where(Account.company_id == current_user.company_id)
+    result = await db.scalars(query.order_by(BankTransaction.updated_at.desc()))
     transactions = result.all()
 
     buffer = io.StringIO()
@@ -2506,7 +2748,7 @@ async def export_reconciliation_csv(
 @router.get("/bank/reconciliation/dashboard", response_model=ReconciliationDashboardOut)
 async def get_reconciliation_dashboard(
     bank_account_id: Optional[int] = None,
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
@@ -2552,42 +2794,58 @@ async def get_reconciliation_dashboard(
 @router.post("/transfers", response_model=FundTransferOut)
 async def create_fund_transfer(
     payload: FundTransferCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from app.utils.accounting import auto_post_journal
-    
-    # Validation logic to ensure accounts exist
-    from_acc = await db.scalar(select(Account).where(Account.id == payload.from_account_id, Account.company_id == current_user.company_id))
-    to_acc = await db.scalar(select(Account).where(Account.id == payload.to_account_id, Account.company_id == current_user.company_id))
-    
-    if not from_acc or not to_acc:
+
+    if payload.from_account_id == payload.to_account_id:
+        raise ValidationError("Source and destination accounts must be different")
+
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    sorted_ids = sorted([payload.from_account_id, payload.to_account_id])
+    query = select(Account).where(Account.id.in_(sorted_ids)).with_for_update()
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Accounts not found")
+        query = query.where(Account.company_id == current_user.company_id)
+
+    accs = (await db.scalars(query)).all()
+    if len(accs) != 2:
         raise NotFoundError("Accounts not found")
 
-    # Post auto journal
+    from_acc = next(a for a in accs if a.id == payload.from_account_id)
+    to_acc = next(a for a in accs if a.id == payload.to_account_id)
+
     je = await auto_post_journal(
-        db, 
-        amount=payload.amount, 
-        debit_code=to_acc.code, 
-        credit_code=from_acc.code, 
-        description=f"Fund transfer: {payload.remarks}"
+        db,
+        amount=payload.amount,
+        debit_code=to_acc.code,
+        credit_code=from_acc.code,
+        description=f"Fund transfer: {payload.remarks or 'Transfer'}",
+        company_id=from_acc.company_id,
     )
 
     ft = FundTransfer(**payload.model_dump())
     if je:
         ft.journal_entry_id = je.id
-        
+
     db.add(ft)
     await db.commit()
     await db.refresh(ft)
     return ft
-
 @router.get("/transfers", response_model=list[FundTransferOut])
 async def list_fund_transfers(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    result = await db.scalars(select(FundTransfer))
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(FundTransfer)
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.join(Account, FundTransfer.from_account_id == Account.id).where(Account.company_id == current_user.company_id)
+    result = await db.scalars(query)
     return result.all()
 
 # ===================== GST & TAXATION =====================
@@ -2595,10 +2853,23 @@ async def list_fund_transfers(
 @router.post("/gst/returns", response_model=GSTReturnOut)
 async def create_gst_return(
     payload: GSTReturnCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    gstr = GSTReturn(**payload.model_dump())
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    target_company_id = current_user.company_id
+    if is_sa and target_company_id is None:
+        first_co = await db.scalar(select(Company.id).where(Company.is_active == True).limit(1))
+        target_company_id = first_co
+
+    if not is_sa and target_company_id is None:
+        raise HTTPException(status_code=403, detail="User has no company assigned")
+    if target_company_id is None:
+        raise HTTPException(status_code=400, detail="Company context required")
+
+    data = payload.model_dump()
+    data["company_id"] = target_company_id
+    gstr = GSTReturn(**data)
     db.add(gstr)
     await db.commit()
     await db.refresh(gstr)
@@ -2606,10 +2877,16 @@ async def create_gst_return(
 
 @router.get("/gst/returns", response_model=list[GSTReturnOut])
 async def list_gst_returns(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(GSTReturn).order_by(GSTReturn.created_at.desc())
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = query.where(GSTReturn.company_id == current_user.company_id)
+    result = await db.scalars(query)
     return result.all()
 
 
@@ -2617,12 +2894,29 @@ async def list_gst_returns(
 async def list_tds_deductions(
     skip: int = 0,
     limit: int = 100,
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    query = select(TDSDeduction)
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        query = (
+            query.outerjoin(VendorBill, TDSDeduction.vendor_bill_id == VendorBill.id)
+            .outerjoin(RABill, TDSDeduction.ra_bill_id == RABill.id)
+            .outerjoin(Project, RABill.project_id == Project.id)
+            .outerjoin(User, TDSDeduction.created_by == User.id)
+            .where(
+                or_(
+                    VendorBill.company_id == current_user.company_id,
+                    Project.company_id == current_user.company_id,
+                    User.company_id == current_user.company_id,
+                )
+            )
+        )
     result = await db.scalars(
-        select(TDSDeduction)
-        .order_by(TDSDeduction.created_at.desc())
+        query.order_by(TDSDeduction.created_at.desc())
         .offset(skip)
         .limit(limit)
     )
@@ -2631,12 +2925,28 @@ async def list_tds_deductions(
 @router.post("/tds/deductions", response_model=TDSDeductionOut)
 async def create_tds_deduction(
     payload: TDSDeductionCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
     from app.utils.accounting import resolve_tax_accounts
     
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise NotFoundError("Tenant required")
+        if getattr(payload, 'vendor_bill_id', None) is not None:
+            vb = await db.get(VendorBill, payload.vendor_bill_id)
+            if not vb or vb.company_id != current_user.company_id:
+                raise NotFoundError("Vendor Bill not found")
+        if getattr(payload, 'ra_bill_id', None) is not None:
+            ra = await db.scalar(
+                select(RABill).join(Project, Project.id == RABill.project_id)
+                .where(RABill.id == payload.ra_bill_id, Project.company_id == current_user.company_id)
+            )
+            if not ra:
+                raise NotFoundError("RA Bill not found")
+
     # Duplicate checking
     if getattr(payload, 'vendor_bill_id', None) is not None:
         existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == payload.vendor_bill_id))
@@ -2656,7 +2966,12 @@ async def create_tds_deduction(
     # Process Auto Journal if posted directly
     if tds.status == "Posted":
         try:
-            tds_acc = await resolve_tax_accounts(db, 'tds_payable')
+            target_company_id = current_user.company_id
+            if getattr(payload, 'vendor_bill_id', None) is not None:
+                vb_obj = await db.get(VendorBill, payload.vendor_bill_id)
+                if vb_obj and vb_obj.company_id:
+                    target_company_id = vb_obj.company_id
+            tds_acc = await resolve_tax_accounts(db, 'tds_payable', company_id=target_company_id)
             if not tds_acc:
                 raise HTTPException(status_code=400, detail="TDS payable account is not configured.")
                 
@@ -2695,27 +3010,34 @@ async def create_tds_deduction(
 @router.get("/tds/deductions/{id}", response_model=TDSDeductionOut)
 async def get_tds_deduction(
     id: int,
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from fastapi import HTTPException
-    tds = await db.get(TDSDeduction, id)
-    if not tds:
-        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+    tds = await _get_scoped_tds_deduction(db, id, current_user)
     return tds
 
 @router.patch("/tds/deductions/{id}", response_model=TDSDeductionOut)
 async def update_tds_deduction(
     id: int,
     payload: TDSDeductionUpdate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.edit")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
     
-    tds = await db.get(TDSDeduction, id)
-    if not tds:
-        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+    tds = await _get_scoped_tds_deduction(db, id, current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and payload.vendor_bill_id is not None:
+        vb = await db.get(VendorBill, payload.vendor_bill_id)
+        if not vb or vb.company_id != current_user.company_id:
+            raise NotFoundError("Vendor Bill not found")
+    if not is_sa and payload.ra_bill_id is not None:
+        ra = await db.scalar(
+            select(RABill).join(Project, Project.id == RABill.project_id)
+            .where(RABill.id == payload.ra_bill_id, Project.company_id == current_user.company_id)
+        )
+        if not ra:
+            raise NotFoundError("RA Bill not found")
         
     is_posted = tds.status == "Posted"
     is_payment_service = tds.status == "PENDING" and tds.vendor_bill_id is not None
@@ -2758,14 +3080,12 @@ async def update_tds_deduction(
 @router.delete("/tds/deductions/{id}", status_code=204)
 async def delete_tds_deduction(
     id: int,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.delete")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
     
-    tds = await db.get(TDSDeduction, id)
-    if not tds:
-        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+    tds = await _get_scoped_tds_deduction(db, id, current_user)
         
     is_posted = tds.status == "Posted"
     is_payment_service = tds.status == "PENDING" and tds.vendor_bill_id is not None
@@ -2784,13 +3104,21 @@ async def delete_tds_deduction(
 
 @router.get("/gst/invoice-register", response_model=list[GSTRegisterItem])
 async def gst_invoice_register(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
     # Combine Invoice and VendorBill
     items = []
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    inv_query = select(Invoice)
+    vb_query = select(VendorBill)
+    if not is_sa:
+        if current_user.company_id is None:
+            return []
+        inv_query = inv_query.where(Invoice.company_id == current_user.company_id)
+        vb_query = vb_query.where(VendorBill.company_id == current_user.company_id)
     
-    invoices = await db.scalars(select(Invoice))
+    invoices = await db.scalars(inv_query)
     for inv in invoices:
         items.append(GSTRegisterItem(
             date=inv.invoice_date or inv.created_at.date(),
@@ -2809,7 +3137,7 @@ async def gst_invoice_register(
             attachments=inv.invoice_copy_url
         ))
         
-    vendor_bills = await db.scalars(select(VendorBill))
+    vendor_bills = await db.scalars(vb_query)
     for vb in vendor_bills:
         items.append(GSTRegisterItem(
             date=vb.bill_date,
@@ -2827,7 +3155,7 @@ async def gst_invoice_register(
 async def generate_gst_return(
     filing_period: str,
     return_type: str,
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     # Calculate from existing tables for the filing period
@@ -2837,25 +3165,46 @@ async def generate_gst_return(
     except ValueError:
         year, month = date.today().year, date.today().month
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     # Taxable Value & GST Liability from Invoices
-    sales = await db.execute(
+    sales_q = (
         select(func.sum(Invoice.amount), func.sum(Invoice.gst_amount))
         .where(extract('year', Invoice.created_at) == year)
         .where(extract('month', Invoice.created_at) == month)
     )
+    purchases_q = (
+        select(func.sum(VendorBill.total_amount))
+        .where(extract('year', VendorBill.bill_date) == year)
+        .where(extract('month', VendorBill.bill_date) == month)
+    )
+    if not is_sa:
+        if current_user.company_id is None:
+            sales_q = sales_q.where(False)
+            purchases_q = purchases_q.where(False)
+        else:
+            sales_q = sales_q.where(Invoice.company_id == current_user.company_id)
+            purchases_q = purchases_q.where(VendorBill.company_id == current_user.company_id)
+
+    sales = await db.execute(sales_q)
     taxable_value, gst_liability = sales.one()
     taxable_value = float(taxable_value or 0.0)
     gst_liability = float(gst_liability or 0.0)
 
     # ITC Available from Vendor Bills
-    purchases = await db.execute(
-        select(func.sum(VendorBill.total_amount)) # Simplified as VendorBill lacks gst_amount currently
-        .where(extract('year', VendorBill.bill_date) == year)
-        .where(extract('month', VendorBill.bill_date) == month)
-    )
+    purchases = await db.execute(purchases_q)
     itc_available = float(purchases.scalar() or 0.0) * 0.18 # Mock 18% ITC for demo
 
+    target_company_id = current_user.company_id
+    if is_sa and target_company_id is None:
+        first_co = await db.scalar(select(Company.id).where(Company.is_active == True).limit(1))
+        target_company_id = first_co
+    if not is_sa and target_company_id is None:
+        raise HTTPException(status_code=403, detail="User has no company assigned")
+    if target_company_id is None:
+        raise HTTPException(status_code=400, detail="Company context required")
+
     gst = GSTReturn(
+        company_id=target_company_id,
         filing_period=filing_period,
         return_type=return_type,
         taxable_value=taxable_value,
@@ -2872,7 +3221,7 @@ async def generate_gst_return(
 @router.post("/gst/reconciliation/match", response_model=list[GSTReconciliationMismatch])
 async def reconcile_gst(
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     # In-memory comparison
@@ -2894,7 +3243,11 @@ async def reconcile_gst(
                 portal_gst = 0.0
                 
             # Query ERP
-            erp_bill = await db.scalar(select(VendorBill).where(VendorBill.bill_number == inv_no))
+            is_sa = getattr(current_user, "is_super_admin", False) is True
+            vb_q = select(VendorBill).where(VendorBill.bill_number == inv_no)
+            if not is_sa and current_user.company_id is not None:
+                vb_q = vb_q.where(VendorBill.company_id == current_user.company_id)
+            erp_bill = await db.scalar(vb_q)
             if not erp_bill:
                 mismatches.append(GSTReconciliationMismatch(
                     invoice_no=inv_no, vendor=vendor, erp_gst=0.0, portal_gst=portal_gst,
@@ -2910,182 +3263,25 @@ async def reconcile_gst(
                     ))
     return mismatches
 
-# ===================== GST & TAXATION =====================
-
-@router.post("/gst/returns", response_model=GSTReturnOut)
-async def create_gst_return(
-    payload: GSTReturnCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    gstr = GSTReturn(**payload.model_dump())
-    db.add(gstr)
-    await db.commit()
-    await db.refresh(gstr)
-    return gstr
-
-@router.get("/gst/returns", response_model=list[GSTReturnOut])
-async def list_gst_returns(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
-    return result.all()
-
-
-
-@router.get("/gst/invoice-register", response_model=list[GSTRegisterItem])
-async def gst_invoice_register(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    # Combine Invoice and VendorBill
-    items = []
-    
-    invoices = await db.scalars(select(Invoice))
-    for inv in invoices:
-        items.append(GSTRegisterItem(
-            date=inv.invoice_date or inv.created_at.date(),
-            invoice_no=inv.invoice_number or str(inv.id),
-            type='SALES',
-            party_name='Customer',
-            gstin=inv.party_gstin,
-            taxable_amount=float(inv.amount),
-            gst_amount=float(inv.gst_amount),
-            invoice_total=float(inv.total_amount),
-            cgst=float(inv.cgst or 0.0),
-            sgst=float(inv.sgst or 0.0),
-            igst=float(inv.igst or 0.0),
-            invoice_copy_url=inv.invoice_copy_url,
-            gst_document_url=inv.gst_document_url,
-            attachments=inv.invoice_copy_url
-        ))
-        
-    vendor_bills = await db.scalars(select(VendorBill))
-    for vb in vendor_bills:
-        items.append(GSTRegisterItem(
-            date=vb.bill_date,
-            invoice_no=vb.bill_number,
-            type='PURCHASE',
-            party_name='Vendor', # Would join Vendor
-            taxable_amount=float(vb.total_amount), # Simplified
-            gst_amount=0.0, # Simplified
-            invoice_total=float(vb.total_amount)
-        ))
-        
-    return items
-
-@router.get("/gst/returns/generate", response_model=GSTReturnOut)
-async def generate_gst_return(
-    filing_period: str,
-    return_type: str,
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    # Calculate from existing tables for the filing period
-    # Assuming filing_period format like "2026-07"
-    try:
-        year, month = map(int, filing_period.split("-"))
-    except ValueError:
-        year, month = date.today().year, date.today().month
-
-    # Taxable Value & GST Liability from Invoices
-    sales = await db.execute(
-        select(func.sum(Invoice.amount), func.sum(Invoice.gst_amount))
-        .where(extract('year', Invoice.created_at) == year)
-        .where(extract('month', Invoice.created_at) == month)
-    )
-    taxable_value, gst_liability = sales.one()
-    taxable_value = float(taxable_value or 0.0)
-    gst_liability = float(gst_liability or 0.0)
-
-    # ITC Available from Vendor Bills
-    purchases = await db.execute(
-        select(func.sum(VendorBill.total_amount)) # Simplified as VendorBill lacks gst_amount currently
-        .where(extract('year', VendorBill.bill_date) == year)
-        .where(extract('month', VendorBill.bill_date) == month)
-    )
-    itc_available = float(purchases.scalar() or 0.0) * 0.18 # Mock 18% ITC for demo
-
-    gst = GSTReturn(
-        filing_period=filing_period,
-        return_type=return_type,
-        taxable_value=taxable_value,
-        gst_liability=gst_liability,
-        itc_available=itc_available,
-        net_gst_payable=gst_liability - itc_available,
-        status="Draft"
-    )
-    db.add(gst)
-    await db.commit()
-    await db.refresh(gst)
-    return gst
-
-@router.post("/gst/reconciliation/match", response_model=list[GSTReconciliationMismatch])
-async def reconcile_gst(
-    file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    # In-memory comparison
-    content = await file.read()
-    text = content.decode('utf-8')
-    lines = text.splitlines()
-    
-    mismatches = []
-    # Assume CSV: invoice_no, vendor, gst_amount
-    for line in lines[1:]: # Skip header
-        if not line.strip(): continue
-        parts = line.split(',')
-        if len(parts) >= 3:
-            inv_no = parts[0].strip()
-            vendor = parts[1].strip()
-            try:
-                portal_gst = float(parts[2].strip())
-            except ValueError:
-                portal_gst = 0.0
-                
-            # Query ERP
-            erp_bill = await db.scalar(select(VendorBill).where(VendorBill.bill_number == inv_no))
-            if not erp_bill:
-                mismatches.append(GSTReconciliationMismatch(
-                    invoice_no=inv_no, vendor=vendor, erp_gst=0.0, portal_gst=portal_gst,
-                    difference=portal_gst, status="MISSING_IN_ERP"
-                ))
-            else:
-                erp_gst = float(erp_bill.total_amount) * 0.18 # Mock ERP GST
-                diff = abs(erp_gst - portal_gst)
-                if diff > 1.0: # 1 rupee tolerance
-                    mismatches.append(GSTReconciliationMismatch(
-                        invoice_no=inv_no, vendor=vendor, erp_gst=erp_gst, portal_gst=portal_gst,
-                        difference=diff, status="MISMATCH"
-                    ))
-                    
-    return mismatches
-
 @router.get("/gst/returns/{id}", response_model=GSTReturnOut)
 async def get_gst_return(
     id: int,
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
-    gstr = await db.get(GSTReturn, id)
-    if not gstr:
-        raise HTTPException(status_code=404, detail="GST Return not found")
+    gstr = await _get_scoped_gst_return(db, id, current_user)
     return gstr
 
 @router.patch("/gst/returns/{id}", response_model=GSTReturnOut)
 async def update_gst_return(
     id: int,
     payload: GSTReturnUpdate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.edit")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
-    gstr = await db.get(GSTReturn, id)
-    if not gstr:
-        raise HTTPException(status_code=404, detail="GST Return not found")
+    gstr = await _get_scoped_gst_return(db, id, current_user)
         
     if gstr.status == "Filed":
         raise HTTPException(status_code=400, detail="Filed GST Return cannot be modified.")
@@ -3104,13 +3300,11 @@ async def update_gst_return(
 @router.delete("/gst/returns/{id}", status_code=204)
 async def delete_gst_return(
     id: int,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.delete")),
     db: AsyncSession = Depends(get_db_session)
 ):
     from fastapi import HTTPException
-    gstr = await db.get(GSTReturn, id)
-    if not gstr:
-        raise HTTPException(status_code=404, detail="GST Return not found")
+    gstr = await _get_scoped_gst_return(db, id, current_user)
         
     if gstr.status == "Filed":
         raise HTTPException(status_code=400, detail="Filed GST Return cannot be deleted.")
@@ -3121,15 +3315,26 @@ async def delete_gst_return(
 
 @router.get("/gst/export")
 async def export_gst(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    current_user: User = Depends(require_permission("accountant.export")),
     db: AsyncSession = Depends(get_db_session)
 ):
     import io
     import csv
     
     # Combine Invoice and VendorBill
-    invoices = await db.scalars(select(Invoice))
-    vendor_bills = await db.scalars(select(VendorBill))
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    inv_query = select(Invoice)
+    vb_query = select(VendorBill)
+    if not is_sa:
+        if current_user.company_id is None:
+            inv_query = inv_query.where(False)
+            vb_query = vb_query.where(False)
+        else:
+            inv_query = inv_query.where(Invoice.company_id == current_user.company_id)
+            vb_query = vb_query.where(VendorBill.company_id == current_user.company_id)
+            
+    invoices = await db.scalars(inv_query)
+    vendor_bills = await db.scalars(vb_query)
     
     stream = io.StringIO()
     writer = csv.writer(stream)
@@ -3171,7 +3376,7 @@ async def export_gst(
 @router.post("/gst/import", response_model=GSTImportResult)
 async def import_gst(
     file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("accountant.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
     content = await file.read()

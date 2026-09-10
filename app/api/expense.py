@@ -24,6 +24,7 @@ from app.utils.helpers import NotFoundError
 from app.core.logger import logger
 
 from app.models.boq import BOQ
+from app.models.material import Supplier
 from sqlalchemy import select, func
 from decimal import Decimal
 
@@ -55,6 +56,13 @@ EXPENSE_WRITE_ROLES = [
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
 
+def _check_tenant_access(current_user: User) -> bool:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    return is_sa
+
+
 @router.post("", response_model=ExpenseOut)
 async def create_expense(
     payload: ExpenseCreate,
@@ -62,14 +70,20 @@ async def create_expense(
     current_user: User = Depends(require_permission("expenses.create")),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    is_sa = _check_tenant_access(current_user)
     logger.info(
         f"Creating expense project_id={payload.project_id} amount={payload.amount}"
     )
 
     project = await db.get(Project, payload.project_id)
-    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+    if not project or (not is_sa and project.company_id != current_user.company_id):
         logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
+
+    if payload.boq_item_id:
+        boq = await db.get(BOQ, payload.boq_item_id)
+        if not boq or boq.project_id != project.id:
+            raise NotFoundError("BOQ item not found")
 
     data = payload.model_dump()
 
@@ -135,7 +149,7 @@ async def create_expense(
         if not expense_acc:
             raise HTTPException(status_code=400, detail="GENERAL_EXPENSE account is not configured.")
 
-        cash_acc = await get_primary_cash_account(db)
+        cash_acc = await get_primary_cash_account(db, company_id=project.company_id)
 
         if expense_acc and cash_acc:
             je = JournalEntry(
@@ -172,12 +186,13 @@ async def get_by_date_range(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     query = (
         select(Expense)
         .join(Project, Expense.project_id == Project.id)
         .where(Expense.expense_date.between(start, end))
     )
-    if current_user.company_id is not None:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
     result = await db.execute(query)
     rows = result.scalars().all()
@@ -198,10 +213,16 @@ async def list_expenses(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     query = select(Expense).join(Project, Expense.project_id == Project.id)
 
-    if current_user.company_id is not None:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
+
+    if vendor_id:
+        supplier = await db.get(Supplier, vendor_id)
+        if not supplier or (not is_sa and supplier.company_id != current_user.company_id):
+            raise NotFoundError("Vendor not found")
 
     if category:
         query = query.where(Expense.category == category)
@@ -227,8 +248,9 @@ async def get_expense(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     query = select(Expense).join(Project, Expense.project_id == Project.id).where(Expense.id == id)
-    if current_user.company_id is not None:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
     obj = await db.scalar(query)
 
@@ -245,6 +267,7 @@ async def update_expense(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.edit")),
 ):
+    is_sa = _check_tenant_access(current_user)
     import time
     logger.info(f"Updating expense id={id}")
 
@@ -257,14 +280,21 @@ async def update_expense(
 
     # Validate parent project belongs to caller's company
     project = await db.get(Project, obj.project_id)
-    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+    if not project or (not is_sa and project.company_id != current_user.company_id):
         logger.warning(f"Expense access denied or project not found id={id}")
         raise NotFoundError("Expense not found")
 
+    target_project = project
     if payload.project_id and payload.project_id != obj.project_id:
         new_project = await db.get(Project, payload.project_id)
-        if not new_project or (current_user.company_id is not None and new_project.company_id != current_user.company_id):
+        if not new_project or (not is_sa and new_project.company_id != current_user.company_id):
             raise NotFoundError("Project not found")
+        target_project = new_project
+
+    if payload.boq_item_id:
+        boq = await db.get(BOQ, payload.boq_item_id)
+        if not boq or boq.project_id != target_project.id:
+            raise NotFoundError("BOQ item not found")
 
     if obj.source_type == "attendance_auto":
         raise HTTPException(
@@ -353,7 +383,7 @@ async def update_expense(
             expense_acc = await db.scalar(select(Account).where(Account.code == 'GENERAL_EXPENSE'))
             if not expense_acc:
                 raise HTTPException(status_code=400, detail="GENERAL_EXPENSE account is not configured.")
-            cash_acc = await get_primary_cash_account(db)
+            cash_acc = await get_primary_cash_account(db, company_id=target_project.company_id)
 
             if expense_acc and cash_acc:
                 new_je = JournalEntry(
@@ -398,6 +428,7 @@ async def delete_expense(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.delete")),
 ):
+    is_sa = _check_tenant_access(current_user)
     logger.info(f"Deleting expense id={id}")
 
     try:
@@ -412,7 +443,7 @@ async def delete_expense(
 
         # Validate parent project belongs to caller's company
         project = await db.get(Project, obj.project_id)
-        if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+        if not project or (not is_sa and project.company_id != current_user.company_id):
             logger.warning(f"Expense access denied or project not found id={id}")
             raise NotFoundError("Expense not found")
 
@@ -510,8 +541,9 @@ async def get_by_project(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     project = await db.get(Project, project_id)
-    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+    if not project or (not is_sa and project.company_id != current_user.company_id):
         raise NotFoundError("Project not found")
     result = await db.execute(select(Expense).where(Expense.project_id == project_id).order_by(Expense.created_at.desc()))
     rows = result.scalars().all()
@@ -524,12 +556,13 @@ async def get_by_category(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     query = (
         select(Expense)
         .join(Project, Expense.project_id == Project.id)
         .where(Expense.category == category)
     )
-    if current_user.company_id is not None:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
     result = await db.execute(query)
     rows = result.scalars().all()
@@ -542,12 +575,13 @@ async def get_by_payment_mode(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     query = (
         select(Expense)
         .join(Project, Expense.project_id == Project.id)
         .where(Expense.payment_mode == mode)
     )
-    if current_user.company_id is not None:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
     result = await db.execute(query)
     rows = result.scalars().all()
@@ -560,8 +594,9 @@ async def summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     project = await db.get(Project, project_id)
-    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+    if not project or (not is_sa and project.company_id != current_user.company_id):
         raise NotFoundError("Project not found")
     total = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
@@ -576,8 +611,9 @@ async def boq_comparison(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     project = await db.get(Project, project_id)
-    if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+    if not project or (not is_sa and project.company_id != current_user.company_id):
         raise NotFoundError("Project not found")
     boq_items = (await db.execute(
         select(BOQ).where(BOQ.project_id == project_id, BOQ.is_latest == True)
@@ -614,6 +650,7 @@ async def get_dashboard(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     # Total Expense
     tot_q = select(func.sum(Expense.amount)).join(Project, Expense.project_id == Project.id)
 
@@ -632,7 +669,7 @@ async def get_dashboard(
         .group_by(Expense.category)
     )
 
-    if current_user.company_id is not None:
+    if not is_sa:
         tot_q = tot_q.where(Project.company_id == current_user.company_id)
         mon_q = mon_q.where(Project.company_id == current_user.company_id)
         cat_q = cat_q.where(Project.company_id == current_user.company_id)
@@ -654,7 +691,7 @@ async def get_dashboard(
         .group_by(Expense.expense_date)
         .order_by(Expense.expense_date.asc())
     )
-    if current_user.company_id is not None:
+    if not is_sa:
         trend_q = trend_q.where(Project.company_id == current_user.company_id)
 
     trend_res = await db.execute(trend_q)
@@ -669,7 +706,7 @@ async def get_dashboard(
             .order_by(Expense.expense_date.asc())
             .limit(30)
         )
-        if current_user.company_id is not None:
+        if not is_sa:
             fallback_q = fallback_q.where(Project.company_id == current_user.company_id)
         trend_rows = (await db.execute(fallback_q)).all()
 
@@ -691,7 +728,7 @@ async def get_dashboard(
             func.lower(Approval.status) == "pending",
         )
     )
-    if current_user.company_id is not None:
+    if not is_sa:
         pending_appr_q = pending_appr_q.where(Project.company_id == current_user.company_id)
 
     pending_approval_count = int(await db.scalar(pending_appr_q) or 0)
@@ -722,6 +759,7 @@ async def get_project_allocations(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     # Group by project
     res_q = (
         select(Project.id, Project.project_name, func.sum(Expense.amount))
@@ -732,7 +770,7 @@ async def get_project_allocations(
         .join(Project, Expense.project_id == Project.id)
     )
 
-    if current_user.company_id is not None:
+    if not is_sa:
         res_q = res_q.where(Project.company_id == current_user.company_id)
         rec_q = rec_q.where(Project.company_id == current_user.company_id)
 
@@ -767,9 +805,10 @@ async def get_expense_ledger(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
+    is_sa = _check_tenant_access(current_user)
     from app.core.enums import AccountType
     acc_q = select(Account.id).where(or_(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
-    if current_user.company_id is not None:
+    if not is_sa:
         acc_q = acc_q.where(Account.company_id == current_user.company_id)
     expense_accs = (await db.execute(acc_q)).scalars().all()
 
@@ -804,6 +843,7 @@ async def import_expenses(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.upload")),
 ):
+    is_sa = _check_tenant_access(current_user)
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files allowed")
 
@@ -820,7 +860,7 @@ async def import_expenses(
             try:
                 pid = int(proj_id)
                 proj = await db.get(Project, pid)
-                if not proj or (current_user.company_id is not None and proj.company_id != current_user.company_id):
+                if not proj or (not is_sa and proj.company_id != current_user.company_id):
                     errors += 1
                     continue
             except (ValueError, TypeError):
@@ -834,8 +874,9 @@ async def export_expenses(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.export")),
 ):
+    is_sa = _check_tenant_access(current_user)
     query = select(Expense, Project.project_name).join(Project, Expense.project_id == Project.id)
-    if current_user.company_id is not None:
+    if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
     expenses = (await db.execute(query.order_by(Expense.expense_date.desc()))).all()
 
@@ -847,4 +888,3 @@ async def export_expenses(
         writer.writerow([exp.id, exp.expense_date, exp.category, pname, "", exp.amount, "", exp.payment_mode, "Approved"])
     output.seek(0)
     return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=expenses.csv"})
-

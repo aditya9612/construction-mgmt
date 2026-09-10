@@ -1,15 +1,15 @@
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.redis import bump_cache_version, cache_get_json, cache_set_json, get_cache_version
-from app.core.dependencies import get_current_active_user, get_request_redis, require_roles, require_feature
+from app.core.dependencies import get_current_active_user, get_request_redis, require_permission, require_feature
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.ai_prediction import AIPrediction
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.schemas.ai_prediction import AIPredictRequest, AIPredictResponse, AIPredictionOut
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.utils.helpers import NotFoundError
@@ -27,6 +27,13 @@ router = APIRouter(
 VERSION_KEY = "cache_version:ai_predictions"
 
 
+def _check_tenant_access(current_user: User) -> bool:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    return is_sa
+
+
 def _placeholder_predict(module_name: str, prompt: Optional[str]) -> Dict[str, Any]:
     prompt_len = len(prompt or "")
     return {
@@ -41,16 +48,29 @@ def _placeholder_predict(module_name: str, prompt: Optional[str]) -> Dict[str, A
 @router.post("/predict", response_model=AIPredictResponse)
 async def predict(
     payload: AIPredictRequest,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("ai.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = _check_tenant_access(current_user)
+    if not is_sa:
+        target_company_id = current_user.company_id
+    else:
+        if current_user.company_id is not None:
+            target_company_id = current_user.company_id
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Super Admin must provide active company context to create AI predictions",
+            )
+
     prediction = _placeholder_predict(payload.module_name, payload.prompt)
     obj = AIPrediction(
         module_name=payload.module_name,
         prompt=payload.prompt,
         prediction=prediction,
         created_by_user_id=current_user.id,
+        company_id=target_company_id,
     )
     db.add(obj)
     await db.flush()
@@ -64,18 +84,24 @@ async def list_predictions(
     offset: int = Query(0, ge=0),
     module_name: Optional[str] = None,
     search: Optional[str] = None,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("ai.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = _check_tenant_access(current_user)
     version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:ai:list:{version}:{limit}:{offset}:{module_name}:{search}"
+    company_scope = current_user.company_id if not is_sa else "sa"
+    cache_key = f"cache:ai:list:{company_scope}:{version}:{limit}:{offset}:{module_name}:{search}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
         return PaginatedResponse[AIPredictionOut].model_validate(cached)
 
     query = select(AIPrediction)
     count_query = select(func.count()).select_from(AIPrediction)
+
+    if not is_sa:
+        query = query.where(AIPrediction.company_id == current_user.company_id)
+        count_query = count_query.where(AIPrediction.company_id == current_user.company_id)
 
     if module_name:
         query = query.where(AIPrediction.module_name == module_name)
@@ -101,17 +127,23 @@ async def list_predictions(
 @router.get("/{prediction_id}", response_model=AIPredictionOut)
 async def get_prediction(
     prediction_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("ai.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = _check_tenant_access(current_user)
     version = await get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:ai:get:{version}:{prediction_id}"
+    company_scope = current_user.company_id if not is_sa else "sa"
+    cache_key = f"cache:ai:get:{company_scope}:{version}:{prediction_id}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
         return AIPredictionOut.model_validate(cached)
 
-    obj = await db.scalar(select(AIPrediction).where(AIPrediction.id == prediction_id))
+    query = select(AIPrediction).where(AIPrediction.id == prediction_id)
+    if not is_sa:
+        query = query.where(AIPrediction.company_id == current_user.company_id)
+
+    obj = await db.scalar(query)
     if obj is None:
         raise NotFoundError("Prediction not found")
 
@@ -124,11 +156,16 @@ async def get_prediction(
 async def update_prediction(
     prediction_id: int,
     payload: Dict[str, Any],
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_permission("ai.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    obj = await db.scalar(select(AIPrediction).where(AIPrediction.id == prediction_id))
+    is_sa = _check_tenant_access(current_user)
+    query = select(AIPrediction).where(AIPrediction.id == prediction_id)
+    if not is_sa:
+        query = query.where(AIPrediction.company_id == current_user.company_id)
+
+    obj = await db.scalar(query)
     if obj is None:
         raise NotFoundError("Prediction not found")
 
@@ -148,11 +185,16 @@ async def update_prediction(
 @router.delete("/{prediction_id}", status_code=204)
 async def delete_prediction(
     prediction_id: int,
-    current_user: User = Depends(require_roles([UserRole.ADMIN])),
+    current_user: User = Depends(require_permission("ai.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    obj = await db.scalar(select(AIPrediction).where(AIPrediction.id == prediction_id))
+    is_sa = _check_tenant_access(current_user)
+    query = select(AIPrediction).where(AIPrediction.id == prediction_id)
+    if not is_sa:
+        query = query.where(AIPrediction.company_id == current_user.company_id)
+
+    obj = await db.scalar(query)
     if obj is None:
         raise NotFoundError("Prediction not found")
 

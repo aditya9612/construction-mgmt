@@ -1678,8 +1678,11 @@ async def pay_salary(
 
     from app.utils.accounting import get_primary_cash_account
 
+    labour_obj = await db.get(Labour, payload.labour_id)
+    target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
+
     try:
-        cash_acc = await get_primary_cash_account(db)
+        cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
     except ValueError:
         from fastapi import HTTPException
 
@@ -2627,8 +2630,11 @@ async def pay_wage_record(
     else:
         from app.utils.accounting import get_primary_cash_account
 
+        labour_obj = await db.get(Labour, wage_record.labour_id)
+        target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
+
         try:
-            cash_acc = await get_primary_cash_account(db)
+            cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
             credit_account_id = cash_acc.id
         except ValueError:
             raise HTTPException(

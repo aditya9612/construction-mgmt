@@ -9,17 +9,25 @@ async def auto_post_journal(
     amount: float,
     debit_code: str,
     credit_code: str,
-    description: str
+    description: str,
+    company_id: Optional[int] = None,
 ) -> Optional[JournalEntry]:
     """
     Automatically creates a balanced journal entry if both accounts are found.
+    Tenant-safe when company_id is provided; backward-compatible when omitted.
     """
     if amount <= 0:
         return None
 
-    # Fetch accounts by code
-    debit_acc = await db.scalar(select(Account).where(Account.code == debit_code))
-    credit_acc = await db.scalar(select(Account).where(Account.code == credit_code))
+    # Fetch accounts by code with optional tenant scoping
+    debit_query = select(Account).where(Account.code == debit_code)
+    credit_query = select(Account).where(Account.code == credit_code)
+    if company_id is not None:
+        debit_query = debit_query.where(Account.company_id == company_id)
+        credit_query = credit_query.where(Account.company_id == company_id)
+
+    debit_acc = await db.scalar(debit_query)
+    credit_acc = await db.scalar(credit_query)
 
     if not debit_acc or not credit_acc:
         # Cannot post if accounts don't exist
@@ -50,63 +58,97 @@ async def auto_post_journal(
     
     return je
 
-async def get_primary_cash_account(db: AsyncSession) -> Account:
+async def get_primary_cash_account(
+    db: AsyncSession,
+    company_id: Optional[int] = None,
+) -> Account:
     """
-    Resolves the primary cash account for the system.
-    1. Checks CompanySettings.primary_cash_account_id
-    2. Raises ValueError if missing
+    Resolves the primary cash account for the system/tenant.
+    Requires company_id; zero cross-tenant fallback.
     """
     from app.models.settings import CompanySettings
-    
-    settings = await db.scalar(select(CompanySettings))
-    
-    if settings and settings.primary_cash_account_id:
+
+    if company_id is None:
+        raise ValueError("Company context is required to resolve primary cash account.")
+
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == company_id)
+    )
+    if not settings:
+        raise ValueError(f"CompanySettings not configured for company {company_id}.")
+
+    if settings.primary_cash_account_id:
         cash_acc = await db.get(Account, settings.primary_cash_account_id)
         if cash_acc:
+            if cash_acc.company_id is not None and cash_acc.company_id != company_id:
+                raise ValueError("Configured primary cash account belongs to a different tenant.")
             return cash_acc
 
-    raise ValueError("Primary Cash Account is not configured.")
+    raise ValueError(f"Primary Cash Account is not configured for company {company_id}.")
 
 
-async def get_petty_cash_account(db: AsyncSession) -> Account:
+async def get_petty_cash_account(
+    db: AsyncSession,
+    company_id: Optional[int] = None,
+) -> Account:
     """
-    Resolves the petty cash account for the system.
-    1. Checks CompanySettings.petty_cash_account_id
-    2. Raises ValueError if missing
+    Resolves the petty cash account for the system/tenant.
+    Requires company_id; zero cross-tenant fallback.
     """
     from app.models.settings import CompanySettings
-    
-    settings = await db.scalar(select(CompanySettings))
-    
-    if settings and settings.petty_cash_account_id:
+
+    if company_id is None:
+        raise ValueError("Company context is required to resolve petty cash account.")
+
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == company_id)
+    )
+    if not settings:
+        raise ValueError(f"CompanySettings not configured for company {company_id}.")
+
+    if settings.petty_cash_account_id:
         cash_acc = await db.get(Account, settings.petty_cash_account_id)
         if cash_acc:
+            if cash_acc.company_id is not None and cash_acc.company_id != company_id:
+                raise ValueError("Configured petty cash account belongs to a different tenant.")
             return cash_acc
 
-    raise ValueError("Petty cash account not configured.")
+    raise ValueError(f"Petty cash account not configured for company {company_id}.")
 
-async def get_payroll_account(db: AsyncSession, account_field_name: str) -> Account:
+
+async def get_payroll_account(
+    db: AsyncSession,
+    account_field_name: str,
+    company_id: Optional[int] = None,
+) -> Account:
     """
     Resolves a payroll account from CompanySettings.
-    Raises ValueError if missing.
+    Requires company_id; zero cross-tenant fallback.
     """
     from app.models.settings import CompanySettings
-    
-    settings = await db.scalar(select(CompanySettings))
+
+    if company_id is None:
+        raise ValueError("Company context is required to resolve payroll accounts.")
+
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == company_id)
+    )
     if not settings:
-        raise ValueError("CompanySettings not configured.")
-        
+        raise ValueError(f"CompanySettings not configured for company {company_id}.")
+
     account_id = getattr(settings, account_field_name, None)
     if not account_id:
-        raise ValueError(f"Payroll account '{account_field_name}' not configured in CompanySettings.")
-        
+        raise ValueError(
+            f"Payroll account '{account_field_name}' not configured in CompanySettings for company {company_id}."
+        )
+
     account = await db.get(Account, account_id)
     if not account:
         raise ValueError(f"Account ID {account_id} for '{account_field_name}' not found.")
-        
-    return account
+    if account.company_id is not None and account.company_id != company_id:
+        raise ValueError(f"Account ID {account_id} belongs to a different tenant.")
 
-from fastapi import HTTPException
+    return account
 
 
 async def resolve_tax_accounts(
@@ -115,31 +157,29 @@ async def resolve_tax_accounts(
     company_id: Optional[int] = None,
 ) -> Account:
     """
-    Dynamically resolves a tax account (e.g., Input GST, Output GST, TDS Payable)
-    using pattern matching or CompanySettings if available.
-    If missing, automatically creates / seeds the standard account.
+    Dynamically resolves a tax account (e.g., Input GST, Output GST, TDS Payable).
+    Requires company_id; zero cross-tenant fallback.
     """
     from app.models.settings import CompanySettings
     from app.core.enums import AccountType
 
-    settings_stmt = select(CompanySettings)
-    if company_id is not None:
-        settings_stmt = settings_stmt.where(CompanySettings.company_id == company_id)
-    settings = await db.scalar(settings_stmt)
-    if not settings and company_id is not None:
-        settings = await db.scalar(select(CompanySettings))
+    if company_id is None:
+        raise ValueError("Company context is required to resolve tax accounts.")
+
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == company_id)
+    )
 
     if account_type_name == "tds_payable":
         if settings and getattr(settings, "tds_payable_account_id", None):
             acc = await db.get(Account, settings.tds_payable_account_id)
-            if acc:
+            if acc and (acc.company_id is None or acc.company_id == company_id):
                 return acc
-        query = select(Account).where(Account.code == "TDS_PAYABLE")
-        if company_id is not None:
-            query = query.where(Account.company_id == company_id)
+        query = select(Account).where(
+            Account.code == "TDS_PAYABLE",
+            Account.company_id == company_id,
+        )
         acc = await db.scalar(query)
-        if not acc:
-            acc = await db.scalar(select(Account).where(Account.code == "TDS_PAYABLE"))
         if not acc:
             acc = Account(
                 name="TDS Payable",
@@ -152,12 +192,11 @@ async def resolve_tax_accounts(
         return acc
 
     elif account_type_name == "input_gst":
-        query = select(Account).where(Account.code == "INPUT_GST")
-        if company_id is not None:
-            query = query.where(Account.company_id == company_id)
+        query = select(Account).where(
+            Account.code == "INPUT_GST",
+            Account.company_id == company_id,
+        )
         acc = await db.scalar(query)
-        if not acc:
-            acc = await db.scalar(select(Account).where(Account.code == "INPUT_GST"))
         if not acc:
             acc = Account(
                 name="Input GST",
@@ -170,12 +209,11 @@ async def resolve_tax_accounts(
         return acc
 
     elif account_type_name == "output_gst":
-        query = select(Account).where(Account.code == "OUTPUT_GST")
-        if company_id is not None:
-            query = query.where(Account.company_id == company_id)
+        query = select(Account).where(
+            Account.code == "OUTPUT_GST",
+            Account.company_id == company_id,
+        )
         acc = await db.scalar(query)
-        if not acc:
-            acc = await db.scalar(select(Account).where(Account.code == "OUTPUT_GST"))
         if not acc:
             acc = Account(
                 name="Output GST",

@@ -18,6 +18,13 @@ class AIPrediction(Base, TimestampMixin):
     # Store generic prediction payload (placeholder for now).
     prediction: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
+    company_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
     created_by_user_id: Mapped[Optional[int]] = mapped_column(
         Integer,
         ForeignKey("users.id", ondelete="SET NULL"),

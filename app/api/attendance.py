@@ -564,7 +564,10 @@ async def list_attendance(
     stmt = select(UserAttendance)
     count_stmt = select(func.count()).select_from(UserAttendance)
     
-    if current_user.company_id:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
         stmt = stmt.join(User, UserAttendance.user_id == User.id).where(User.company_id == current_user.company_id)
         count_stmt = count_stmt.join(User, UserAttendance.user_id == User.id).where(User.company_id == current_user.company_id)
 
@@ -629,7 +632,10 @@ async def proxy_check_in(
         await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
 
 
-    if current_user.company_id:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
         users = (await db.execute(select(User.id).where(User.id.in_(payload.user_ids), User.company_id == current_user.company_id))).scalars().all()
         if len(users) != len(payload.user_ids):
             raise HTTPException(status_code=403, detail="Cross-tenant proxy check-in not allowed")
@@ -682,7 +688,10 @@ async def proxy_check_out(
     current_user: User = Depends(require_permission("attendance.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
         valid_atts = (await db.execute(
             select(UserAttendance.id)
             .join(User, UserAttendance.user_id == User.id)
@@ -773,7 +782,10 @@ async def export_attendance_csv(
         .outerjoin(Project, UserAttendance.project_id == Project.id)
     )
 
-    if current_user.company_id:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
         query = query.where(User.company_id == current_user.company_id)
 
     query = query.where(UserAttendance.attendance_date >= start_date)
@@ -859,7 +871,10 @@ async def export_attendance_pdf_audit(
         .join(User, UserAttendance.user_id == User.id)
         .outerjoin(Project, UserAttendance.project_id == Project.id)
     )
-    if current_user.company_id:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
         query = query.where(User.company_id == current_user.company_id)
 
     query = query.where(
@@ -963,7 +978,10 @@ async def export_attendance_payroll(
         ),
     ).join(UserAttendance, UserAttendance.user_id == User.id)
 
-    if current_user.company_id:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
         query = query.where(User.company_id == current_user.company_id)
 
     query = query.where(

@@ -5647,10 +5647,17 @@ async def delete_material(
 )
 async def get_ai_material_recommendation(
     payload: AIMaterialRecommendationRequest,
-    current_user: User = Depends(require_roles(MATERIAL_READ_ROLES)),
+    current_user: User = Depends(require_permission("materials.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    project = await db.get(Project, payload.project_id)
+    if not project or (not is_sa and project.company_id != current_user.company_id):
+        raise NotFoundError("Project not found")
 
     try:
         await assert_project_access(
@@ -5658,9 +5665,13 @@ async def get_ai_material_recommendation(
         )
     except Exception:
         raise NotFoundError("Project not found")
+
+    target_company_id = project.company_id
+
     version = await get_cache_version(redis, VERSION_KEY)
+    company_scope = current_user.company_id if not is_sa else "sa"
     cache_key = (
-        f"cache:materials:ai_rec:{version}:{payload.project_id}:{payload.target_days}"
+        f"cache:materials:ai_rec:{company_scope}:{version}:{payload.project_id}:{payload.target_days}"
     )
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
@@ -5672,17 +5683,15 @@ async def get_ai_material_recommendation(
         target_days=payload.target_days,
     )
 
-    try:
-        ai_obj = AIPrediction(
-            module_name="material_recommendation",
-            prompt=f"project_id={payload.project_id}, target_days={payload.target_days}",
-            prediction=result,
-            created_by_user_id=current_user.id,
-        )
-        db.add(ai_obj)
-        await db.flush()
-    except Exception as e:
-        logger.warning(f"Failed to store AIPrediction log: {e}")
+    ai_obj = AIPrediction(
+        module_name="material_recommendation",
+        prompt=f"project_id={payload.project_id}, target_days={payload.target_days}",
+        prediction=result,
+        created_by_user_id=current_user.id,
+        company_id=target_company_id,
+    )
+    db.add(ai_obj)
+    await db.flush()
 
     await cache_set_json(redis, cache_key, result)
     return AIMaterialRecommendationResponse.model_validate(result)

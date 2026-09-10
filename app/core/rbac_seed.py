@@ -58,6 +58,7 @@ MODULES = [
     "vendor_bills",
     "payment_vouchers",
     "journal",
+    "accountant",
 
     # =====================================================
     # CONTRACTORS, WORK ORDERS & OWNERS
@@ -111,10 +112,12 @@ MODULES = [
     "approvals",
 
     # =====================================================
-    # SETTINGS
+    # SETTINGS & SYSTEM
     # =====================================================
 
     "settings",
+    "ai",
+    "master_data",
 ]
 
 
@@ -182,6 +185,25 @@ MODULE_ACTIONS = {
         "edit",
         "delete",
         "export",
+    ],
+    "accountant": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+        "export",
+    ],
+    "ai": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+    ],
+    "master_data": [
+        "view",
+        "create",
+        "edit",
+        "delete",
     ],
 }
 

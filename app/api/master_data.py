@@ -2,22 +2,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, List
+from sqlalchemy.orm import selectinload
 
 from app.db.session import get_db_session
-from app.api.user import get_current_active_user, User
 from app.models import master_data as m
 from app.schemas import master_data as s
-from sqlalchemy.orm import selectinload
 from app.utils.common import generate_readable_master_code
 from app.utils.helpers import NotFoundError, ValidationError
-
-from app.core.dependencies import (
-    get_request_redis,
-    require_roles,
-)
-
-from app.models.user import User, UserRole
-
+from app.core.dependencies import get_request_redis, require_permission
+from app.models.user import User
 from app.cache import redis as r
 
 router = APIRouter(prefix="/master", tags=["Master Data"])
@@ -25,8 +18,12 @@ router = APIRouter(prefix="/master", tags=["Master Data"])
 CACHE_KEY = "master"
 VERSION_KEY = "master_version"
 
-#  FIX: define once (NO inline callable)
-admin_required = require_roles([UserRole.ADMIN])
+
+def _check_tenant_access(current_user: User) -> bool:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    return is_sa
 
 
 # ===================== STATS =====================
@@ -34,26 +31,36 @@ admin_required = require_roles([UserRole.ADMIN])
 
 @router.get("/stats", response_model=s.MasterDataStats)
 async def get_master_stats(
+    current_user: User = Depends(require_permission("master_data.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
 
-    materials = await db.scalar(
-        select(func.count(m.MaterialMaster.id)).where(
-            m.MaterialMaster.is_active == True
+    mat_q = select(func.count(m.MaterialMaster.id)).where(m.MaterialMaster.is_active == True)
+    lab_q = select(func.count(m.LabourType.id)).where(m.LabourType.is_active == True)
+    act_q = select(func.count(m.ActivityType.id)).where(m.ActivityType.is_active == True)
+    unit_q = select(func.count(m.Unit.id)).where(m.Unit.is_active == True)
+
+    if not is_sa:
+        mat_q = mat_q.where(
+            or_(
+                m.MaterialMaster.company_id == current_user.company_id,
+                m.MaterialMaster.company_id.is_(None),
+            )
         )
-    )
+        lab_q = lab_q.where(
+            or_(
+                m.LabourType.company_id == current_user.company_id,
+                m.LabourType.company_id.is_(None),
+            )
+        )
+        act_q = act_q.where(m.ActivityType.company_id == current_user.company_id)
+        unit_q = unit_q.where(m.Unit.company_id == current_user.company_id)
 
-    labour = await db.scalar(
-        select(func.count(m.LabourType.id)).where(m.LabourType.is_active == True)
-    )
-
-    activity = await db.scalar(
-        select(func.count(m.ActivityType.id)).where(m.ActivityType.is_active == True)
-    )
-
-    units = await db.scalar(
-        select(func.count(m.Unit.id)).where(m.Unit.is_active == True)
-    )
+    materials = await db.scalar(mat_q)
+    labour = await db.scalar(lab_q)
+    activity = await db.scalar(act_q)
+    units = await db.scalar(unit_q)
 
     return s.MasterDataStats(
         total_materials=int(materials or 0),
@@ -72,11 +79,13 @@ async def get_master_stats(
 async def get_all_master_data(
     search: Optional[str] = None,
     tag: Optional[str] = Query(None, description="MATERIAL, LABOR, ACTIVITY, UNIT"),
+    current_user: User = Depends(require_permission("master_data.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
     Returns a unified list of all master data with optional searching and tag filtering.
     """
+    is_sa = _check_tenant_access(current_user)
     results = []
 
     # 1. Materials
@@ -86,6 +95,13 @@ async def get_all_master_data(
             .options(selectinload(m.MaterialMaster.unit))
             .where(m.MaterialMaster.is_active == True)
         )
+        if not is_sa:
+            q = q.where(
+                or_(
+                    m.MaterialMaster.company_id == current_user.company_id,
+                    m.MaterialMaster.company_id.is_(None),
+                )
+            )
         if search:
             q = q.where(
                 or_(
@@ -108,9 +124,14 @@ async def get_all_master_data(
 
     # 2. Labor
     if not tag or tag == "LABOR":
-
         q = select(m.LabourType).where(m.LabourType.is_active == True)
-
+        if not is_sa:
+            q = q.where(
+                or_(
+                    m.LabourType.company_id == current_user.company_id,
+                    m.LabourType.company_id.is_(None),
+                )
+            )
         if search:
             q = q.where(
                 or_(
@@ -118,11 +139,8 @@ async def get_all_master_data(
                     m.LabourType.unique_code.ilike(f"%{search}%"),
                 )
             )
-
         res = await db.execute(q)
-
         for x in res.scalars().all():
-
             results.append(
                 s.MasterDataUnified(
                     id=x.id,
@@ -137,6 +155,8 @@ async def get_all_master_data(
     # 3. Activity
     if not tag or tag == "ACTIVITY":
         q = select(m.ActivityType).where(m.ActivityType.is_active == True)
+        if not is_sa:
+            q = q.where(m.ActivityType.company_id == current_user.company_id)
         if search:
             q = q.where(
                 or_(
@@ -158,9 +178,9 @@ async def get_all_master_data(
 
     # 4. Units
     if not tag or tag == "UNIT":
-
         q = select(m.Unit).where(m.Unit.is_active == True)
-
+        if not is_sa:
+            q = q.where(m.Unit.company_id == current_user.company_id)
         if search:
             q = q.where(
                 or_(
@@ -168,11 +188,8 @@ async def get_all_master_data(
                     m.Unit.unique_code.ilike(f"%{search}%"),
                 )
             )
-
         res = await db.execute(q)
-
         for x in res.scalars().all():
-
             results.append(
                 s.MasterDataUnified(
                     id=x.id,
@@ -191,23 +208,28 @@ async def get_all_master_data(
 
 @router.get("/units", response_model=list[s.UnitOut])
 async def get_units(
+    current_user: User = Depends(require_permission("master_data.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = _check_tenant_access(current_user)
     version = await r.get_cache_version(redis, VERSION_KEY)
-    cache_key = f"{CACHE_KEY}:{version}:units"
+    company_scope = current_user.company_id if not is_sa else "sa"
+    cache_key = f"{CACHE_KEY}:{company_scope}:{version}:units"
 
     cached = await r.cache_get_json(redis, cache_key)
     if cached:
         return cached
 
-    result = await db.execute(
-        select(m.Unit).where(m.Unit.is_active == True).order_by(m.Unit.name)
-    )
+    q = select(m.Unit).where(m.Unit.is_active == True)
+    if not is_sa:
+        q = q.where(m.Unit.company_id == current_user.company_id)
+    q = q.order_by(m.Unit.name)
+
+    result = await db.execute(q)
     data = result.scalars().all()
 
     response = [s.UnitOut.model_validate(x).model_dump() for x in data]
-
     await r.cache_set_json(redis, cache_key, response)
     return response
 
@@ -218,20 +240,21 @@ async def get_units(
 @router.post("/units", response_model=s.UnitOut)
 async def create_unit(
     payload: s.UnitCreate,
+    current_user: User = Depends(require_permission("master_data.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
+    target_company_id = current_user.company_id
 
-    # CHECK EXISTING UNIT
-    existing = await db.scalar(
-        select(m.Unit).where(func.lower(m.Unit.name) == payload.name.strip().lower())
-    )
+    # CHECK EXISTING UNIT IN SAME TENANT
+    dup_q = select(m.Unit).where(func.lower(m.Unit.name) == payload.name.strip().lower())
+    if not is_sa:
+        dup_q = dup_q.where(m.Unit.company_id == current_user.company_id)
+    elif target_company_id is not None:
+        dup_q = dup_q.where(m.Unit.company_id == target_company_id)
 
+    existing = await db.scalar(dup_q)
     if existing:
         raise ValidationError("Unit already exists")
 
@@ -241,16 +264,15 @@ async def create_unit(
     )
 
     obj = m.Unit(
-        company_id=_current_company_user.company_id,**payload.model_dump(), unique_code=unique_code)
-
+        company_id=target_company_id,
+        **payload.model_dump(),
+        unique_code=unique_code,
+    )
     db.add(obj)
-
     await db.commit()
-
     await db.refresh(obj)
 
     await r.bump_cache_version(redis, VERSION_KEY)
-
     return obj
 
 
@@ -261,30 +283,33 @@ async def create_unit(
 async def update_unit(
     id: int,
     payload: s.UnitUpdate,
+    current_user: User = Depends(require_permission("master_data.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-
+    is_sa = _check_tenant_access(current_user)
     obj = await db.get(m.Unit, id)
 
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Unit not found")
+
+    if not is_sa:
+        if obj.company_id != current_user.company_id:
+            raise NotFoundError("Unit not found")
 
     update_data = payload.model_dump(exclude_unset=True)
 
     if "name" in update_data:
-        existing = await db.scalar(
-            select(m.Unit).where(
-                func.lower(m.Unit.name) == update_data["name"].strip().lower(),
-                m.Unit.id != id,
-            )
+        dup_q = select(m.Unit).where(
+            func.lower(m.Unit.name) == update_data["name"].strip().lower(),
+            m.Unit.id != id,
         )
+        if not is_sa:
+            dup_q = dup_q.where(m.Unit.company_id == current_user.company_id)
+        elif obj.company_id is not None:
+            dup_q = dup_q.where(m.Unit.company_id == obj.company_id)
 
+        existing = await db.scalar(dup_q)
         if existing:
             raise ValidationError("Unit already exists")
 
@@ -293,9 +318,7 @@ async def update_unit(
 
     await db.commit()
     await db.refresh(obj)
-
     await r.bump_cache_version(redis, VERSION_KEY)
-
     return obj
 
 
@@ -305,23 +328,22 @@ async def update_unit(
 @router.delete("/units/{id}")
 async def delete_unit(
     id: int,
+    current_user: User = Depends(require_permission("master_data.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
     obj = await db.get(m.Unit, id)
 
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Unit not found")
 
+    if not is_sa:
+        if obj.company_id != current_user.company_id:
+            raise NotFoundError("Unit not found")
+
     obj.is_active = False
-
     await db.commit()
-
     await r.bump_cache_version(redis, VERSION_KEY)
 
     return {
@@ -335,54 +357,68 @@ async def delete_unit(
 
 @router.get("/labour-types", response_model=list[s.LabourTypeOut])
 async def get_labour_types(
+    current_user: User = Depends(require_permission("master_data.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-
+    is_sa = _check_tenant_access(current_user)
     version = await r.get_cache_version(redis, VERSION_KEY)
-
-    cache_key = f"{CACHE_KEY}:{version}:labour-types"
+    company_scope = current_user.company_id if not is_sa else "sa"
+    cache_key = f"{CACHE_KEY}:{company_scope}:{version}:labour-types"
 
     cached = await r.cache_get_json(redis, cache_key)
-
     if cached:
         return cached
 
-    result = await db.execute(
-        select(m.LabourType)
-        .where(m.LabourType.is_active == True)
-        .order_by(m.LabourType.name)
-    )
+    q = select(m.LabourType).where(m.LabourType.is_active == True)
+    if not is_sa:
+        q = q.where(
+            or_(
+                m.LabourType.company_id == current_user.company_id,
+                m.LabourType.company_id.is_(None),
+            )
+        )
+    q = q.order_by(m.LabourType.name)
 
+    result = await db.execute(q)
     data = result.scalars().all()
 
     response = [s.LabourTypeOut.model_validate(x).model_dump() for x in data]
-
     await r.cache_set_json(redis, cache_key, response)
-
     return response
 
 
-# ===================== LABOUR TYPES =====================
+# ===================== CREATE LABOUR TYPE =====================
 
 
 @router.post("/labour-types", response_model=s.LabourTypeOut)
 async def create_labour_type(
     payload: s.LabourTypeCreate,
+    current_user: User = Depends(require_permission("master_data.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
+    target_company_id = current_user.company_id
 
-    # CHECK EXISTING LABOUR TYPE
-    existing = await db.scalar(
-        select(m.LabourType).where(m.LabourType.name == payload.name)
-    )
+    # CHECK EXISTING LABOUR TYPE IN SAME SCOPE
+    dup_q = select(m.LabourType).where(m.LabourType.name == payload.name)
+    if not is_sa:
+        dup_q = dup_q.where(
+            or_(
+                m.LabourType.company_id == current_user.company_id,
+                m.LabourType.company_id.is_(None),
+            )
+        )
+    elif target_company_id is not None:
+        dup_q = dup_q.where(
+            or_(
+                m.LabourType.company_id == target_company_id,
+                m.LabourType.company_id.is_(None),
+            )
+        )
 
+    existing = await db.scalar(dup_q)
     if existing:
         raise ValidationError("Labour type already exists")
 
@@ -392,16 +428,15 @@ async def create_labour_type(
     )
 
     obj = m.LabourType(
-        company_id=_current_company_user.company_id,**payload.model_dump(), unique_code=unique_code)
-
+        company_id=target_company_id,
+        **payload.model_dump(),
+        unique_code=unique_code,
+    )
     db.add(obj)
-
     await db.commit()
-
     await db.refresh(obj)
 
     await r.bump_cache_version(redis, VERSION_KEY)
-
     return obj
 
 
@@ -415,33 +450,35 @@ async def create_labour_type(
 async def update_labour_type(
     id: int,
     payload: s.LabourTypeUpdate,
+    current_user: User = Depends(require_permission("master_data.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
+    obj = await db.get(m.LabourType, id)
 
-    obj = await db.get(
-        m.LabourType,
-        id,
-    )
-
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Labour type not found")
+
+    if not is_sa:
+        if obj.company_id is None:
+            raise HTTPException(status_code=403, detail="Cannot modify system template")
+        if obj.company_id != current_user.company_id:
+            raise NotFoundError("Labour type not found")
 
     update_data = payload.model_dump(exclude_unset=True)
 
     if "name" in update_data:
-        existing = await db.scalar(
-            select(m.LabourType).where(
-                func.lower(m.LabourType.name) == update_data["name"].strip().lower(),
-                m.LabourType.id != id,
-            )
+        dup_q = select(m.LabourType).where(
+            func.lower(m.LabourType.name) == update_data["name"].strip().lower(),
+            m.LabourType.id != id,
         )
+        if not is_sa:
+            dup_q = dup_q.where(m.LabourType.company_id == current_user.company_id)
+        elif obj.company_id is not None:
+            dup_q = dup_q.where(m.LabourType.company_id == obj.company_id)
 
+        existing = await db.scalar(dup_q)
         if existing:
             raise ValidationError("Labour type already exists")
 
@@ -450,12 +487,7 @@ async def update_labour_type(
 
     await db.commit()
     await db.refresh(obj)
-
-    await r.bump_cache_version(
-        redis,
-        VERSION_KEY,
-    )
-
+    await r.bump_cache_version(redis, VERSION_KEY)
     return obj
 
 
@@ -465,23 +497,24 @@ async def update_labour_type(
 @router.delete("/labour-types/{id}")
 async def delete_labour_type(
     id: int,
+    current_user: User = Depends(require_permission("master_data.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
     obj = await db.get(m.LabourType, id)
 
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Labour type not found")
 
+    if not is_sa:
+        if obj.company_id is None:
+            raise HTTPException(status_code=403, detail="Cannot modify system template")
+        if obj.company_id != current_user.company_id:
+            raise NotFoundError("Labour type not found")
+
     obj.is_active = False
-
     await db.commit()
-
     await r.bump_cache_version(redis, VERSION_KEY)
 
     return {
@@ -495,25 +528,28 @@ async def delete_labour_type(
 
 @router.get("/activity-types", response_model=list[s.ActivityTypeOut])
 async def get_activity_types(
+    current_user: User = Depends(require_permission("master_data.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = _check_tenant_access(current_user)
     version = await r.get_cache_version(redis, VERSION_KEY)
-    cache_key = f"{CACHE_KEY}:{version}:activity-types"
+    company_scope = current_user.company_id if not is_sa else "sa"
+    cache_key = f"{CACHE_KEY}:{company_scope}:{version}:activity-types"
 
     cached = await r.cache_get_json(redis, cache_key)
     if cached:
         return cached
 
-    result = await db.execute(
-        select(m.ActivityType)
-        .where(m.ActivityType.is_active == True)
-        .order_by(m.ActivityType.name)
-    )
+    q = select(m.ActivityType).where(m.ActivityType.is_active == True)
+    if not is_sa:
+        q = q.where(m.ActivityType.company_id == current_user.company_id)
+    q = q.order_by(m.ActivityType.name)
+
+    result = await db.execute(q)
     data = result.scalars().all()
 
     response = [s.ActivityTypeOut.model_validate(x).model_dump() for x in data]
-
     await r.cache_set_json(redis, cache_key, response)
     return response
 
@@ -524,27 +560,28 @@ async def get_activity_types(
 @router.post("/activity-types", response_model=s.ActivityTypeOut)
 async def create_activity_type(
     payload: s.ActivityTypeCreate,
+    current_user: User = Depends(require_permission("master_data.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
+    target_company_id = current_user.company_id
 
     if payload.default_unit_id:
-
         unit = await db.get(m.Unit, payload.default_unit_id)
-
         if not unit:
             raise ValidationError("Invalid unit")
+        if not is_sa and unit.company_id != current_user.company_id:
+            raise ValidationError("Invalid unit: unit belongs to another company")
 
     # CHECK EXISTING ACTIVITY TYPE
-    existing = await db.scalar(
-        select(m.ActivityType).where(m.ActivityType.name == payload.name)
-    )
+    dup_q = select(m.ActivityType).where(m.ActivityType.name == payload.name)
+    if not is_sa:
+        dup_q = dup_q.where(m.ActivityType.company_id == current_user.company_id)
+    elif target_company_id is not None:
+        dup_q = dup_q.where(m.ActivityType.company_id == target_company_id)
 
+    existing = await db.scalar(dup_q)
     if existing:
         raise ValidationError("Activity type already exists")
 
@@ -554,16 +591,15 @@ async def create_activity_type(
     )
 
     obj = m.ActivityType(
-        company_id=_current_company_user.company_id,**payload.model_dump(), unique_code=unique_code)
-
+        company_id=target_company_id,
+        **payload.model_dump(),
+        unique_code=unique_code,
+    )
     db.add(obj)
-
     await db.commit()
-
     await db.refresh(obj)
 
     await r.bump_cache_version(redis, VERSION_KEY)
-
     return obj
 
 
@@ -577,42 +613,40 @@ async def create_activity_type(
 async def update_activity_type(
     id: int,
     payload: s.ActivityTypeUpdate,
+    current_user: User = Depends(require_permission("master_data.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
+    obj = await db.get(m.ActivityType, id)
 
-    obj = await db.get(
-        m.ActivityType,
-        id,
-    )
-
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Activity type not found")
+
+    if not is_sa:
+        if obj.company_id != current_user.company_id:
+            raise NotFoundError("Activity type not found")
 
     update_data = payload.model_dump(exclude_unset=True)
 
     if "default_unit_id" in update_data and update_data["default_unit_id"] is not None:
-        unit = await db.get(
-            m.Unit,
-            update_data["default_unit_id"],
-        )
-
+        unit = await db.get(m.Unit, update_data["default_unit_id"])
         if not unit:
             raise ValidationError("Invalid unit")
+        if not is_sa and unit.company_id != current_user.company_id:
+            raise ValidationError("Invalid unit: unit belongs to another company")
 
     if "name" in update_data:
-        existing = await db.scalar(
-            select(m.ActivityType).where(
-                func.lower(m.ActivityType.name) == update_data["name"].strip().lower(),
-                m.ActivityType.id != id,
-            )
+        dup_q = select(m.ActivityType).where(
+            func.lower(m.ActivityType.name) == update_data["name"].strip().lower(),
+            m.ActivityType.id != id,
         )
+        if not is_sa:
+            dup_q = dup_q.where(m.ActivityType.company_id == current_user.company_id)
+        elif obj.company_id is not None:
+            dup_q = dup_q.where(m.ActivityType.company_id == obj.company_id)
 
+        existing = await db.scalar(dup_q)
         if existing:
             raise ValidationError("Activity type already exists")
 
@@ -621,12 +655,7 @@ async def update_activity_type(
 
     await db.commit()
     await db.refresh(obj)
-
-    await r.bump_cache_version(
-        redis,
-        VERSION_KEY,
-    )
-
+    await r.bump_cache_version(redis, VERSION_KEY)
     return obj
 
 
@@ -636,23 +665,22 @@ async def update_activity_type(
 @router.delete("/activity-types/{id}")
 async def delete_activity_type(
     id: int,
+    current_user: User = Depends(require_permission("master_data.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
     obj = await db.get(m.ActivityType, id)
 
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Activity type not found")
 
+    if not is_sa:
+        if obj.company_id != current_user.company_id:
+            raise NotFoundError("Activity type not found")
+
     obj.is_active = False
-
     await db.commit()
-
     await r.bump_cache_version(redis, VERSION_KEY)
 
     return {
@@ -669,32 +697,34 @@ async def delete_activity_type(
     response_model=list[s.MaterialMasterOut],
 )
 async def get_material_master(
+    current_user: User = Depends(require_permission("master_data.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = _check_tenant_access(current_user)
+    version = await r.get_cache_version(redis, VERSION_KEY)
+    company_scope = current_user.company_id if not is_sa else "sa"
+    cache_key = f"{CACHE_KEY}:{company_scope}:{version}:materials"
 
-    version = await r.get_cache_version(
-        redis,
-        VERSION_KEY,
-    )
-
-    cache_key = f"{CACHE_KEY}:{version}:materials"
-
-    cached = await r.cache_get_json(
-        redis,
-        cache_key,
-    )
-
+    cached = await r.cache_get_json(redis, cache_key)
     if cached:
         return cached
 
-    result = await db.execute(
+    q = (
         select(m.MaterialMaster)
         .options(selectinload(m.MaterialMaster.unit))
         .where(m.MaterialMaster.is_active == True)
-        .order_by(m.MaterialMaster.name)
     )
+    if not is_sa:
+        q = q.where(
+            or_(
+                m.MaterialMaster.company_id == current_user.company_id,
+                m.MaterialMaster.company_id.is_(None),
+            )
+        )
+    q = q.order_by(m.MaterialMaster.name)
 
+    result = await db.execute(q)
     materials = result.scalars().all()
 
     response = [
@@ -715,12 +745,7 @@ async def get_material_master(
         for obj in materials
     ]
 
-    await r.cache_set_json(
-        redis,
-        cache_key,
-        response,
-    )
-
+    await r.cache_set_json(redis, cache_key, response)
     return response
 
 
@@ -730,34 +755,46 @@ async def get_material_master(
 @router.post("/materials", response_model=s.MaterialMasterOut)
 async def create_material_master(
     payload: s.MaterialMasterCreate,
+    current_user: User = Depends(require_permission("master_data.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
+    target_company_id = current_user.company_id
 
     # ===== CHECK UNIT =====
-    unit = await db.get(
-        m.Unit,
-        payload.unit_id,
-    )
-
+    unit = await db.get(m.Unit, payload.unit_id)
     if not unit:
+        raise HTTPException(
+            status_code=404,
+            detail="Unit not found",
+        )
+    if not is_sa and unit.company_id != current_user.company_id:
         raise HTTPException(
             status_code=404,
             detail="Unit not found",
         )
 
     # ===== CHECK EXISTING MATERIAL =====
-    existing = await db.scalar(
-        select(m.MaterialMaster).where(
-            func.lower(m.MaterialMaster.name) == payload.name.strip().lower()
-        )
+    dup_q = select(m.MaterialMaster).where(
+        func.lower(m.MaterialMaster.name) == payload.name.strip().lower()
     )
+    if not is_sa:
+        dup_q = dup_q.where(
+            or_(
+                m.MaterialMaster.company_id == current_user.company_id,
+                m.MaterialMaster.company_id.is_(None),
+            )
+        )
+    elif target_company_id is not None:
+        dup_q = dup_q.where(
+            or_(
+                m.MaterialMaster.company_id == target_company_id,
+                m.MaterialMaster.company_id.is_(None),
+            )
+        )
 
+    existing = await db.scalar(dup_q)
     if existing:
         raise ValidationError("Material already exists")
 
@@ -771,7 +808,7 @@ async def create_material_master(
 
     # ===== CREATE MATERIAL MASTER =====
     obj = m.MaterialMaster(
-        company_id=_current_company_user.company_id,
+        company_id=target_company_id,
         name=payload.name.strip(),
         category=payload.category,
         unit_id=payload.unit_id,
@@ -785,15 +822,9 @@ async def create_material_master(
     )
 
     db.add(obj)
-
     await db.commit()
-
     await db.refresh(obj)
-
-    await r.bump_cache_version(
-        redis,
-        VERSION_KEY,
-    )
+    await r.bump_cache_version(redis, VERSION_KEY)
 
     return s.MaterialMasterOut(
         id=obj.id,
@@ -821,47 +852,44 @@ async def create_material_master(
 async def update_material_master(
     id: int,
     payload: s.MaterialMasterUpdate,
+    current_user: User = Depends(require_permission("master_data.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
+    obj = await db.get(m.MaterialMaster, id)
 
-    obj = await db.get(
-        m.MaterialMaster,
-        id,
-    )
-
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Material not found")
+
+    if not is_sa:
+        if obj.company_id is None:
+            raise HTTPException(status_code=403, detail="Cannot modify system template")
+        if obj.company_id != current_user.company_id:
+            raise NotFoundError("Material not found")
 
     update_data = payload.model_dump(exclude_unset=True)
 
     # ===== UNIT VALIDATION =====
     if "unit_id" in update_data and update_data["unit_id"] is not None:
-
-        unit = await db.get(
-            m.Unit,
-            update_data["unit_id"],
-        )
-
+        unit = await db.get(m.Unit, update_data["unit_id"])
         if not unit:
             raise ValidationError("Invalid unit")
+        if not is_sa and unit.company_id != current_user.company_id:
+            raise ValidationError("Invalid unit: unit belongs to another company")
 
     # ===== DUPLICATE NAME CHECK =====
     if "name" in update_data:
-
-        existing = await db.scalar(
-            select(m.MaterialMaster).where(
-                func.lower(m.MaterialMaster.name)
-                == update_data["name"].strip().lower(),
-                m.MaterialMaster.id != id,
-            )
+        dup_q = select(m.MaterialMaster).where(
+            func.lower(m.MaterialMaster.name) == update_data["name"].strip().lower(),
+            m.MaterialMaster.id != id,
         )
+        if not is_sa:
+            dup_q = dup_q.where(m.MaterialMaster.company_id == current_user.company_id)
+        elif obj.company_id is not None:
+            dup_q = dup_q.where(m.MaterialMaster.company_id == obj.company_id)
 
+        existing = await db.scalar(dup_q)
         if existing:
             raise ValidationError("Material already exists")
 
@@ -874,19 +902,11 @@ async def update_material_master(
 
     # ===== FETCH UNIT NAME SAFELY =====
     unit_name = None
-
     if obj.unit_id:
-        unit_obj = await db.get(
-            m.Unit,
-            obj.unit_id,
-        )
-
+        unit_obj = await db.get(m.Unit, obj.unit_id)
         unit_name = unit_obj.name if unit_obj else None
 
-    await r.bump_cache_version(
-        redis,
-        VERSION_KEY,
-    )
+    await r.bump_cache_version(redis, VERSION_KEY)
 
     return s.MaterialMasterOut(
         id=obj.id,
@@ -910,26 +930,28 @@ async def update_material_master(
 @router.delete("/materials/{id}")
 async def delete_material_master(
     id: int,
+    current_user: User = Depends(require_permission("master_data.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
-    current_user: User = Depends(admin_required),
 ):
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
-    _current_company_user = current_user
+    is_sa = _check_tenant_access(current_user)
     obj = await db.get(m.MaterialMaster, id)
 
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Material master not found")
 
+    if not is_sa:
+        if obj.company_id is None:
+            raise HTTPException(status_code=403, detail="Cannot modify system template")
+        if obj.company_id != current_user.company_id:
+            raise NotFoundError("Material master not found")
+
     obj.is_active = False
-
     await db.commit()
-
     await r.bump_cache_version(redis, VERSION_KEY)
 
     return {
         "message": "Material master deleted",
         "id": obj.id,
     }
+

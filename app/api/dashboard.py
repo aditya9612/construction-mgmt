@@ -694,7 +694,7 @@ async def accountant_dashboard(
         from app.utils.accounting import get_primary_cash_account
 
         try:
-            cash_acc = await get_primary_cash_account(db)
+            cash_acc = await get_primary_cash_account(db, company_id=current_user.company_id)
             cash_balance_query = await db.scalar(
                 select(func.sum(JournalLine.debit - JournalLine.credit))
                 .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)

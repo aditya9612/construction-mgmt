@@ -2649,8 +2649,8 @@ async def create_maintenance(
 
         if boq_item.project_id != effective_project_id:
             raise HTTPException(
-                status_code=400,
-                detail="BOQ item does not belong to selected project",
+                status_code=404,
+                detail="BOQ item not found",
             )
 
     # ================= CREATE MAINTENANCE =================
@@ -2811,6 +2811,8 @@ async def update_maintenance(
             detail="Maintenance record not found",
         )
 
+    equipment = await get_active_equipment_or_404(db, maintenance.equipment_id, current_user)
+
     # ================= SAVE OLD VALUES =================
 
     old_cost = maintenance.cost or Decimal("0")
@@ -2818,10 +2820,20 @@ async def update_maintenance(
 
     update_data = payload.model_dump(exclude_unset=True)
 
+    effective_project_id = update_data.get("project_id") or maintenance.project_id
+
     if "project_id" in update_data and update_data["project_id"] is not None:
         await assert_project_access(
             db, project_id=update_data["project_id"], current_user=current_user
         )
+
+    if "boq_item_id" in update_data and update_data["boq_item_id"] is not None:
+        boq_item = await db.get(BOQ, update_data["boq_item_id"])
+        if not boq_item or boq_item.project_id != effective_project_id:
+            raise HTTPException(
+                status_code=404,
+                detail="BOQ item not found",
+            )
 
     # ================= VALIDATE BEFORE MUTATING =================
 

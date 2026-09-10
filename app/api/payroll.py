@@ -210,14 +210,14 @@ async def process_staff_salary(
 
     # 4. Get Payroll Account Mapping
     try:
-        staff_acc = await get_payroll_account(db, "staff_salary_account_id")
+        staff_acc = await get_payroll_account(db, "staff_salary_account_id", company_id=staff.company_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Payroll account mapping not configured")
 
     # 5. Resolve Payment Account
     if payload.payment_mode == "cash":
         try:
-            pay_acc = await get_primary_cash_account(db)
+            pay_acc = await get_primary_cash_account(db, company_id=staff.company_id)
         except ValueError:
             raise HTTPException(status_code=400, detail="Primary cash account not configured")
     else:
