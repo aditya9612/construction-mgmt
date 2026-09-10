@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from pydantic import (
     ConfigDict,
@@ -356,8 +356,8 @@ class EquipmentMaintenanceCreate(BaseSchema):
 
     next_maintenance_date: Optional[date] = None
 
-    project_id: int = Field(
-        ...,
+    project_id: Optional[int] = Field(
+        None,
         gt=0,
     )
 
@@ -713,6 +713,8 @@ class EquipmentRentalOut(BaseSchema):
 
     boq_item_id: Optional[int]
 
+    is_completed: bool = False
+
     model_config = ConfigDict(
         from_attributes=True,
         json_encoders={Decimal: lambda v: round(float(v), 2)},
@@ -763,9 +765,12 @@ class EquipmentPurchaseCreate(BaseSchema):
         max_length=100,
     )
 
-    quantity: int = Field(
+    quantity: Union[int, Decimal] = Field(
         ...,
         gt=0,
+        examples=[1],
+        json_schema_extra={"example": 1},
+        description="Number of units purchased",
     )
 
     unit_price: Decimal = Field(
@@ -773,6 +778,11 @@ class EquipmentPurchaseCreate(BaseSchema):
         gt=0,
         max_digits=12,
         decimal_places=2,
+    )
+
+    total_amount: Optional[Decimal] = Field(
+        None,
+        description="Client-provided total amount; ignored and reliably calculated server-side as quantity * unit_price",
     )
 
     warranty_end_date: Optional[date] = None
@@ -838,9 +848,12 @@ class EquipmentPurchaseUpdate(BaseSchema):
         max_length=100,
     )
 
-    quantity: Optional[int] = Field(
+    quantity: Optional[Union[int, Decimal]] = Field(
         None,
         gt=0,
+        examples=[1],
+        json_schema_extra={"example": 1},
+        description="Number of units purchased",
     )
 
     unit_price: Optional[Decimal] = Field(
@@ -848,6 +861,11 @@ class EquipmentPurchaseUpdate(BaseSchema):
         gt=0,
         max_digits=12,
         decimal_places=2,
+    )
+
+    total_amount: Optional[Decimal] = Field(
+        None,
+        description="Client-provided total amount; ignored and reliably calculated server-side as quantity * unit_price",
     )
 
     warranty_end_date: Optional[date] = None
@@ -912,7 +930,7 @@ class EquipmentPurchaseOut(BaseSchema):
 
     invoice_number: str
 
-    quantity: int
+    quantity: Union[int, Decimal] = Field(..., examples=[1], json_schema_extra={"example": 1})
 
     unit_price: float
 

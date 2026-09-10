@@ -106,46 +106,219 @@ async def get_payroll_account(db: AsyncSession, account_field_name: str) -> Acco
         
     return account
 
-async def resolve_tax_accounts(db: AsyncSession, account_type_name: str) -> Account:
+from fastapi import HTTPException
+
+
+async def resolve_tax_accounts(
+    db: AsyncSession,
+    account_type_name: str,
+    company_id: Optional[int] = None,
+) -> Account:
     """
     Dynamically resolves a tax account (e.g., Input GST, Output GST, TDS Payable)
-    using pattern matching or CompanySettings if available to avoid hardcoding exact names.
-    account_type_name could be 'input_gst', 'output_gst', or 'tds_payable'.
+    using pattern matching or CompanySettings if available.
+    If missing, automatically creates / seeds the standard account.
     """
     from app.models.settings import CompanySettings
     from app.core.enums import AccountType
-    
-    settings = await db.scalar(select(CompanySettings))
-    
-    if account_type_name == 'tds_payable':
-        if settings and getattr(settings, 'tds_payable_account_id', None):
+
+    settings_stmt = select(CompanySettings)
+    if company_id is not None:
+        settings_stmt = settings_stmt.where(CompanySettings.company_id == company_id)
+    settings = await db.scalar(settings_stmt)
+    if not settings and company_id is not None:
+        settings = await db.scalar(select(CompanySettings))
+
+    if account_type_name == "tds_payable":
+        if settings and getattr(settings, "tds_payable_account_id", None):
             acc = await db.get(Account, settings.tds_payable_account_id)
-            if acc: return acc
-        raise ValueError("TDS Payable account not configured.")
-        
-    elif account_type_name == 'input_gst':
-        acc = await db.scalar(select(Account).where(Account.code == 'INPUT_GST'))
-        if acc: return acc
-        raise ValueError("Input GST account not configured.")
-        
-    elif account_type_name == 'output_gst':
-        acc = await db.scalar(select(Account).where(Account.code == 'OUTPUT_GST'))
-        if acc: return acc
-        raise ValueError("Output GST account not configured.")
+            if acc:
+                return acc
+        query = select(Account).where(Account.code == "TDS_PAYABLE")
+        if company_id is not None:
+            query = query.where(Account.company_id == company_id)
+        acc = await db.scalar(query)
+        if not acc:
+            acc = await db.scalar(select(Account).where(Account.code == "TDS_PAYABLE"))
+        if not acc:
+            acc = Account(
+                name="TDS Payable",
+                code="TDS_PAYABLE",
+                type=AccountType.LIABILITY,
+                company_id=company_id,
+            )
+            db.add(acc)
+            await db.flush()
+        return acc
 
-    raise ValueError(f"Unknown tax account type request: {account_type_name}")
+    elif account_type_name == "input_gst":
+        query = select(Account).where(Account.code == "INPUT_GST")
+        if company_id is not None:
+            query = query.where(Account.company_id == company_id)
+        acc = await db.scalar(query)
+        if not acc:
+            acc = await db.scalar(select(Account).where(Account.code == "INPUT_GST"))
+        if not acc:
+            acc = Account(
+                name="Input GST",
+                code="INPUT_GST",
+                type=AccountType.ASSET,
+                company_id=company_id,
+            )
+            db.add(acc)
+            await db.flush()
+        return acc
+
+    elif account_type_name == "output_gst":
+        query = select(Account).where(Account.code == "OUTPUT_GST")
+        if company_id is not None:
+            query = query.where(Account.company_id == company_id)
+        acc = await db.scalar(query)
+        if not acc:
+            acc = await db.scalar(select(Account).where(Account.code == "OUTPUT_GST"))
+        if not acc:
+            acc = Account(
+                name="Output GST",
+                code="OUTPUT_GST",
+                type=AccountType.LIABILITY,
+                company_id=company_id,
+            )
+            db.add(acc)
+            await db.flush()
+        return acc
+
+    raise HTTPException(
+        status_code=400, detail=f"Unknown tax account type request: {account_type_name}"
+    )
 
 
-async def get_accounts_receivable(db: AsyncSession) -> Account:
+async def get_accounts_receivable(
+    db: AsyncSession,
+    company_id: Optional[int] = None,
+) -> Account:
     from app.core.enums import AccountType
-    acc = await db.scalar(select(Account).where(Account.code == 'ACCOUNTS_RECEIVABLE'))
+
+    query = select(Account).where(Account.code == "ACCOUNTS_RECEIVABLE")
+    if company_id is not None:
+        query = query.where(Account.company_id == company_id)
+    acc = await db.scalar(query)
     if not acc:
-        raise ValueError("Accounts Receivable account not configured.")
+        acc = await db.scalar(select(Account).where(Account.code == "ACCOUNTS_RECEIVABLE"))
+    if not acc:
+        acc = Account(
+            name="Accounts Receivable",
+            code="ACCOUNTS_RECEIVABLE",
+            type=AccountType.ASSET,
+            company_id=company_id,
+        )
+        db.add(acc)
+        await db.flush()
     return acc
 
-async def get_revenue_account(db: AsyncSession) -> Account:
+
+async def get_revenue_account(
+    db: AsyncSession,
+    company_id: Optional[int] = None,
+) -> Account:
     from app.core.enums import AccountType
-    acc = await db.scalar(select(Account).where(Account.code == 'SALES_REVENUE'))
+
+    query = select(Account).where(Account.code == "SALES_REVENUE")
+    if company_id is not None:
+        query = query.where(Account.company_id == company_id)
+    acc = await db.scalar(query)
     if not acc:
-        raise ValueError("Revenue account not configured.")
+        acc = await db.scalar(select(Account).where(Account.code == "SALES_REVENUE"))
+    if not acc:
+        acc = Account(
+            name="Sales Revenue",
+            code="SALES_REVENUE",
+            type=AccountType.INCOME,
+            company_id=company_id,
+        )
+        db.add(acc)
+        await db.flush()
     return acc
+
+
+STANDARD_SYSTEM_ACCOUNTS = [
+    # Assets
+    {"name": "Main Bank Account", "code": "BANK", "type": "ASSET"},
+    {"name": "Primary Cash", "code": "CASH", "type": "ASSET"},
+    {"name": "Petty Cash", "code": "PETTY_CASH", "type": "ASSET"},
+    {"name": "Input GST", "code": "INPUT_GST", "type": "ASSET"},
+    {"name": "Accounts Receivable", "code": "ACCOUNTS_RECEIVABLE", "type": "ASSET"},
+    {"name": "Cash / Bank (1001)", "code": "1001", "type": "ASSET"},
+    {"name": "Accounts Receivable (1200)", "code": "1200", "type": "ASSET"},
+
+    # Liabilities
+    {"name": "Vendor Payable", "code": "VENDOR_PAYABLE", "type": "LIABILITY"},
+    {"name": "Contractor Payable", "code": "CONTRACTOR_PAYABLE", "type": "LIABILITY"},
+    {"name": "Wages Payable", "code": "WAGES_PAYABLE", "type": "LIABILITY"},
+    {"name": "Output GST", "code": "OUTPUT_GST", "type": "LIABILITY"},
+    {"name": "TDS Payable", "code": "TDS_PAYABLE", "type": "LIABILITY"},
+    {"name": "Retention Payable", "code": "RETENTION_PAYABLE", "type": "LIABILITY"},
+
+    # Income
+    {"name": "Sales Revenue", "code": "SALES_REVENUE", "type": "INCOME"},
+
+    # Expenses
+    {"name": "General Expense", "code": "GENERAL_EXPENSE", "type": "EXPENSE"},
+    {"name": "Operating Expense", "code": "EXPENSE", "type": "EXPENSE"},
+    {"name": "Labour Expense", "code": "LABOUR_EXPENSE", "type": "EXPENSE"},
+    {"name": "Wages Expense", "code": "WAGES_EXPENSE", "type": "EXPENSE"},
+    {"name": "Staff Salary Expense", "code": "SALARY_EXPENSE", "type": "EXPENSE"},
+    {"name": "Contractor Expense", "code": "CONTRACTOR_EXPENSE", "type": "EXPENSE"},
+]
+
+
+async def seed_company_chart_of_accounts(db: AsyncSession, company_id: int) -> dict:
+    """
+    Seeds the standard Chart of Accounts for a company idempotently,
+    and links the default accounts to CompanySettings.
+    """
+    from app.core.enums import AccountType
+    from app.models.settings import CompanySettings
+
+    # 1. Fetch existing accounts for this company
+    existing = await db.scalars(
+        select(Account).where(Account.company_id == company_id)
+    )
+    acc_map = {a.code: a for a in existing.all()}
+
+    # 2. Insert missing standard accounts
+    for item in STANDARD_SYSTEM_ACCOUNTS:
+        if item["code"] not in acc_map:
+            acc_type = AccountType[item["type"]]
+            new_acc = Account(
+                company_id=company_id,
+                name=item["name"],
+                code=item["code"],
+                type=acc_type,
+            )
+            db.add(new_acc)
+            await db.flush()
+            acc_map[item["code"]] = new_acc
+
+    # 3. Connect default account IDs into CompanySettings
+    settings = await db.scalar(
+        select(CompanySettings).where(CompanySettings.company_id == company_id)
+    )
+    if settings:
+        if not settings.primary_cash_account_id and "CASH" in acc_map:
+            settings.primary_cash_account_id = acc_map["CASH"].id
+        if not settings.petty_cash_account_id and "PETTY_CASH" in acc_map:
+            settings.petty_cash_account_id = acc_map["PETTY_CASH"].id
+        if not settings.wages_account_id and "WAGES_EXPENSE" in acc_map:
+            settings.wages_account_id = acc_map["WAGES_EXPENSE"].id
+        if not settings.staff_salary_account_id and "SALARY_EXPENSE" in acc_map:
+            settings.staff_salary_account_id = acc_map["SALARY_EXPENSE"].id
+        if not settings.contractor_expense_account_id and "CONTRACTOR_EXPENSE" in acc_map:
+            settings.contractor_expense_account_id = acc_map["CONTRACTOR_EXPENSE"].id
+        if not settings.tds_payable_account_id and "TDS_PAYABLE" in acc_map:
+            settings.tds_payable_account_id = acc_map["TDS_PAYABLE"].id
+        if not settings.retention_payable_account_id and "RETENTION_PAYABLE" in acc_map:
+            settings.retention_payable_account_id = acc_map["RETENTION_PAYABLE"].id
+        await db.flush()
+
+    return acc_map
+

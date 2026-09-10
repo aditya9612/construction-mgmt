@@ -145,6 +145,7 @@ class LabourOut(BaseModel):
     role: Optional[str] = None
     aadhaar_number: Optional[str]
     labour_name: str
+    project_id: Optional[int] = None
     mobile_number: Optional[str]
     pan_number: Optional[str] = None
     address: Optional[str] = None
@@ -394,11 +395,13 @@ class AggregateReportOut(BaseModel):
     class Config:
         json_encoders = {Decimal: float}
 
+
 class LabourPaymentSummary(BaseModel):
     total_payout: float
     high_payouts: int
     ot_intensive: int
     advance_adjusted: float
+
 
 class LabourPaymentRecord(BaseModel):
     id: str
@@ -410,6 +413,7 @@ class LabourPaymentRecord(BaseModel):
     remarks: Optional[str]
     status: str
 
+
 class LabourPaymentResponse(BaseModel):
     summary: LabourPaymentSummary
     records: List[LabourPaymentRecord]
@@ -417,6 +421,7 @@ class LabourPaymentResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
+
 
 class WeeklyReportOut(BaseModel):
     week: int
@@ -432,6 +437,7 @@ class WeeklyReportOut(BaseModel):
         from_attributes = True
         json_encoders = {Decimal: float}
 
+
 class MonthlyReportOut(BaseModel):
     month: int
     total_days: int
@@ -443,7 +449,8 @@ class MonthlyReportOut(BaseModel):
     total_wage: Decimal
 
     class Config:
-        json_encoders = {Decimal: float} 
+        json_encoders = {Decimal: float}
+
 
 class DashboardStatsOut(BaseModel):
     total_labour_today: int
@@ -452,7 +459,7 @@ class DashboardStatsOut(BaseModel):
     class Config:
         json_encoders = {Decimal: float}
 
+
 class AttendanceDashboardOut(BaseModel):
     total_labour: int
     present: int
-

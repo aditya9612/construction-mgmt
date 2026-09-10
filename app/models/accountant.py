@@ -11,8 +11,11 @@ from sqlalchemy import (
     DateTime,
     func,
     JSON,
+    UniqueConstraint,
+    select,
 )
 from sqlalchemy.orm import relationship
+from sqlalchemy.ext.hybrid import hybrid_property
 from datetime import datetime
 import enum
 from sqlalchemy import Text
@@ -28,7 +31,7 @@ class Account(Base):
     company_id = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=True)
 
     name = Column(String(100), nullable=False)
-    code = Column(String(20), unique=True, nullable=False)
+    code = Column(String(20), nullable=False)
 
     type = Column(Enum(AccountType), nullable=False)
 
@@ -45,7 +48,10 @@ class Account(Base):
     parent_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
     parent = relationship("Account", remote_side=[id])
 
-    __table_args__ = (Index("ix_accounts_code", "code"),)
+    __table_args__ = (
+        UniqueConstraint("company_id", "code", name="uq_accounts_company_code"),
+        Index("ix_accounts_code", "code"),
+    )
 
 
 # ===================== JOURNAL ENTRY =====================
@@ -348,6 +354,16 @@ class BankAccount(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+    account = relationship("Account")
+
+    @hybrid_property
+    def company_id(self):
+        return self.account.company_id if self.account else None
+
+    @company_id.expression
+    def company_id(cls):
+        return select(Account.company_id).where(Account.id == cls.account_id).scalar_subquery()
 
 
 class RecurringJournal(Base):

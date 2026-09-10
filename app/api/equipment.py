@@ -46,7 +46,7 @@ from app.core import db
 from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
-    require_roles,
+    require_permission,
 )
 
 # Internal - DB / Models
@@ -145,15 +145,41 @@ VERSION_KEY = "cache_version:equipment"
 
 
 # === UTILITY FUNCTIONS ===
-async def get_active_equipment_or_404(db: AsyncSession, equipment_id: int):
-    """Get active (not deleted) equipment or 404"""
-    stmt = select(Equipment).where(
-        and_(Equipment.id == equipment_id, Equipment.is_deleted == False)
-    )
+def _is_super_admin(user: Optional[User]) -> bool:
+    return getattr(user, "is_super_admin", False) is True
+
+
+async def get_active_equipment_or_404(
+    db: AsyncSession,
+    equipment_id: int,
+    current_user: Optional[User] = None,
+):
+    """Get active (not deleted) equipment or 404 with tenant isolation and project authorization."""
+    is_super = _is_super_admin(current_user)
+
+    if current_user is not None and not is_super:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=404, detail="Equipment not found")
+        stmt = select(Equipment).where(
+            and_(
+                Equipment.id == equipment_id,
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+    else:
+        stmt = select(Equipment).where(
+            and_(Equipment.id == equipment_id, Equipment.is_deleted == False)
+        )
+
     result = await db.execute(stmt)
     obj = result.scalar_one_or_none()
     if not obj:
         raise HTTPException(status_code=404, detail="Equipment not found")
+
+    if current_user is not None and not is_super and obj.project_id is not None:
+        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     return obj
 
 
@@ -273,6 +299,7 @@ async def calculate_equipment_status(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed.is_(False),
                 EquipmentRental.start_date <= today,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -292,6 +319,7 @@ async def calculate_equipment_status(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed.is_(False),
                 EquipmentRental.start_date > today,
             )
         )
@@ -339,6 +367,7 @@ async def recalculate_equipment_status(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed.is_(False),
                 EquipmentRental.start_date <= today,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -362,6 +391,7 @@ async def recalculate_equipment_status(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed.is_(False),
                 EquipmentRental.start_date > today,
             )
         )
@@ -397,7 +427,7 @@ async def get_equipment_purchase_history(
     date_to: Optional[date] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -411,10 +441,7 @@ async def get_equipment_purchase_history(
 
     # Equipment filter (optional)
     if equipment_id is not None:
-        eq = await get_active_equipment_or_404(
-            db,
-            equipment_id,
-        )
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(
                 db, project_id=eq.project_id, current_user=current_user
@@ -488,93 +515,67 @@ async def get_equipment_purchase_history(
 
 @router.get("/kpi", response_model=EquipmentKPIOut)
 async def equipment_kpi(
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    company_id: Optional[int] = Query(None, description="Optional: filter by company (SuperAdmin)"),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id is None:
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Super Admin cannot access company equipment KPI directly",
+            detail="User without company cannot access equipment KPI",
         )
 
-    company_project_ids = select(Project.id).where(Project.company_id == current_user.company_id)
+    target_company_id = company_id if is_super else current_user.company_id
+
+    base_filter = [Equipment.is_deleted == False]
+    if target_company_id is not None:
+        base_filter.append(Equipment.company_id == target_company_id)
 
     total_equipment = await db.scalar(
-        select(func.count())
-        .select_from(Equipment)
-        .where(
-            Equipment.is_deleted == False,
-            Equipment.project_id.in_(company_project_ids),
-        )
+        select(func.count()).select_from(Equipment).where(*base_filter)
     )
 
     available = await db.scalar(
         select(func.count())
         .select_from(Equipment)
-        .where(
-            Equipment.status == EquipmentStatus.AVAILABLE,
-            Equipment.is_deleted == False,
-            Equipment.project_id.in_(company_project_ids),
-        )
+        .where(Equipment.status == EquipmentStatus.AVAILABLE, *base_filter)
     )
 
     allocated = await db.scalar(
         select(func.count())
         .select_from(Equipment)
-        .where(
-            Equipment.status == EquipmentStatus.IN_PROJECT,
-            Equipment.is_deleted == False,
-            Equipment.project_id.in_(company_project_ids),
-        )
+        .where(Equipment.status == EquipmentStatus.IN_PROJECT, *base_filter)
     )
 
     rented = await db.scalar(
         select(func.count())
         .select_from(Equipment)
-        .where(
-            Equipment.status == EquipmentStatus.RENTED,
-            Equipment.is_deleted == False,
-            Equipment.project_id.in_(company_project_ids),
-        )
+        .where(Equipment.status == EquipmentStatus.RENTED, *base_filter)
     )
 
     maintenance = await db.scalar(
         select(func.count())
         .select_from(Equipment)
-        .where(
-            Equipment.status == EquipmentStatus.MAINTENANCE,
-            Equipment.is_deleted == False,
-            Equipment.project_id.in_(company_project_ids),
-        )
+        .where(Equipment.status == EquipmentStatus.MAINTENANCE, *base_filter)
     )
 
     damaged = await db.scalar(
         select(func.count())
         .select_from(Equipment)
-        .where(
-            Equipment.condition == EquipmentCondition.DAMAGED,
-            Equipment.is_deleted == False,
-            Equipment.project_id.in_(company_project_ids),
-        )
+        .where(Equipment.condition == EquipmentCondition.DAMAGED, *base_filter)
     )
 
     total_hours = (
         await db.scalar(
             select(func.sum(EquipmentUsage.working_hours))
-            .join(
-                Equipment,
-                Equipment.id == EquipmentUsage.equipment_id,
-            )
-            .where(
-                Equipment.is_deleted == False,
-                Equipment.project_id.in_(company_project_ids),
-            )
+            .join(Equipment, Equipment.id == EquipmentUsage.equipment_id)
+            .where(*base_filter)
         )
         or 0
     )
 
     max_possible_hours = (total_equipment or 0) * MAX_MONTHLY_HOURS
-
     utilization_rate = (
         (float(total_hours) / max_possible_hours) * 100 if max_possible_hours else 0
     )
@@ -582,21 +583,8 @@ async def equipment_kpi(
     rental_revenue = (
         await db.scalar(
             select(func.sum(EquipmentRental.rental_cost))
-            .join(
-                Equipment,
-                Equipment.id == EquipmentRental.equipment_id,
-            )
-            .outerjoin(
-                Project,
-                Project.id == EquipmentRental.project_id,
-            )
-            .where(
-                Equipment.is_deleted == False,
-                or_(
-                    Project.company_id == current_user.company_id,
-                    Equipment.project_id.in_(company_project_ids),
-                ),
-            )
+            .join(Equipment, Equipment.id == EquipmentRental.equipment_id)
+            .where(*base_filter)
         )
         or 0
     )
@@ -604,18 +592,8 @@ async def equipment_kpi(
     maintenance_cost = (
         await db.scalar(
             select(func.sum(EquipmentMaintenance.cost))
-            .join(
-                Equipment,
-                Equipment.id == EquipmentMaintenance.equipment_id,
-            )
-            .join(
-                Project,
-                Project.id == EquipmentMaintenance.project_id,
-            )
-            .where(
-                Equipment.is_deleted == False,
-                Project.company_id == current_user.company_id,
-            )
+            .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
+            .where(*base_filter)
         )
         or 0
     )
@@ -652,7 +630,7 @@ async def usage_report(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
 ):
     if current_user.company_id is None:
         return []
@@ -669,14 +647,12 @@ async def usage_report(
         .join(Equipment, Equipment.id == EquipmentUsage.equipment_id)
         .where(
             Equipment.is_deleted == False,
-            Equipment.project_id.in_(
-                select(Project.id).where(Project.company_id == current_user.company_id)
-            ),
+            Equipment.company_id == current_user.company_id,
         )
     )
 
     if equipment_id:
-        eq = await get_active_equipment_or_404(db, equipment_id)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
         stmt = stmt.where(EquipmentUsage.equipment_id == equipment_id)
@@ -711,9 +687,19 @@ async def usage_report(
 # ========================== COST REPORT ===========================
 
 
-@router.get("/cost/report", response_model=List[CostReportItem])
+@router.get(
+    "/cost/report",
+    response_model=List[CostReportItem],
+    operation_id="equipment_cost_report",
+)
+@router.get(
+    "/cost-report",
+    response_model=List[CostReportItem],
+    operation_id="equipment_cost_report_alias",
+)
 async def cost_report(
     equipment_id: Optional[int] = Query(None),
+    company_id: Optional[int] = Query(None, description="Optional: filter by company (SuperAdmin)"),
     date_from: Optional[date] = Query(
         None, description="Optional: rental start_date >= date_from"
     ),
@@ -723,10 +709,13 @@ async def cost_report(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
 ):
-    if current_user.company_id is None:
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is None:
         return []
+
+    target_company_id = company_id if is_super else current_user.company_id
 
     stmt = (
         select(
@@ -755,19 +744,19 @@ async def cost_report(
         )
         .where(
             Equipment.is_deleted == False,
-            or_(
-                Project.company_id == current_user.company_id,
-                Equipment.project_id.in_(
-                    select(Project.id).where(Project.company_id == current_user.company_id)
-                ),
-            ),
         )
     )
 
+    if target_company_id is not None:
+        stmt = stmt.where(
+            or_(
+                Project.company_id == target_company_id,
+                Equipment.company_id == target_company_id,
+            )
+        )
+
     if equipment_id:
-        eq = await get_active_equipment_or_404(db, equipment_id)
-        if eq.project_id is not None:
-            await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         stmt = stmt.where(EquipmentRental.equipment_id == equipment_id)
 
     if date_from:
@@ -830,7 +819,7 @@ async def purchase_report(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
 ):
     if current_user.company_id is None:
         return []
@@ -901,13 +890,13 @@ async def maintenance_alerts(
     ),
     days_ahead: int = Query(30, ge=1, le=365, description="Look-ahead window in days"),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
 ):
     if current_user.company_id is None:
         return []
 
     if equipment_id is not None:
-        eq = await get_active_equipment_or_404(db, equipment_id)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
 
@@ -915,12 +904,18 @@ async def maintenance_alerts(
     upcoming_date = today + timedelta(days=days_ahead)
 
     # Nearest pending maintenance per equipment
-    subq_stmt = select(
-        EquipmentMaintenance.equipment_id,
-        func.min(EquipmentMaintenance.next_maintenance_date).label("next_date"),
-    ).where(
-        EquipmentMaintenance.next_maintenance_date.isnot(None),
-        EquipmentMaintenance.is_completed == False,
+    subq_stmt = (
+        select(
+            EquipmentMaintenance.equipment_id,
+            func.min(EquipmentMaintenance.next_maintenance_date).label("next_date"),
+        )
+        .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
+        .where(
+            EquipmentMaintenance.next_maintenance_date.isnot(None),
+            EquipmentMaintenance.is_completed == False,
+            Equipment.is_deleted == False,
+            Equipment.company_id == current_user.company_id,
+        )
     )
 
     if equipment_id:
@@ -941,16 +936,12 @@ async def maintenance_alerts(
             Equipment,
             Equipment.id == EquipmentMaintenance.equipment_id,
         )
-        .join(
-            Project,
-            Project.id == EquipmentMaintenance.project_id,
-        )
         .where(
             and_(
                 EquipmentMaintenance.next_maintenance_date.isnot(None),
                 EquipmentMaintenance.is_completed == False,
                 Equipment.is_deleted == False,
-                Project.company_id == current_user.company_id,
+                Equipment.company_id == current_user.company_id,
                 # Show all overdue and upcoming maintenance within the window
                 EquipmentMaintenance.next_maintenance_date <= upcoming_date,
             )
@@ -993,30 +984,32 @@ async def maintenance_alerts(
 
 
 @router.get("/eq/availability", response_model=List[AvailabilityReportItem])
+@router.get("/availability", response_model=List[AvailabilityReportItem])
 async def availability_report(
     project_id: Optional[int] = Query(None, description="Optional: filter by project"),
+    company_id: Optional[int] = Query(None, description="Optional: filter by company (SuperAdmin)"),
     is_available: Optional[bool] = Query(
         None, description="Optional: filter available/unavailable"
     ),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
 ):
-    if current_user.company_id is None:
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is None:
         return []
+
+    target_company_id = company_id if is_super else current_user.company_id
 
     if project_id is not None:
         await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     today = date.today()
 
-    eq_stmt = select(Equipment).where(
-        Equipment.is_deleted == False,
-        Equipment.project_id.in_(
-            select(Project.id).where(Project.company_id == current_user.company_id)
-        ),
-    )
+    eq_stmt = select(Equipment).where(Equipment.is_deleted == False)
+    if target_company_id is not None:
+        eq_stmt = eq_stmt.where(Equipment.company_id == target_company_id)
 
     if project_id:
         eq_stmt = eq_stmt.where(Equipment.project_id == project_id)
@@ -1031,6 +1024,7 @@ async def availability_report(
         (
             await db.execute(
                 select(EquipmentRental.equipment_id).where(
+                    EquipmentRental.is_completed.is_(False),
                     EquipmentRental.start_date <= today,
                     or_(
                         EquipmentRental.end_date.is_(None),
@@ -1101,7 +1095,7 @@ async def availability_report(
 )
 async def allocate_equipment(
     payload: EquipmentAllocateRequest,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.assign")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -1126,6 +1120,13 @@ async def allocate_equipment(
             detail="Project not found",
         )
 
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None and project.company_id != current_user.company_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Project belongs to another company",
+        )
+
     # Prevent allocation to completed project
     if project.end_date and project.end_date < today:
         raise HTTPException(
@@ -1138,12 +1139,14 @@ async def allocate_equipment(
 
     for equipment_id in payload.equipment_ids:
 
-        obj = await db.scalar(
-            select(Equipment).where(
-                Equipment.id == equipment_id,
-                Equipment.is_deleted == False,
-            )
+        obj_query = select(Equipment).where(
+            Equipment.id == equipment_id,
+            Equipment.is_deleted == False,
         )
+        if not is_super and current_user.company_id is not None:
+            obj_query = obj_query.where(Equipment.company_id == current_user.company_id)
+
+        obj = await db.scalar(obj_query)
 
         if not obj:
             failed.append(
@@ -1161,7 +1164,7 @@ async def allocate_equipment(
                 failed.append(
                     {
                         "equipment_id": equipment_id,
-                        "reason": "Equipment belongs to another company",
+                        "reason": "Equipment not found",
                     }
                 )
                 continue
@@ -1183,6 +1186,7 @@ async def allocate_equipment(
             select(
                 exists().where(
                     EquipmentRental.equipment_id == equipment_id,
+                    EquipmentRental.is_completed.is_(False),
                     or_(
                         # Active rental
                         and_(
@@ -1357,7 +1361,7 @@ async def allocate_equipment(
 )
 async def deallocate_equipment(
     payload: EquipmentDeallocateRequest,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.assign")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -1368,6 +1372,13 @@ async def deallocate_equipment(
             detail="Super Admin cannot deallocate company equipment directly",
         )
     await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+    is_super = _is_super_admin(current_user)
+    project = await db.get(Project, payload.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not is_super and current_user.company_id is not None and project.company_id != current_user.company_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Project belongs to another company")
+
     deallocated_ids = []
     failed = []
 
@@ -1375,12 +1386,14 @@ async def deallocate_equipment(
 
     for equipment_id in payload.equipment_ids:
 
-        obj = await db.scalar(
-            select(Equipment).where(
-                Equipment.id == equipment_id,
-                Equipment.is_deleted == False,
-            )
+        obj_query = select(Equipment).where(
+            Equipment.id == equipment_id,
+            Equipment.is_deleted == False,
         )
+        if not is_super and current_user.company_id is not None:
+            obj_query = obj_query.where(Equipment.company_id == current_user.company_id)
+
+        obj = await db.scalar(obj_query)
 
         if not obj:
             failed.append(
@@ -1420,6 +1433,7 @@ async def deallocate_equipment(
             select(
                 exists().where(
                     EquipmentRental.equipment_id == equipment_id,
+                    EquipmentRental.is_completed == False,
                     EquipmentRental.start_date > today,
                 )
             )
@@ -1488,17 +1502,20 @@ async def deallocate_equipment(
 async def get_allocation(
     equipment_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
 ):
     if current_user.company_id is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Super Admin cannot access equipment allocation directly",
         )
-    obj = await get_active_equipment_or_404(db, equipment_id)
+    obj = await get_active_equipment_or_404(db, equipment_id, current_user)
     if not obj.project_id:
         raise HTTPException(status_code=404, detail="Equipment not found")
-    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    try:
+        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Equipment not found")
     return AllocationOut(
         equipment_id=obj.id,
         project_id=obj.project_id,
@@ -1516,7 +1533,7 @@ async def get_allocation(
 )
 async def create_equipment(
     payload: EquipmentCreate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -1525,12 +1542,8 @@ async def create_equipment(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Super Admin cannot create company equipment directly",
         )
-    if not payload.project_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="project_id is required to create equipment",
-        )
-    await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
+    if payload.project_id is not None:
+        await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
     # Check duplicate code
     existing = await db.scalar(
         select(Equipment).where(
@@ -1560,7 +1573,15 @@ async def create_equipment(
                 detail="Project not found",
             )
 
-    obj = Equipment(**payload.model_dump())
+        if current_user.company_id is not None and project.company_id != current_user.company_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Project belongs to another company",
+            )
+
+    data = payload.model_dump()
+    data["company_id"] = current_user.company_id
+    obj = Equipment(**data)
 
     db.add(obj)
 
@@ -1602,12 +1623,16 @@ async def list_equipment(
     offset: int = Query(0, ge=0),
     search: Optional[str] = None,
     project_id: Optional[int] = None,
+    company_id: Optional[int] = Query(None, description="Optional: filter by company (SuperAdmin)"),
     condition: Optional[str] = None,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    if current_user.company_id is None:
+    is_super = _is_super_admin(current_user)
+    target_company_id = company_id if is_super else current_user.company_id
+
+    if current_user.company_id is None and target_company_id is None:
         return PaginatedResponse[EquipmentOut](
             items=[],
             meta=PaginationMeta(total=0, limit=limit, offset=offset),
@@ -1619,7 +1644,7 @@ async def list_equipment(
     version = await get_cache_version(redis, VERSION_KEY)
 
     cache_key = (
-        f"equipment_list:{version}:{current_user.company_id}:{limit}:{offset}:"
+        f"equipment_list:{version}:{target_company_id or 'all'}:{limit}:{offset}:"
         f"{search or ''}:{project_id}:{condition or ''}"
     )
 
@@ -1628,23 +1653,12 @@ async def list_equipment(
     if cached:
         return PaginatedResponse[EquipmentOut](**cached)
 
-    query = (
-        select(Equipment)
-        .join(Project, Project.id == Equipment.project_id)
-        .where(
-            Equipment.is_deleted.is_(False),
-            Project.company_id == current_user.company_id,
-        )
-    )
+    query = select(Equipment).where(Equipment.is_deleted.is_(False))
+    count_query = select(func.count(Equipment.id)).where(Equipment.is_deleted.is_(False))
 
-    count_query = (
-        select(func.count(Equipment.id))
-        .join(Project, Project.id == Equipment.project_id)
-        .where(
-            Equipment.is_deleted.is_(False),
-            Project.company_id == current_user.company_id,
-        )
-    )
+    if target_company_id is not None:
+        query = query.where(Equipment.company_id == target_company_id)
+        count_query = count_query.where(Equipment.company_id == target_company_id)
 
     # ================= SEARCH (optional) =================
 
@@ -1715,7 +1729,7 @@ async def list_equipment(
 @router.delete("/{equipment_id}", status_code=204)
 async def soft_delete_equipment(
     equipment_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -1724,13 +1738,9 @@ async def soft_delete_equipment(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Super Admin cannot delete company equipment directly",
         )
-    obj = await get_active_equipment_or_404(
-        db,
-        equipment_id,
-    )
-    if not obj.project_id:
+    obj = await get_active_equipment_or_404(db, equipment_id, current_user)
+    if obj.company_id != current_user.company_id:
         raise HTTPException(status_code=404, detail="Equipment not found")
-    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
 
     today = date.today()
 
@@ -1756,6 +1766,7 @@ async def soft_delete_equipment(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment_id,
+                EquipmentRental.is_completed == False,
                 or_(
                     # Future rental
                     EquipmentRental.start_date > today,
@@ -1829,7 +1840,7 @@ async def soft_delete_equipment(
 @router.put("/{equipment_id}/restore", response_model=EquipmentOut)
 async def restore_equipment(
     equipment_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -1842,13 +1853,11 @@ async def restore_equipment(
     obj = await db.get(Equipment, equipment_id)
     if not obj:
         raise HTTPException(status_code=404, detail="Equipment not found")
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None and obj.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Equipment not found")
     if obj.project_id:
         await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
-    else:
-        raise HTTPException(status_code=404, detail="Equipment not found")
-
-    if not obj:
-        raise HTTPException(status_code=404, detail="Equipment not found")
 
     if not obj.is_deleted:
         raise HTTPException(status_code=400, detail="Equipment is not deleted")
@@ -1921,7 +1930,7 @@ async def restore_equipment(
 async def create_usage(
     equipment_id: int,
     payload: EquipmentUsageCreate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -1932,10 +1941,7 @@ async def create_usage(
             detail="Super Admin cannot access standard equipment APIs",
         )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
 
     today = date.today()
 
@@ -2015,6 +2021,7 @@ async def create_usage(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment_id,
+                EquipmentRental.is_completed == False,
                 EquipmentRental.start_date <= payload.usage_date,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -2127,7 +2134,7 @@ async def create_usage(
 )
 async def get_usage(
     usage_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -2147,20 +2154,23 @@ async def get_usage(
             detail="Usage record not found",
         )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        usage.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, usage.equipment_id, current_user)
 
     if equipment.project_id is None:
         raise HTTPException(
-            status_code=403,
-            detail="Equipment is not allocated to any project",
+            status_code=404,
+            detail="Usage record not found",
         )
 
-    await assert_project_access(
-        db, project_id=equipment.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=equipment.project_id, current_user=current_user
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="Usage record not found",
+        )
 
     return EquipmentUsageOut(
         id=usage.id,
@@ -2198,7 +2208,7 @@ async def list_usage(
     ),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -2215,7 +2225,7 @@ async def list_usage(
     )
 
     if equipment_id is not None:
-        eq = await get_active_equipment_or_404(db, equipment_id)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         if eq.project_id is None:
             return []
         await assert_project_access(
@@ -2264,7 +2274,7 @@ async def list_usage(
 async def update_usage(
     usage_id: int,
     payload: EquipmentUsageUpdate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -2286,20 +2296,23 @@ async def update_usage(
             detail="Usage record not found",
         )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        usage.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, usage.equipment_id, current_user)
 
     if equipment.project_id is None:
         raise HTTPException(
-            status_code=403,
-            detail="Equipment is not allocated to any project",
+            status_code=404,
+            detail="Usage record not found",
         )
 
-    await assert_project_access(
-        db, project_id=equipment.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=equipment.project_id, current_user=current_user
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="Usage record not found",
+        )
 
     if usage.cost is None or usage.rental_rate_at_usage is None:
         raise HTTPException(
@@ -2431,7 +2444,7 @@ async def update_usage(
 
 async def delete_usage(
     usage_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -2447,10 +2460,7 @@ async def delete_usage(
             detail="Usage record not found",
         )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        usage.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, usage.equipment_id, current_user)
 
     if usage.cost is None or usage.rental_rate_at_usage is None:
         raise HTTPException(
@@ -2540,7 +2550,7 @@ async def create_maintenance(
     equipment_id: int,
     payload: EquipmentMaintenanceCreate,
     request: Request,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -2550,10 +2560,14 @@ async def create_maintenance(
             detail="Super Admin cannot access standard equipment APIs",
         )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
+
+    effective_project_id = payload.project_id or equipment.project_id
+    if effective_project_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="project_id is required for central equipment maintenance",
+        )
 
     if equipment.project_id is not None:
         await assert_project_access(
@@ -2561,7 +2575,7 @@ async def create_maintenance(
         )
 
     await assert_project_access(
-        db, project_id=payload.project_id, current_user=current_user
+        db, project_id=effective_project_id, current_user=current_user
     )
 
     today = date.today()
@@ -2577,20 +2591,13 @@ async def create_maintenance(
             detail="Next maintenance date must be after maintenance date",
         )
 
-    # ================= PROJECT CHECK =================
-
-    if equipment.project_id is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Equipment is currently allocated to a project",
-        )
-
     # ================= RENTAL VALIDATION =================
 
     rental_exists = await db.scalar(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment_id,
+                EquipmentRental.is_completed == False,
                 EquipmentRental.start_date <= payload.maintenance_date,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -2640,7 +2647,7 @@ async def create_maintenance(
                 detail="BOQ item not found",
             )
 
-        if boq_item.project_id != payload.project_id:
+        if boq_item.project_id != effective_project_id:
             raise HTTPException(
                 status_code=400,
                 detail="BOQ item does not belong to selected project",
@@ -2650,8 +2657,11 @@ async def create_maintenance(
 
     old_status = equipment.status
 
+    maint_data = payload.model_dump()
+    maint_data["project_id"] = effective_project_id
+
     obj = EquipmentMaintenance(
-        **payload.model_dump(),
+        **maint_data,
         equipment_id=equipment_id,
     )
 
@@ -2769,7 +2779,7 @@ async def create_maintenance(
 async def update_maintenance(
     maintenance_id: int,
     payload: EquipmentMaintenanceUpdate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -2791,9 +2801,15 @@ async def update_maintenance(
             detail="Maintenance record not found",
         )
 
-    await assert_project_access(
-        db, project_id=maintenance.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=maintenance.project_id, current_user=current_user
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="Maintenance record not found",
+        )
 
     # ================= SAVE OLD VALUES =================
 
@@ -2866,10 +2882,7 @@ async def update_maintenance(
 
     # ================= STATUS RECALCULATION =================
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        maintenance.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, maintenance.equipment_id, current_user)
 
     await recalculate_equipment_status(
         db,
@@ -2947,7 +2960,7 @@ async def update_maintenance(
 async def complete_maintenance(
     maintenance_id: int,
     request: Request,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -2968,9 +2981,15 @@ async def complete_maintenance(
             detail="Maintenance record not found",
         )
 
-    await assert_project_access(
-        db, project_id=maintenance.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=maintenance.project_id, current_user=current_user
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="Maintenance record not found",
+        )
 
     if maintenance.is_completed:
         raise HTTPException(
@@ -2978,10 +2997,7 @@ async def complete_maintenance(
             detail="Maintenance already completed",
         )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        maintenance.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, maintenance.equipment_id, current_user)
 
     old_status = equipment.status
 
@@ -3063,7 +3079,7 @@ async def complete_maintenance(
 )
 async def delete_maintenance(
     maintenance_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -3085,14 +3101,17 @@ async def delete_maintenance(
             detail="Maintenance record not found",
         )
 
-    await assert_project_access(
-        db, project_id=maintenance.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=maintenance.project_id, current_user=current_user
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="Maintenance record not found",
+        )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        maintenance.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, maintenance.equipment_id, current_user)
 
     # ================= BOQ COST ROLLBACK =================
 
@@ -3159,7 +3178,7 @@ async def delete_maintenance(
 )
 async def get_maintenance(
     maintenance_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -3179,14 +3198,17 @@ async def get_maintenance(
             detail="Maintenance record not found",
         )
 
-    await assert_project_access(
-        db, project_id=maintenance.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=maintenance.project_id, current_user=current_user
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="Maintenance record not found",
+        )
 
-    await get_active_equipment_or_404(
-        db,
-        maintenance.equipment_id,
-    )
+    await get_active_equipment_or_404(db, maintenance.equipment_id, current_user)
 
     return EquipmentMaintenanceOut(
         id=maintenance.id,
@@ -3227,7 +3249,7 @@ async def list_maintenance(
     ),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -3241,7 +3263,7 @@ async def list_maintenance(
 
     # Optional equipment filter
     if equipment_id is not None:
-        eq = await get_active_equipment_or_404(db, equipment_id)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(
                 db, project_id=eq.project_id, current_user=current_user
@@ -3297,7 +3319,7 @@ async def create_rental(
     equipment_id: int,
     payload: EquipmentRentalCreate,
     request: Request,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -3307,10 +3329,7 @@ async def create_rental(
             detail="Super Admin cannot access standard equipment APIs",
         )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
 
     if equipment.project_id is not None:
         await assert_project_access(
@@ -3593,7 +3612,7 @@ async def list_rental(
     ),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -3607,6 +3626,7 @@ async def list_rental(
         .outerjoin(Project, Project.id == EquipmentRental.project_id)
         .where(
             or_(
+                Equipment.company_id == current_user.company_id,
                 Project.company_id == current_user.company_id,
                 Equipment.project_id.in_(
                     select(Project.id).where(
@@ -3620,7 +3640,7 @@ async def list_rental(
 
     # Optional equipment filter
     if equipment_id is not None:
-        eq = await get_active_equipment_or_404(db, equipment_id)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(
                 db, project_id=eq.project_id, current_user=current_user
@@ -3643,16 +3663,25 @@ async def list_rental(
             )
 
         if normalized == "UPCOMING":
-            stmt = stmt.where(EquipmentRental.start_date > today)
+            stmt = stmt.where(
+                EquipmentRental.is_completed == False,
+                EquipmentRental.start_date > today,
+            )
 
         elif normalized == "COMPLETED":
             stmt = stmt.where(
-                EquipmentRental.end_date.isnot(None),
-                EquipmentRental.end_date < today,
+                or_(
+                    EquipmentRental.is_completed == True,
+                    and_(
+                        EquipmentRental.end_date.isnot(None),
+                        EquipmentRental.end_date < today,
+                    ),
+                )
             )
 
         else:  # ACTIVE
             stmt = stmt.where(
+                EquipmentRental.is_completed == False,
                 EquipmentRental.start_date <= today,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -3685,11 +3714,11 @@ async def list_rental(
             notes=rental.notes,
             created_at=rental.created_at,
             status=(
-                "UPCOMING"
-                if rental.start_date > today
+                "COMPLETED"
+                if rental.is_completed or ((rental.end_date or rental.start_date) < today)
                 else (
-                    "COMPLETED"
-                    if (rental.end_date or rental.start_date) < today
+                    "UPCOMING"
+                    if rental.start_date > today
                     else "ACTIVE"
                 )
             ),
@@ -3703,6 +3732,7 @@ async def list_rental(
                 ),
                 2,
             ),
+            is_completed=rental.is_completed,
         )
         for rental in rentals
     ]
@@ -3717,7 +3747,7 @@ async def list_rental(
 )
 async def get_rental(
     rental_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -3738,11 +3768,17 @@ async def get_rental(
         )
 
     if rental.project_id is not None:
-        await assert_project_access(
-            db, project_id=rental.project_id, current_user=current_user
-        )
+        try:
+            await assert_project_access(
+                db, project_id=rental.project_id, current_user=current_user
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=404,
+                detail="Rental not found",
+            )
     else:
-        eq = await get_active_equipment_or_404(db, rental.equipment_id)
+        eq = await get_active_equipment_or_404(db, rental.equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(
                 db, project_id=eq.project_id, current_user=current_user
@@ -3755,11 +3791,11 @@ async def get_rental(
     duration = (end_date - rental.start_date).days + 1
 
     # Rental Status
-    if rental.start_date > today:
-        rental_status = "UPCOMING"
-
-    elif end_date < today:
+    if rental.is_completed or end_date < today:
         rental_status = "COMPLETED"
+
+    elif rental.start_date > today:
+        rental_status = "UPCOMING"
 
     else:
         rental_status = "ACTIVE"
@@ -3780,6 +3816,7 @@ async def get_rental(
         status=rental_status,
         duration=duration,
         per_day_cost=round(per_day_cost, 2),
+        is_completed=rental.is_completed,
     )
 
 
@@ -3797,7 +3834,7 @@ async def get_rental(
 async def update_rental(
     rental_id: int,
     payload: EquipmentRentalUpdate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -3820,20 +3857,23 @@ async def update_rental(
         )
 
     if rental.project_id is not None:
-        await assert_project_access(
-            db, project_id=rental.project_id, current_user=current_user
-        )
+        try:
+            await assert_project_access(
+                db, project_id=rental.project_id, current_user=current_user
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=404,
+                detail="Rental not found",
+            )
     else:
-        eq = await get_active_equipment_or_404(db, rental.equipment_id)
+        eq = await get_active_equipment_or_404(db, rental.equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(
                 db, project_id=eq.project_id, current_user=current_user
             )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        rental.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, rental.equipment_id, current_user)
 
     # ================= OLD VALUES =================
 
@@ -3903,20 +3943,15 @@ async def update_rental(
     # ================= BOQ COST UPDATE =================
 
     if old_boq_item_id:
-
         old_boq = await db.get(
             BOQ,
             old_boq_item_id,
         )
-
         await db.flush()
-        await recalculate_boq_actuals(db, old_boq_id)
+        await recalculate_boq_actuals(db, old_boq_item_id)
 
     if rental.boq_item_id:
         new_boq = await db.get(BOQ, rental.boq_item_id)
-        if new_boq:
-            await recalculate_boq_actuals(db, rental.boq_item_id)
-
         if not new_boq:
             raise HTTPException(
                 status_code=404,
@@ -3930,6 +3965,9 @@ async def update_rental(
                 status_code=400,
                 detail="BOQ item does not belong to project",
             )
+
+        await db.flush()
+        await recalculate_boq_actuals(db, rental.boq_item_id)
 
 
     # ================= STATUS =================
@@ -4001,7 +4039,7 @@ async def update_rental(
 )
 async def delete_rental(
     rental_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -4024,20 +4062,23 @@ async def delete_rental(
         )
 
     if rental.project_id is not None:
-        await assert_project_access(
-            db, project_id=rental.project_id, current_user=current_user
-        )
+        try:
+            await assert_project_access(
+                db, project_id=rental.project_id, current_user=current_user
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=404,
+                detail="Rental not found",
+            )
     else:
-        eq = await get_active_equipment_or_404(db, rental.equipment_id)
+        eq = await get_active_equipment_or_404(db, rental.equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(
                 db, project_id=eq.project_id, current_user=current_user
             )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        rental.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, rental.equipment_id, current_user)
 
     old_status = equipment.status
 
@@ -4114,7 +4155,7 @@ async def delete_rental(
 async def complete_rental(
     rental_id: int,
     request: Request,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
@@ -4136,24 +4177,33 @@ async def complete_rental(
         )
 
     if rental.project_id is not None:
-        await assert_project_access(
-            db, project_id=rental.project_id, current_user=current_user
-        )
+        try:
+            await assert_project_access(
+                db, project_id=rental.project_id, current_user=current_user
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=404,
+                detail="Rental not found",
+            )
     else:
-        eq = await get_active_equipment_or_404(db, rental.equipment_id)
+        eq = await get_active_equipment_or_404(db, rental.equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(
                 db, project_id=eq.project_id, current_user=current_user
             )
 
-    equipment = await get_active_equipment_or_404(
-        db,
-        rental.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, rental.equipment_id, current_user)
 
     today = date.today()
 
     # ================= VALIDATIONS =================
+
+    if rental.is_completed:
+        raise HTTPException(
+            status_code=400,
+            detail="Rental already completed",
+        )
 
     if rental.start_date > today:
         raise HTTPException(
@@ -4161,7 +4211,7 @@ async def complete_rental(
             detail="Upcoming rental cannot be completed",
         )
 
-    if rental.end_date and rental.end_date <= today:
+    if rental.end_date and rental.end_date < today:
         raise HTTPException(
             status_code=400,
             detail="Rental already completed",
@@ -4172,7 +4222,9 @@ async def complete_rental(
 
     # ================= COMPLETE RENTAL =================
 
-    rental.end_date = today
+    rental.is_completed = True
+    if not rental.end_date or rental.end_date > today:
+        rental.end_date = today
 
     await db.flush()
 
@@ -4192,10 +4244,12 @@ async def complete_rental(
         old_values={
             "status": old_status.value if old_status else None,
             "end_date": str(old_end_date) if old_end_date else None,
+            "is_completed": False,
         },
         new_values={
             "status": equipment.status.value,
             "end_date": str(rental.end_date),
+            "is_completed": True,
         },
         user_id=current_user.id,
         request=request,
@@ -4242,6 +4296,7 @@ async def complete_rental(
         status="COMPLETED",
         duration=duration,
         per_day_cost=per_day_cost,
+        is_completed=rental.is_completed,
     )
 
 
@@ -4249,18 +4304,22 @@ async def complete_rental(
 
 
 @router.get("/report/utilization", response_model=List[UtilizationReportItem])
+@router.get("/utilization", response_model=List[UtilizationReportItem])
 async def utilization_report(
     equipment_id: Optional[int] = Query(
         None, description="Optional: filter by equipment"
     ),
+    company_id: Optional[int] = Query(None, description="Optional: filter by company (SuperAdmin)"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id is None:
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is None:
         return []
 
+    target_company_id = company_id if is_super else current_user.company_id
     MAX_HOURS = 26 * 8  # configurable later
 
     stmt = (
@@ -4274,16 +4333,14 @@ async def utilization_report(
         .outerjoin(EquipmentUsage, Equipment.id == EquipmentUsage.equipment_id)
         .where(
             Equipment.is_deleted == False,
-            Equipment.project_id.in_(
-                select(Project.id).where(Project.company_id == current_user.company_id)
-            ),
         )
     )
 
+    if target_company_id is not None:
+        stmt = stmt.where(Equipment.company_id == target_company_id)
+
     if equipment_id:
-        eq = await get_active_equipment_or_404(db, equipment_id)
-        if eq.project_id is not None:
-            await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         stmt = stmt.where(Equipment.id == equipment_id)
 
     stmt = (
@@ -4326,7 +4383,7 @@ async def equipment_alerts(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
 ):
     if current_user.company_id is None:
         return []
@@ -4410,7 +4467,7 @@ async def get_audit_logs(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     action: Optional[str] = None,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -4418,7 +4475,7 @@ async def get_audit_logs(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Super Admin cannot access equipment audit logs",
         )
-    eq = await get_active_equipment_or_404(db, equipment_id)
+    eq = await get_active_equipment_or_404(db, equipment_id, current_user)
     if eq.project_id is not None:
         await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
 
@@ -4475,7 +4532,7 @@ async def get_audit_logs(
 )
 async def create_purchase(
     payload: EquipmentPurchaseCreate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -4509,10 +4566,7 @@ async def create_purchase(
 
     if payload.asset_id is not None:
 
-        equipment = await get_active_equipment_or_404(
-            db,
-            payload.asset_id,
-        )
+        equipment = await get_active_equipment_or_404(db, payload.asset_id, current_user)
 
         if equipment.project_id is not None:
             await assert_project_access(
@@ -4571,14 +4625,17 @@ async def create_purchase(
 
     # ================= TOTAL AMOUNT =================
 
-    total_amount = Decimal(payload.quantity) * Decimal(payload.unit_price)
+    total_amount = (
+        Decimal(str(payload.quantity)) * Decimal(str(payload.unit_price))
+    ).quantize(Decimal("0.01"))
 
     try:
 
         # ================= CREATE PURCHASE =================
 
+        purchase_data = payload.model_dump(exclude={"total_amount"})
         purchase = EquipmentPurchase(
-            **payload.model_dump(),
+            **purchase_data,
             total_amount=total_amount,
         )
 
@@ -4606,7 +4663,11 @@ async def create_purchase(
                 "purchase_type": payload.purchase_type.value,
                 "vendor_name": payload.vendor_name,
                 "invoice_number": payload.invoice_number,
-                "quantity": payload.quantity,
+                "quantity": (
+                    payload.quantity
+                    if isinstance(payload.quantity, int)
+                    else float(payload.quantity)
+                ),
                 "unit_price": float(payload.unit_price),
                 "total_amount": float(total_amount),
             },
@@ -4664,7 +4725,7 @@ async def list_purchase(
     purchase_date_to: Optional[date] = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -4677,7 +4738,7 @@ async def list_purchase(
         await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     if asset_id is not None:
-        eq = await get_active_equipment_or_404(db, asset_id)
+        eq = await get_active_equipment_or_404(db, asset_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
 
@@ -4811,7 +4872,7 @@ async def list_purchase(
 )
 async def get_purchase(
     purchase_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -4844,9 +4905,15 @@ async def get_purchase(
 
     purchase, equipment_name = row
 
-    await assert_project_access(
-        db, project_id=purchase.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=purchase.project_id, current_user=current_user
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="Purchase not found",
+        )
 
     return EquipmentPurchaseOut(
         id=purchase.id,
@@ -4877,7 +4944,7 @@ async def get_purchase(
 async def update_purchase(
     purchase_id: int,
     payload: EquipmentPurchaseUpdate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -4931,7 +4998,7 @@ async def update_purchase(
 
     # ================= UPDATE DATA =================
 
-    update_data = payload.model_dump(exclude_unset=True)
+    update_data = payload.model_dump(exclude_unset=True, exclude={"total_amount"})
 
     old_values = {}
 
@@ -4954,7 +5021,9 @@ async def update_purchase(
     # ================= RECALCULATE TOTAL =================
 
     if purchase.quantity is not None and purchase.unit_price is not None:
-        purchase.total_amount = purchase.quantity * purchase.unit_price
+        purchase.total_amount = (
+            Decimal(str(purchase.quantity)) * Decimal(str(purchase.unit_price))
+        ).quantize(Decimal("0.01"))
 
     new_total_amount = purchase.total_amount or Decimal("0")
     new_boq_item_id = purchase.boq_item_id
@@ -5044,7 +5113,7 @@ async def update_purchase(
 @router.delete("/purchase/{purchase_id}", status_code=status.HTTP_200_OK)
 async def delete_purchase(
     purchase_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.delete")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -5060,9 +5129,12 @@ async def delete_purchase(
     if not purchase:
         raise HTTPException(status_code=404, detail="Purchase not found")
 
-    await assert_project_access(
-        db, project_id=purchase.project_id, current_user=current_user
-    )
+    try:
+        await assert_project_access(
+            db, project_id=purchase.project_id, current_user=current_user
+        )
+    except Exception:
+        raise HTTPException(status_code=404, detail="Purchase not found")
 
     asset_id = purchase.asset_id
     invoice_number = purchase.invoice_number
@@ -5111,7 +5183,7 @@ async def delete_purchase(
 @router.post("/transfer")
 async def transfer_equipment(
     payload: EquipmentTransferRequest,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.assign")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
@@ -5121,10 +5193,7 @@ async def transfer_equipment(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Super Admin cannot transfer company equipment directly",
         )
-    equipment = await get_active_equipment_or_404(
-        db,
-        payload.equipment_id,
-    )
+    equipment = await get_active_equipment_or_404(db, payload.equipment_id, current_user)
 
     if equipment.condition == EquipmentCondition.DAMAGED:
         raise HTTPException(
@@ -5166,6 +5235,13 @@ async def transfer_equipment(
             detail="Target project not found",
         )
 
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None and project.company_id != current_user.company_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Target project belongs to another company",
+        )
+
     today = date.today()
 
     if project.end_date and project.end_date < today:
@@ -5178,6 +5254,7 @@ async def transfer_equipment(
         select(
             exists().where(
                 EquipmentRental.equipment_id == equipment.id,
+                EquipmentRental.is_completed == False,
                 EquipmentRental.start_date <= today,
                 or_(
                     EquipmentRental.end_date.is_(None),
@@ -5245,15 +5322,14 @@ async def get_transfer_history(
     equipment_id: int,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
         return {"items": [], "meta": {"total": 0, "limit": limit, "offset": offset}}
-    eq = await get_active_equipment_or_404(db, equipment_id)
-    if not eq.project_id:
-        raise HTTPException(status_code=404, detail="Equipment not found")
-    await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
+    eq = await get_active_equipment_or_404(db, equipment_id, current_user)
+    if eq.project_id is not None:
+        await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
 
     base_query = select(EquipmentAuditLog).where(
         EquipmentAuditLog.equipment_id == equipment_id,
@@ -5335,7 +5411,7 @@ async def list_transfer_history(
     offset: int = Query(0, ge=0),
     equipment_id: int | None = Query(None),
     project_id: int | None = Query(None),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -5343,18 +5419,17 @@ async def list_transfer_history(
     if project_id:
         await assert_project_access(db, project_id=project_id, current_user=current_user)
     if equipment_id:
-        eq = await get_active_equipment_or_404(db, equipment_id)
-        if not eq.project_id:
-            raise HTTPException(status_code=404, detail="Equipment not found")
-        await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
+        if eq.project_id is not None:
+            await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
 
     query = (
         select(EquipmentAuditLog)
         .join(Equipment, Equipment.id == EquipmentAuditLog.equipment_id)
-        .join(Project, Project.id == Equipment.project_id)
         .where(
             EquipmentAuditLog.action == "TRANSFER",
-            Project.company_id == current_user.company_id,
+            Equipment.is_deleted == False,
+            Equipment.company_id == current_user.company_id,
         )
     )
 
@@ -5475,7 +5550,7 @@ async def list_transfer_history(
 )
 async def generate_equipment_qr(
     equipment_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id is None:
@@ -5484,7 +5559,7 @@ async def generate_equipment_qr(
             detail="Super Admin cannot access equipment QR code",
         )
     # Verify equipment exists using standard helper
-    equipment = await get_active_equipment_or_404(db, equipment_id)
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
     if equipment.project_id is not None:
         await assert_project_access(
             db, project_id=equipment.project_id, current_user=current_user
@@ -5511,21 +5586,14 @@ async def generate_equipment_qr(
 @router.get("/{equipment_id}", response_model=EquipmentOut)
 async def get_equipment(
     equipment_id: int,
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Super Admin cannot access company equipment directly",
-        )
     obj = await get_active_equipment_or_404(
         db,
         equipment_id,
+        current_user,
     )
-    if not obj.project_id:
-        raise HTTPException(status_code=404, detail="Equipment not found")
-    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
 
     response = EquipmentOut.model_validate(obj)
     response.status = await calculate_equipment_status(
@@ -5543,21 +5611,24 @@ async def get_equipment(
 async def update_equipment(
     equipment_id: int,
     payload: EquipmentUpdate,
-    current_user: User = Depends(require_roles(EQUIPMENT_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("equipment.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     request: Request = None,
 ):
-    if current_user.company_id is None:
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Super Admin cannot update company equipment directly",
         )
-    obj = await get_active_equipment_or_404(db, equipment_id)
-    if not obj.project_id:
-        raise HTTPException(status_code=404, detail="Equipment not found")
-    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+    obj = await get_active_equipment_or_404(db, equipment_id, current_user)
     if payload.project_id and payload.project_id != obj.project_id:
+        target_proj = await db.get(Project, payload.project_id)
+        if not target_proj:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if not is_super and current_user.company_id is not None and target_proj.company_id != current_user.company_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Project belongs to another company")
         await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
 
     if payload.equipment_code and payload.equipment_code != obj.equipment_code:
@@ -5577,6 +5648,7 @@ async def update_equipment(
             )
 
     update_data = payload.model_dump(exclude_unset=True)
+    update_data.pop("company_id", None)
 
     old_data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
 
@@ -5660,17 +5732,17 @@ async def equipment_full_pdf_report(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.export")),
 ):
     if current_user.company_id is None:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=403,
             detail="Super Admin cannot export reports in standard equipment API",
         )
     if project_id is not None:
         await assert_project_access(db, project_id=project_id, current_user=current_user)
     if equipment_id is not None:
-        eq = await get_active_equipment_or_404(db, equipment_id)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
     """
@@ -5683,7 +5755,6 @@ async def equipment_full_pdf_report(
         import os
         from datetime import datetime
 
-        from fastapi import HTTPException
         from fastapi.responses import StreamingResponse
 
         from reportlab.platypus import (
@@ -5769,9 +5840,7 @@ async def equipment_full_pdf_report(
 
         equipment_stmt = select(Equipment).where(
             Equipment.is_deleted == False,
-            Equipment.project_id.in_(
-                select(Project.id).where(Project.company_id == current_user.company_id)
-            ),
+            Equipment.company_id == current_user.company_id,
         )
 
         if project_id:
@@ -5788,7 +5857,17 @@ async def equipment_full_pdf_report(
 
         equipments = (await db.execute(equipment_stmt)).scalars().all() or []
 
-        usage_stmt = select(EquipmentUsage)
+        usage_stmt = (
+            select(EquipmentUsage)
+            .join(Equipment, Equipment.id == EquipmentUsage.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            usage_stmt = usage_stmt.where(Equipment.project_id == project_id)
 
         if equipment_id:
             usage_stmt = usage_stmt.where(EquipmentUsage.equipment_id == equipment_id)
@@ -5801,7 +5880,19 @@ async def equipment_full_pdf_report(
 
         usages = (await db.execute(usage_stmt)).scalars().all() or []
 
-        maint_stmt = select(EquipmentMaintenance)
+        maint_stmt = (
+            select(EquipmentMaintenance)
+            .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.project_id == project_id
+            )
 
         if equipment_id:
             maint_stmt = maint_stmt.where(
@@ -5820,7 +5911,19 @@ async def equipment_full_pdf_report(
 
         maint = (await db.execute(maint_stmt)).scalars().all() or []
 
-        rental_stmt = select(EquipmentRental)
+        rental_stmt = (
+            select(EquipmentRental)
+            .join(Equipment, Equipment.id == EquipmentRental.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            rental_stmt = rental_stmt.where(
+                EquipmentRental.project_id == project_id
+            )
 
         if equipment_id:
             rental_stmt = rental_stmt.where(
@@ -5835,7 +5938,18 @@ async def equipment_full_pdf_report(
 
         rentals = (await db.execute(rental_stmt)).scalars().all() or []
 
-        purchase_stmt = select(EquipmentPurchase)
+        purchase_stmt = (
+            select(EquipmentPurchase)
+            .join(Project, Project.id == EquipmentPurchase.project_id)
+            .where(
+                Project.company_id == current_user.company_id
+            )
+        )
+
+        if project_id:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.project_id == project_id
+            )
 
         if equipment_id:
             purchase_stmt = purchase_stmt.where(
@@ -6243,24 +6357,23 @@ async def equipment_excel_report(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(EQUIPMENT_READ_ROLES)),
+    current_user: User = Depends(require_permission("equipment.export")),
 ):
     if current_user.company_id is None:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=403,
             detail="Super Admin cannot export reports in standard equipment API",
         )
     if project_id is not None:
         await assert_project_access(db, project_id=project_id, current_user=current_user)
     if equipment_id is not None:
-        eq = await get_active_equipment_or_404(db, equipment_id)
+        eq = await get_active_equipment_or_404(db, equipment_id, current_user)
         if eq.project_id is not None:
             await assert_project_access(db, project_id=eq.project_id, current_user=current_user)
     try:
         import io
         from datetime import datetime
 
-        from fastapi import HTTPException
         from fastapi.responses import StreamingResponse
 
         from openpyxl import Workbook
@@ -6276,9 +6389,7 @@ async def equipment_excel_report(
 
         equipment_stmt = select(Equipment).where(
             Equipment.is_deleted == False,
-            Equipment.project_id.in_(
-                select(Project.id).where(Project.company_id == current_user.company_id)
-            ),
+            Equipment.company_id == current_user.company_id,
         )
 
         if project_id:
@@ -6295,7 +6406,17 @@ async def equipment_excel_report(
 
         equipments = (await db.execute(equipment_stmt)).scalars().all() or []
 
-        usage_stmt = select(EquipmentUsage)
+        usage_stmt = (
+            select(EquipmentUsage)
+            .join(Equipment, Equipment.id == EquipmentUsage.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            usage_stmt = usage_stmt.where(Equipment.project_id == project_id)
 
         if equipment_id:
             usage_stmt = usage_stmt.where(EquipmentUsage.equipment_id == equipment_id)
@@ -6308,7 +6429,19 @@ async def equipment_excel_report(
 
         usages = (await db.execute(usage_stmt)).scalars().all() or []
 
-        maint_stmt = select(EquipmentMaintenance)
+        maint_stmt = (
+            select(EquipmentMaintenance)
+            .join(Equipment, Equipment.id == EquipmentMaintenance.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            maint_stmt = maint_stmt.where(
+                EquipmentMaintenance.project_id == project_id
+            )
 
         if equipment_id:
             maint_stmt = maint_stmt.where(
@@ -6327,7 +6460,19 @@ async def equipment_excel_report(
 
         maint = (await db.execute(maint_stmt)).scalars().all() or []
 
-        rental_stmt = select(EquipmentRental)
+        rental_stmt = (
+            select(EquipmentRental)
+            .join(Equipment, Equipment.id == EquipmentRental.equipment_id)
+            .where(
+                Equipment.is_deleted == False,
+                Equipment.company_id == current_user.company_id,
+            )
+        )
+
+        if project_id:
+            rental_stmt = rental_stmt.where(
+                EquipmentRental.project_id == project_id
+            )
 
         if equipment_id:
             rental_stmt = rental_stmt.where(
@@ -6342,7 +6487,18 @@ async def equipment_excel_report(
 
         rentals = (await db.execute(rental_stmt)).scalars().all() or []
 
-        purchase_stmt = select(EquipmentPurchase)
+        purchase_stmt = (
+            select(EquipmentPurchase)
+            .join(Project, Project.id == EquipmentPurchase.project_id)
+            .where(
+                Project.company_id == current_user.company_id
+            )
+        )
+
+        if project_id:
+            purchase_stmt = purchase_stmt.where(
+                EquipmentPurchase.project_id == project_id
+            )
 
         if equipment_id:
             purchase_stmt = purchase_stmt.where(

@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 from app.schemas.base import BaseSchema
 from app.core.validators import (
     validate_positive_required,
@@ -107,10 +107,7 @@ class BOQOut(BaseSchema):
     status: str
     approval_status: str
 
-    class Config:
-        from_attributes = True
-
-        json_encoders = {Decimal: float}
+    model_config = ConfigDict(from_attributes=True)
 
 
 class BOQBulkCreate(BaseSchema):

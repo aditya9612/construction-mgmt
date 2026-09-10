@@ -1,12 +1,23 @@
-from datetime import date
+import csv
+from datetime import date, datetime, time
+from decimal import Decimal
 import io
-from reportlab.lib.pagesizes import A4
-from fastapi import APIRouter, Depends, HTTPException, Query
+from io import BytesIO
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, status
+from fastapi.responses import StreamingResponse
 from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.api import owner
-from app.core.dependencies import get_current_active_user, require_roles
+
+from app.api.boq import assert_project_access_masked
+from app.core.dependencies import get_current_active_user, require_permission
 from app.core.enums import (
     AttendanceStatus,
     InvoiceStatus,
@@ -14,81 +25,44 @@ from app.core.enums import (
     InvoiceType,
     InvoiceSourceType,
 )
-import app.schemas.invoice as s
+from app.core.logger import logger
+from app.db.session import get_db_session
+from app.models.accountant import JournalEntry, JournalLine, Account
+from app.models.billing import RABill
 from app.models.expense import Expense
 from app.models.final_measurement import FinalMeasurement
+from app.models.invoice import Invoice, Transaction
 from app.models.labour import Labour
 from app.models.notification import Notification
-from app.models.user import UserAttendance
-from app.models.project import Project, ProjectMember, Task
-from app.db.session import get_db_session
-from app.models.invoice import Invoice, Transaction
 from app.models.owner import Owner, OwnerTransaction
-from app.models.user import User, ActivityLog
+from app.models.project import Project, ProjectMember, Task
+from app.models.quotation import QuotationMaster, QuotationStatus
+from app.models.user import User, ActivityLog, UserAttendance, UserRole
+import app.schemas.invoice as s
 from app.schemas.invoice import (
     AnalyticsSummaryOut,
+    ClientLedgerResponse,
+    ClientLedgerTransactionOut,
+    CollectionOut,
     CreateInvoice,
     InvoiceCreate,
-    InvoiceUpdate,
     InvoiceOut,
+    InvoiceUpdate,
     LabourInvoiceCreate,
     ManualReceivableCreate,
     ReceivablesSummaryOut,
-    ClientLedgerResponse,
-    CollectionOut,
-    ClientLedgerTransactionOut,
     SendInvoiceRequest,
     SendInvoiceResponse,
 )
-from fastapi import APIRouter, Depends, status
-from app.models.billing import RABill
-from app.models.accountant import JournalEntry, JournalLine, Account
 from app.utils.accounting import (
     get_accounts_receivable,
-    get_revenue_account,
     get_primary_cash_account,
+    get_revenue_account,
 )
 from app.utils.common import assert_project_access, create_system_alert
-from app.utils.helpers import NotFoundError, ValidationError
-from decimal import Decimal
-from fastapi.responses import StreamingResponse
-from io import BytesIO
-from app.core.logger import logger
-from app.models.quotation import QuotationMaster, QuotationStatus
-from app.models.user import UserRole
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.dependencies import require_roles
-from app.models.expense import Expense
-from app.models.final_measurement import FinalMeasurement
-from app.models.labour import Labour
-from app.models.user import UserAttendance
-from app.models.project import Project, Task
-from app.db.session import get_db_session
-from app.models.invoice import Invoice, Transaction
-from app.models.owner import OwnerTransaction
-from app.models.user import User
-from app.schemas.invoice import (
-    AnalyticsSummaryOut,
-    InvoiceCreate,
-    InvoiceUpdate,
-    InvoiceOut,
-    LabourInvoiceCreate,
-    InvoiceOut,
-    SendInvoiceRequest,
-    SendInvoiceResponse,
-)
-from app.utils.common import assert_project_access, create_system_alert
-from app.utils.helpers import NotFoundError, ValidationError
-from decimal import Decimal
-from fastapi.responses import StreamingResponse
-from io import BytesIO
-from app.core.logger import logger
-from app.models.quotation import QuotationMaster, QuotationStatus
-from app.models.user import UserRole
-from app.utils.common import create_system_alert
+from app.utils.helpers import InvalidStateError, NotFoundError, PermissionDeniedError, ValidationError
 
+# Legacy role definitions kept for backward compatibility; active route decisions use DB-driven permissions.
 INVOICE_READ_ROLES = [
     r.value
     for r in [
@@ -114,17 +88,56 @@ PAYMENT_ROLES = INVOICE_WRITE_ROLES + [UserRole.CLIENT.value]
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
 
+def _is_super_admin(user: User) -> bool:
+    return getattr(user, "is_super_admin", False) is True
+
+
+async def _get_invoice_or_404(
+    db: AsyncSession,
+    *,
+    invoice_id: int,
+    current_user: User,
+) -> tuple[Invoice, Project]:
+    """Resolve Invoice -> Project -> Company ownership chain and verify access.
+
+    Masks foreign/nonexistent/inaccessible invoices as 404 Not Found.
+    """
+    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id))
+    if not invoice:
+        raise NotFoundError("Invoice not found")
+
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None:
+        if invoice.company_id is not None and invoice.company_id != current_user.company_id:
+            raise NotFoundError("Invoice not found")
+
+    try:
+        project = await assert_project_access_masked(
+            db, project_id=invoice.project_id, current_user=current_user
+        )
+    except (NotFoundError, PermissionDeniedError):
+        raise NotFoundError("Invoice not found")
+
+    if not is_super and current_user.company_id is not None and project.company_id != current_user.company_id:
+        raise NotFoundError("Invoice not found")
+
+    return invoice, project
+
+
+# ------------------ 1. CREATE MANUAL INVOICE ------------------
+
+
 @router.post("", response_model=InvoiceOut, status_code=status.HTTP_201_CREATED)
 async def create_invoice(
     payload: CreateInvoice,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.create")),
 ):
     """Create a new manual invoice."""
-    # Validate Project
-    project = await db.get(Project, payload.project_id)
-    if not project:
-        raise NotFoundError("Project not found")
+    # Validate Project with tenant/project access masking
+    project = await assert_project_access_masked(
+        db, project_id=payload.project_id, current_user=current_user
+    )
 
     # Validate Owner
     if project.owner_id != payload.owner_id:
@@ -170,7 +183,7 @@ async def create_invoice(
     total_amount = amount + gst_amount - tax_amount
 
     invoice = Invoice(
-        company_id=current_user.company_id,
+        company_id=project.company_id or current_user.company_id,
         project_id=payload.project_id,
         owner_id=payload.owner_id,
         quotation_id=None,
@@ -239,16 +252,26 @@ async def create_invoice(
     return InvoiceOut.model_validate(invoice)
 
 
+# ------------------ 2. CREATE FROM QUOTATION ------------------
+
+
 @router.post("/from-quotation/{quotation_id}", response_model=InvoiceOut)
 async def create_invoice_from_quotation(
     quotation_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.create")),
 ):
     # 1. Get quotation
     quotation = await db.get(QuotationMaster, quotation_id)
+    if not quotation or not getattr(quotation, "project_id", None):
+        raise NotFoundError("Quotation not found")
 
-    if not quotation:
+    # Verify project access and company ownership
+    try:
+        project = await assert_project_access_masked(
+            db, project_id=quotation.project_id, current_user=current_user
+        )
+    except (NotFoundError, PermissionDeniedError):
         raise NotFoundError("Quotation not found")
 
     # 2. Must be approved
@@ -258,16 +281,6 @@ async def create_invoice_from_quotation(
     # 3. Prevent duplicate conversion
     if quotation.converted_to_invoice:
         raise ValidationError("Quotation already converted to invoice")
-
-    # 4. Project is required for invoice linkage
-    if not getattr(quotation, "project_id", None):
-        raise ValidationError("Quotation is not linked to any project")
-
-    # 5. Get project
-    project = await db.get(Project, quotation.project_id)
-
-    if not project:
-        raise NotFoundError("Project not found")
 
     # 6. Additional safety check
     existing_invoice = await db.scalar(
@@ -282,7 +295,7 @@ async def create_invoice_from_quotation(
 
     # 8. Create invoice
     invoice = Invoice(
-        company_id=current_user.company_id,
+        company_id=project.company_id or current_user.company_id,
         project_id=quotation.project_id,
         owner_id=project.owner_id,
         quotation_id=quotation.id,
@@ -298,7 +311,7 @@ async def create_invoice_from_quotation(
         paid_amount=Decimal(0),
         pending_amount=Decimal(quotation.grand_total or 0),
         status=InvoiceStatus.PENDING,
-        description=(f"Invoice generated from quotation " f"{quotation.quotation_no}"),
+        description=f"Invoice generated from quotation {quotation.quotation_no}",
     )
 
     try:
@@ -365,40 +378,46 @@ async def create_invoice_from_quotation(
     return InvoiceOut.model_validate(invoice)
 
 
+# ------------------ 3. LIST INVOICES ------------------
+
+
 @router.get("", response_model=list[InvoiceOut])
 async def list_invoices(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
-    rows = (
-        (await db.execute(select(Invoice).where(Invoice.pending_amount > 0, Invoice.company_id == current_user.company_id)))
-        .scalars()
-        .all()
-    )
+    is_super = _is_super_admin(current_user)
+    if is_super:
+        stmt = select(Invoice).where(Invoice.pending_amount > 0)
+    else:
+        stmt = select(Invoice).where(
+            Invoice.pending_amount > 0,
+            Invoice.company_id == current_user.company_id,
+        )
+    rows = (await db.execute(stmt)).scalars().all()
     return [InvoiceOut.model_validate(r) for r in rows]
 
 
-from datetime import datetime, time
+# ------------------ 4. GET BY DATE RANGE ------------------
 
 
 @router.get("/date-range")
 async def get_by_date_range(
     start: date,
     end: date,
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     start_dt = datetime.combine(start, time.min)
-    end_dt = datetime.combine(end, time.max)  # 🔥 FULL DAY
+    end_dt = datetime.combine(end, time.max)
+
+    is_super = _is_super_admin(current_user)
+    stmt = select(Invoice).where(Invoice.created_at.between(start_dt, end_dt))
+    if not is_super:
+        stmt = stmt.where(Invoice.company_id == current_user.company_id)
 
     rows = (
-        (
-            await db.execute(
-                select(Invoice)
-                .where(Invoice.created_at.between(start_dt, end_dt), Invoice.company_id == current_user.company_id)
-                .order_by(Invoice.created_at.desc())
-            )
-        )
+        (await db.execute(stmt.order_by(Invoice.created_at.desc())))
         .scalars()
         .all()
     )
@@ -406,18 +425,20 @@ async def get_by_date_range(
     return [InvoiceOut.model_validate(r) for r in rows]
 
 
+# ------------------ 5. GET INVOICE ------------------
+
+
 @router.get("/{id}", response_model=InvoiceOut)
 async def get_invoice(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
-    obj = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
-
-    if not obj:
-        raise NotFoundError("Invoice not found")
-
+    obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
     return InvoiceOut.model_validate(obj)
+
+
+# ------------------ 6. UPDATE INVOICE ------------------
 
 
 @router.put("/{id}", response_model=InvoiceOut)
@@ -425,15 +446,11 @@ async def update_invoice(
     id: int,
     payload: InvoiceUpdate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.edit")),
 ):
     logger.info(f"Updating invoice id={id}")
 
-    obj = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
-
-    if not obj:
-        logger.warning(f"Invoice not found id={id}")
-        raise NotFoundError("Invoice not found")
+    obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
 
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
@@ -462,19 +479,18 @@ async def update_invoice(
     return InvoiceOut.model_validate(obj)
 
 
+# ------------------ 7. DELETE INVOICE ------------------
+
+
 @router.delete("/{id}", status_code=204)
 async def delete_invoice(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.delete")),
 ):
     logger.info(f"Deleting invoice id={id}")
 
-    obj = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
-
-    if not obj:
-        logger.warning(f"Invoice not found id={id}")
-        raise NotFoundError("Invoice not found")
+    obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
 
     try:
         await db.delete(obj)
@@ -489,41 +505,46 @@ async def delete_invoice(
     return None
 
 
+# ------------------ 8. GET BY PROJECT ------------------
+
+
 @router.get("/project/{project_id}")
 async def get_by_project(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
+    await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
+    is_super = _is_super_admin(current_user)
+    stmt = select(Invoice).where(Invoice.project_id == project_id)
+    if not is_super:
+        stmt = stmt.where(Invoice.company_id == current_user.company_id)
+
     rows = (
-        (
-            await db.execute(
-                select(Invoice)
-                .where(Invoice.project_id == project_id, Invoice.company_id == current_user.company_id)
-                .order_by(Invoice.created_at.desc())
-            )
-        )
+        (await db.execute(stmt.order_by(Invoice.created_at.desc())))
         .scalars()
         .all()
     )
 
     return [InvoiceOut.model_validate(r) for r in rows]
+
+
+# ------------------ 9. GET BY TYPE ------------------
 
 
 @router.get("/type/{type}")
 async def get_by_type(
     type: InvoiceType,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
+    is_super = _is_super_admin(current_user)
+    stmt = select(Invoice).where(Invoice.type == type)
+    if not is_super:
+        stmt = stmt.where(Invoice.company_id == current_user.company_id)
+
     rows = (
-        (
-            await db.execute(
-                select(Invoice)
-                .where(Invoice.type == type, Invoice.company_id == current_user.company_id)
-                .order_by(Invoice.created_at.desc())
-            )
-        )
+        (await db.execute(stmt.order_by(Invoice.created_at.desc())))
         .scalars()
         .all()
     )
@@ -531,16 +552,16 @@ async def get_by_type(
     return [InvoiceOut.model_validate(r) for r in rows]
 
 
+# ------------------ 10. MARK PAID ------------------
+
+
 @router.post("/{id}/mark-paid")
 async def mark_paid(
     id: int,
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice = await db.get(Invoice, id)
-
-    if not invoice:
-        raise NotFoundError("Invoice not found")
+    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
 
     if invoice.pending_amount <= 0:
         raise ValidationError("Already paid")
@@ -585,26 +606,18 @@ async def mark_paid(
     }
 
 
-from io import BytesIO
-from fastapi.responses import StreamingResponse
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, Spacer, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+# ------------------ 11. GENERATE INVOICE PDF ------------------
 
 
 @router.get("/{id}/pdf")
 async def generate_invoice_pdf(
     id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.export")),
 ):
+    obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
 
-    obj = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
-    if not obj:
-        raise NotFoundError("Invoice not found")
-
-    #  Register Unicode font (₹ support)
+    # Register Unicode font (₹ support)
     pdfmetrics.registerFont(TTFont("DejaVu", "app/fonts/DejaVuSans.ttf"))
 
     buffer = BytesIO()
@@ -612,7 +625,7 @@ async def generate_invoice_pdf(
 
     styles = getSampleStyleSheet()
 
-    #  Apply font to ALL styles
+    # Apply font to ALL styles
     for style in styles.byName.values():
         style.fontName = "DejaVu"
 
@@ -620,7 +633,6 @@ async def generate_invoice_pdf(
 
     # Title
     elements.append(Paragraph(f"Invoice #{obj.id}", styles["Title"]))
-
     elements.append(Spacer(1, 12))
 
     # Details
@@ -712,11 +724,14 @@ async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
             pass
 
 
+# ------------------ 12. CREATE LABOUR INVOICE ------------------
+
+
 @router.post("/labour", response_model=InvoiceOut)
 async def create_labour_invoice(
     payload: LabourInvoiceCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.create")),
 ):
     # 0. Validate dates
     if payload.end_date < payload.start_date:
@@ -726,10 +741,10 @@ async def create_labour_invoice(
     start_date = payload.start_date
     end_date = payload.end_date
 
-    # 1. Project check
-    project = await db.get(Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found")
+    # 1. Project check with tenant/project access masking
+    project = await assert_project_access_masked(
+        db, project_id=project_id, current_user=current_user
+    )
 
     description = f"Labour invoice ({start_date} to {end_date})"
 
@@ -739,7 +754,7 @@ async def create_labour_invoice(
             Invoice.project_id == project_id,
             Invoice.type == InvoiceType.LABOUR,
             Invoice.description == description,
-            Invoice.company_id == current_user.company_id
+            Invoice.company_id == (project.company_id or current_user.company_id),
         )
     )
     if existing_invoice:
@@ -767,7 +782,7 @@ async def create_labour_invoice(
     try:
         # 6. Create invoice
         obj = Invoice(
-            company_id=current_user.company_id,
+            company_id=project.company_id or current_user.company_id,
             project_id=project_id,
             owner_id=project.owner_id,
             type=InvoiceType.LABOUR,
@@ -814,15 +829,18 @@ async def create_labour_invoice(
     return InvoiceOut.model_validate(obj)
 
 
+# ------------------ 13. CREATE MATERIAL INVOICE ------------------
+
+
 @router.post("/material", response_model=InvoiceOut)
 async def create_material_invoice(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.create")),
 ):
-    project = await db.get(Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found")
+    project = await assert_project_access_masked(
+        db, project_id=project_id, current_user=current_user
+    )
 
     result = await db.execute(
         select(Expense).where(
@@ -840,7 +858,7 @@ async def create_material_invoice(
 
     try:
         obj = Invoice(
-            company_id=current_user.company_id,
+            company_id=project.company_id or current_user.company_id,
             project_id=project_id,
             owner_id=project.owner_id,
             type=InvoiceType.MATERIAL,
@@ -886,23 +904,29 @@ async def create_material_invoice(
     return InvoiceOut.model_validate(obj)
 
 
+# ------------------ 14. CREATE FROM MEASUREMENT ------------------
+
+
 @router.post("/from-measurement/{measurement_id}", response_model=InvoiceOut)
 async def create_invoice_from_measurement(
     measurement_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.create")),
 ):
     logger.info(f"Creating owner invoice from measurement_id={measurement_id}")
 
     # 1. Get measurement
     measurement = await db.get(FinalMeasurement, measurement_id)
-    if not measurement:
+    if not measurement or not getattr(measurement, "project_id", None):
         raise NotFoundError("Measurement not found")
 
-    # 2. Get project
-    project = await db.get(Project, measurement.project_id)
-    if not project:
-        raise NotFoundError("Project not found")
+    # 2. Get project with tenant/project access masking
+    try:
+        project = await assert_project_access_masked(
+            db, project_id=measurement.project_id, current_user=current_user
+        )
+    except (NotFoundError, PermissionDeniedError):
+        raise NotFoundError("Measurement not found")
 
     # 3. Check existing owner invoice
     existing_invoice = await db.scalar(
@@ -919,12 +943,12 @@ async def create_invoice_from_measurement(
 
         # 4. Create invoice
         obj = Invoice(
-            company_id=current_user.company_id,
+            company_id=project.company_id or current_user.company_id,
             project_id=measurement.project_id,
             owner_id=project.owner_id,
             type=InvoiceType.OWNER,
             source_type=InvoiceSourceType.MEASUREMENT,
-            reference_id=measurement.id,  #  link to measurement
+            reference_id=measurement.id,
             amount=total_amount,
             gst_percent=Decimal(0),
             gst_amount=Decimal(0),
@@ -969,21 +993,26 @@ async def create_invoice_from_measurement(
     return InvoiceOut.model_validate(obj)
 
 
+# ------------------ 15. PROJECT PAYMENT SUMMARY ------------------
+
+
 @router.get("/project/{project_id}/summary")
 async def payment_summary(
     project_id: int,
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
 
-    paid = await db.scalar(
-        select(func.sum(Invoice.paid_amount)).where(Invoice.project_id == project_id, Invoice.company_id == current_user.company_id)
-    )
+    is_super = _is_super_admin(current_user)
+    paid_stmt = select(func.sum(Invoice.paid_amount)).where(Invoice.project_id == project_id)
+    pending_stmt = select(func.sum(Invoice.pending_amount)).where(Invoice.project_id == project_id)
+    if not is_super:
+        paid_stmt = paid_stmt.where(Invoice.company_id == current_user.company_id)
+        pending_stmt = pending_stmt.where(Invoice.company_id == current_user.company_id)
 
-    pending = await db.scalar(
-        select(func.sum(Invoice.pending_amount)).where(Invoice.project_id == project_id, Invoice.company_id == current_user.company_id)
-    )
+    paid = await db.scalar(paid_stmt)
+    pending = await db.scalar(pending_stmt)
 
     return {
         "paid": float(paid or 0),
@@ -991,13 +1020,18 @@ async def payment_summary(
     }
 
 
+# ------------------ 16. ANALYTICS SUMMARY ------------------
+
+
 @router.get("/analytics/summary", response_model=AnalyticsSummaryOut)
 async def analytics_summary(
     project_id: int,
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
+
+    is_super = _is_super_admin(current_user)
 
     # 1. Progress (task-based)
     progress = await db.scalar(
@@ -1007,34 +1041,29 @@ async def analytics_summary(
     )
 
     # 2. Revenue (owner invoices)
-    total_revenue = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.type == InvoiceType.OWNER,
-            Invoice.company_id == current_user.company_id
-        )
+    rev_stmt = select(func.sum(Invoice.total_amount)).where(
+        Invoice.project_id == project_id,
+        Invoice.type == InvoiceType.OWNER,
     )
+    if not is_super:
+        rev_stmt = rev_stmt.where(Invoice.company_id == current_user.company_id)
+    total_revenue = await db.scalar(rev_stmt)
 
     # 3. Expense (labour + material)
-    total_expense = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id == project_id,
-            Invoice.type.in_(
-                [
-                    InvoiceType.LABOUR,
-                    InvoiceType.MATERIAL,
-                ]
-            ),
-            Invoice.company_id == current_user.company_id
-        )
+    exp_stmt = select(func.sum(Invoice.total_amount)).where(
+        Invoice.project_id == project_id,
+        Invoice.type.in_([InvoiceType.LABOUR, InvoiceType.MATERIAL]),
     )
+    if not is_super:
+        exp_stmt = exp_stmt.where(Invoice.company_id == current_user.company_id)
+    total_expense = await db.scalar(exp_stmt)
 
     # 4. Paid amount (for financial progress)
-    total_paid = await db.scalar(
-        select(func.sum(Invoice.paid_amount)).where(Invoice.project_id == project_id, Invoice.company_id == current_user.company_id)
-    )
+    paid_stmt = select(func.sum(Invoice.paid_amount)).where(Invoice.project_id == project_id)
+    if not is_super:
+        paid_stmt = paid_stmt.where(Invoice.company_id == current_user.company_id)
+    total_paid = await db.scalar(paid_stmt)
 
-    #  Convert safely (important for Decimal)
     total_revenue_val = float(total_revenue or 0)
     total_paid_val = float(total_paid or 0)
 
@@ -1051,19 +1080,19 @@ async def analytics_summary(
     )
 
 
+# ------------------ 17. PAY INVOICE ------------------
+
+
 @router.post("/{id}/pay")
 async def pay_invoice(
     id: int,
     amount: Decimal,
     mode: PaymentMode,
     reference: str | None = None,
-    current_user: User = Depends(require_roles(PAYMENT_ROLES)),
+    current_user: User = Depends(require_permission("invoices.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice = await db.scalar(select(Invoice).where(Invoice.id == id, Invoice.company_id == current_user.company_id))
-
-    if not invoice:
-        raise NotFoundError("Invoice not found")
+    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
 
     if amount <= 0:
         raise ValidationError("Invalid payment amount")
@@ -1133,45 +1162,83 @@ async def pay_invoice(
     }
 
 
+# ------------------ 18. INVOICE TRANSACTIONS ------------------
+
+
 @router.get("/{id}/transactions")
 async def invoice_transactions(
     id: int,
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.execute(select(Transaction).where(Transaction.invoice_id == id))
+    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    result = await db.execute(select(Transaction).where(Transaction.invoice_id == invoice.id))
     return result.scalars().all()
+
+
+# ------------------ 19. RECEIVABLES SUMMARY ------------------
 
 
 @router.get("/receivables/summary", response_model=ReceivablesSummaryOut)
 async def receivable_summary(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
-    inv_total = await db.scalar(select(func.sum(Invoice.total_amount)).where(Invoice.company_id == current_user.company_id)) or 0
-    inv_paid = await db.scalar(select(func.sum(Invoice.paid_amount)).where(Invoice.company_id == current_user.company_id)) or 0
-    inv_pending = await db.scalar(select(func.sum(Invoice.pending_amount)).where(Invoice.company_id == current_user.company_id)) or 0
+    is_super = _is_super_admin(current_user)
 
-    # Invoices overdue
-    today = date.today()
-    # Simple overdue calculation if due date were there, but just use pending as we don't have strict due dates in schema,
-    # but wait, let's query overdue if due_date is in Invoice. I'll just use pending.
-    inv_overdue = 0
-
-    rabill_total = (
-        await db.scalar(
-            select(func.sum(RABill.total_amount)).where(RABill.status == "Approved")
+    if is_super:
+        inv_total = await db.scalar(select(func.sum(Invoice.total_amount))) or 0
+        inv_paid = await db.scalar(select(func.sum(Invoice.paid_amount))) or 0
+        inv_pending = await db.scalar(select(func.sum(Invoice.pending_amount))) or 0
+        rabill_total = (
+            await db.scalar(
+                select(func.sum(RABill.total_amount)).where(RABill.status == "Approved")
+            )
+            or 0
         )
-        or 0
-    )
-    rabill_paid = 0  # RABill does not track paid_amount separately
-    rabill_pending = rabill_total  # treat all approved as pending
+    else:
+        inv_total = (
+            await db.scalar(
+                select(func.sum(Invoice.total_amount)).where(
+                    Invoice.company_id == current_user.company_id
+                )
+            )
+            or 0
+        )
+        inv_paid = (
+            await db.scalar(
+                select(func.sum(Invoice.paid_amount)).where(
+                    Invoice.company_id == current_user.company_id
+                )
+            )
+            or 0
+        )
+        inv_pending = (
+            await db.scalar(
+                select(func.sum(Invoice.pending_amount)).where(
+                    Invoice.company_id == current_user.company_id
+                )
+            )
+            or 0
+        )
+        rabill_total = (
+            await db.scalar(
+                select(func.sum(RABill.total_amount))
+                .join(Project, Project.id == RABill.project_id)
+                .where(
+                    RABill.status == "Approved",
+                    Project.company_id == current_user.company_id,
+                )
+            )
+            or 0
+        )
+
+    rabill_paid = 0
+    rabill_pending = rabill_total
 
     total_billed = float(inv_total + rabill_total)
     total_received = float(inv_paid + rabill_paid)
     pending_amount = float(inv_pending + rabill_pending)
-
-    # For portfolio value, let's consider total billed
     portfolio_value = total_billed
 
     return ReceivablesSummaryOut(
@@ -1179,22 +1246,26 @@ async def receivable_summary(
         total_billed=total_billed,
         total_received=total_received,
         pending_amount=pending_amount,
-        overdue_amount=0.0,  # Implement actual logic if due_date is added, else 0
+        overdue_amount=0.0,
     )
+
+
+# ------------------ 20. RECEIVABLES AGING ------------------
 
 
 @router.get("/receivables/aging")
 async def receivable_aging(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
     today = date.today()
 
-    rows = (
-        (await db.execute(select(Invoice).where(Invoice.pending_amount > 0, Invoice.company_id == current_user.company_id)))
-        .scalars()
-        .all()
-    )
+    is_super = _is_super_admin(current_user)
+    stmt = select(Invoice).where(Invoice.pending_amount > 0)
+    if not is_super:
+        stmt = stmt.where(Invoice.company_id == current_user.company_id)
+
+    rows = (await db.execute(stmt)).scalars().all()
 
     result = {"0-30": 0, "30-60": 0, "60+": 0}
 
@@ -1214,10 +1285,7 @@ async def receivable_aging(
     return result
 
 
-# ----------------- RECEIVABLES NEW ENDPOINTS -----------------
-
-import csv
-from fastapi import UploadFile, File
+# ------------------ 21. CLIENT LEDGER ------------------
 
 
 @router.get(
@@ -1226,12 +1294,14 @@ from fastapi import UploadFile, File
 async def get_client_ledger(
     client_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
-    from app.models.owner import Owner
-
     owner = await db.get(Owner, client_id)
     if not owner:
+        raise NotFoundError("Client not found")
+
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None and owner.company_id != current_user.company_id:
         raise NotFoundError("Client not found")
 
     try:
@@ -1242,16 +1312,6 @@ async def get_client_ledger(
             total_billed=0.0, total_received=0.0, outstanding=0.0, transactions=[]
         )
 
-    # Query Journal Lines where account = AR and status = Posted, somehow tied to client.
-    # Wait! JournalLine does not have a client_id field directly.
-    # Usually in this system, the OwnerTransaction serves as a subledger, but the instruction said "Do NOT use OwnerTransaction as source. Source: JournalEntry, JournalLine. Only status=Posted."
-    # If JournalEntry doesn't have an owner_id, how do we filter? Let's check JournalEntry model.
-    # I'll just write a generic query, maybe the system expects us to use OwnerTransaction for filtering but pull the amount from JournalEntry? No, the instruction says "Do NOT use OwnerTransaction as source. Source: JournalEntry, JournalLine. Only: JournalEntry.status == 'Posted'".
-    # I will assume JournalEntry has owner_id or we can just fetch all and filter by description or something.
-    # Wait, JournalEntry doesn't have owner_id. I will just query JournalEntry and if it fails during compile I will add owner_id to JournalEntry? No, no schema migration.
-    # How are Journal Entries linked to clients? Invoices have owner_id, RA Bills have client_id.
-    # I'll join Invoice and RABill to JournalEntry via journal_number! J-INV-{id} and J-REC-{id} and J-RAB-{id}.
-
     result = await db.execute(
         select(JournalEntry, JournalLine)
         .join(JournalLine)
@@ -1261,14 +1321,11 @@ async def get_client_ledger(
 
     rows = result.all()
 
-    # In a real scenario we need to filter by client_id. Since we formatted journal_number as J-INV-{id}, we could parse it and check invoice.owner_id.
-    # For now, to fulfill the test safely without complex regex in SQL, we fetch invoices for this owner:
-    invoices = (
-        (await db.execute(select(Invoice.id).where(Invoice.owner_id == client_id, Invoice.company_id == current_user.company_id)))
-        .scalars()
-        .all()
-    )
-    rabills: list[int] = []  # RABill has no client_id field; skip RA Bill filtering
+    inv_stmt = select(Invoice.id).where(Invoice.owner_id == client_id)
+    if not is_super and current_user.company_id is not None:
+        inv_stmt = inv_stmt.where(Invoice.company_id == current_user.company_id)
+    invoices = (await db.execute(inv_stmt)).scalars().all()
+    rabills: list[int] = []
 
     valid_jnums = set(
         [f"J-INV-{i}" for i in invoices] + [f"J-RAB-{r}" for r in rabills]
@@ -1280,7 +1337,6 @@ async def get_client_ledger(
     total_received = 0.0
 
     for je, jl in rows:
-        # Check if this journal belongs to this client's invoices/bills
         is_owner = False
         if je.journal_number in valid_jnums:
             is_owner = True
@@ -1288,13 +1344,11 @@ async def get_client_ledger(
             inv_id_str = je.journal_number.replace("J-REC-INV", "")
             if inv_id_str.isdigit() and int(inv_id_str) in invoices:
                 is_owner = True
-        elif je.journal_number and je.journal_number.startswith(
-            "J-REC-"
-        ):  # generic receipt might use txn id, we'd need to check transaction. But let's assume it matches.
+        elif je.journal_number and je.journal_number.startswith("J-REC-"):
             pass
 
-        # Let's simplify and just include it if it's broadly matching or we can just include all for now if parsing fails.
-        # Actually, let's just do a string match on description if owner_id isn't directly linked.
+        if not is_owner:
+            continue
 
         debit = float(jl.debit or 0)
         credit = float(jl.credit or 0)
@@ -1321,23 +1375,33 @@ async def get_client_ledger(
     )
 
 
+# ------------------ 22. COLLECTIONS ------------------
+
+
 @router.get("/receivables/collections", response_model=list[CollectionOut])
 async def get_collections(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_READ_ROLES)),
+    current_user: User = Depends(require_permission("invoices.view")),
 ):
-    # Fetch transactions of type receipt
-    txns = (
-        (await db.execute(select(Transaction).where(Transaction.type == "receipt")))
-        .scalars()
-        .all()
-    )
+    is_super = _is_super_admin(current_user)
+    if is_super:
+        stmt = select(Transaction).where(Transaction.type == "receipt")
+    else:
+        stmt = (
+            select(Transaction)
+            .join(Project, Project.id == Transaction.project_id)
+            .where(
+                Transaction.type == "receipt",
+                Project.company_id == current_user.company_id,
+            )
+        )
+    txns = (await db.execute(stmt)).scalars().all()
     res = []
     for t in txns:
         res.append(
             CollectionOut(
                 invoice_no=f"INV-{t.invoice_id}" if t.invoice_id else "N/A",
-                client="Client",  # would join owner ideally
+                client="Client",
                 amount_received=float(t.amount or 0),
                 received_on=t.created_at,
                 mode=t.mode or "Cash",
@@ -1348,12 +1412,23 @@ async def get_collections(
     return res
 
 
+# ------------------ 23. MANUAL RECEIVABLE ------------------
+
+
 @router.post("/receivables/manual")
 async def create_manual_receivable(
     payload: ManualReceivableCreate,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.create")),
 ):
+    owner = await db.get(Owner, payload.client_id)
+    if not owner:
+        raise NotFoundError("Client not found")
+
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None and owner.company_id != current_user.company_id:
+        raise NotFoundError("Client not found")
+
     je = JournalEntry(
         entry_type="Manual Receivable",
         journal_number=f"J-MAN-REC-{payload.client_id}-{date.today().strftime('%Y%m%d')}",
@@ -1384,17 +1459,20 @@ async def create_manual_receivable(
             )
         )
     except (ValueError, Exception):
-        pass  # Journal lines skipped if AR/Revenue accounts not configured
+        pass
 
     await db.commit()
     return {"message": "Manual receivable posted", "journal_id": je.id}
+
+
+# ------------------ 24. IMPORT RECEIVABLES ------------------
 
 
 @router.post("/receivables/import")
 async def import_receivables(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(INVOICE_WRITE_ROLES)),
+    current_user: User = Depends(require_permission("invoices.create")),
 ):
     content = await file.read()
     decoded = content.decode("utf-8")
@@ -1413,11 +1491,27 @@ async def import_receivables(
     }
 
 
+# ------------------ 25. EXPORT RECEIVABLES ------------------
+
+
 @router.get("/receivables/export")
-async def export_receivables(db: AsyncSession = Depends(get_db_session)):
+async def export_receivables(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("invoices.export")),
+):
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["ID", "Amount"])
+
+    is_super = _is_super_admin(current_user)
+    stmt = select(Invoice).where(Invoice.pending_amount > 0)
+    if not is_super:
+        stmt = stmt.where(Invoice.company_id == current_user.company_id)
+
+    invoices = (await db.execute(stmt)).scalars().all()
+    for inv in invoices:
+        writer.writerow([inv.id, float(inv.pending_amount or 0)])
+
     output.seek(0)
     return StreamingResponse(
         output,
@@ -1426,11 +1520,34 @@ async def export_receivables(db: AsyncSession = Depends(get_db_session)):
     )
 
 
+# ------------------ 26. EXPORT COLLECTIONS ------------------
+
+
 @router.get("/receivables/collections/export")
-async def export_collections(db: AsyncSession = Depends(get_db_session)):
+async def export_collections(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("invoices.export")),
+):
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Invoice", "Amount Received"])
+
+    is_super = _is_super_admin(current_user)
+    if is_super:
+        stmt = select(Transaction).where(Transaction.type == "receipt")
+    else:
+        stmt = (
+            select(Transaction)
+            .join(Project, Project.id == Transaction.project_id)
+            .where(
+                Transaction.type == "receipt",
+                Project.company_id == current_user.company_id,
+            )
+        )
+    txns = (await db.execute(stmt)).scalars().all()
+    for t in txns:
+        writer.writerow([f"INV-{t.invoice_id}" if t.invoice_id else "N/A", float(t.amount or 0)])
+
     output.seek(0)
     return StreamingResponse(
         output,
@@ -1439,13 +1556,73 @@ async def export_collections(db: AsyncSession = Depends(get_db_session)):
     )
 
 
+# ------------------ 27. EXPORT CLIENT LEDGER ------------------
+
+
 @router.get("/receivables/client-ledger/{client_id}/export")
 async def export_client_ledger(
-    client_id: int, db: AsyncSession = Depends(get_db_session)
+    client_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("invoices.export")),
 ):
+    owner = await db.get(Owner, client_id)
+    if not owner:
+        raise NotFoundError("Client not found")
+
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None and owner.company_id != current_user.company_id:
+        raise NotFoundError("Client not found")
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Date", "Particulars", "Debit", "Credit", "Balance"])
+
+    try:
+        ar_acc = await get_accounts_receivable(db)
+        ar_acc_id = ar_acc.id
+    except (ValueError, Exception):
+        ar_acc_id = None
+
+    if ar_acc_id:
+        result = await db.execute(
+            select(JournalEntry, JournalLine)
+            .join(JournalLine)
+            .where(JournalLine.account_id == ar_acc_id, JournalEntry.status == "Posted")
+            .order_by(JournalEntry.entry_date.asc())
+        )
+        rows = result.all()
+
+        inv_stmt = select(Invoice.id).where(Invoice.owner_id == client_id)
+        if not is_super and current_user.company_id is not None:
+            inv_stmt = inv_stmt.where(Invoice.company_id == current_user.company_id)
+        invoices = (await db.execute(inv_stmt)).scalars().all()
+        valid_jnums = set([f"J-INV-{i}" for i in invoices])
+
+        running_balance = 0.0
+        for je, jl in rows:
+            is_match = False
+            if je.journal_number in valid_jnums:
+                is_match = True
+            elif je.journal_number and je.journal_number.startswith("J-REC-INV"):
+                inv_id_str = je.journal_number.replace("J-REC-INV", "")
+                if inv_id_str.isdigit() and int(inv_id_str) in invoices:
+                    is_match = True
+
+            if not is_match:
+                continue
+
+            debit = float(jl.debit or 0)
+            credit = float(jl.credit or 0)
+            running_balance += debit - credit
+
+            writer.writerow([
+                je.entry_date.strftime("%Y-%m-%d") if je.entry_date else "",
+                je.description or je.journal_number,
+                debit,
+                credit,
+                running_balance,
+            ])
+
     output.seek(0)
     return StreamingResponse(
         output,
@@ -1454,7 +1631,7 @@ async def export_client_ledger(
     )
 
 
-# ================================================
+# ------------------ 28. SEND INVOICE ------------------
 
 
 @router.post("/{invoice_id}/send", response_model=s.SendInvoiceResponse)
@@ -1462,34 +1639,27 @@ async def send_invoice(
     invoice_id: int,
     payload: s.SendInvoiceRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("invoices.edit")),
 ):
     # =====================================================
-    # ONLY ADMIN CAN SEND INVOICE
+    # GET INVOICE WITH TENANT & PROJECT AUTHORIZATION
     # =====================================================
-    if current_user.role.lower() != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="Only admin can send invoices.",
-        )
+    invoice, project = await _get_invoice_or_404(
+        db, invoice_id=invoice_id, current_user=current_user
+    )
 
     # =====================================================
-    # GET INVOICE
-    # =====================================================
-    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id, Invoice.company_id == current_user.company_id))
-
-    if not invoice:
-        raise HTTPException(
-            status_code=404,
-            detail="Invoice not found.",
-        )
-
-    # =====================================================
-    # VALIDATE CLIENT
+    # VALIDATE CLIENT (SAME COMPANY & CLIENT ROLE)
     # =====================================================
     client = await db.get(User, payload.client_user_id)
-
     if not client:
+        raise HTTPException(
+            status_code=404,
+            detail="Client not found.",
+        )
+
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None and client.company_id != current_user.company_id:
         raise HTTPException(
             status_code=404,
             detail="Client not found.",
@@ -1499,17 +1669,6 @@ async def send_invoice(
         raise HTTPException(
             status_code=400,
             detail="Selected user is not a client.",
-        )
-
-    # =====================================================
-    # VALIDATE PROJECT
-    # =====================================================
-    project = await db.get(Project, invoice.project_id)
-
-    if not project:
-        raise HTTPException(
-            status_code=404,
-            detail="Project not found.",
         )
 
     # =====================================================

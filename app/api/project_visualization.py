@@ -11,7 +11,7 @@ from app.models.project import Project
 from app.models.project_visualization import ProjectVisualization
 from app.models.user import User
 from app.schemas.project_visualization import VisualizationCreate, VisualizationOut
-from app.core.dependencies import get_current_active_user
+from app.core.dependencies import get_current_active_user, require_permission
 from app.utils.helpers import NotFoundError
 
 router = APIRouter(prefix="/projects", tags=["Visualizations"])
@@ -23,7 +23,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 @router.get("/{id}/visualizations", response_model=List[VisualizationOut])
 async def list_visualizations(
     id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     project = await db.get(Project, id)
@@ -41,7 +41,7 @@ async def upload_visualization(
     title: str = Form(...),
     points: int = Form(0),
     image_file: UploadFile = File(...),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("projects.upload")),
     db: AsyncSession = Depends(get_db_session),
 ):
     project = await db.get(Project, id)

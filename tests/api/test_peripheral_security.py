@@ -236,6 +236,10 @@ class MockPeripheralSession:
                 return MockResult(filtered)
             return MockResult(items)
 
+        # RBAC permissions resolution for Tenant Admin
+        if "role_permissions" in stmt_str:
+            return MockResult(["*"])
+
         return MockResult([])
 
     async def get(self, model, ident):

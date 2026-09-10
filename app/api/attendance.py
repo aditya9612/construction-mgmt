@@ -4,7 +4,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import desc, func, select
-from app.core.dependencies import get_current_user, require_roles
+from app.core.dependencies import get_current_user, require_permission, require_roles
 from app.core.enums import (
     AttendanceStatus,
     OTPolicyType,
@@ -558,13 +558,9 @@ async def list_attendance(
     status: Optional[str] = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("attendance.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # If not admin/PM/SE, they can only see their own attendance
-    if current_user.role not in APPROVE_ROLES:
-        user_id = current_user.id
-
     stmt = select(UserAttendance)
     count_stmt = select(func.count()).select_from(UserAttendance)
     
@@ -618,10 +614,10 @@ async def list_attendance(
 
 
 # ===================== PROXY BULK CHECK-IN =====================
-@router.post("/proxy-check-in", dependencies=[Depends(require_roles(APPROVE_ROLES))])
+@router.post("/proxy-check-in")
 async def proxy_check_in(
     payload: ProxyBulkCheckInForm,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("attendance.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     actual_in_time = get_naive_utc_now()
@@ -680,10 +676,10 @@ async def proxy_check_in(
 
 
 # ===================== PROXY BULK CHECK-OUT =====================
-@router.put("/proxy-check-out", dependencies=[Depends(require_roles(APPROVE_ROLES))])
+@router.put("/proxy-check-out")
 async def proxy_check_out(
     payload: ProxyBulkCheckOutForm,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("attendance.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     if current_user.company_id:
@@ -769,11 +765,8 @@ async def export_attendance_csv(
     role: Optional[str] = None,
     is_approved: Optional[bool] = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("attendance.export")),
 ):
-    if current_user.role not in APPROVE_ROLES:
-        user_id = current_user.id
-
     query = (
         select(UserAttendance, User, Project)
         .join(User, UserAttendance.user_id == User.id)
@@ -857,11 +850,8 @@ async def export_attendance_pdf_audit(
     project_id: int,
     user_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("attendance.export")),
 ):
-    if current_user.role not in APPROVE_ROLES:
-        user_id = current_user.id
-
     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
     query = (
@@ -960,11 +950,8 @@ async def export_attendance_payroll(
     user_id: Optional[int] = None,
     role: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("attendance.export")),
 ):
-    if current_user.role not in APPROVE_ROLES:
-        user_id = current_user.id
-
     query = select(
         User.id,
         User.full_name,
