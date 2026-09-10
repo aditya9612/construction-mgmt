@@ -344,7 +344,12 @@ async def list_labour(
     total = await db.scalar(count_query)
     rows = (await db.execute(query)).scalars().all()
 
-    items = [s.LabourOut.model_validate(r).model_dump() for r in rows]
+    items = []
+    for r in rows:
+        dump = s.LabourOut.model_validate(r).model_dump()
+        if project_id is not None:
+            dump["project_id"] = project_id
+        items.append(dump)
 
     result = {
         "items": items,
@@ -1586,7 +1591,7 @@ async def unlock_payroll(
 # =========================
 # PAYROLL PAYMENT
 # =========================
-@router.post("/payroll/pay")
+@router.post("/payroll/pay", response_model=s.PayrollOut)
 async def pay_salary(
     payload: s.PayrollPayment,
     current_user: User = Depends(d.require_permission("payroll.approve")),
