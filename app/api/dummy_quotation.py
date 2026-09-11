@@ -207,9 +207,9 @@ async def preview_dummy_quotation(
         payload.cgst_percent,
         payload.sgst_percent,
         payload.gst_percent,
-        payload.discount_amount,
-        payload.tds_percent,
-        payload.advance_paid,
+        0.0,
+        0.0,
+        0.0,
     )
     
     return {
@@ -227,11 +227,11 @@ async def preview_dummy_quotation(
         "sgst_percent": totals["sgst_percent"],
         "cgst_amount": totals["cgst_amount"],
         "sgst_amount": totals["sgst_amount"],
-        "discount_amount": payload.discount_amount,
-        "tds_percent": payload.tds_percent,
+        "discount_amount": 0.0,
+        "tds_percent": 0.0,
         "tds_amount": totals["tds_amount"],
         "grand_total": totals["grand_total"],
-        "advance_paid": payload.advance_paid,
+        "advance_paid": 0.0,
         "balance_due": totals["balance_due"],
         "notes": payload.notes,
         "created_at": datetime.utcnow().isoformat(),
@@ -257,9 +257,9 @@ async def create_dummy_quotation(
         gst_percent=payload.gst_percent,
         cgst_percent=payload.cgst_percent,
         sgst_percent=payload.sgst_percent,
-        discount_amount=payload.discount_amount,
-        tds_percent=payload.tds_percent,
-        advance_paid=payload.advance_paid,
+        discount_amount=0.0,
+        tds_percent=0.0,
+        advance_paid=0.0,
         notes=payload.notes,
     )
     

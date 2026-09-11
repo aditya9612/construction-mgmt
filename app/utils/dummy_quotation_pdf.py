@@ -85,7 +85,7 @@ def generate_dummy_quotation_pdf(
         leftMargin=20,
         rightMargin=20,
         topMargin=100,
-        bottomMargin=110,
+        bottomMargin=20,
     )
 
     styles = getSampleStyleSheet()
@@ -109,11 +109,39 @@ def generate_dummy_quotation_pdf(
 
     title_para = Paragraph("<b>DUMMY QUOTATION</b>", title_style)
 
+    # Quotation Info for Header Right Side
+    quotation_no = data.get("dummy_quotation_no", "PREVIEW")
+    created_at = data.get("created_at")
+    if created_at:
+        if isinstance(created_at, str):
+            try:
+                date_str = datetime.fromisoformat(created_at).strftime("%d-%m-%Y")
+            except ValueError:
+                date_str = created_at
+        else:
+            date_str = created_at.strftime("%d-%m-%Y")
+    else:
+        date_str = datetime.now().strftime("%d-%m-%Y")
+
+    right_style = ParagraphStyle("RightInfo", parent=styles["Normal"], fontSize=10, leading=14)
+    right_info_table = Table([
+        [Paragraph("<b>Quotation No</b>", right_style), Paragraph(f": {quotation_no}", right_style)],
+        [Paragraph("<b>Date</b>", right_style), Paragraph(f": {date_str}", right_style)]
+    ], colWidths=[75, 100])
+    right_info_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, 0), 12),
+        ("TOPPADDING", (0, 1), (-1, 1), 2),
+    ]))
+
     if logo_path:
         logo = Image(logo_path, width=80, height=80)
-        header_table = Table([[logo, title_para, ""]], colWidths=[100, 350, 100])
+        header_table = Table([[logo, title_para, right_info_table]], colWidths=[100, 280, 175])
     else:
-        header_table = Table([["", title_para, ""]], colWidths=[100, 350, 100])
+        header_table = Table([["", title_para, right_info_table]], colWidths=[100, 280, 175])
 
     header_table.setStyle(
         TableStyle(
@@ -130,58 +158,43 @@ def generate_dummy_quotation_pdf(
         )
     )
 
-    # Company Details
+    # Company & Client Details Side-by-Side
     company_name = company_settings.company_name if company_settings else ""
     gst = company_settings.gst_number if company_settings else "-"
     mobile = company_settings.mobile_number if company_settings else "-"
     email = company_settings.email if company_settings else "-"
 
-    company_details = f"""
+    client_name = data.get("client_name") or "-"
+    billing_address = data.get("billing_address") or "-"
+    client_mobile = data.get("mobile_number") or "-"
+    client_gst = data.get("gst_number") or "-"
+    client_email = data.get("email") or "-"
+
+    company_cell = f"""
     <b>{company_name}</b><br/>
     GST: {gst}<br/>
     Mobile: {mobile}<br/>
     Email: {email}
     """
 
-    elements.append(Paragraph(company_details, styles["BodyText"]))
-    elements.append(Spacer(1, 12))
+    client_cell = f"""
+    <b>{client_name}</b><br/>
+    Billing Address: {billing_address}<br/>
+    Mobile: {client_mobile}<br/>
+    GST Number: {client_gst}<br/>
+    Email: {client_email}
+    """
 
-    # Quotation Info
-    created_at = data.get("created_at")
-    if created_at:
-        if isinstance(created_at, str):
-            try:
-                date_str = datetime.fromisoformat(created_at).strftime("%d-%m-%Y")
-            except ValueError:
-                date_str = created_at
-        else:
-            date_str = created_at.strftime("%d-%m-%Y")
-    else:
-        date_str = datetime.now().strftime("%d-%m-%Y")
-
-    quotation_info = [
-        ["Field", "Value"],
-        ["Quotation No", data.get("dummy_quotation_no", "PREVIEW")],
-        ["Date", date_str],
+    details_data = [
+        ["Company Details", "Client Details"],
+        [Paragraph(company_cell, styles["BodyText"]), Paragraph(client_cell, styles["BodyText"])]
     ]
-    elements.append(create_styled_table(quotation_info, [150, 370]))
-    elements.append(Spacer(1, 15))
-
-    # Client Details
-    client_info = [
-        ["Field", "Value"],
-        ["Client Name", data.get("client_name") or "-"],
-        ["Billing Address", data.get("billing_address") or "-"],
-        ["Mobile", data.get("mobile_number") or "-"],
-        ["GST Number", data.get("gst_number") or "-"],
-        ["Email", data.get("email") or "-"],
-    ]
+    
+    # 275 + 280 = 555 max width
     elements.append(
         KeepTogether(
             [
-                Paragraph("<b>Client Details</b>", styles["Heading2"]),
-                Spacer(1, 6),
-                create_styled_table(client_info, [150, 370]),
+                create_styled_table(details_data, [275, 280]),
                 Spacer(1, 15),
             ]
         )
@@ -306,47 +319,8 @@ def generate_dummy_quotation_pdf(
 
 
     # =====================================================
-    # SIGNATURE
+    # FOOTER TABLE (built before signature for KeepTogether)
     # =====================================================
-    signature_path = None
-    if company_settings and getattr(company_settings, "signature_image", None):
-        if os.path.exists(company_settings.signature_image):
-            signature_path = company_settings.signature_image
-
-    if signature_path and signature_path.lower().endswith((".png", ".jpg", ".jpeg")):
-        signature_img = Image(signature_path, width=140, height=50)
-        signature_img.hAlign = "LEFT"
-        elements.append(signature_img)
-        elements.append(Spacer(1, 5))
-
-    company_name_text = company_settings.company_name if company_settings and company_settings.company_name else "Company"
-    elements.append(
-        Paragraph(
-            f"<b>Authorized Signature</b><br/>{company_name_text}",
-            styles["BodyText"],
-        )
-    )
-    elements.append(Spacer(1, 10))
-
-    line_table = Table([[""]], colWidths=[555])
-    line_table.setStyle(
-        TableStyle(
-            [
-                ("LINEABOVE", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ]
-        )
-    )
-    elements.append(line_table)
-    elements.append(Spacer(1, 15))
-
-    # =====================================================
-    # FOOTER (DRAWN DIRECTLY IN PDF)
-    # =====================================================
-
     footer_style = ParagraphStyle(
         "FooterStyle",
         parent=styles["BodyText"],
@@ -363,20 +337,12 @@ def generate_dummy_quotation_pdf(
     website = company_settings.website if company_settings and getattr(company_settings, "website", None) else "-"
     address = company_settings.address if company_settings and getattr(company_settings, "address", None) else "-"
 
-    icon_dir = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "static", "icons")
-    )
-    
-    # Actually Final uses 'static' then 'phone.png' or 'static/icons/phone.png'. Let's check exactly what Final did:
-    # "os.path.join(..., 'static')" and then "phone.png". Wait, let me just assume 'static/icons' if 'static' doesn't have it.
-    # The final quote audit showed: icon_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "static"))
-    # Let me follow that exactly.
     icon_dir_final = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "static"))
 
     def get_icon(filename):
         path = os.path.join(icon_dir_final, filename)
         if not os.path.exists(path):
-            path = os.path.join(icon_dir_final, "icons", filename) # fallback
+            path = os.path.join(icon_dir_final, "icons", filename)
             if not os.path.exists(path):
                 return Spacer(1, 18)
         try:
@@ -409,13 +375,11 @@ def generate_dummy_quotation_pdf(
         Spacer(1, 8),
         create_icon_text_table("email.png", email_footer, 126),
     ]
-
     center_column = [
         create_icon_text_table("instagram.png", instagram_handle, 126),
         Spacer(1, 8),
         create_icon_text_table("whatsapp.png", whatsapp_number, 126),
     ]
-
     right_column = [
         create_icon_text_table("location.png", address, 140),
         Spacer(1, 8),
@@ -438,19 +402,37 @@ def generate_dummy_quotation_pdf(
         )
     )
 
-    # Render PDF
+    # Render callbacks
     def draw_first_page(canvas, doc):
         canvas.saveState()
-        # Draw Header only on first page
         header_table.wrapOn(canvas, doc.width, doc.topMargin)
         header_table.drawOn(canvas, doc.leftMargin, A4[1] - 90)
         canvas.restoreState()
 
     def draw_later_pages(canvas, doc):
-        pass # No header, no footer by default
+        pass  # No header on subsequent pages
 
-    # Append absolute footer so it only renders on the last page
-    elements.append(AbsoluteFooter(footer_table, doc.leftMargin, 15, doc.width))
+    # =====================================================
+    # SIGNATURE + FOOTER (content-aware, normal flow)
+    # =====================================================
+    company_name_text = company_settings.company_name if company_settings and company_settings.company_name else "Company"
+    signature_para = Paragraph(
+        f"<b>Authorized Signature</b><br/>{company_name_text}",
+        styles["BodyText"],
+    )
+
+    # Spacer is outside KeepTogether so only signature+footer (~125pt) must
+    # fit together — the leading gap does NOT force the block to a new page.
+    elements.append(Spacer(1, 20))
+    elements.append(
+        KeepTogether(
+            [
+                signature_para,
+                Spacer(1, 15),
+                footer_table,
+            ]
+        )
+    )
 
     doc.build(elements, onFirstPage=draw_first_page, onLaterPages=draw_later_pages)
     
