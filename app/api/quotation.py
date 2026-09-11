@@ -230,32 +230,33 @@ def create_styled_table(data, col_widths, highlight_last_row=False):
 
 
 def calculate_quotation_totals(quotation: QuotationMaster):
-
+    from decimal import Decimal
+    
     # =====================================================
     # ITEM TOTAL
     # =====================================================
 
-    item_total = sum(item.amount or 0 for item in quotation.items)
+    item_total = sum(Decimal(str(item.amount or 0)) for item in quotation.items)
 
     # =====================================================
     # LABOUR TOTAL
     # =====================================================
 
-    labour_total = sum(labour.amount or 0 for labour in quotation.labour_items)
+    labour_total = sum(Decimal(str(labour.amount or 0)) for labour in quotation.labour_items)
 
     # =====================================================
     # MATERIAL TOTAL
     # =====================================================
 
     material_total = sum(
-        material.estimated_amount or 0 for material in quotation.material_items
+        Decimal(str(material.estimated_amount or 0)) for material in quotation.material_items
     )
 
     # =====================================================
     # EXTRA CHARGES TOTAL
     # =====================================================
 
-    extra_total = sum(extra.amount or 0 for extra in quotation.extra_charge_items)
+    extra_total = sum(Decimal(str(extra.amount or 0)) for extra in quotation.extra_charge_items)
 
     # =====================================================
     # SUBTOTAL
@@ -267,9 +268,11 @@ def calculate_quotation_totals(quotation: QuotationMaster):
     # GST BREAKDOWN
     # =====================================================
 
-    cgst_amount = (subtotal * quotation.cgst_percent) / 100
+    cgst_percent_d = Decimal(str(quotation.cgst_percent or 0))
+    sgst_percent_d = Decimal(str(quotation.sgst_percent or 0))
 
-    sgst_amount = (subtotal * quotation.sgst_percent) / 100
+    cgst_amount = (subtotal * cgst_percent_d) / Decimal('100')
+    sgst_amount = (subtotal * sgst_percent_d) / Decimal('100')
 
     gross_total = subtotal + cgst_amount + sgst_amount
 
@@ -277,19 +280,22 @@ def calculate_quotation_totals(quotation: QuotationMaster):
     # TDS DEDUCTION
     # =====================================================
 
-    tds_amount = (gross_total * quotation.tds_percent) / 100
+    tds_percent_d = Decimal(str(quotation.tds_percent or 0))
+    tds_amount = (gross_total * tds_percent_d) / Decimal('100')
 
     # =====================================================
     # FINAL GRAND TOTAL
     # =====================================================
 
-    grand_total = gross_total - tds_amount - quotation.discount_amount
+    discount_amount_d = Decimal(str(quotation.discount_amount or 0))
+    grand_total = gross_total - tds_amount - discount_amount_d
 
     # =====================================================
     # BALANCE DUE
     # =====================================================
 
-    balance_due = grand_total - quotation.advance_paid
+    advance_paid_d = Decimal(str(quotation.advance_paid or 0))
+    balance_due = grand_total - advance_paid_d
 
     # =====================================================
     # SAVE VALUES
@@ -300,6 +306,7 @@ def calculate_quotation_totals(quotation: QuotationMaster):
     quotation.cgst_amount = round(cgst_amount, 2)
 
     quotation.sgst_amount = round(sgst_amount, 2)
+
 
     quotation.tds_amount = round(tds_amount, 2)
 
@@ -312,9 +319,9 @@ def calculate_quotation_totals(quotation: QuotationMaster):
     quotation.balance_due = round(balance_due, 2)
 
 
-def calculate_labour_amount(
-    labour_count, daily_wage, labour_days, overtime_hours, overtime_rate
-):
+def calculate_labour_amount(labour_count, daily_wage, labour_days, overtime_hours, overtime_rate):
+    daily_wage = float(daily_wage or 0)
+    overtime_rate = float(overtime_rate or 0)
 
     base_amount = labour_count * daily_wage * labour_days
 
@@ -2114,7 +2121,7 @@ async def update_quotation_item(
 
     elif "rate" in update_data:
 
-        item.amount = round(item.quantity * item.rate, 2)
+        item.amount = round(float(item.quantity or 0) * float(item.rate or 0), 2)
 
     # =====================================================
     # RECALCULATE QUOTATION TOTALS
@@ -2983,7 +2990,7 @@ async def update_material_item(
     # =====================================================
 
     material_item.estimated_amount = round(
-        material_item.estimated_quantity * material_item.estimated_rate,
+        float(material_item.estimated_quantity or 0) * float(material_item.estimated_rate or 0),
         2,
     )
 
@@ -3225,8 +3232,7 @@ async def update_extra_charge(
     # =====================================================
 
     extra_charge.amount = (
-        (extra_charge.quantity or 0)
-        * (extra_charge.rate or 0)
+        float(extra_charge.quantity or 0) * float(extra_charge.rate or 0)
     )
 
     await db.flush()

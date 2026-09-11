@@ -2,6 +2,8 @@ import enum
 from datetime import date
 from typing import Any, Dict, Optional
 
+from decimal import Decimal
+from sqlalchemy import DECIMAL
 from sqlalchemy import (
     JSON,
     VARCHAR,
@@ -194,7 +196,7 @@ class UserAttendance(Base, TimestampMixin):
 
     working_hours: Mapped[float] = mapped_column(Float, default=0)
     overtime_hours: Mapped[float] = mapped_column(Float, default=0)
-    overtime_rate: Mapped[float] = mapped_column(Float, default=0)
+    overtime_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     check_in_latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     check_in_longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

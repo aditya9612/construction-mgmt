@@ -8,9 +8,11 @@ from sqlalchemy import (
     Text,
     ForeignKey,
     Boolean,
+    DECIMAL,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from datetime import datetime, date
+from decimal import Decimal
 
 from app.models.base import Base
 
@@ -31,18 +33,18 @@ class DummyQuotation(Base):
     gst_number: Mapped[str | None] = mapped_column(String(50))
 
     # Basic Total / Financial Info
-    subtotal: Mapped[float] = mapped_column(Float, default=0)
+    subtotal: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
     gst_percent: Mapped[float] = mapped_column(Float, default=0)
     cgst_percent: Mapped[float] = mapped_column(Float, default=0)
     sgst_percent: Mapped[float] = mapped_column(Float, default=0)
-    cgst_amount: Mapped[float] = mapped_column(Float, default=0)
-    sgst_amount: Mapped[float] = mapped_column(Float, default=0)
-    grand_total: Mapped[float] = mapped_column(Float, default=0)
-    discount_amount: Mapped[float] = mapped_column(Float, default=0)
+    cgst_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
+    sgst_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
+    grand_total: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
+    discount_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
     tds_percent: Mapped[float] = mapped_column(Float, default=0)
-    tds_amount: Mapped[float] = mapped_column(Float, default=0)
-    advance_paid: Mapped[float] = mapped_column(Float, default=0)
-    balance_due: Mapped[float] = mapped_column(Float, default=0)
+    tds_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
+    advance_paid: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
+    balance_due: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     notes: Mapped[str | None] = mapped_column(Text)
     
@@ -70,8 +72,8 @@ class DummyQuotationItem(Base):
     description: Mapped[str | None] = mapped_column(Text)
     unit: Mapped[str | None] = mapped_column(String(50))
     quantity: Mapped[float] = mapped_column(Float, default=0.0)
-    rate: Mapped[float] = mapped_column(Float, default=0.0)
-    amount: Mapped[float] = mapped_column(Float, default=0.0)
+    rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
+    amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
     
     dummy_quotation = relationship("DummyQuotation", back_populates="items", lazy="selectin")
     

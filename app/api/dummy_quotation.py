@@ -74,6 +74,8 @@ def calculate_dummy_item_measurements(unit: str, length: float, width: float, he
     }
 
 
+from decimal import Decimal
+
 def calculate_dummy_totals(
     subtotal: float,
     cgst_percent: float,
@@ -83,27 +85,37 @@ def calculate_dummy_totals(
     tds_percent: float = 0.0,
     advance_paid: float = 0.0,
 ):
-    cgst_amount = (subtotal * cgst_percent) / 100
-    sgst_amount = (subtotal * sgst_percent) / 100
+    # Convert all inputs to Decimal for exact precision
+    subtotal_d = Decimal(str(subtotal))
+    cgst_percent_d = Decimal(str(cgst_percent))
+    sgst_percent_d = Decimal(str(sgst_percent))
+    gst_percent_d = Decimal(str(gst_percent))
+    discount_amount_d = Decimal(str(discount_amount))
+    tds_percent_d = Decimal(str(tds_percent))
+    advance_paid_d = Decimal(str(advance_paid))
+    
+    cgst_amount_d = (subtotal_d * cgst_percent_d) / Decimal('100')
+    sgst_amount_d = (subtotal_d * sgst_percent_d) / Decimal('100')
+    
     # If legacy gst_percent is provided instead
-    if gst_percent > 0 and cgst_percent == 0 and sgst_percent == 0:
-        cgst_amount = (subtotal * (gst_percent / 2)) / 100
-        sgst_amount = (subtotal * (gst_percent / 2)) / 100
-        cgst_percent = gst_percent / 2
-        sgst_percent = gst_percent / 2
+    if gst_percent_d > 0 and cgst_percent_d == 0 and sgst_percent_d == 0:
+        cgst_amount_d = (subtotal_d * (gst_percent_d / Decimal('2'))) / Decimal('100')
+        sgst_amount_d = (subtotal_d * (gst_percent_d / Decimal('2'))) / Decimal('100')
+        cgst_percent_d = gst_percent_d / Decimal('2')
+        sgst_percent_d = gst_percent_d / Decimal('2')
 
-    tds_amount = (subtotal * tds_percent) / 100
-    grand_total = subtotal + cgst_amount + sgst_amount - discount_amount - tds_amount
-    balance_due = grand_total - advance_paid
+    tds_amount_d = (subtotal_d * tds_percent_d) / Decimal('100')
+    grand_total_d = subtotal_d + cgst_amount_d + sgst_amount_d - discount_amount_d - tds_amount_d
+    balance_due_d = grand_total_d - advance_paid_d
 
     return {
-        "cgst_percent": cgst_percent,
-        "sgst_percent": sgst_percent,
-        "cgst_amount": round(cgst_amount, 2),
-        "sgst_amount": round(sgst_amount, 2),
-        "tds_amount": round(tds_amount, 2),
-        "grand_total": round(grand_total, 2),
-        "balance_due": round(balance_due, 2),
+        "cgst_percent": float(cgst_percent_d),
+        "sgst_percent": float(sgst_percent_d),
+        "cgst_amount": round(float(cgst_amount_d), 2),
+        "sgst_amount": round(float(sgst_amount_d), 2),
+        "tds_amount": round(float(tds_amount_d), 2),
+        "grand_total": round(float(grand_total_d), 2),
+        "balance_due": round(float(balance_due_d), 2),
     }
 
 async def generate_dummy_quotation_no(db: AsyncSession):
