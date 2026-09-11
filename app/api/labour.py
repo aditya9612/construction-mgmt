@@ -1666,8 +1666,19 @@ async def pay_salary(
     db.add(entry)
     await db.flush()  # get entry.id
 
+    labour_obj = await db.get(Labour, payload.labour_id)
+    target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
+    if target_company_id is None:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400, detail="Primary Cash Account not configured"
+        )
+
     wages_payable_acc = await db.scalar(
-        select(Account).where(Account.code == "WAGES_PAYABLE")
+        select(Account).where(
+            Account.code == "WAGES_PAYABLE",
+            Account.company_id == target_company_id,
+        )
     )
     if not wages_payable_acc:
         from fastapi import HTTPException
@@ -1677,9 +1688,6 @@ async def pay_salary(
         )
 
     from app.utils.accounting import get_primary_cash_account
-
-    labour_obj = await db.get(Labour, payload.labour_id)
-    target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
 
     try:
         cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
@@ -2606,9 +2614,13 @@ async def pay_wage_record(
     db.add(entry)
     await db.flush()
 
-    wages_payable_acc = await db.scalar(
-        select(Account).where(Account.code == "WAGES_PAYABLE")
-    )
+    labour_obj = await db.get(Labour, wage_record.labour_id)
+    target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
+
+    wages_query = select(Account).where(Account.code == "WAGES_PAYABLE")
+    if target_company_id is not None:
+        wages_query = wages_query.where(Account.company_id == target_company_id)
+    wages_payable_acc = await db.scalar(wages_query)
     if not wages_payable_acc:
         raise HTTPException(
             status_code=400, detail="WAGES_PAYABLE account is not configured."
@@ -2621,17 +2633,20 @@ async def pay_wage_record(
             )
         from app.models.accountant import BankAccount
 
-        bank_acc = await db.scalar(
-            select(BankAccount).where(BankAccount.id == wage_record.bank_account_id)
-        )
+        bank_query = select(BankAccount).where(BankAccount.id == wage_record.bank_account_id)
+        if target_company_id is not None:
+            bank_query = bank_query.where(BankAccount.company_id == target_company_id)
+        bank_acc = await db.scalar(bank_query)
         if not bank_acc:
             raise NotFoundError("Bank account not found")
         credit_account_id = bank_acc.account_id
     else:
         from app.utils.accounting import get_primary_cash_account
 
-        labour_obj = await db.get(Labour, wage_record.labour_id)
-        target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
+        if target_company_id is None:
+            raise HTTPException(
+                status_code=400, detail="Primary Cash Account not configured"
+            )
 
         try:
             cash_acc = await get_primary_cash_account(db, company_id=target_company_id)

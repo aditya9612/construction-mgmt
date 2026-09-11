@@ -5,7 +5,11 @@ from pydantic import ValidationError
 from sqlalchemy import String, and_, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache.redis import cache_get_json, cache_set_json, get_cache_version
-from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
+from app.core.dependencies import (
+    get_current_active_user,
+    get_request_redis,
+    require_permission,
+)
 from app.core.security import get_password_hash
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
@@ -42,6 +46,19 @@ async def get_current_user_optional(
         return await get_current_active_user(current_user=user)
     except Exception:
         return None
+
+
+def _check_tenant_access(current_user: User) -> bool:
+    """
+    Validate tenant access.
+    Returns True if user is Super Admin.
+    For non-SA, verifies current_user.company_id is not None, raising 403 otherwise.
+    """
+    if getattr(current_user, "is_super_admin", False) is True:
+        return True
+    if current_user.company_id is None:
+        raise AppError(403, "User does not belong to any company.")
+    return False
 
 
 AUDIT_ALLOWED_FIELDS = {
@@ -113,7 +130,7 @@ router = APIRouter(
 async def create_user(
     payload: UserCreatePayload = Depends(),
     profile_image: UploadFile = File(None),
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("users.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
     """Create a user with any role. Provide either email+password or mobile_number."""
@@ -148,6 +165,7 @@ async def create_user(
         # ------------------------
         # ACTOR & TENANT (AUDIT SUPPORT & ISOLATION)
         # ------------------------
+        _check_tenant_access(current_user)
         if current_user.company_id is None:
             raise AppError(403, "User does not belong to any company.")
             
@@ -300,39 +318,6 @@ async def me(current_user: User = Depends(get_current_active_user)):
     return UserOut.model_validate(current_user)
 
 
-# @router.get("", response_model=PaginatedResponse[UserOut])
-# async def list_users(
-#     limit: int = Query(20, ge=1, le=100),
-#     offset: int = Query(0, ge=0),
-#     search: Optional[str] = None,
-#     current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
-#     db: AsyncSession = Depends(get_db_session),
-# ):
-#     query = select(User).where(User.is_deleted == False)
-#     count_query = select(func.count()).select_from(User).where(User.is_deleted == False)
-
-#     if search:
-#         logger.info(f"User search query={search}")
-#         like = f"%{search}%"
-#         cond = or_(
-#             User.email.ilike(like),
-#             User.full_name.ilike(like),
-#             User.mobile.cast(String).ilike(like),
-#         )
-#         query = query.where(cond)
-#         count_query = count_query.where(cond)
-
-#     total = await db.scalar(count_query)
-#     rows = (
-#         (await db.execute(query.order_by(User.id.desc()).limit(limit).offset(offset)))
-#         .scalars()
-#         .all()
-#     )
-
-#     items = [UserOut.model_validate(r) for r in rows]
-#     meta = PaginationMeta(total=int(total or 0), limit=limit, offset=offset)
-#     return {"items": items, "meta": meta.model_dump()}
-
 VERSION_KEY = "cache_version:users"
 
 @router.get("", response_model=PaginatedResponse[UserOut])
@@ -340,21 +325,17 @@ async def list_users(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     search: Optional[str] = None,
-    current_user: User = Depends(
-        require_roles([
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-            UserRole.SITE_ENGINEER.value,
-        ])
-    ),
+    current_user: User = Depends(require_permission("users.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
+    is_sa = _check_tenant_access(current_user)
     version = await get_cache_version(redis, VERSION_KEY)
 
+    comp_key = "sa" if is_sa else str(current_user.company_id)
     cache_key = (
         f"cache:users:list:{version}:"
-        f"{current_user.id}:{current_user.role}:"
+        f"{comp_key}:{current_user.id}:{current_user.role}:"
         f"{limit}:{offset}:{search}"
     )
 
@@ -362,10 +343,12 @@ async def list_users(
     if cached is not None:
         return PaginatedResponse[UserOut].model_validate(cached)
 
-    query = select(User).where(User.is_deleted == False, User.company_id == current_user.company_id)
-    count_query = select(func.count()).select_from(User).where(
-        User.is_deleted == False, User.company_id == current_user.company_id
-    )
+    query = select(User).where(User.is_deleted == False)
+    count_query = select(func.count()).select_from(User).where(User.is_deleted == False)
+
+    if not is_sa:
+        query = query.where(User.company_id == current_user.company_id)
+        count_query = count_query.where(User.company_id == current_user.company_id)
 
     if search:
         like = f"%{search}%"
@@ -415,13 +398,14 @@ async def list_roles(
         description="Filter roles by user status: all, active, inactive"
     ),
     role: Optional[str] = Query(None, description="Filter by a specific role"),
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("users.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
     Return role counts, optionally filtered by status and specific role.
     Always includes all roles with 0 counts if no specific role is requested.
     """
+    is_sa = _check_tenant_access(current_user)
 
     # Base query
     query = (
@@ -431,6 +415,9 @@ async def list_roles(
         )
         .where(User.is_deleted == False)
     )
+
+    if not is_sa:
+        query = query.where(User.company_id == current_user.company_id)
 
     # Apply status filter
     if status == "active":
@@ -480,7 +467,7 @@ async def update_role_status(
         ...,
         description="true = activate role users, false = deactivate role users"
     ),
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("users.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
@@ -572,16 +559,19 @@ async def update_role_status(
 @router.get("/{user_id}", response_model=UserOut)
 async def get_user(
     user_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("users.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    user = await db.scalar(
-        select(User).where(
-            User.id == user_id, 
-            User.is_deleted == False,
-            User.company_id == current_user.company_id
-        )
+    is_sa = _check_tenant_access(current_user)
+
+    stmt = select(User).where(
+        User.id == user_id, 
+        User.is_deleted == False,
     )
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    user = await db.scalar(stmt)
 
     if user is None:
         logger.warning(f"User not found id={user_id}")
@@ -595,20 +585,25 @@ async def update_user(
     user_id: int,
     payload: UserUpdatePayload = Depends(),
     profile_image: UploadFile = File(None),
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("users.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Updating user id={user_id}")
 
-    user = await db.scalar(
-        select(User).where(
-            User.id == user_id, 
-            User.is_deleted == False,
-            User.company_id == current_user.company_id
-        )
+    is_sa = _check_tenant_access(current_user)
+
+    stmt = select(User).where(
+        User.id == user_id, 
+        User.is_deleted == False,
     )
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    user = await db.scalar(stmt)
     if user is None:
         raise NotFoundError("User not found")
+
+    target_company_id = user.company_id
 
     try:
         data = payload.model_dump(exclude_unset=True)
@@ -637,7 +632,7 @@ async def update_user(
             data["mobile"] = mobile_val
 
             existing = await db.scalar(
-                select(User).where(and_(User.mobile == mobile_val, User.id != user_id, User.company_id == current_user.company_id))
+                select(User).where(and_(User.mobile == mobile_val, User.id != user_id, User.company_id == target_company_id))
             )
             if existing:
                 raise ConflictError("Mobile already registered")
@@ -651,7 +646,7 @@ async def update_user(
 
             existing = await db.scalar(
                 select(User).where(
-                    and_(User.email == data["email"], User.id != user_id, User.company_id == current_user.company_id)
+                    and_(User.email == data["email"], User.id != user_id, User.company_id == target_company_id)
                 )
             )
             if existing:
@@ -748,18 +743,21 @@ async def update_user(
 @router.delete("/{user_id}", status_code=204)
 async def delete_user(
     user_id: int,
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("users.delete")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Deleting user id={user_id}")
 
-    user = await db.scalar(
-        select(User).where(
-            User.id == user_id, 
-            User.is_deleted == False,
-            User.company_id == current_user.company_id
-        )
+    is_sa = _check_tenant_access(current_user)
+
+    stmt = select(User).where(
+        User.id == user_id, 
+        User.is_deleted == False,
     )
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    user = await db.scalar(stmt)
 
     if user is None:
         raise NotFoundError("User not found")
@@ -786,14 +784,18 @@ async def delete_user(
 @router.put("/{user_id}/restore", response_model=UserOut)
 async def restore_user(
     user_id: int,
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("users.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Restoring user id={user_id}")
 
-    user = await db.scalar(
-        select(User).where(User.id == user_id, User.is_deleted == True)
-    )
+    is_sa = _check_tenant_access(current_user)
+
+    stmt = select(User).where(User.id == user_id, User.is_deleted == True)
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    user = await db.scalar(stmt)
 
     if user is None:
         raise NotFoundError("Deleted user not found")
@@ -823,32 +825,23 @@ async def get_user_audit_logs(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     changed_by: Optional[int] = Query(None),
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("users.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
     logger.info(f"Fetching audit logs for user id={user_id}")
 
-    is_sa = getattr(current_user, "is_super_admin", False) is True
+    is_sa = _check_tenant_access(current_user)
 
+    stmt = select(User).where(
+        User.id == user_id,
+        User.is_deleted == False,
+    )
     if not is_sa:
-        target_user = await db.scalar(
-            select(User).where(
-                User.id == user_id,
-                User.company_id == current_user.company_id,
-                User.is_deleted == False,
-            )
-        )
-        if target_user is None:
-            raise NotFoundError("User not found")
-    else:
-        target_user = await db.scalar(
-            select(User).where(
-                User.id == user_id,
-                User.is_deleted == False,
-            )
-        )
-        if target_user is None:
-            raise NotFoundError("User not found")
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    target_user = await db.scalar(stmt)
+    if target_user is None:
+        raise NotFoundError("User not found")
 
     query = select(UserAuditLog).where(UserAuditLog.user_id == user_id)
 
@@ -878,29 +871,20 @@ async def get_user_audit_logs(
 async def get_grouped_audit_logs(
     user_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(require_permission("users.view")),
 ):
-    is_sa = getattr(current_user, "is_super_admin", False) is True
+    is_sa = _check_tenant_access(current_user)
 
+    stmt = select(User).where(
+        User.id == user_id,
+        User.is_deleted == False,
+    )
     if not is_sa:
-        target_user = await db.scalar(
-            select(User).where(
-                User.id == user_id,
-                User.company_id == current_user.company_id,
-                User.is_deleted == False,
-            )
-        )
-        if target_user is None:
-            raise NotFoundError("User not found")
-    else:
-        target_user = await db.scalar(
-            select(User).where(
-                User.id == user_id,
-                User.is_deleted == False,
-            )
-        )
-        if target_user is None:
-            raise NotFoundError("User not found")
+        stmt = stmt.where(User.company_id == current_user.company_id)
+
+    target_user = await db.scalar(stmt)
+    if target_user is None:
+        raise NotFoundError("User not found")
 
     result = await db.execute(
         select(UserAuditLog)

@@ -14,17 +14,23 @@ async def auto_post_journal(
 ) -> Optional[JournalEntry]:
     """
     Automatically creates a balanced journal entry if both accounts are found.
-    Tenant-safe when company_id is provided; backward-compatible when omitted.
+    Requires company_id; zero cross-tenant fallback.
     """
     if amount <= 0:
         return None
 
-    # Fetch accounts by code with optional tenant scoping
-    debit_query = select(Account).where(Account.code == debit_code)
-    credit_query = select(Account).where(Account.code == credit_code)
-    if company_id is not None:
-        debit_query = debit_query.where(Account.company_id == company_id)
-        credit_query = credit_query.where(Account.company_id == company_id)
+    if company_id is None:
+        raise ValueError("Company context is required to auto post journal.")
+
+    # Fetch accounts by code strictly scoped to tenant
+    debit_query = select(Account).where(
+        Account.code == debit_code,
+        Account.company_id == company_id,
+    )
+    credit_query = select(Account).where(
+        Account.code == credit_code,
+        Account.company_id == company_id,
+    )
 
     debit_acc = await db.scalar(debit_query)
     credit_acc = await db.scalar(credit_query)
@@ -236,12 +242,14 @@ async def get_accounts_receivable(
 ) -> Account:
     from app.core.enums import AccountType
 
-    query = select(Account).where(Account.code == "ACCOUNTS_RECEIVABLE")
-    if company_id is not None:
-        query = query.where(Account.company_id == company_id)
+    if company_id is None:
+        raise ValueError("Company context is required to resolve accounts receivable.")
+
+    query = select(Account).where(
+        Account.code == "ACCOUNTS_RECEIVABLE",
+        Account.company_id == company_id,
+    )
     acc = await db.scalar(query)
-    if not acc:
-        acc = await db.scalar(select(Account).where(Account.code == "ACCOUNTS_RECEIVABLE"))
     if not acc:
         acc = Account(
             name="Accounts Receivable",
@@ -260,12 +268,14 @@ async def get_revenue_account(
 ) -> Account:
     from app.core.enums import AccountType
 
-    query = select(Account).where(Account.code == "SALES_REVENUE")
-    if company_id is not None:
-        query = query.where(Account.company_id == company_id)
+    if company_id is None:
+        raise ValueError("Company context is required to resolve revenue account.")
+
+    query = select(Account).where(
+        Account.code == "SALES_REVENUE",
+        Account.company_id == company_id,
+    )
     acc = await db.scalar(query)
-    if not acc:
-        acc = await db.scalar(select(Account).where(Account.code == "SALES_REVENUE"))
     if not acc:
         acc = Account(
             name="Sales Revenue",

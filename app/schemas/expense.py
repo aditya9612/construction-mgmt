@@ -19,6 +19,7 @@ class ExpenseCreate(ExpenseBase):
 
 
 class ExpenseUpdate(BaseModel):
+    project_id: Optional[int] = None
     category: Optional[str] = None
     description: Optional[str] = None
     amount: Optional[Decimal] = None

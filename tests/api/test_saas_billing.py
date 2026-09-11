@@ -50,6 +50,8 @@ class MockAsyncSession:
                 return ScalarsResult()
             def scalar_one_or_none(self):
                 return self.data[0] if self.data else None
+            def all(self):
+                return self.data
         
         # Super naive statement matching
         stmt_str = str(stmt).lower()
@@ -67,7 +69,21 @@ class MockAsyncSession:
         if "subscription" in stmt_str and "subscription_invoice" not in stmt_str and "activity_log" not in stmt_str:
             return MockResult([Subscription(id=1, company_id=1, plan_id=1, status="active")])
             
+        if "override" in stmt_str:
+            return MockResult([])
+        if "role_permission" in stmt_str or "permissions" in stmt_str:
+            return MockResult(["saas_billing.*"])
+            
         return MockResult([])
+
+    async def scalar(self, stmt):
+        stmt_str = str(stmt).lower()
+        if "role" in stmt_str and "company_id" in stmt_str:
+            class MockRole:
+                id = 1
+                name = "Admin"
+            return MockRole()
+        return None
 
 class MockEntitlementService:
     async def get_company_entitlements(self, db, company_id):

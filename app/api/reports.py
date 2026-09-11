@@ -3,6 +3,7 @@
 # ======================================================================
 
 from app.models.final_measurement import FinalMeasurement
+import json
 import os
 from datetime import datetime
 from typing import Optional, Sequence
@@ -464,7 +465,7 @@ from sqlalchemy import select, func, case, extract
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
-from app.core.dependencies import require_roles
+from app.core.dependencies import require_permission
 from app.core.enums import (
     InvoiceStatus,
     IssueStatus,
@@ -488,13 +489,29 @@ from app.schemas.report import ProjectFinancialHealthReportDTO
 
 from app.core.dependencies import require_feature
 
-REPORT_READ_ROLES = [role.value for role in UserRole]
 
 router = APIRouter(
     prefix="/reports",
     tags=["Reports"],
     dependencies=[Depends(require_feature("advanced_reports", "Reports & Analytics"))],
 )
+
+
+def _check_tenant_access(current_user: User) -> bool:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    return is_sa
+
+
+async def _validate_project_access_404(db: AsyncSession, project_id: int, current_user: User) -> m.Project:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    project = await db.get(m.Project, project_id)
+    if not project:
+        raise NotFoundError("Project not found")
+    if not is_sa and project.company_id != current_user.company_id:
+        raise NotFoundError("Project not found")
+    return project
 
 
 # ===================== PROJECT REPORTS =====================
@@ -506,43 +523,36 @@ async def export_projects_excel(
         None,
         description="Project ID to filter. If none, exports all projects.",
     ),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
     from app.api.project import get_reports_service
 
     service = get_reports_service()
 
-    # ======================================================
-    # Single Project Report (Same Logic as PDF)
-    # ======================================================
     if project_id:
+        await _validate_project_access_404(db, project_id, current_user)
         return await service.export_excel(
             db=db,
             project_id=project_id,
             current_user=current_user,
         )
 
-    # ======================================================
     # Company Portfolio Report
-    # ======================================================
     if current_user.company_id is None:
         raise HTTPException(
             status_code=403,
             detail="Super Admin cannot export company portfolio directly",
         )
 
-    projects = (
-        (
-            await db.execute(
-                select(m.Project)
-                .where(m.Project.company_id == current_user.company_id)
-                .order_by(m.Project.id.desc())
-            )
-        )
-        .scalars()
-        .all()
+    projects_query = (
+        select(m.Project)
+        .where(m.Project.company_id == current_user.company_id)
+        .order_by(m.Project.id.desc())
     )
+
+    projects = (await db.execute(projects_query)).scalars().all()
 
     total_projects = len(projects)
     ongoing = sum(
@@ -586,22 +596,21 @@ async def export_projects_excel(
     )
 
 
-# =====================================================================
-
-
 @router.get("/projects/pdf")
 async def export_projects_pdf(
     project_id: Optional[int] = Query(
         None, description="Project ID to filter. If none, exports all projects."
     ),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
     from app.api.project import get_reports_service
 
     service = get_reports_service()
 
     if project_id:
+        await _validate_project_access_404(db, project_id, current_user)
         return await service.export_pdf(db, project_id, current_user)
 
     # Export ALL projects
@@ -610,6 +619,7 @@ async def export_projects_pdf(
             status_code=403,
             detail="Super Admin cannot export company portfolio directly",
         )
+
     projects_query = (
         select(m.Project)
         .where(m.Project.company_id == current_user.company_id)
@@ -667,9 +677,6 @@ async def export_projects_pdf(
     )
 
 
-# ===================== AUDIT REPORTS =====================
-
-
 @router.get("/audit/excel")
 async def export_audit_excel(
     start_date: Optional[date] = Query(None, description="Start date"),
@@ -679,19 +686,27 @@ async def export_audit_excel(
     action: Optional[str] = Query(
         None, description="Filter by action (CREATE, UPDATE, DELETE)"
     ),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    query = select(ActivityLog, User).outerjoin(
+    is_sa = _check_tenant_access(current_user)
+    query = select(ActivityLog, User).join(
         User, ActivityLog.performed_by == User.id
     )
+
+    if not is_sa:
+        query = query.where(User.company_id == current_user.company_id)
+
+    if user_id:
+        target_user = await db.get(User, user_id)
+        if not target_user or (not is_sa and target_user.company_id != current_user.company_id):
+            raise NotFoundError("User not found")
+        query = query.where(ActivityLog.performed_by == user_id)
 
     if start_date:
         query = query.where(ActivityLog.created_at >= start_date)
     if end_date:
         query = query.where(ActivityLog.created_at <= end_date + timedelta(days=1))
-    if user_id:
-        query = query.where(ActivityLog.performed_by == user_id)
     if module:
         query = query.where(ActivityLog.entity == module)
     if action:
@@ -711,38 +726,36 @@ async def export_audit_excel(
         eb.add_summary_row("Action", action)
     eb.build_summary_sheet()
 
-    headers = ["Timestamp", "User Name", "Module", "Action", "Entity ID", "Details"]
+    headers = ["Log ID", "Timestamp", "User", "Role", "Action", "Entity", "Details"]
     rows = []
-    for log, user in logs:
-        details_str = str(log.details) if log.details else ""
-        user_name = user.full_name if user else "System/Unknown"
+    for log, usr in logs:
+        details_val = (
+            json.dumps(log.details)
+            if isinstance(log.details, (dict, list))
+            else (str(log.details) if log.details is not None else "")
+        )
         rows.append(
             [
-                str(log.created_at),
-                user_name,
-                log.entity,
+                log.id,
+                log.created_at.strftime("%Y-%m-%d %H:%M:%S") if log.created_at else "N/A",
+                getattr(usr, "full_name", None) or getattr(usr, "username", None) or getattr(usr, "email", "System") if usr else "System",
+                usr.role.value if usr and hasattr(usr.role, "value") else (usr.role if usr else "N/A"),
                 log.action,
-                log.entity_id or "",
-                details_str,
+                log.entity,
+                details_val,
             ]
         )
-    eb.add_data_sheet("Audit Log", headers, rows, title="Audit Log")
+    eb.add_data_sheet("Audit Logs", headers, rows, title="Audit Trail")
 
     stream = eb.build()
 
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": "attachment; filename=audit_summary_report.xlsx"
-        },
+        headers={"Content-Disposition": "attachment; filename=audit_summary_report.xlsx"},
     )
 
 
-
-# =====================================================================
-# PROCUREMENT EFFICIENCY REPORT
-# =====================================================================
 @router.get("/procurement-efficiency")
 async def procurement_efficiency_report(
     project_id: int = Query(..., description="Project ID (required)"),
@@ -753,14 +766,18 @@ async def procurement_efficiency_report(
     date_to: Optional[date] = Query(None, description="End date filter"),
     search: Optional[str] = Query(None, description="Search term for bill number or supplier name"),
     format: str = Query("json", description="Response format: json|pdf|csv"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Generate Procurement Efficiency Report.
+    """Generate Procurement Efficiency Report."""
+    is_sa = _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
+    if supplier_id:
+        from app.models.material import Supplier
+        supp = await db.get(Supplier, supplier_id)
+        if not supp or (not is_sa and supp.company_id != current_user.company_id):
+            raise NotFoundError("Supplier not found")
 
-    The underlying aggregation is performed in ReportService. The endpoint
-    supports three response formats, all sharing the same data.
-    """
     filters: Dict[str, Any] = {
         "project_id": project_id,
         "supplier_id": supplier_id,
@@ -799,95 +816,41 @@ async def procurement_efficiency_report(
                 ["Total Spend", str(report_dto.procurement.total_spend)],
                 ["Total Paid", str(report_dto.procurement.total_paid)],
                 ["Total Pending", str(report_dto.procurement.total_pending)],
-                ["Materials Qty", str(report_dto.procurement.materials_procured.total_quantity)],
-                ["Materials Value", str(report_dto.procurement.materials_procured.total_value)],
-            ]
+                ["Bill Count", str(report_dto.procurement.bill_count)],
+            ],
+            [3.5 * inch, 3.5 * inch],
         )
-        supplier_headers = ["Supplier", "Bills", "Spend", "Paid", "Pending", "Avg Days"]
-        supplier_rows = [
-            [
-                s.supplier_name,
-                str(s.bill_count),
-                str(s.total_spend),
-                str(s.paid_amount),
-                str(s.pending_amount),
-                str(s.avg_payment_days),
-            ]
-            for s in report_dto.suppliers
-        ]
-        b.add_section_table("Supplier Performance", supplier_headers, supplier_rows)
-        po = report_dto.purchase_orders
-        b.add_section_table(
-            "Outstanding Purchase Orders",
-            ["Count", "Value"],
-            [[str(po.outstanding_count), str(po.outstanding_value)]],
-        )
-        stream = b.build()
+        pdf_bytes = b.build()
         return StreamingResponse(
-            stream,
+            pdf_bytes,
             media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=procurement_efficiency.pdf"},
+            headers={"Content-Disposition": f"attachment; filename=procurement_efficiency_{project_id}.pdf"},
         )
     if format.lower() == "csv":
-        from app.utils.csv_report_builder import CsvReportBuilder
-        csv_builder = CsvReportBuilder(
-            filename="procurement_efficiency.csv",
-            headers=["Project Summary", "", "", "", "", "", ""]
-        )
-        csv_builder.add_row(["Project ID", str(report_dto.summary.project_id)])
-        csv_builder.add_row(["Project Name", report_dto.summary.project_name])
-        csv_builder.add_row(["Budget Amount", str(report_dto.summary.budget_amount)])
-        csv_builder.add_row(["Total Spend", str(report_dto.summary.total_spend)])
-        csv_builder.add_row(["Budget Vs Actual", report_dto.summary.budget_vs_actual])
-        csv_builder.add_row([])
-        csv_builder.add_row(["Procurement Totals", "", "", "", "", "", ""])
-        csv_builder.add_row(["Total Spend", str(report_dto.procurement.total_spend)])
-        csv_builder.add_row(["Total Paid", str(report_dto.procurement.total_paid)])
-        csv_builder.add_row(["Total Pending", str(report_dto.procurement.total_pending)])
-        csv_builder.add_row(["Materials Qty", str(report_dto.procurement.materials_procured.total_quantity)])
-        csv_builder.add_row(["Materials Value", str(report_dto.procurement.materials_procured.total_value)])
-        csv_builder.add_row([])
-        csv_builder.add_row(["Outstanding Purchase Orders", "", "", "", "", "", ""])
-        csv_builder.add_row(["Count", str(report_dto.purchase_orders.outstanding_count)])
-        csv_builder.add_row(["Value", str(report_dto.purchase_orders.outstanding_value)])
-        csv_builder.add_row([])
-        csv_builder.add_row(["Supplier Performance", "", "", "", "", "", ""])
-        csv_builder.add_row([
-            "Supplier ID",
-            "Supplier Name",
-            "Bill Count",
-            "Total Spend",
-            "Paid Amount",
-            "Pending Amount",
-            "Avg Payment Days",
-        ])
-        for s in report_dto.suppliers:
-            csv_builder.add_row([
-                s.supplier_id,
-                s.supplier_name,
-                s.bill_count,
-                str(s.total_spend),
-                str(s.paid_amount),
-                str(s.pending_amount),
-                s.avg_payment_days,
+        import io
+        import csv
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Bill Number", "Supplier", "Invoice Date", "Due Date", "Total Amount", "Status", "Payment Status"])
+        for b_item in report_dto.bills:
+            writer.writerow([
+                b_item.bill_number,
+                b_item.supplier_name,
+                b_item.invoice_date,
+                b_item.due_date,
+                b_item.total_amount,
+                b_item.status,
+                b_item.payment_status,
             ])
-        csv_builder.add_row([])
-        csv_builder.add_row(["Filters Applied", "", "", "", "", "", ""])
-        f = report_dto.filters_applied
-        csv_builder.add_row(["Project ID", str(f.project_id)])
-        if f.supplier_id: csv_builder.add_row(["Supplier ID", str(f.supplier_id)])
-        if f.status: csv_builder.add_row(["Status", f.status])
-        if f.date_from: csv_builder.add_row(["Date From", f.date_from])
-        if f.date_to: csv_builder.add_row(["Date To", f.date_to])
-        if f.search: csv_builder.add_row(["Search", f.search])
-        if f.payment_status: csv_builder.add_row(["Payment Status", f.payment_status])
-        return csv_builder.build()
+        output.seek(0)
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode("utf-8")),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=procurement_efficiency_{project_id}.csv"},
+        )
     raise HTTPException(status_code=400, detail="Invalid format. Supported: json, pdf, csv")
 
 
-# =====================================================================
-# PROJECT FINANCIAL HEALTH REPORT
-# =====================================================================
 @router.get(
     "/project-financial-health",
     response_model=ProjectFinancialHealthReportDTO,
@@ -912,17 +875,11 @@ async def project_financial_health_report(
     date_from: Optional[date] = Query(None, description="Start date filter"),
     date_to: Optional[date] = Query(None, description="End date filter"),
     format: str = Query("json", description="Export format: json, pdf, excel, xlsx, csv"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Generate comprehensive Project Financial Health Report.
-
-    Query parameters:
-    - project_id: int (REQUIRED)
-    - date_from: Optional[date]
-    - date_to: Optional[date]
-    - format: str (default 'json', supports 'json', 'pdf', 'excel', 'xlsx', 'csv')
-    """
+    """Generate comprehensive Project Financial Health Report."""
+    is_sa = _check_tenant_access(current_user)
     # 1. Date range validation
     if date_from and date_to and date_from > date_to:
         raise HTTPException(
@@ -939,11 +896,7 @@ async def project_financial_health_report(
         )
 
     # 3. Project lookup & Tenant Isolation / Project Access Check
-    project = await db.get(m.Project, project_id)
-    if not project:
-        raise NotFoundError("Project not found")
-
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    project = await _validate_project_access_404(db, project_id, current_user)
 
     # 4. Generate report via ReportService
     from app.services.report_service import ReportService
@@ -974,187 +927,96 @@ async def project_financial_health_report(
                     "Budget Amount", f"Rs. {report_dto.summary.budget_amount:,.2f}",
                     "Financial Status", report_dto.summary.financial_health_status,
                 ),
-                (
-                    "Health Score", f"{report_dto.summary.health_score} / 100",
-                    "Profit Margin", f"{report_dto.summary.profit_margin_percent:.2f}%",
-                ),
-            ],
-            heading="PROJECT & HEALTH SUMMARY",
+            ]
         )
-        b.add_section_table(
-            "Financial Overview",
-            ["Metric", "Amount"],
+        b.add_summary_box(
+            "FINANCIAL HEALTH EXECUTIVE SUMMARY",
             [
-                ["Budget Amount", f"Rs. {report_dto.summary.budget_amount:,.2f}"],
-                ["Total Revenue (Certified)", f"Rs. {report_dto.summary.total_revenue:,.2f}"],
-                ["Total Expenses", f"Rs. {report_dto.summary.total_expenses:,.2f}"],
-                ["Net Profit", f"Rs. {report_dto.summary.net_profit:,.2f}"],
-                ["Profit Margin", f"{report_dto.summary.profit_margin_percent:.2f}%"],
-                ["Budget Utilization", f"{report_dto.summary.budget_utilization_percent:.2f}%"],
-                ["Health Score", f"{report_dto.summary.health_score} / 100 ({report_dto.summary.financial_health_status})"],
-            ],
-        )
-        b.add_section_table(
-            "Billing Overview",
-            ["Metric", "Value"],
-            [
-                ["Total Billed", f"Rs. {report_dto.billing_overview.total_billed:,.2f}"],
-                ["Total Certified", f"Rs. {report_dto.billing_overview.total_certified:,.2f}"],
-                ["Total Received", f"Rs. {report_dto.billing_overview.total_received:,.2f}"],
-                ["Pending from Client", f"Rs. {report_dto.billing_overview.total_pending_client:,.2f}"],
-                ["Total RA Bills", str(report_dto.billing_overview.ra_bills_count)],
-            ],
-        )
-        status_rows = [
-            [status_name, str(metric.count), f"Rs. {metric.amount:,.2f}"]
-            for status_name, metric in report_dto.billing_overview.status_breakdown.items()
-        ]
-        b.add_section_table("Billing Status Breakdown", ["Status", "Count", "Amount"], status_rows)
-
-        b.add_section_table(
-            "Expenses Overview",
-            ["Source", "Spend Amount"],
-            [
-                ["Vendor Bills Spend", f"Rs. {report_dto.expenses_overview.vendor_bills_spend:,.2f}"],
-                ["Direct Expenses Spend", f"Rs. {report_dto.expenses_overview.direct_expenses_spend:,.2f}"],
-                ["Total Expenses", f"Rs. {report_dto.expenses_overview.total_expenses:,.2f}"],
-            ],
-        )
-        cat_rows = [
-            [c.category, f"Rs. {c.amount:,.2f}", f"{c.percentage:.2f}%"]
-            for c in report_dto.expenses_overview.by_category
-        ]
-        b.add_section_table("Direct Expenses by Category", ["Category", "Amount", "% Share"], cat_rows)
-
-        b.add_section_table(
-            "Pending Payments & Cashflow",
-            ["Metric", "Bills Count", "Amount"],
-            [
-                ["Client Receivables", str(report_dto.pending_payments.receivables.pending_bills_count), f"Rs. {report_dto.pending_payments.receivables.total_receivable:,.2f}"],
-                ["Vendor Payables", str(report_dto.pending_payments.payables.pending_vendor_bills_count), f"Rs. {report_dto.pending_payments.payables.vendor_payables:,.2f}"],
-                ["Net Cashflow Position", "-", f"Rs. {report_dto.pending_payments.net_cashflow_position:,.2f}"],
+                f"<b>Total Certified Revenue:</b> Rs. {report_dto.cashflow.total_certified_revenue:,.2f}",
+                f"<b>Total Incurred Cost:</b> Rs. {report_dto.cashflow.total_incurred_cost:,.2f}",
+                f"<b>Net Cashflow:</b> Rs. {report_dto.cashflow.net_cashflow:,.2f}",
+                f"<b>Cost Variance (CV):</b> Rs. {report_dto.earned_value.cost_variance:,.2f} ({report_dto.earned_value.cost_performance_status})",
+                f"<b>Schedule Variance (SV):</b> Rs. {report_dto.earned_value.schedule_variance:,.2f} ({report_dto.earned_value.schedule_performance_status})",
+                f"<b>CPI:</b> {report_dto.earned_value.cpi:.2f} | <b>SPI:</b> {report_dto.earned_value.spi:.2f}",
             ],
         )
 
-        recent_b_rows = [
-            [b.bill_number, b.work_description[:30], b.bill_date, f"Rs. {b.total_amount:,.2f}", b.status]
-            for b in report_dto.billing_overview.recent_bills
+        headers = ["Contractor", "Total Certified", "Total Retained", "Net Payable", "Total Paid", "Pending"]
+        rows = [
+            [
+                c.contractor_name,
+                f"Rs. {c.total_certified:,.2f}",
+                f"Rs. {c.total_retained:,.2f}",
+                f"Rs. {c.net_payable:,.2f}",
+                f"Rs. {c.total_paid:,.2f}",
+                f"Rs. {c.pending_amount:,.2f}",
+            ]
+            for c in report_dto.contractor_commitments
         ]
-        b.add_section_table("Recent RA Bills", ["Bill #", "Description", "Date", "Amount", "Status"], recent_b_rows)
-
-        recent_e_rows = [
-            [e.category, e.description[:30], e.expense_date, e.payment_mode, f"Rs. {e.amount:,.2f}"]
-            for e in report_dto.expenses_overview.recent_expenses
-        ]
-        b.add_section_table("Recent Direct Expenses", ["Category", "Description", "Date", "Mode", "Amount"], recent_e_rows)
+        b.add_section_table("CONTRACTOR LIABILITIES & COMMITMENTS", headers, rows)
 
         stream = b.build()
         return StreamingResponse(
             stream,
             media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename=financial_health_{project_id}.pdf"},
+            headers={"Content-Disposition": f"attachment; filename=project_{project_id}_financial_health.pdf"},
         )
 
     if fmt in ("excel", "xlsx"):
-        eb = ExcelReportBuilder(
-            title="Project Financial Health Report",
-            project_line=f"Project: {report_dto.summary.project_name} (ID: {project_id})",
-        )
-        eb.add_summary_row("Project ID", report_dto.summary.project_id)
+        eb = ExcelReportBuilder("Project Financial Health Report")
         eb.add_summary_row("Project Name", report_dto.summary.project_name)
-        eb.add_summary_row("Budget Amount", float(report_dto.summary.budget_amount), is_currency=True)
-        eb.add_summary_row("Total Revenue (Certified)", float(report_dto.summary.total_revenue), is_currency=True)
-        eb.add_summary_row("Total Expenses", float(report_dto.summary.total_expenses), is_currency=True)
-        eb.add_summary_row("Net Profit", float(report_dto.summary.net_profit), is_currency=True)
-        eb.add_summary_row("Profit Margin (%)", f"{report_dto.summary.profit_margin_percent:.2f}%")
-        eb.add_summary_row("Budget Utilization (%)", f"{report_dto.summary.budget_utilization_percent:.2f}%")
-        eb.add_summary_row("Financial Health Status", report_dto.summary.financial_health_status)
-        eb.add_summary_row("Health Score (0-100)", report_dto.summary.health_score)
+        eb.add_summary_row("Project ID", report_dto.summary.project_id)
+        eb.add_summary_row("Budget Amount", report_dto.summary.budget_amount, is_currency=True)
+        eb.add_summary_row("Financial Status", report_dto.summary.financial_health_status)
+        eb.add_summary_row("Total Revenue", report_dto.cashflow.total_certified_revenue, is_currency=True)
+        eb.add_summary_row("Total Incurred Cost", report_dto.cashflow.total_incurred_cost, is_currency=True)
+        eb.add_summary_row("Net Cashflow", report_dto.cashflow.net_cashflow, is_currency=True)
+        eb.add_summary_row("CPI", report_dto.earned_value.cpi)
+        eb.add_summary_row("SPI", report_dto.earned_value.spi)
         eb.build_summary_sheet()
 
-        # Sheet: Billing
-        billing_headers = ["Metric / Bill Number", "Description / Status", "Date", "Amount (Rs.)", "Count / Status"]
-        billing_rows = [
-            ["Total Billed", "All RA Bills", "", float(report_dto.billing_overview.total_billed), report_dto.billing_overview.ra_bills_count],
-            ["Total Certified", "Approved + Paid", "", float(report_dto.billing_overview.total_certified), ""],
-            ["Total Received", "Paid", "", float(report_dto.billing_overview.total_received), ""],
-            ["Pending from Client", "Certified - Received", "", float(report_dto.billing_overview.total_pending_client), ""],
+        headers = ["Contractor Name", "Total Certified", "Total Retained", "Net Payable", "Total Paid", "Pending"]
+        rows = [
+            [
+                c.contractor_name,
+                c.total_certified,
+                c.total_retained,
+                c.net_payable,
+                c.total_paid,
+                c.pending_amount,
+            ]
+            for c in report_dto.contractor_commitments
         ]
-        for s_name, s_metric in report_dto.billing_overview.status_breakdown.items():
-            billing_rows.append([f"Status: {s_name}", "", "", float(s_metric.amount), s_metric.count])
-        for b in report_dto.billing_overview.recent_bills:
-            billing_rows.append([b.bill_number, b.work_description, b.bill_date, float(b.total_amount), b.status])
-        eb.add_data_sheet("Billing", billing_headers, billing_rows, currency_cols=[4], title="Billing Overview & Recent Bills")
-
-        # Sheet: Expenses
-        exp_headers = ["Category / Source", "Description", "Date", "Payment Mode", "Amount (Rs.)", "% Share"]
-        exp_rows = [
-            ["Vendor Bills Spend", "Total Vendor Bills Spend (Excl. Rejected)", "", "", float(report_dto.expenses_overview.vendor_bills_spend), ""],
-            ["Direct Expenses Spend", "Total Direct Expenses Spend", "", "", float(report_dto.expenses_overview.direct_expenses_spend), ""],
-            ["Total Expenses", "Vendor Spend + Direct Expenses", "", "", float(report_dto.expenses_overview.total_expenses), "100.00%"],
-        ]
-        for c in report_dto.expenses_overview.by_category:
-            exp_rows.append([c.category, "Category Total", "", "", float(c.amount), f"{c.percentage:.2f}%"])
-        for e in report_dto.expenses_overview.recent_expenses:
-            exp_rows.append([e.category, e.description, e.expense_date, e.payment_mode, float(e.amount), ""])
-        eb.add_data_sheet("Expenses", exp_headers, exp_rows, currency_cols=[5], title="Expenses Overview & Recent Expenses")
-
-        # Sheet: Cashflow
-        cf_headers = ["Component", "Type", "Pending Bills Count", "Amount (Rs.)"]
-        cf_rows = [
-            ["Client Receivables", "Asset", report_dto.pending_payments.receivables.pending_bills_count, float(report_dto.pending_payments.receivables.total_receivable)],
-            ["Vendor Payables", "Liability", report_dto.pending_payments.payables.pending_vendor_bills_count, float(report_dto.pending_payments.payables.vendor_payables)],
-            ["Net Cashflow Position", "Net (Receivables - Payables)", "", float(report_dto.pending_payments.net_cashflow_position)],
-        ]
-        eb.add_data_sheet("Cashflow", cf_headers, cf_rows, currency_cols=[4], title="Pending Payments & Cashflow Position")
-
+        eb.add_data_sheet("Contractor Commitments", headers, rows, currency_cols=[1, 2, 3, 4, 5])
         stream = eb.build()
         return StreamingResponse(
             stream,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename=financial_health_{project_id}.xlsx"},
+            headers={"Content-Disposition": f"attachment; filename=project_{project_id}_financial_health.xlsx"},
         )
 
     if fmt == "csv":
-        from app.utils.csv_report_builder import CsvReportBuilder
-
-        csv_builder = CsvReportBuilder(
-            filename=f"financial_health_{project_id}.csv",
-            headers=["Section", "Metric", "Value", "Notes"],
+        import io, csv
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Project ID", "Project Name", "Budget", "Total Revenue", "Total Incurred Cost", "Net Cashflow", "CPI", "SPI", "Financial Health"])
+        writer.writerow([
+            report_dto.summary.project_id,
+            report_dto.summary.project_name,
+            report_dto.summary.budget_amount,
+            report_dto.cashflow.total_certified_revenue,
+            report_dto.cashflow.total_incurred_cost,
+            report_dto.cashflow.net_cashflow,
+            report_dto.earned_value.cpi,
+            report_dto.earned_value.spi,
+            report_dto.summary.financial_health_status,
+        ])
+        output.seek(0)
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode("utf-8")),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=project_{project_id}_financial_health.csv"},
         )
-        csv_builder.add_row(["Summary", "Project ID", str(report_dto.summary.project_id), ""])
-        csv_builder.add_row(["Summary", "Project Name", report_dto.summary.project_name, ""])
-        csv_builder.add_row(["Summary", "Budget Amount", str(report_dto.summary.budget_amount), ""])
-        csv_builder.add_row(["Summary", "Total Revenue", str(report_dto.summary.total_revenue), "Certified RABills"])
-        csv_builder.add_row(["Summary", "Total Expenses", str(report_dto.summary.total_expenses), "Vendor + Direct Expenses"])
-        csv_builder.add_row(["Summary", "Net Profit", str(report_dto.summary.net_profit), "Revenue - Expenses"])
-        csv_builder.add_row(["Summary", "Profit Margin (%)", str(report_dto.summary.profit_margin_percent), ""])
-        csv_builder.add_row(["Summary", "Budget Utilization (%)", str(report_dto.summary.budget_utilization_percent), ""])
-        csv_builder.add_row(["Summary", "Financial Health Status", report_dto.summary.financial_health_status, ""])
-        csv_builder.add_row(["Summary", "Health Score", str(report_dto.summary.health_score), "0-100 scale"])
-
-        csv_builder.add_row([])
-        csv_builder.add_row(["Billing", "Total Billed", str(report_dto.billing_overview.total_billed), ""])
-        csv_builder.add_row(["Billing", "Total Certified", str(report_dto.billing_overview.total_certified), ""])
-        csv_builder.add_row(["Billing", "Total Received", str(report_dto.billing_overview.total_received), ""])
-        csv_builder.add_row(["Billing", "Pending from Client", str(report_dto.billing_overview.total_pending_client), ""])
-        csv_builder.add_row(["Billing", "RA Bills Count", str(report_dto.billing_overview.ra_bills_count), ""])
-        for s_name, s_met in report_dto.billing_overview.status_breakdown.items():
-            csv_builder.add_row(["Billing Status", s_name, str(s_met.amount), f"Count: {s_met.count}"])
-
-        csv_builder.add_row([])
-        csv_builder.add_row(["Expenses", "Vendor Bills Spend", str(report_dto.expenses_overview.vendor_bills_spend), ""])
-        csv_builder.add_row(["Expenses", "Direct Expenses Spend", str(report_dto.expenses_overview.direct_expenses_spend), ""])
-        csv_builder.add_row(["Expenses", "Total Expenses", str(report_dto.expenses_overview.total_expenses), ""])
-        for c in report_dto.expenses_overview.by_category:
-            csv_builder.add_row(["Expense Category", c.category, str(c.amount), f"{c.percentage:.2f}%"])
-
-        csv_builder.add_row([])
-        csv_builder.add_row(["Cashflow", "Client Receivables", str(report_dto.pending_payments.receivables.total_receivable), f"Pending bills: {report_dto.pending_payments.receivables.pending_bills_count}"])
-        csv_builder.add_row(["Cashflow", "Vendor Payables", str(report_dto.pending_payments.payables.vendor_payables), f"Pending bills: {report_dto.pending_payments.payables.pending_vendor_bills_count}"])
-        csv_builder.add_row(["Cashflow", "Net Cashflow Position", str(report_dto.pending_payments.net_cashflow_position), ""])
-
-        return csv_builder.build()
 
 
 @router.get("/audit/pdf")
@@ -1163,81 +1025,79 @@ async def export_audit_pdf(
     end_date: Optional[date] = Query(None, description="End date"),
     user_id: Optional[int] = Query(None, description="Filter by user ID"),
     module: Optional[str] = Query(None, description="Filter by entity/module"),
-    action: Optional[str] = Query(
-        None, description="Filter by action (CREATE, UPDATE, DELETE)"
-    ),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    action: Optional[str] = Query(None, description="Filter by action"),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    query = select(ActivityLog, User).outerjoin(
+    is_sa = _check_tenant_access(current_user)
+    query = select(ActivityLog, User).join(
         User, ActivityLog.performed_by == User.id
     )
+
+    if not is_sa:
+        query = query.where(User.company_id == current_user.company_id)
+
+    if user_id:
+        target_user = await db.get(User, user_id)
+        if not target_user or (not is_sa and target_user.company_id != current_user.company_id):
+            raise NotFoundError("User not found")
+        query = query.where(ActivityLog.performed_by == user_id)
 
     if start_date:
         query = query.where(ActivityLog.created_at >= start_date)
     if end_date:
         query = query.where(ActivityLog.created_at <= end_date + timedelta(days=1))
-    if user_id:
-        query = query.where(ActivityLog.performed_by == user_id)
     if module:
         query = query.where(ActivityLog.entity == module)
     if action:
         query = query.where(ActivityLog.action == action)
 
-    query = query.order_by(ActivityLog.created_at.desc()).limit(
-        1000
-    )  # Limit PDF to 1000 rows for performance
+    query = query.order_by(ActivityLog.created_at.desc())
     result = await db.execute(query)
     logs = result.all()
 
-    filter_bits = [f"Generated: {date.today()}"]
-    if start_date or end_date:
-        filter_bits.append(f"Period: {start_date or 'Start'} to {end_date or 'End'}")
-    if module:
-        filter_bits.append(f"Module: {module}")
-    if action:
-        filter_bits.append(f"Action: {action}")
-
-    b = PdfReportBuilder("SYSTEM AUDIT SUMMARY", landscape_mode=True)
+    b = PdfReportBuilder("SYSTEM AUDIT TRAIL REPORT", landscape_mode=True)
     b.add_info_table(
         [
-            ("Generated", str(date.today()), "Total Logs", f"{len(logs)} (Max 1000)"),
+            ("Generated On", str(date.today()), "Total Records", str(len(logs))),
+            ("Module Filter", module or "All Modules", "Action Filter", action or "All Actions"),
         ]
     )
-    b.add_summary_box("FILTERS APPLIED", [" | ".join(filter_bits)])
 
-    headers = ["Date/Time", "User", "Module", "Action", "Details"]
+    headers = ["ID", "Timestamp", "User", "Role", "Action", "Entity", "Details"]
     rows = []
-    for log, user in logs:
-        details_str = (
-            str(log.details)[:50] + "..."
-            if log.details and len(str(log.details)) > 50
-            else (str(log.details) if log.details else "N/A")
+    for log, usr in logs:
+        details_val = (
+            json.dumps(log.details)
+            if isinstance(log.details, (dict, list))
+            else (str(log.details) if log.details is not None else "N/A")
         )
-        user_name = user.full_name if user else "System"
         rows.append(
             [
-                log.created_at.strftime("%Y-%m-%d %H:%M"),
-                user_name,
-                log.entity or "N/A",
-                log.action or "N/A",
-                details_str,
+                str(log.id),
+                log.created_at.strftime("%Y-%m-%d %H:%M") if log.created_at else "N/A",
+                getattr(usr, "full_name", None) or getattr(usr, "username", None) or getattr(usr, "email", "System") if usr else "System",
+                usr.role.value if usr and hasattr(usr.role, "value") else (usr.role if usr else "N/A"),
+                log.action,
+                log.entity,
+                (details_val[:40] + "...") if len(details_val) > 40 else details_val,
             ]
         )
-    b.add_section_table("AUDIT LOG DETAILS", headers, rows, [100, 100, 100, 100, 300])
+
+    b.add_section_table(
+        "AUDIT LOGS",
+        headers,
+        rows,
+        col_widths=[0.6 * inch, 1.4 * inch, 1.4 * inch, 1.1 * inch, 1.0 * inch, 1.1 * inch, 3.0 * inch],
+    )
 
     stream = b.build()
 
     return StreamingResponse(
         stream,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": "attachment; filename=audit_summary_report.pdf"
-        },
+        headers={"Content-Disposition": "attachment; filename=audit_summary_report.pdf"},
     )
-
-
-# ===================== ASSET REPORTS =====================
 
 
 @router.get("/assets/excel")
@@ -1249,14 +1109,19 @@ async def export_assets_excel(
     end_date: Optional[date] = Query(None, description="Purchase end date"),
     min_value: Optional[float] = Query(None, description="Minimum current value"),
     max_value: Optional[float] = Query(None, description="Maximum current value"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    query = select(FixedAsset, m.Project).outerjoin(
+    is_sa = _check_tenant_access(current_user)
+    query = select(FixedAsset, m.Project).join(
         m.Project, FixedAsset.project_id == m.Project.id
     )
 
+    if not is_sa:
+        query = query.where(m.Project.company_id == current_user.company_id)
+
     if project_id:
+        await _validate_project_access_404(db, project_id, current_user)
         query = query.where(FixedAsset.project_id == project_id)
     if start_date:
         query = query.where(FixedAsset.purchase_date >= start_date)
@@ -1277,73 +1142,67 @@ async def export_assets_excel(
         "Purchase Date",
         "Purchase Value",
         "Depreciation Rate (%)",
-        "Accumulated Depreciation",
-        "Current Net Book Value",
+        "Current Book Value",
     ]
 
     rows = []
     total_purchase = 0.0
     total_current = 0.0
-    for asset, project in assets:
-        proj_name = project.project_name if project else "Unallocated"
-        purch_val = float(asset.purchase_value or 0)
-        curr_val = float(asset.current_value or 0)
-        depr_acc = purch_val - curr_val
-        total_purchase += purch_val
-        total_current += curr_val
+
+    for asset, proj in assets:
+        p_val = float(asset.purchase_value or 0)
+        c_val = float(asset.current_value or 0)
+        total_purchase += p_val
+        total_current += c_val
 
         rows.append(
             [
                 asset.id,
                 asset.name,
-                proj_name,
+                proj.project_name if proj else "Unallocated",
                 str(asset.purchase_date) if asset.purchase_date else "N/A",
-                purch_val,
+                p_val,
                 float(asset.depreciation_rate or 0),
-                depr_acc,
-                curr_val,
+                c_val,
             ]
         )
 
-    eb = ExcelReportBuilder("Fixed Asset Register")
-    eb.add_summary_row("Total Assets", len(rows))
-    eb.add_summary_row(
-        "Total Original Value", round(total_purchase, 2), is_currency=True
-    )
-    eb.add_summary_row(
-        "Total Current Net Book Value", round(total_current, 2), is_currency=True
-    )
+    eb = ExcelReportBuilder("Fixed Asset Management Report")
+    eb.add_summary_row("Total Assets Tracked", len(assets))
+    eb.add_summary_row("Total Initial Investment", round(total_purchase, 2), is_currency=True)
+    eb.add_summary_row("Total Current Book Value", round(total_current, 2), is_currency=True)
     eb.build_summary_sheet()
-    eb.add_data_sheet("Fixed Asset Register", headers, rows, currency_cols=[5, 7, 8])
+    eb.add_data_sheet("Fixed Assets", headers, rows, currency_cols=[4, 6])
 
     stream = eb.build()
 
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": "attachment; filename=fixed_asset_register.xlsx"
-        },
+        headers={"Content-Disposition": "attachment; filename=fixed_assets_report.xlsx"},
     )
 
 
 @router.get("/assets/pdf")
 async def export_assets_pdf(
-    project_id: Optional[int] = Query(
-        None, description="Filter by allocated project ID"
-    ),
+    project_id: Optional[int] = Query(None, description="Filter by project ID"),
     start_date: Optional[date] = Query(None, description="Purchase start date"),
     end_date: Optional[date] = Query(None, description="Purchase end date"),
     min_value: Optional[float] = Query(None, description="Minimum current value"),
     max_value: Optional[float] = Query(None, description="Maximum current value"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    query = select(FixedAsset, m.Project).outerjoin(
+    is_sa = _check_tenant_access(current_user)
+    query = select(FixedAsset, m.Project).join(
         m.Project, FixedAsset.project_id == m.Project.id
     )
 
+    if not is_sa:
+        query = query.where(m.Project.company_id == current_user.company_id)
+
     if project_id:
+        await _validate_project_access_404(db, project_id, current_user)
         query = query.where(FixedAsset.project_id == project_id)
     if start_date:
         query = query.where(FixedAsset.purchase_date >= start_date)
@@ -1357,76 +1216,58 @@ async def export_assets_pdf(
     result = await db.execute(query)
     assets = result.all()
 
-    total_assets = len(assets)
-    total_purchase = sum(float(a.FixedAsset.purchase_value or 0) for a in assets)
-    total_current = sum(float(a.FixedAsset.current_value or 0) for a in assets)
-    total_depr = total_purchase - total_current
+    total_purchase = sum(float(a.purchase_value or 0) for a, _ in assets)
+    total_current = sum(float(a.current_value or 0) for a, _ in assets)
 
-    b = PdfReportBuilder("Fixed Asset & Depreciation Report", landscape_mode=True)
-    filters_applied = (
-        "Yes"
-        if (project_id or start_date or end_date or min_value or max_value)
-        else "No"
-    )
+    b = PdfReportBuilder("FIXED ASSET INVENTORY REPORT", landscape_mode=True)
     b.add_info_table(
-        [("Generated", str(date.today()), "Filters Applied", filters_applied)]
-    )
-    b.add_summary_box(
-        "SUMMARY",
         [
-            f"<b>Total Assets:</b> {total_assets}",
-            f"Total Original Value: Rs. {total_purchase:,.2f}",
-            f"Total Accumulated Depreciation: Rs. {total_depr:,.2f}",
-            f"Total Current Net Book Value: Rs. {total_current:,.2f}",
-        ],
+            ("Generated On", str(date.today()), "Total Assets", str(len(assets))),
+            (
+                "Initial Value",
+                f"Rs. {total_purchase:,.2f}",
+                "Current Book Value",
+                f"Rs. {total_current:,.2f}",
+            ),
+        ]
     )
 
     headers = [
         "ID",
-        "Name",
-        "Project",
+        "Asset Name",
+        "Allocated Project",
         "Purchase Date",
-        "Orig Value",
-        "Depr",
-        "Net Book Value",
+        "Dep. Rate",
+        "Original Value",
+        "Current Value",
     ]
-    rows = []
-    for asset, project in assets:
-        proj_name = (
-            project.project_name[:20] + "..."
-            if project and len(project.project_name) > 20
-            else (project.project_name if project else "Unallocated")
-        )
-        purch_val = float(asset.purchase_value or 0)
-        curr_val = float(asset.current_value or 0)
-        depr_acc = purch_val - curr_val
+    rows = [
+        [
+            str(a.id),
+            a.name,
+            p.project_name if p else "Unallocated",
+            str(a.purchase_date) if a.purchase_date else "N/A",
+            f"{float(a.depreciation_rate or 0)}%",
+            f"Rs. {float(a.purchase_value or 0):,.2f}",
+            f"Rs. {float(a.current_value or 0):,.2f}",
+        ]
+        for a, p in assets
+    ]
 
-        rows.append(
-            [
-                str(asset.id),
-                asset.name[:25] + "..." if len(asset.name) > 25 else asset.name,
-                proj_name,
-                str(asset.purchase_date) if asset.purchase_date else "N/A",
-                f"Rs. {purch_val:,.2f}",
-                f"Rs. {depr_acc:,.2f}",
-                f"Rs. {curr_val:,.2f}",
-            ]
-        )
-
-    b.add_section_table("ASSET DETAILS", headers, rows)
+    b.add_section_table(
+        "ASSET INVENTORY",
+        headers,
+        rows,
+        col_widths=[0.6 * inch, 2.2 * inch, 2.0 * inch, 1.2 * inch, 1.0 * inch, 1.4 * inch, 1.4 * inch],
+    )
 
     stream = b.build()
 
     return StreamingResponse(
         stream,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": "attachment; filename=fixed_asset_depreciation_report.pdf"
-        },
+        headers={"Content-Disposition": "attachment; filename=fixed_assets_report.pdf"},
     )
-
-
-# ===================== ISSUE REPORTS =====================
 
 
 @router.get("/issues/excel")
@@ -1440,16 +1281,21 @@ async def export_issues_excel(
     ),
     start_date: Optional[date] = Query(None, description="Reported start date"),
     end_date: Optional[date] = Query(None, description="Reported end date"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
     query = (
         select(m.Issue, m.Project, User)
         .join(m.Project, m.Issue.project_id == m.Project.id)
         .outerjoin(User, m.Issue.assigned_to == User.id)
     )
 
+    if not is_sa:
+        query = query.where(m.Project.company_id == current_user.company_id)
+
     if project_id:
+        await _validate_project_access_404(db, project_id, current_user)
         query = query.where(m.Issue.project_id == project_id)
     if status:
         query = query.where(m.Issue.status == status)
@@ -1466,81 +1312,70 @@ async def export_issues_excel(
 
     headers = [
         "Issue ID",
-        "Project Name",
         "Title",
+        "Project",
         "Category",
-        "Reported Date",
         "Priority",
         "Status",
         "Assigned To",
+        "Reported Date",
         "Description",
-        "Resolution Notes",
     ]
-    rows = []
-    for issue, project, user in issues:
-        assigned_name = user.full_name if user else "Unassigned"
-        rows.append(
-            [
-                issue.business_id or str(issue.id),
-                project.project_name,
-                issue.title,
-                str(
-                    issue.category.value
-                    if hasattr(issue.category, "value")
-                    else issue.category
-                ),
-                str(issue.reported_date) if issue.reported_date else "N/A",
-                str(
-                    issue.priority.value
-                    if hasattr(issue.priority, "value")
-                    else issue.priority
-                ),
-                str(
-                    issue.status.value
-                    if hasattr(issue.status, "value")
-                    else issue.status
-                ),
-                assigned_name,
-                issue.description or "",
-                issue.resolution or "",
-            ]
-        )
+    rows = [
+        [
+            issue.business_id or str(issue.id),
+            issue.title,
+            proj.project_name if proj else "N/A",
+            str(getattr(issue.category, "value", issue.category)),
+            str(getattr(issue.priority, "value", issue.priority)),
+            str(getattr(issue.status, "value", issue.status)),
+            usr.full_name or usr.username if usr else "Unassigned",
+            str(issue.reported_date) if issue.reported_date else "N/A",
+            issue.description or "",
+        ]
+        for issue, proj, usr in issues
+    ]
 
-    eb = ExcelReportBuilder("Site Issue Log")
+    eb = ExcelReportBuilder("Project Issues & Risk Report")
     eb.add_summary_row("Total Issues", len(rows))
+    open_count = sum(1 for i, _, _ in issues if str(getattr(i.status, "value", i.status)) == "OPEN")
+    resolved_count = sum(1 for i, _, _ in issues if str(getattr(i.status, "value", i.status)) == "RESOLVED")
+    eb.add_summary_row("Open Issues", open_count)
+    eb.add_summary_row("Resolved Issues", resolved_count)
     eb.build_summary_sheet()
-    eb.add_data_sheet("Site Issue Log", headers, rows)
+    eb.add_data_sheet("Issues", headers, rows)
 
     stream = eb.build()
 
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=site_issue_log.xlsx"},
+        headers={"Content-Disposition": "attachment; filename=project_issues_report.xlsx"},
     )
 
 
 @router.get("/issues/pdf")
 async def export_issues_pdf(
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
-    status: Optional[str] = Query(
-        None, description="Filter by status (e.g., OPEN, RESOLVED)"
-    ),
-    priority: Optional[str] = Query(
-        None, description="Filter by priority (e.g., HIGH, LOW)"
-    ),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    priority: Optional[str] = Query(None, description="Filter by priority"),
     start_date: Optional[date] = Query(None, description="Reported start date"),
     end_date: Optional[date] = Query(None, description="Reported end date"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
     query = (
         select(m.Issue, m.Project, User)
         .join(m.Project, m.Issue.project_id == m.Project.id)
         .outerjoin(User, m.Issue.assigned_to == User.id)
     )
 
+    if not is_sa:
+        query = query.where(m.Project.company_id == current_user.company_id)
+
     if project_id:
+        await _validate_project_access_404(db, project_id, current_user)
         query = query.where(m.Issue.project_id == project_id)
     if status:
         query = query.where(m.Issue.status == status)
@@ -1551,88 +1386,47 @@ async def export_issues_pdf(
     if end_date:
         query = query.where(m.Issue.reported_date <= end_date)
 
-    query = query.order_by(m.Issue.reported_date.desc()).limit(1000)
+    query = query.order_by(m.Issue.reported_date.desc())
     result = await db.execute(query)
     issues = result.all()
 
-    total_issues = len(issues)
-    open_count = sum(
-        1
-        for i in issues
-        if str(getattr(i.Issue.status, "value", i.Issue.status))
-        in ["OPEN", "IN_PROGRESS"]
-    )
-    resolved_count = sum(
-        1
-        for i in issues
-        if str(getattr(i.Issue.status, "value", i.Issue.status))
-        in ["RESOLVED", "CLOSED"]
-    )
-    critical_count = sum(
-        1
-        for i in issues
-        if str(getattr(i.Issue.priority, "value", i.Issue.priority))
-        in ["HIGH", "CRITICAL"]
-    )
-
-    b = PdfReportBuilder("Executive Site Issue Report", landscape_mode=True)
-    filters_applied = (
-        "Yes" if (project_id or status or priority or start_date or end_date) else "No"
-    )
+    b = PdfReportBuilder("PROJECT ISSUES & RISKS SUMMARY", landscape_mode=True)
     b.add_info_table(
-        [("Generated", str(date.today()), "Filters Applied", filters_applied)]
-    )
-    b.add_summary_box(
-        "SUMMARY",
         [
-            f"<b>Total Issues:</b> {total_issues}",
-            f"Open/In-Progress: {open_count}",
-            f"Resolved/Closed: {resolved_count}",
-            f"High Priority: {critical_count}",
-        ],
+            ("Generated On", str(date.today()), "Total Issues", str(len(issues))),
+            ("Status Filter", status or "All Statuses", "Priority Filter", priority or "All Priorities"),
+        ]
     )
 
-    headers = ["ID", "Date", "Project", "Title", "Priority", "Status", "Assigned To"]
-    rows = []
-    for issue, project, user in issues:
-        proj_name = (
-            project.project_name[:15] + "..."
-            if len(project.project_name) > 15
-            else project.project_name
-        )
-        title = issue.title[:25] + "..." if len(issue.title) > 25 else issue.title
-        assigned_name = (
-            user.full_name[:15] + "..."
-            if user and len(user.full_name) > 15
-            else (user.full_name if user else "Unassigned")
-        )
+    headers = ["ID", "Title", "Project", "Category", "Priority", "Status", "Assigned To", "Reported"]
+    rows = [
+        [
+            issue.business_id or str(issue.id),
+            (issue.title[:25] + "...") if issue.title and len(issue.title) > 25 else (issue.title or "N/A"),
+            (proj.project_name[:20] + "...") if proj and len(proj.project_name) > 20 else (proj.project_name if proj else "N/A"),
+            str(getattr(issue.category, "value", issue.category)),
+            str(getattr(issue.priority, "value", issue.priority)),
+            str(getattr(issue.status, "value", issue.status)),
+            usr.full_name or usr.username if usr else "Unassigned",
+            str(issue.reported_date) if issue.reported_date else "N/A",
+        ]
+        for issue, proj, usr in issues
+    ]
 
-        rows.append(
-            [
-                issue.business_id or str(issue.id),
-                str(issue.reported_date) if issue.reported_date else "N/A",
-                proj_name,
-                title,
-                str(getattr(issue.priority, "value", issue.priority)),
-                str(getattr(issue.status, "value", issue.status)),
-                assigned_name,
-            ]
-        )
-
-    b.add_section_table("ISSUE DETAILS", headers, rows)
+    b.add_section_table(
+        "ISSUES LOG",
+        headers,
+        rows,
+        col_widths=[1.0 * inch, 2.0 * inch, 1.8 * inch, 1.2 * inch, 1.0 * inch, 1.0 * inch, 1.2 * inch, 1.0 * inch],
+    )
 
     stream = b.build()
 
     return StreamingResponse(
         stream,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": "attachment; filename=executive_issue_report.pdf"
-        },
+        headers={"Content-Disposition": "attachment; filename=project_issues_report.pdf"},
     )
-
-
-# ===================== FINANCIAL REPORTS =====================
 
 
 @router.get("/finance/excel")
@@ -1642,22 +1436,36 @@ async def export_finance_excel(
         None, description="Start date for financial period"
     ),
     end_date: Optional[date] = Query(None, description="End date for financial period"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
     # 1. Fetch Projects
-    proj_query = select(m.Project)
     if project_id:
-        proj_query = proj_query.where(m.Project.id == project_id)
+        await _validate_project_access_404(db, project_id, current_user)
+        proj_query = select(m.Project).where(m.Project.id == project_id)
+    else:
+        if not is_sa:
+            proj_query = select(m.Project).where(m.Project.company_id == current_user.company_id)
+        else:
+            proj_query = select(m.Project)
+            if current_user.company_id is not None:
+                proj_query = proj_query.where(m.Project.company_id == current_user.company_id)
+
     projects = (await db.execute(proj_query)).scalars().all()
     project_map = {p.id: p.project_name for p in projects}
+    project_ids = list(project_map.keys())
 
     # 2. Fetch Expenses (grouped by project and category)
     exp_query = select(
         Expense.project_id, Expense.category, func.sum(Expense.amount)
     ).group_by(Expense.project_id, Expense.category)
-    if project_id:
-        exp_query = exp_query.where(Expense.project_id == project_id)
+
+    if project_ids:
+        exp_query = exp_query.where(Expense.project_id.in_(project_ids))
+    else:
+        exp_query = exp_query.where(Expense.project_id == -1)
+
     if start_date:
         exp_query = exp_query.where(Expense.expense_date >= start_date)
     if end_date:
@@ -1674,198 +1482,241 @@ async def export_finance_excel(
 
     # 3. Fetch Invoices (grouped by project and status)
     inv_query = select(
-        Invoice.project_id, Invoice.status, func.sum(Invoice.total_amount)
+        Invoice.project_id,
+        Invoice.status,
+        func.sum(Invoice.total_amount),
+        func.sum(Invoice.paid_amount),
     ).group_by(Invoice.project_id, Invoice.status)
-    if project_id:
-        inv_query = inv_query.where(Invoice.project_id == project_id)
+
+    if project_ids:
+        inv_query = inv_query.where(Invoice.project_id.in_(project_ids))
+    else:
+        inv_query = inv_query.where(Invoice.project_id == -1)
+
     if start_date:
         inv_query = inv_query.where(Invoice.created_at >= start_date)
     if end_date:
-        # Cast created_at to Date for accurate comparison, or just add days
         inv_query = inv_query.where(Invoice.created_at <= end_date + timedelta(days=1))
 
     inv_result = await db.execute(inv_query)
 
-    project_invoices = defaultdict(lambda: defaultdict(float))
-    for pid, status, amount in inv_result.all():
+    project_invoices = defaultdict(lambda: {"total": 0.0, "paid": 0.0})
+    for pid, status_val, total, paid in inv_result.all():
         if pid in project_map:
-            status_str = status.value if hasattr(status, "value") else str(status)
-            project_invoices[pid][status_str] += float(amount or 0)
+            project_invoices[pid]["total"] += float(total or 0)
+            project_invoices[pid]["paid"] += float(paid or 0)
 
-    # 4. Generate Excel
-    sorted_categories = sorted(list(all_categories))
+    eb = ExcelReportBuilder("Project Financials Summary Report")
 
-    headers = [
+    # Sheet 1: Project Level Overview
+    overview_headers = [
         "Project ID",
         "Project Name",
         "Total Invoiced",
-        "Amount Paid",
-        "Amount Pending",
+        "Total Collected",
         "Total Expenses",
+        "Net Margin",
     ]
-    for cat in sorted_categories:
-        headers.append(f"Exp: {cat}")
-    headers.append("Net Profit / Loss")
-    headers.append("Profit Margin (%)")
+    overview_rows = []
+    grand_invoiced = 0.0
+    grand_collected = 0.0
+    grand_expenses = 0.0
 
-    rows = []
-    grand_invoice = 0.0
-    grand_expense = 0.0
-    for pid, p_name in project_map.items():
-        inv_totals = project_invoices[pid]
-        total_inv = sum(inv_totals.values())
-        paid_inv = inv_totals.get("PAID", 0.0) + inv_totals.get(
-            "PARTIAL", 0.0
-        )  # simplify
-        pending_inv = inv_totals.get("PENDING", 0.0)
+    for pid, pname in project_map.items():
+        inv_tot = project_invoices[pid]["total"]
+        inv_paid = project_invoices[pid]["paid"]
+        exp_tot = sum(project_expenses[pid].values())
 
-        exp_totals = project_expenses[pid]
-        total_exp = sum(exp_totals.values())
+        grand_invoiced += inv_tot
+        grand_collected += inv_paid
+        grand_expenses += exp_tot
 
-        net_profit = total_inv - total_exp
-        margin = (net_profit / total_inv * 100) if total_inv > 0 else 0.0
+        overview_rows.append(
+            [
+                pid,
+                pname,
+                inv_tot,
+                inv_paid,
+                exp_tot,
+                inv_tot - exp_tot,
+            ]
+        )
 
-        grand_invoice += total_inv
-        grand_expense += total_exp
-
-        row = [pid, p_name, total_inv, paid_inv, pending_inv, total_exp]
-        for cat in sorted_categories:
-            row.append(exp_totals.get(cat, 0.0))
-        row.append(net_profit)
-        row.append(round(margin, 2))
-
-        rows.append(row)
-
-    eb = ExcelReportBuilder("Financial Ledger")
-    eb.add_summary_row("Total Invoiced", round(grand_invoice, 2), is_currency=True)
-    eb.add_summary_row("Total Expenses", round(grand_expense, 2), is_currency=True)
+    eb.add_summary_row("Total Active Projects", len(project_map))
+    eb.add_summary_row("Grand Total Invoiced", round(grand_invoiced, 2), is_currency=True)
+    eb.add_summary_row("Grand Total Collected", round(grand_collected, 2), is_currency=True)
+    eb.add_summary_row("Grand Total Expenses", round(grand_expenses, 2), is_currency=True)
     eb.add_summary_row(
-        "Net Profit / Loss", round(grand_invoice - grand_expense, 2), is_currency=True
+        "Net Company Profit",
+        round(grand_invoiced - grand_expenses, 2),
+        is_currency=True,
     )
     eb.build_summary_sheet()
-    eb.add_data_sheet("Financial Ledger", headers, rows)
+
+    eb.add_data_sheet(
+        "Financial Overview",
+        overview_headers,
+        overview_rows,
+        currency_cols=[2, 3, 4, 5],
+    )
+
+    # Sheet 2: Expense Breakdown by Category
+    sorted_categories = sorted(list(all_categories))
+    cat_headers = ["Project ID", "Project Name"] + sorted_categories + ["Total Project Expenses"]
+    cat_rows = []
+    for pid, pname in project_map.items():
+        row = [pid, pname]
+        p_total = 0.0
+        for cat in sorted_categories:
+            amt = project_expenses[pid][cat]
+            row.append(amt)
+            p_total += amt
+        row.append(p_total)
+        cat_rows.append(row)
+
+    if sorted_categories:
+        c_cols = list(range(2, len(cat_headers)))
+        eb.add_data_sheet(
+            "Expense Breakdown",
+            cat_headers,
+            cat_rows,
+            currency_cols=c_cols,
+            title="Expenses by Category",
+        )
 
     stream = eb.build()
 
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": "attachment; filename=financial_ledger_report.xlsx"
-        },
+        headers={"Content-Disposition": "attachment; filename=project_financials_report.xlsx"},
     )
 
 
 @router.get("/finance/pdf")
 async def export_finance_pdf(
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
-    start_date: Optional[date] = Query(
-        None, description="Start date for financial period"
-    ),
-    end_date: Optional[date] = Query(None, description="End date for financial period"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    start_date: Optional[date] = Query(None, description="Start date"),
+    end_date: Optional[date] = Query(None, description="End date"),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    proj_query = select(m.Project)
+    is_sa = _check_tenant_access(current_user)
     if project_id:
-        proj_query = proj_query.where(m.Project.id == project_id)
+        await _validate_project_access_404(db, project_id, current_user)
+        proj_query = select(m.Project).where(m.Project.id == project_id)
+    else:
+        if not is_sa:
+            proj_query = select(m.Project).where(m.Project.company_id == current_user.company_id)
+        else:
+            proj_query = select(m.Project)
+            if current_user.company_id is not None:
+                proj_query = proj_query.where(m.Project.company_id == current_user.company_id)
+
     projects = (await db.execute(proj_query)).scalars().all()
     project_map = {p.id: p.project_name for p in projects}
+    project_ids = list(project_map.keys())
 
     exp_query = select(Expense.project_id, func.sum(Expense.amount)).group_by(
         Expense.project_id
     )
-    if project_id:
-        exp_query = exp_query.where(Expense.project_id == project_id)
+    if project_ids:
+        exp_query = exp_query.where(Expense.project_id.in_(project_ids))
+    else:
+        exp_query = exp_query.where(Expense.project_id == -1)
+
     if start_date:
         exp_query = exp_query.where(Expense.expense_date >= start_date)
     if end_date:
         exp_query = exp_query.where(Expense.expense_date <= end_date)
 
-    exp_result = await db.execute(exp_query)
-    project_expenses = {pid: float(amt or 0) for pid, amt in exp_result.all()}
+    exp_result = (await db.execute(exp_query)).all()
+    project_expenses = {pid: float(amt or 0) for pid, amt in exp_result}
 
     inv_query = select(
-        Invoice.project_id, Invoice.status, func.sum(Invoice.total_amount)
-    ).group_by(Invoice.project_id, Invoice.status)
-    if project_id:
-        inv_query = inv_query.where(Invoice.project_id == project_id)
+        Invoice.project_id,
+        func.sum(Invoice.total_amount),
+        func.sum(Invoice.paid_amount),
+    ).group_by(Invoice.project_id)
+    if project_ids:
+        inv_query = inv_query.where(Invoice.project_id.in_(project_ids))
+    else:
+        inv_query = inv_query.where(Invoice.project_id == -1)
+
     if start_date:
         inv_query = inv_query.where(Invoice.created_at >= start_date)
     if end_date:
         inv_query = inv_query.where(Invoice.created_at <= end_date + timedelta(days=1))
 
-    inv_result = await db.execute(inv_query)
-    project_invoices = defaultdict(lambda: defaultdict(float))
-    for pid, status, amount in inv_result.all():
-        status_str = status.value if hasattr(status, "value") else str(status)
-        project_invoices[pid][status_str] += float(amount or 0)
+    inv_result = (await db.execute(inv_query)).all()
+    project_invoices = {
+        pid: (float(tot or 0), float(paid or 0)) for pid, tot, paid in inv_result
+    }
 
-    global_exp = sum(project_expenses.values())
-    global_inv = sum(sum(inv.values()) for inv in project_invoices.values())
-    global_profit = global_inv - global_exp
-    global_margin = (global_profit / global_inv * 100) if global_inv > 0 else 0.0
+    grand_invoiced = sum(v[0] for v in project_invoices.values())
+    grand_collected = sum(v[1] for v in project_invoices.values())
+    grand_expenses = sum(project_expenses.values())
+    net_margin = grand_invoiced - grand_expenses
 
-    b = PdfReportBuilder("Executive Financial Summary", landscape_mode=True)
-    filters_applied = "Yes" if (project_id or start_date or end_date) else "No"
+    b = PdfReportBuilder("FINANCIAL OVERVIEW REPORT", landscape_mode=True)
     b.add_info_table(
-        [("Generated", str(date.today()), "Filters Applied", filters_applied)]
-    )
-    b.add_summary_box(
-        "SUMMARY",
         [
-            f"<b>Total Company Expenses:</b> Rs. {global_exp:,.2f}",
-            f"Total Company Invoiced: Rs. {global_inv:,.2f}",
-            f"Total Net Profit: Rs. {global_profit:,.2f}",
-            f"Overall Profit Margin: {global_margin:,.2f}%",
+            ("Generated On", str(date.today()), "Total Projects", str(len(project_map))),
+            (
+                "Period",
+                f"{start_date or 'Start'} to {end_date or 'End'}",
+                "Net Margin",
+                f"Rs. {net_margin:,.2f}",
+            ),
+        ]
+    )
+
+    b.add_summary_box(
+        "FINANCIAL TOTALS",
+        [
+            f"<b>Total Invoiced:</b> Rs. {grand_invoiced:,.2f} | "
+            f"<b>Total Collected:</b> Rs. {grand_collected:,.2f} | "
+            f"<b>Total Expenses:</b> Rs. {grand_expenses:,.2f}",
         ],
     )
 
     headers = [
-        "Project",
-        "Total Expenses",
+        "ID",
+        "Project Name",
         "Total Invoiced",
-        "Pending",
+        "Total Collected",
+        "Total Expenses",
         "Net Profit",
-        "Margin",
     ]
     rows = []
-    for pid, p_name in project_map.items():
-        total_exp = project_expenses.get(pid, 0.0)
-        inv_totals = project_invoices[pid]
-        total_inv = sum(inv_totals.values())
-        pending_inv = inv_totals.get("PENDING", 0.0)
-
-        net_profit = total_inv - total_exp
-        margin = (net_profit / total_inv * 100) if total_inv > 0 else 0.0
-
-        p_name_short = p_name[:25] + "..." if len(p_name) > 25 else p_name
-
+    for pid, pname in project_map.items():
+        inv_tot, inv_paid = project_invoices.get(pid, (0.0, 0.0))
+        exp_tot = project_expenses.get(pid, 0.0)
         rows.append(
             [
-                p_name_short,
-                f"Rs. {total_exp:,.2f}",
-                f"Rs. {total_inv:,.2f}",
-                f"Rs. {pending_inv:,.2f}",
-                f"Rs. {net_profit:,.2f}",
-                f"{margin:,.2f}%",
+                str(pid),
+                pname,
+                f"Rs. {inv_tot:,.2f}",
+                f"Rs. {inv_paid:,.2f}",
+                f"Rs. {exp_tot:,.2f}",
+                f"Rs. {(inv_tot - exp_tot):,.2f}",
             ]
         )
 
-    b.add_section_table("PROJECT FINANCIALS", headers, rows)
+    b.add_section_table(
+        "PROJECT BREAKDOWN",
+        headers,
+        rows,
+        col_widths=[0.6 * inch, 2.6 * inch, 1.6 * inch, 1.6 * inch, 1.6 * inch, 1.6 * inch],
+    )
 
     stream = b.build()
 
     return StreamingResponse(
         stream,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": "attachment; filename=executive_financial_summary.pdf"
-        },
+        headers={"Content-Disposition": "attachment; filename=project_financials_report.pdf"},
     )
-
-
-# ===================== PROFIT & LOSS REPORTS =====================
 
 
 @router.get("/profit-loss/excel")
@@ -1875,16 +1726,24 @@ async def export_profit_loss_excel(
     quarter: Optional[int] = Query(None, description="Quarter (1-4)"),
     start_date: Optional[date] = Query(None, description="Start date"),
     end_date: Optional[date] = Query(None, description="End date"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    # Base queries
-    inv_query = select(Invoice)
-    exp_query = select(Expense)
-
+    is_sa = _check_tenant_access(current_user)
     if project_id:
-        inv_query = inv_query.where(Invoice.project_id == project_id)
-        exp_query = exp_query.where(Expense.project_id == project_id)
+        await _validate_project_access_404(db, project_id, current_user)
+        inv_query = select(Invoice).where(Invoice.project_id == project_id)
+        exp_query = select(Expense).where(Expense.project_id == project_id)
+    else:
+        if not is_sa:
+            inv_query = select(Invoice).join(m.Project, Invoice.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+            exp_query = select(Expense).join(m.Project, Expense.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+        else:
+            inv_query = select(Invoice)
+            exp_query = select(Expense)
+            if current_user.company_id is not None:
+                inv_query = inv_query.join(m.Project, Invoice.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+                exp_query = exp_query.join(m.Project, Expense.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
 
     if year:
         inv_query = inv_query.where(extract("year", Invoice.created_at) == year)
@@ -1909,119 +1768,51 @@ async def export_profit_loss_excel(
     invoices = (await db.execute(inv_query)).scalars().all()
     expenses = (await db.execute(exp_query)).scalars().all()
 
-    # Group by YYYY-MM
-    monthly_data = defaultdict(
-        lambda: {
-            "revenue": 0.0,
-            "cogs_labour": 0.0,
-            "cogs_material": 0.0,
-            "overhead": defaultdict(float),
-        }
-    )
-    all_months = set()
-
+    # Calculate Totals
+    income_by_type = defaultdict(float)
+    total_income = 0.0
     for inv in invoices:
-        month_key = inv.created_at.strftime("%Y-%m")
-        all_months.add(month_key)
         amt = float(inv.total_amount or 0)
+        total_income += amt
+        income_by_type[inv.type or "General Invoice"] += amt
 
-        # 'owner' invoices are revenue. others are COGS
-        if inv.type == "owner":
-            monthly_data[month_key]["revenue"] += amt
-        elif inv.type == "labour":
-            monthly_data[month_key]["cogs_labour"] += amt
-        elif inv.type == "material":
-            monthly_data[month_key]["cogs_material"] += amt
-
+    expense_by_cat = defaultdict(float)
+    total_expense = 0.0
     for exp in expenses:
-        month_key = exp.expense_date.strftime("%Y-%m")
-        all_months.add(month_key)
         amt = float(exp.amount or 0)
-        monthly_data[month_key]["overhead"][exp.category] += amt
+        total_expense += amt
+        expense_by_cat[exp.category or "General Expense"] += amt
 
-    sorted_months = sorted(list(all_months))
-    all_overhead_cats = set()
-    for data in monthly_data.values():
-        all_overhead_cats.update(data["overhead"].keys())
-    sorted_overhead_cats = sorted(list(all_overhead_cats))
+    net_profit = total_income - total_expense
+    margin = (net_profit / total_income * 100) if total_income > 0 else 0.0
 
-    headers = ["Category", "Total"] + sorted_months
-    rows = []
-
-    def append_row(name, data_dict, overhead_cat=None):
-        total = 0.0
-        month_vals = []
-        for mth in sorted_months:
-            if overhead_cat:
-                val = data_dict[mth]["overhead"].get(overhead_cat, 0.0)
-            elif name == "Revenue":
-                val = data_dict[mth]["revenue"]
-            elif name == "Labour Costs":
-                val = data_dict[mth]["cogs_labour"]
-            elif name == "Material Costs":
-                val = data_dict[mth]["cogs_material"]
-            else:
-                val = 0.0
-            total += val
-            month_vals.append(val)
-        rows.append([name, total] + month_vals)
-        return total, month_vals
-
-    def blank_row():
-        rows.append([""] * len(headers))
-
-    def divider_row(label):
-        rows.append([label] + [""] * (len(headers) - 1))
-
-    divider_row("--- REVENUE ---")
-    total_rev, rev_months = append_row("Revenue", monthly_data)
-
-    blank_row()
-    divider_row("--- COST OF GOODS SOLD (COGS) ---")
-    t_labour, m_labour = append_row("Labour Costs", monthly_data)
-    t_material, m_material = append_row("Material Costs", monthly_data)
-
-    total_cogs = t_labour + t_material
-    cogs_months = [l + mt for l, mt in zip(m_labour, m_material)]
-
-    gross_profit = total_rev - total_cogs
-    gp_months = [r - c for r, c in zip(rev_months, cogs_months)]
-    rows.append(["Gross Profit", gross_profit] + gp_months)
-
-    blank_row()
-    divider_row("--- OPERATING EXPENSES (OVERHEAD) ---")
-    total_op_ex = 0.0
-    op_ex_months = [0.0] * len(sorted_months)
-    for cat in sorted_overhead_cats:
-        t_cat, m_cat = append_row(cat, monthly_data, overhead_cat=cat)
-        total_op_ex += t_cat
-        op_ex_months = [o + c for o, c in zip(op_ex_months, m_cat)]
-
-    rows.append(["Total Operating Expenses", total_op_ex] + op_ex_months)
-
-    blank_row()
-    divider_row("--- NET INCOME ---")
-    net_income = gross_profit - total_op_ex
-    ni_months = [g - o for g, o in zip(gp_months, op_ex_months)]
-    rows.append(["Net Income", net_income] + ni_months)
-
-    eb = ExcelReportBuilder("Profit and Loss")
-    eb.add_summary_row("Total Revenue", round(total_rev, 2), is_currency=True)
-    eb.add_summary_row("Total COGS", round(total_cogs, 2), is_currency=True)
-    eb.add_summary_row("Gross Profit", round(gross_profit, 2), is_currency=True)
-    eb.add_summary_row(
-        "Total Operating Expenses", round(total_op_ex, 2), is_currency=True
-    )
-    eb.add_summary_row("Net Income", round(net_income, 2), is_currency=True)
+    eb = ExcelReportBuilder("Profit and Loss Statement")
+    eb.add_summary_row("Total Revenue", round(total_income, 2), is_currency=True)
+    eb.add_summary_row("Total Operating Expenses", round(total_expense, 2), is_currency=True)
+    eb.add_summary_row("Net Profit", round(net_profit, 2), is_currency=True)
+    eb.add_summary_row("Net Margin (%)", f"{round(margin, 2)}%")
     eb.build_summary_sheet()
-    eb.add_data_sheet("Profit and Loss", headers, rows)
+
+    pnl_headers = ["Account Category", "Classification", "Total Amount"]
+    pnl_rows = []
+    for itype, amt in sorted(income_by_type.items()):
+        pnl_rows.append([itype, "Operating Revenue", amt])
+    pnl_rows.append(["TOTAL REVENUE", "Operating Revenue", total_income])
+
+    for ecat, amt in sorted(expense_by_cat.items()):
+        pnl_rows.append([ecat, "Operating Expense", amt])
+    pnl_rows.append(["TOTAL EXPENSES", "Operating Expense", total_expense])
+
+    pnl_rows.append(["NET PROFIT / (LOSS)", "Net Result", net_profit])
+
+    eb.add_data_sheet("P&L Statement", pnl_headers, pnl_rows, currency_cols=[2])
 
     stream = eb.build()
 
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=profit_and_loss.xlsx"},
+        headers={"Content-Disposition": "attachment; filename=profit_loss_report.xlsx"},
     )
 
 
@@ -2032,15 +1823,24 @@ async def export_profit_loss_pdf(
     quarter: Optional[int] = Query(None, description="Quarter (1-4)"),
     start_date: Optional[date] = Query(None, description="Start date"),
     end_date: Optional[date] = Query(None, description="End date"),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    inv_query = select(Invoice)
-    exp_query = select(Expense)
-
+    is_sa = _check_tenant_access(current_user)
     if project_id:
-        inv_query = inv_query.where(Invoice.project_id == project_id)
-        exp_query = exp_query.where(Expense.project_id == project_id)
+        await _validate_project_access_404(db, project_id, current_user)
+        inv_query = select(Invoice).where(Invoice.project_id == project_id)
+        exp_query = select(Expense).where(Expense.project_id == project_id)
+    else:
+        if not is_sa:
+            inv_query = select(Invoice).join(m.Project, Invoice.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+            exp_query = select(Expense).join(m.Project, Expense.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+        else:
+            inv_query = select(Invoice)
+            exp_query = select(Expense)
+            if current_user.company_id is not None:
+                inv_query = inv_query.join(m.Project, Invoice.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+                exp_query = exp_query.join(m.Project, Expense.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
 
     if year:
         inv_query = inv_query.where(extract("year", Invoice.created_at) == year)
@@ -2065,88 +1865,74 @@ async def export_profit_loss_pdf(
     invoices = (await db.execute(inv_query)).scalars().all()
     expenses = (await db.execute(exp_query)).scalars().all()
 
-    revenue = 0.0
-    cogs_labour = 0.0
-    cogs_material = 0.0
-    overhead = defaultdict(float)
+    total_income = sum(float(i.total_amount or 0) for i in invoices)
+    total_expense = sum(float(e.amount or 0) for e in expenses)
+    net_profit = total_income - total_expense
+    margin = (net_profit / total_income * 100) if total_income > 0 else 0.0
 
+    b = PdfReportBuilder("PROFIT & LOSS STATEMENT")
+    period_str = (
+        f"FY {year} Q{quarter}"
+        if (year and quarter)
+        else (f"FY {year}" if year else "Custom Date Range")
+    )
+
+    b.add_info_table(
+        [
+            ("Report Date", str(date.today()), "Reporting Period", period_str),
+            ("Scope", f"Project ID: {project_id}" if project_id else "All Active Projects", "Status", "Audited Financials"),
+        ]
+    )
+
+    b.add_summary_box(
+        "EXECUTIVE SUMMARY",
+        [
+            f"<b>Total Revenue:</b> Rs. {total_income:,.2f}",
+            f"<b>Total Expenses:</b> Rs. {total_expense:,.2f}",
+            f"<b>Net Profit:</b> Rs. {net_profit:,.2f} ({margin:.1f}% Margin)",
+        ],
+    )
+
+    headers = ["Category", "Type", "Amount"]
+    rows = []
+
+    income_by_type = defaultdict(float)
     for inv in invoices:
-        amt = float(inv.total_amount or 0)
-        if inv.type == "owner":
-            revenue += amt
-        elif inv.type == "labour":
-            cogs_labour += amt
-        elif inv.type == "material":
-            cogs_material += amt
+        income_by_type[inv.type or "General"] += float(inv.total_amount or 0)
+    for itype, amt in sorted(income_by_type.items()):
+        rows.append([f"Revenue: {itype}", "Income", f"Rs. {amt:,.2f}"])
 
-    total_overhead = 0.0
+    exp_by_cat = defaultdict(float)
     for exp in expenses:
-        amt = float(exp.amount or 0)
-        overhead[exp.category] += amt
-        total_overhead += amt
+        exp_by_cat[exp.category or "General"] += float(exp.amount or 0)
+    for ecat, amt in sorted(exp_by_cat.items()):
+        rows.append([f"Expense: {ecat}", "Cost", f"Rs. {amt:,.2f}"])
 
-    cogs = cogs_labour + cogs_material
-    gross_profit = revenue - cogs
-    net_income = gross_profit - total_overhead
-    margin = (net_income / revenue * 100) if revenue > 0 else 0.0
-
-    b = PdfReportBuilder("Profit & Loss Statement")
-    info_bits = [
-        (
-            "Generated",
-            str(date.today()),
-            "Project",
-            str(project_id) if project_id else "All Projects",
-        )
-    ]
-    b.add_info_table(info_bits)
-
-    filter_bits = []
-    if year:
-        filter_bits.append(f"Year: {year}")
-    if quarter:
-        filter_bits.append(f"Quarter: {quarter}")
-    if filter_bits:
-        b.add_summary_box("FILTERS APPLIED", [" | ".join(filter_bits)])
-
-    headers = ["Particulars", "Amount (Rs.)"]
-    rows = [
-        ["Revenue", f"Rs. {revenue:,.2f}"],
-        ["Labour Costs", f"Rs. {cogs_labour:,.2f}"],
-        ["Material Costs", f"Rs. {cogs_material:,.2f}"],
-        ["Total COGS", f"Rs. {cogs:,.2f}"],
-        ["Gross Profit", f"Rs. {gross_profit:,.2f}"],
-    ]
-    for cat, amt in overhead.items():
-        rows.append([cat, f"Rs. {amt:,.2f}"])
-    rows.append(["Total Operating Expenses", f"Rs. {total_overhead:,.2f}"])
-    rows.append(["Net Income", f"Rs. {net_income:,.2f}"])
-    rows.append(["Net Profit Margin", f"{margin:,.2f}%"])
-
-    b.add_section_table("PROFIT & LOSS STATEMENT", headers, rows, col_widths=[300, 150])
+    b.add_section_table(
+        "INCOME & EXPENDITURE BREAKDOWN",
+        headers,
+        rows,
+        col_widths=[3.5 * inch, 1.5 * inch, 2.0 * inch],
+    )
 
     stream = b.build()
 
     return StreamingResponse(
         stream,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": "attachment; filename=profit_and_loss_statement.pdf"
-        },
+        headers={"Content-Disposition": "attachment; filename=profit_loss_report.pdf"},
     )
-
-
-# ===================== DAILY REPORT =====================
 
 
 @router.get("/daily")
 async def daily_report(
     project_id: int,
     report_date: date,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     dsr = await db.scalar(
         select(m.DailySiteReport).where(
             m.DailySiteReport.project_id == project_id,
@@ -2157,17 +1943,15 @@ async def daily_report(
     return {"dsr": dsr}
 
 
-# ===================== DAILY REPORT PDF =====================
-
-
 @router.get("/daily/export/pdf")
 async def export_daily_pdf(
     project_id: int,
     report_date: date,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     dsr = await db.scalar(
         select(m.DailySiteReport).where(
             m.DailySiteReport.project_id == project_id,
@@ -2199,16 +1983,14 @@ async def export_daily_pdf(
     )
 
 
-# ===================== WEEKLY PROGRESS =====================
-
-
 @router.get("/weekly")
 async def weekly_progress(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     week_ago = datetime.utcnow() - timedelta(days=7)
 
     result = await db.execute(
@@ -2223,7 +2005,6 @@ async def weekly_progress(
 
     rows = result.all()
 
-    #  safe calculation
     progress = (
         sum(float(r[1]) for r in rows if r[1] is not None) / len(rows) if rows else 0
     )
@@ -2231,16 +2012,14 @@ async def weekly_progress(
     return {"weekly_progress_percent": round(progress, 2), "tasks_count": len(rows)}
 
 
-# ===================== LABOUR REPORT =====================
-
-
 @router.get("/labour")
 async def labour_report(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     from app.models.labour import Labour
 
     result = await db.execute(
@@ -2259,9 +2038,6 @@ async def labour_report(
     return {"labour_summary": [{"skill_type": row[0], "count": row[1]} for row in rows]}
 
 
-# ===================== LABOUR DISTRIBUTION REPORTS =====================
-
-
 @router.get("/labour-distribution/excel")
 async def export_labour_distribution_excel(
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
@@ -2271,9 +2047,10 @@ async def export_labour_distribution_excel(
     skill_category: Optional[str] = Query(
         None, description="Filter by SKILLED, UNSKILLED, etc"
     ),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
     from app.models.labour import Labour, LabourProject
 
     query = (
@@ -2283,7 +2060,11 @@ async def export_labour_distribution_excel(
         .outerjoin(LabourType, Labour.labour_type_id == LabourType.id)
     )
 
+    if not is_sa:
+        query = query.where(m.Project.company_id == current_user.company_id)
+
     if project_id:
+        await _validate_project_access_404(db, project_id, current_user)
         query = query.where(m.Project.id == project_id)
     if skill_category:
         query = query.where(LabourType.skill_category == skill_category)
@@ -2296,89 +2077,62 @@ async def export_labour_distribution_excel(
         att_query = select(UserAttendance.user_id, UserAttendance.status).where(
             UserAttendance.date == date
         )
+        if not is_sa:
+            att_query = att_query.join(m.Project, UserAttendance.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
         if project_id:
             att_query = att_query.where(UserAttendance.project_id == project_id)
-        att_results = (await db.execute(att_query)).all()
-        attendance_map = {user_id: status for user_id, status in att_results}
+        att_records = (await db.execute(att_query)).all()
+        attendance_map = {r[0]: r[1] for r in att_records}
 
-    agg_headers = ["Project Name", "Skill Category", "Trade", "Total Count"]
-    det_headers = [
-        "Project Name",
-        "Worker Code",
-        "Worker Name",
+    headers = [
+        "Labour ID",
+        "Labour Name",
         "Skill Category",
-        "Trade",
-        "Status",
+        "Labour Type",
+        "Project",
+        "Daily Wage Rate",
+        "Attendance Status",
     ]
-    if date:
-        det_headers.append(f"Attendance ({date})")
-
-    agg_data = defaultdict(int)
-    det_rows = []
-
-    for labour, project, ltype in results:
-        skill = (
-            str(getattr(ltype.skill_category, "value", ltype.skill_category))
-            if ltype and getattr(ltype, "skill_category", None)
-            else "Unclassified"
+    rows = []
+    for lab, proj, ltype in results:
+        status_str = attendance_map.get(lab.user_id, "N/A") if date else "Active"
+        rows.append(
+            [
+                lab.worker_code or str(lab.id),
+                lab.labour_name or "",
+                ltype.skill_category if ltype else "Uncategorized",
+                ltype.name if ltype else "N/A",
+                proj.project_name if proj else "N/A",
+                float(lab.custom_daily_wage_rate or (ltype.daily_wage_rate if ltype else 0.0) or 0.0),
+                status_str,
+            ]
         )
-        trade = ltype.name if ltype else "N/A"
-
-        att_status = "Not Logged"
-        if date and labour.user_id:
-            att_status_raw = attendance_map.get(labour.user_id)
-            att_status = (
-                str(getattr(att_status_raw, "value", att_status_raw))
-                if att_status_raw
-                else "Absent"
-            )
-
-        row = [
-            project.project_name,
-            labour.worker_code,
-            labour.labour_name,
-            skill,
-            trade,
-            str(getattr(labour.status, "value", labour.status)),
-        ]
-        if date:
-            row.append(att_status)
-        det_rows.append(row)
-
-        agg_key = (project.project_name, skill, trade)
-        agg_data[agg_key] += 1
-
-    agg_rows = [
-        [proj, skill, trade, count]
-        for (proj, skill, trade), count in sorted(agg_data.items())
-    ]
 
     eb = ExcelReportBuilder("Labour Distribution Report")
-    eb.add_summary_row("Total Active Workers", len(det_rows))
+    eb.add_summary_row("Total Active Labour", len(rows))
+    if date:
+        eb.add_summary_row("Date of Record", str(date))
     eb.build_summary_sheet()
-    eb.add_data_sheet("Distribution Summary", agg_headers, agg_rows)
-    eb.add_data_sheet("Detailed Roster", det_headers, det_rows)
+    eb.add_data_sheet("Labour Roster", headers, rows, currency_cols=[5])
 
     stream = eb.build()
 
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": "attachment; filename=labour_distribution_report.xlsx"
-        },
+        headers={"Content-Disposition": "attachment; filename=labour_distribution_report.xlsx"},
     )
 
 
 @router.get("/labour-distribution/pdf")
 async def export_labour_distribution_pdf(
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
-    skill_category: Optional[str] = Query(
-        None, description="Filter by SKILLED, UNSKILLED, etc"
-    ),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    date: Optional[date] = Query(None, description="Date for attendance filter"),
+    skill_category: Optional[str] = Query(None, description="Skill category filter"),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
     from app.models.labour import Labour, LabourProject
 
     query = (
@@ -2386,109 +2140,78 @@ async def export_labour_distribution_pdf(
         .join(LabourProject, Labour.id == LabourProject.labour_id)
         .join(m.Project, LabourProject.project_id == m.Project.id)
         .outerjoin(LabourType, Labour.labour_type_id == LabourType.id)
-        .where(Labour.status == LabourStatus.ACTIVE)
     )
 
+    if not is_sa:
+        query = query.where(m.Project.company_id == current_user.company_id)
+
     if project_id:
+        await _validate_project_access_404(db, project_id, current_user)
         query = query.where(m.Project.id == project_id)
     if skill_category:
         query = query.where(LabourType.skill_category == skill_category)
 
+    query = query.where(Labour.status == LabourStatus.ACTIVE)
     results = (await db.execute(query)).all()
 
-    project_stats = defaultdict(
-        lambda: {"SKILLED": 0, "UNSKILLED": 0, "SEMI_SKILLED": 0, "OTHER": 0}
-    )
-    total_workers = 0
-    total_skilled = 0
-    total_unskilled = 0
-
-    for labour, project, ltype in results:
-        skill = (
-            str(getattr(ltype.skill_category, "value", ltype.skill_category)).upper()
-            if ltype and getattr(ltype, "skill_category", None)
-            else "OTHER"
+    attendance_map = {}
+    if date:
+        att_query = select(UserAttendance.user_id, UserAttendance.status).where(
+            UserAttendance.date == date
         )
-        if skill not in project_stats[project.project_name]:
-            skill = "OTHER"
+        if not is_sa:
+            att_query = att_query.join(m.Project, UserAttendance.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+        if project_id:
+            att_query = att_query.where(UserAttendance.project_id == project_id)
+        att_records = (await db.execute(att_query)).all()
+        attendance_map = {r[0]: r[1] for r in att_records}
 
-        project_stats[project.project_name][skill] += 1
-        total_workers += 1
-        if skill == "SKILLED":
-            total_skilled += 1
-        elif skill == "UNSKILLED":
-            total_unskilled += 1
-
-    b = PdfReportBuilder("Executive Labour Distribution Summary")
-    filters_applied = "Yes" if project_id else "No"
+    b = PdfReportBuilder("LABOUR DISTRIBUTION & ROSTER", landscape_mode=True)
     b.add_info_table(
         [
-            (
-                "Generated",
-                datetime.now().strftime("%Y-%m-%d"),
-                "Filters Applied",
-                filters_applied,
-            )
+            ("Generated On", str(date if date else date.today()), "Total Workers", str(len(results))),
+            ("Project", str(project_id) if project_id else "All Projects", "Skill Category", skill_category or "All Skills"),
         ]
     )
 
-    summary_lines = [f"<b>Total Active Workforce:</b> {total_workers}"]
-    if total_workers > 0:
-        summary_lines.append(
-            f"Skilled: {total_skilled} ({total_skilled/total_workers*100:.1f}%) | "
-            f"Unskilled: {total_unskilled} ({total_unskilled/total_workers*100:.1f}%)"
-        )
-    summary_lines.append(f"Total Active Projects: {len(project_stats)}")
-    b.add_summary_box("SUMMARY", summary_lines)
-
-    headers = [
-        "Project Name",
-        "Skilled",
-        "Semi",
-        "Unskilled",
-        "Other",
-        "Total",
-        "% of Company",
+    headers = ["ID", "Name", "Skill Category", "Designation", "Project", "Wage Rate", "Status"]
+    rows = [
+        [
+            lab.worker_code or str(lab.id),
+            lab.labour_name or "",
+            ltype.skill_category if ltype else "Uncategorized",
+            ltype.name if ltype else "N/A",
+            proj.project_name if proj else "N/A",
+            f"Rs. {float(lab.custom_daily_wage_rate or (ltype.daily_wage_rate if ltype else 0) or 0):,.2f}",
+            attendance_map.get(lab.user_id, "Active") if date else "Active",
+        ]
+        for lab, proj, ltype in results
     ]
-    rows = []
-    for proj, stats in sorted(project_stats.items()):
-        p_total = sum(stats.values())
-        pct = (p_total / total_workers * 100) if total_workers > 0 else 0
-        rows.append(
-            [
-                proj[:25] + "..." if len(proj) > 25 else proj,
-                stats["SKILLED"],
-                stats["SEMI_SKILLED"],
-                stats["UNSKILLED"],
-                stats["OTHER"],
-                p_total,
-                f"{pct:.1f}%",
-            ]
-        )
 
-    b.add_section_table("LABOUR DISTRIBUTION", headers, rows)
+    b.add_section_table(
+        "ACTIVE WORKFORCE",
+        headers,
+        rows,
+        col_widths=[1.0 * inch, 2.0 * inch, 1.4 * inch, 1.6 * inch, 1.8 * inch, 1.2 * inch, 1.0 * inch],
+    )
 
     stream = b.build()
 
     return StreamingResponse(
         stream,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": "attachment; filename=labour_distribution_summary.pdf"
-        },
+        headers={"Content-Disposition": "attachment; filename=labour_distribution_report.pdf"},
     )
-
-
-# ===================== MATERIAL REPORT =====================
 
 
 @router.get("/material")
 async def material_report(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     result = await db.execute(
         select(Material)
         .where(Material.project_id == project_id)
@@ -2500,16 +2223,14 @@ async def material_report(
     return {"materials": materials}
 
 
-# ===================== MATERIAL EXCEL =====================
-
-
 @router.get("/material/export/excel")
 async def export_material_excel(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     stmt = (
         select(Material)
         .options(joinedload(Material.material_master).joinedload(MaterialMaster.unit))
@@ -2571,16 +2292,14 @@ async def export_material_excel(
     )
 
 
-# ===================== ISSUE REPORT =====================
-
-
 @router.get("/issues")
 async def issue_report(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     open_issues = await db.scalar(
         select(func.count())
         .select_from(m.Issue)
@@ -2602,16 +2321,14 @@ async def issue_report(
     return {"open": open_issues, "closed": closed_issues}
 
 
-# ===================== ISSUE EXCEL =====================
-
-
 @router.get("/issues/export/excel")
 async def export_issue_excel(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     result = await db.execute(
         select(m.Issue)
         .where(m.Issue.project_id == project_id)
@@ -2657,18 +2374,16 @@ async def export_issue_excel(
     )
 
 
-# ===================== FILTERED REPORT DOWNLOAD =====================
-
-
 @router.get("/download")
 async def client_report_download(
     project_id: int,
     start_date: date,
     end_date: date,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     result = await db.execute(
         select(m.DailySiteReport)
         .where(
@@ -2705,19 +2420,18 @@ async def combined_report(
     project_id: int,
     start_date: date,
     end_date: date,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
 
-    #  Work Progress
     progress = await db.scalar(
         select(func.avg(m.Task.completion_percentage)).where(
             m.Task.project_id == project_id
         )
     )
 
-    #  Financials
     total_paid = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PAID
@@ -2730,7 +2444,6 @@ async def combined_report(
         )
     )
 
-    #  DSR (work summary)
     reports = await db.execute(
         select(m.DailySiteReport).where(
             m.DailySiteReport.project_id == project_id,
@@ -2769,24 +2482,22 @@ async def combined_report(
 @router.get("/contractor-performance")
 async def contractor_performance(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
 
-    # 1. Total tasks
     total_tasks = await db.scalar(
         select(func.count(m.Task.id)).where(m.Task.project_id == project_id)
     )
 
-    # 2. Avg progress
     avg_progress = await db.scalar(
         select(func.avg(m.Task.completion_percentage)).where(
             m.Task.project_id == project_id
         )
     )
 
-    # 3. Total paid invoices
     total_paid = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id,
@@ -2796,7 +2507,6 @@ async def contractor_performance(
 
     progress_val = float(avg_progress or 0)
 
-    # 4. Performance logic
     if progress_val >= 75:
         rating = "Excellent"
     elif progress_val >= 50:
@@ -2818,20 +2528,40 @@ async def contractor_performance(
 @router.get("/profit-loss")
 async def profit_loss(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
 ):
-
-    # Income (owner invoices)
-    income = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(Invoice.type == "owner")
-    )
-
-    # Expense (labour + material)
-    expense = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
+    is_sa = _check_tenant_access(current_user)
+    if not is_sa:
+        income = await db.scalar(
+            select(func.sum(Invoice.total_amount))
+            .join(m.Project, Invoice.project_id == m.Project.id)
+            .where(
+                Invoice.type == "owner",
+                m.Project.company_id == current_user.company_id,
+            )
+        )
+        expense = await db.scalar(
+            select(func.sum(Invoice.total_amount))
+            .join(m.Project, Invoice.project_id == m.Project.id)
+            .where(
+                Invoice.type.in_(["labour", "material"]),
+                m.Project.company_id == current_user.company_id,
+            )
+        )
+    else:
+        income_q = select(func.sum(Invoice.total_amount)).where(Invoice.type == "owner")
+        expense_q = select(func.sum(Invoice.total_amount)).where(
             Invoice.type.in_(["labour", "material"])
         )
-    )
+        if current_user.company_id is not None:
+            income_q = income_q.join(m.Project, Invoice.project_id == m.Project.id).where(
+                m.Project.company_id == current_user.company_id
+            )
+            expense_q = expense_q.join(m.Project, Invoice.project_id == m.Project.id).where(
+                m.Project.company_id == current_user.company_id
+            )
+        income = await db.scalar(income_q)
+        expense = await db.scalar(expense_q)
 
     income_val = float(income or 0)
     expense_val = float(expense or 0)
@@ -2846,18 +2576,17 @@ async def profit_loss(
 @router.get("/project/{project_id}")
 async def project_financial_summary_by_id(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-    #  Revenue (owner invoices only)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     revenue = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id, Invoice.type == "owner"
         )
     )
 
-    #  Expense (labour + material invoices)
     expense = await db.scalar(
         select(func.sum(Invoice.total_amount)).where(
             Invoice.project_id == project_id, Invoice.type.in_(["labour", "material"])
@@ -2878,15 +2607,38 @@ async def project_financial_summary_by_id(
 @router.get("/cashflow")
 async def cashflow(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
 ):
-    inflow = await db.scalar(
-        select(func.sum(Transaction.amount)).where(Transaction.type == "receipt")
-    )
-
-    outflow = await db.scalar(
-        select(func.sum(Transaction.amount)).where(Transaction.type == "payment")
-    )
+    is_sa = _check_tenant_access(current_user)
+    if not is_sa:
+        inflow = await db.scalar(
+            select(func.sum(Transaction.amount))
+            .join(m.Project, Transaction.project_id == m.Project.id)
+            .where(
+                Transaction.type == "receipt",
+                m.Project.company_id == current_user.company_id,
+            )
+        )
+        outflow = await db.scalar(
+            select(func.sum(Transaction.amount))
+            .join(m.Project, Transaction.project_id == m.Project.id)
+            .where(
+                Transaction.type == "payment",
+                m.Project.company_id == current_user.company_id,
+            )
+        )
+    else:
+        inflow_q = select(func.sum(Transaction.amount)).where(Transaction.type == "receipt")
+        outflow_q = select(func.sum(Transaction.amount)).where(Transaction.type == "payment")
+        if current_user.company_id is not None:
+            inflow_q = inflow_q.join(m.Project, Transaction.project_id == m.Project.id).where(
+                m.Project.company_id == current_user.company_id
+            )
+            outflow_q = outflow_q.join(m.Project, Transaction.project_id == m.Project.id).where(
+                m.Project.company_id == current_user.company_id
+            )
+        inflow = await db.scalar(inflow_q)
+        outflow = await db.scalar(outflow_q)
 
     return {
         "inflow": float(inflow or 0),
@@ -2898,22 +2650,35 @@ async def cashflow(
 @router.get("/assets")
 async def asset_report(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
 ):
-    result = await db.execute(select(FixedAsset))
+    is_sa = _check_tenant_access(current_user)
+    if not is_sa:
+        result = await db.execute(
+            select(FixedAsset)
+            .join(m.Project, FixedAsset.project_id == m.Project.id)
+            .where(m.Project.company_id == current_user.company_id)
+        )
+    else:
+        query = select(FixedAsset)
+        if current_user.company_id is not None:
+            query = query.join(m.Project, FixedAsset.project_id == m.Project.id).where(
+                m.Project.company_id == current_user.company_id
+            )
+        result = await db.execute(query)
     assets = result.scalars().all()
 
     return assets
 
 
-# ===================== FINANCIAL SUMMARY =====================
 @router.get("/financial-summary")
 async def financial_summary(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     total_expense = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
@@ -2942,16 +2707,16 @@ async def financial_summary(
     }
 
 
-# ===================== QUARTERLY AUDIT SUMMARY =====================
 @router.get("/quarterly-audit-summary")
 async def quarterly_financial_audit(
     project_id: int,
     year: int,
     quarter: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     if quarter not in [1, 2, 3, 4]:
         raise HTTPException(status_code=400, detail="Quarter must be between 1 and 4")
     quarter_map = {
@@ -3001,20 +2766,19 @@ async def quarterly_financial_audit(
     }
 
 
-# ===================== WORK SUMMARY =====================
 @router.get("/work-summary")
 async def work_summary(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     result = await db.execute(select(m.Task).where(m.Task.project_id == project_id))
     tasks = result.scalars().all()
     summary = []
     for task in tasks:
         actual = round(float(task.completion_percentage or 0), 2)
-        # Future ready
         planned = 100
         if actual >= 90:
             efficiency = "HIGH"
@@ -3039,15 +2803,14 @@ async def work_summary(
     }
 
 
-# ===================== AUDIT PDF =====================
 @router.get("/audit-pdf")
 async def audit_pdf(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
-    # ================= FINANCIAL =================
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     total_expense = await db.scalar(
         select(func.sum(Expense.amount)).where(Expense.project_id == project_id)
     )
@@ -3064,7 +2827,7 @@ async def audit_pdf(
             Invoice.project_id == project_id, Invoice.status == InvoiceStatus.PENDING
         )
     )
-    # ================= TASKS =================
+
     total_tasks = await db.scalar(
         select(func.count()).select_from(m.Task).where(m.Task.project_id == project_id)
     )
@@ -3073,68 +2836,49 @@ async def audit_pdf(
         .select_from(m.Task)
         .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.COMPLETED)
     )
-    in_progress_tasks = await db.scalar(
+    delayed_tasks = await db.scalar(
         select(func.count())
         .select_from(m.Task)
-        .where(m.Task.project_id == project_id, m.Task.status == TaskStatus.IN_PROGRESS)
+        .where(
+            m.Task.project_id == project_id,
+            m.Task.end_date.isnot(None),
+            m.Task.end_date < date.today(),
+            m.Task.status != TaskStatus.COMPLETED,
+        )
     )
-    # ================= ISSUES =================
-    open_issues = await db.scalar(
-        select(func.count())
-        .select_from(m.Issue)
-        .where(m.Issue.project_id == project_id, m.Issue.status == IssueStatus.OPEN)
-    )
-    closed_issues = await db.scalar(
-        select(func.count())
-        .select_from(m.Issue)
-        .where(m.Issue.project_id == project_id, m.Issue.status == IssueStatus.CLOSED)
-    )
-    # ================= PROGRESS =================
+
     progress = await db.scalar(
         select(func.avg(m.Task.completion_percentage)).where(
             m.Task.project_id == project_id
         )
     )
 
-    b = PdfReportBuilder("Detailed Audit Report")
+    project = await db.get(m.Project, project_id)
+
+    b = PdfReportBuilder(
+        title="PROJECT AUDIT REPORT",
+        subtitle=f"Generated on {date.today().strftime('%d %b %Y')}",
+    )
+
     b.add_info_table(
         [
-            (
-                "Project ID",
-                str(project_id),
-                "Generated On",
-                datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
-            )
+            ("Project Name", project.project_name if project else f"Project #{project_id}", "Project ID", str(project_id)),
+            ("Audit Date", str(date.today()), "Status", project.status.value if project and hasattr(project.status, 'value') else "Active"),
         ]
     )
+
+    expense_val = float(total_expense or 0)
+    invoice_val = float(total_invoice or 0)
+    paid_val = float(paid_invoice or 0)
+    pending_val = float(pending_invoice or 0)
     b.add_summary_box(
-        "FINANCIAL SUMMARY",
+        "EXECUTIVE AUDIT SUMMARY",
         [
-            f"Total Expense: Rs. {round(float(total_expense or 0), 2)}",
-            f"Total Invoice: Rs. {round(float(total_invoice or 0), 2)}",
-            f"Paid Invoice: Rs. {round(float(paid_invoice or 0), 2)}",
-            f"Pending Invoice: Rs. {round(float(pending_invoice or 0), 2)}",
-            f"Profit: Rs. {round(float((total_invoice or 0) - (total_expense or 0)), 2)}",
+            f"<b>Overall Progress:</b> {round(float(progress or 0), 2)}%",
+            f"<b>Total Revenue:</b> Rs. {invoice_val:,.2f} | <b>Collected:</b> Rs. {paid_val:,.2f}",
+            f"<b>Total Expenses:</b> Rs. {expense_val:,.2f} | <b>Net Margin:</b> Rs. {(invoice_val - expense_val):,.2f}",
+            f"<b>Tasks Completed:</b> {int(completed_tasks or 0)} of {int(total_tasks or 0)} | <b>Delayed Tasks:</b> {int(delayed_tasks or 0)}",
         ],
-    )
-    b.add_summary_box(
-        "WORK SUMMARY",
-        [
-            f"Total Tasks: {int(total_tasks or 0)}",
-            f"Completed Tasks: {int(completed_tasks or 0)}",
-            f"In Progress Tasks: {int(in_progress_tasks or 0)}",
-        ],
-    )
-    b.add_summary_box(
-        "ISSUE SUMMARY",
-        [
-            f"Open Issues: {int(open_issues or 0)}",
-            f"Closed Issues: {int(closed_issues or 0)}",
-        ],
-    )
-    b.add_summary_box(
-        "PROJECT PROGRESS",
-        [f"Overall Progress: {round(float(progress or 0), 2)} %"],
     )
 
     stream = b.build()
@@ -3142,15 +2886,8 @@ async def audit_pdf(
     return StreamingResponse(
         stream,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"attachment; filename=audit_report_{project_id}.pdf"
-        },
+        headers={"Content-Disposition": f"attachment; filename=project_{project_id}_audit.pdf"},
     )
-
-
-# =========================================================
-# UNIFIED PROJECT REPORT
-# =========================================================
 
 
 @router.get("/project")
@@ -3163,40 +2900,29 @@ async def project_report(
     month: int | None = None,
     year: int | None = None,
     quarter: int | None = None,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = _check_tenant_access(current_user)
     project_ids = []
     if project_id is not None:
-        await assert_project_access(
-            db, project_id=project_id, current_user=current_user
-        )
+        await _validate_project_access_404(db, project_id, current_user)
         project_ids = [project_id]
     else:
-        # Get all accessible projects
-        if current_user.role in [
-            UserRole.ADMIN.value,
-            UserRole.OWNER.value,
-            UserRole.ACCOUNTANT.value,
-        ]:
-            res = await db.execute(select(m.Project.id))
-        else:
+        if not is_sa:
             res = await db.execute(
-                select(m.Project.id).where(
-                    m.Project.id.in_(
-                        select(m.ProjectAssignment.project_id).where(
-                            m.ProjectAssignment.user_id == current_user.id
-                        )
-                    )
-                )
+                select(m.Project.id).where(m.Project.company_id == current_user.company_id)
             )
+        else:
+            if current_user.company_id is not None:
+                res = await db.execute(
+                    select(m.Project.id).where(m.Project.company_id == current_user.company_id)
+                )
+            else:
+                res = await db.execute(select(m.Project.id))
         project_ids = res.scalars().all()
         if not project_ids:
             raise HTTPException(status_code=403, detail="No accessible projects found")
-
-    # =====================================================
-    # VALIDATION
-    # =====================================================
 
     if type not in ["daily", "weekly", "monthly", "quarterly"]:
         raise HTTPException(status_code=400, detail="Invalid report type")
@@ -3208,177 +2934,102 @@ async def project_report(
 
     if type == "weekly" and (not start_date or not end_date):
         raise HTTPException(
-            status_code=400, detail="start_date and end_date required for weekly report"
+            status_code=400,
+            detail="start_date and end_date are required for weekly report",
         )
 
-    if type == "monthly":
-        if not month or not year:
-            raise HTTPException(
-                status_code=400, detail="month and year required for monthly report"
-            )
+    if type == "monthly" and (not month or not year):
+        raise HTTPException(
+            status_code=400, detail="month and year are required for monthly report"
+        )
 
-        start_date = date(year, month, 1)
-        end_date = date(year, month, monthrange(year, month)[1])
-
-    # =====================================================
-    # QUARTERLY
-    # =====================================================
-
-    if type == "quarterly":
-
-        if not quarter or not year:
-            raise HTTPException(
-                status_code=400, detail="quarter and year required for quarterly report"
-            )
-
-        if quarter not in [1, 2, 3, 4]:
-            raise HTTPException(
-                status_code=400, detail="quarter must be between 1 and 4"
-            )
-
-        quarter_map = {
-            1: (1, 3),
-            2: (4, 6),
-            3: (7, 9),
-            4: (10, 12),
-        }
-
-        start_month, end_month = quarter_map[quarter]
-
-        start_date = date(year, start_month, 1)
-
-        end_date = date(year, end_month, monthrange(year, end_month)[1])
+    if type == "quarterly" and (not quarter or not year):
+        raise HTTPException(
+            status_code=400, detail="quarter and year are required for quarterly report"
+        )
 
     if type == "daily":
         start_date = report_date
         end_date = report_date
 
-    # =====================================================
-    # PROJECT
-    # =====================================================
+    elif type == "weekly":
+        pass
 
-    if project_id is not None:
-        project = await db.scalar(select(m.Project).where(m.Project.id == project_id))
-        project_data = {"id": project.id, "project_name": project.project_name}
-    else:
-        project_data = {"id": None, "project_name": "All Authorized Projects"}
+    elif type == "monthly":
+        days = monthrange(year, month)[1]
+        start_date = date(year, month, 1)
+        end_date = date(year, month, days)
 
-    # =====================================================
-    # TASK SUMMARY
-    # =====================================================
+    elif type == "quarterly":
+        quarter_map = {1: (1, 3), 2: (4, 6), 3: (7, 9), 4: (10, 12)}
+        start_month, end_month = quarter_map[quarter]
+        days = monthrange(year, end_month)[1]
+        start_date = date(year, start_month, 1)
+        end_date = date(year, end_month, days)
 
-    total_tasks = await db.scalar(
-        select(func.count())
-        .select_from(m.Task)
-        .where(m.Task.project_id.in_(project_ids))
-    )
-
-    completed_tasks = await db.scalar(
-        select(func.count())
-        .select_from(m.Task)
+    dsr_result = await db.execute(
+        select(m.DailySiteReport)
         .where(
-            m.Task.project_id.in_(project_ids),
-            (
-                m.Task.status == TaskStatus.COMPLETED.value
-                if hasattr(TaskStatus.COMPLETED, "value")
-                else TaskStatus.COMPLETED
-            ),
+            m.DailySiteReport.project_id.in_(project_ids),
+            m.DailySiteReport.report_date >= start_date,
+            m.DailySiteReport.report_date <= end_date,
         )
+        .order_by(m.DailySiteReport.report_date.desc())
     )
+    dsr_list = dsr_result.scalars().all()
 
-    progress = await db.scalar(
+    overall_progress = await db.scalar(
         select(func.avg(m.Task.completion_percentage)).where(
             m.Task.project_id.in_(project_ids)
         )
     )
-
-    # =====================================================
-    # FINANCIALS
-    # =====================================================
-
-    total_invoice = await db.scalar(
-        select(func.sum(Invoice.total_amount)).where(
-            Invoice.project_id.in_(project_ids)
+    total_tasks = await db.scalar(
+        select(func.count(m.Task.id)).where(m.Task.project_id.in_(project_ids))
+    )
+    completed_tasks = await db.scalar(
+        select(func.count(m.Task.id)).where(
+            m.Task.project_id.in_(project_ids),
+            m.Task.status == TaskStatus.COMPLETED.value,
         )
     )
-
-    total_expense = await db.scalar(
-        select(func.sum(Expense.amount)).where(Expense.project_id.in_(project_ids))
-    )
-
-    # =====================================================
-    # ISSUES
-    # =====================================================
 
     open_issues = await db.scalar(
-        select(func.count())
-        .select_from(m.Issue)
-        .where(
+        select(func.count(m.Issue.id)).where(
             m.Issue.project_id.in_(project_ids),
-            (
-                m.Issue.status == IssueStatus.OPEN.value
-                if hasattr(IssueStatus.OPEN, "value")
-                else IssueStatus.OPEN
-            ),
+            m.Issue.status == IssueStatus.OPEN.value,
         )
     )
 
-    # =====================================================
-    # DSR
-    # =====================================================
-
-    dsr_list = []
+    single_project = None
     if project_id is not None:
-        dsr_result = await db.execute(
-            select(m.DailySiteReport)
-            .where(
-                m.DailySiteReport.project_id == project_id,
-                m.DailySiteReport.report_date >= start_date,
-                m.DailySiteReport.report_date <= end_date,
-            )
-            .order_by(m.DailySiteReport.report_date.desc())
-        )
-        dsr_list = dsr_result.scalars().all()
-
-    # =====================================================
-    # RESPONSE
-    # =====================================================
+        p = await db.get(m.Project, project_id)
+        if p:
+            single_project = {
+                "id": p.id,
+                "project_name": p.project_name,
+                "status": p.status.value if p.status else None,
+            }
 
     return {
-        "project": project_data,
-        "report_type": type,
-        "quarter": f"Q{quarter}" if type == "quarterly" else None,
-        "date_range": {
-            "start_date": start_date,
-            "end_date": end_date,
-        },
+        "project": single_project,
+        "type": type,
+        "period": {"start_date": start_date, "end_date": end_date},
         "summary": {
+            "overall_progress": round(float(overall_progress or 0), 2),
             "total_tasks": int(total_tasks or 0),
             "completed_tasks": int(completed_tasks or 0),
             "open_issues": int(open_issues or 0),
-            "overall_progress": round(float(progress or 0), 2),
-        },
-        "financials": {
-            "total_invoice": round(float(total_invoice or 0), 2),
-            "total_expense": round(float(total_expense or 0), 2),
-            "profit": round(float((total_invoice or 0) - (total_expense or 0)), 2),
         },
         "daily_reports": [
             {
                 "date": r.report_date,
                 "work_done": r.work_done,
-                "weather": r.weather,
-                "remarks": r.remarks,
+                "issues": r.issues,
+                "site_location": r.site_location,
             }
             for r in dsr_list
         ],
-        "generated_at": datetime.utcnow(),
     }
-
-
-# =========================================================
-# EXPORT PDF
-# =========================================================
 
 
 @router.get("/project/export/pdf")
@@ -3391,9 +3042,10 @@ async def export_project_report_pdf(
     month: int | None = None,
     year: int | None = None,
     quarter: int | None = None,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _check_tenant_access(current_user)
     response = await project_report(
         project_id=project_id,
         type=type,
@@ -3408,11 +3060,12 @@ async def export_project_report_pdf(
     )
 
     b = PdfReportBuilder(f"{type.title()} Project Report")
+    proj_name = response["project"]["project_name"] if response.get("project") else "Portfolio"
     b.add_info_table(
         [
             (
                 "Project",
-                response["project"]["project_name"],
+                proj_name,
                 "Report Type",
                 type.title(),
             )
@@ -3444,11 +3097,6 @@ async def export_project_report_pdf(
     )
 
 
-# =========================================================
-# EXPORT EXCEL
-# =========================================================
-
-
 @router.get("/project/export/excel")
 async def export_project_report_excel(
     type: str,
@@ -3459,9 +3107,10 @@ async def export_project_report_excel(
     month: int | None = None,
     year: int | None = None,
     quarter: int | None = None,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _check_tenant_access(current_user)
     response = await project_report(
         project_id=project_id,
         type=type,
@@ -3475,29 +3124,26 @@ async def export_project_report_excel(
         db=db,
     )
 
-    eb = ExcelReportBuilder(
-        f"{type.title()} Project Report",
-        project_line=response["project"]["project_name"],
-    )
-    eb.add_summary_row("Report Type", response["report_type"])
-    eb.add_summary_row("Overall Progress (%)", response["summary"]["overall_progress"])
-    eb.add_summary_row("Completed Tasks", response["summary"]["completed_tasks"])
-    eb.add_summary_row("Open Issues", response["summary"]["open_issues"])
-    eb.add_summary_row(
-        "Total Invoice", response["financials"]["total_invoice"], is_currency=True
-    )
-    eb.add_summary_row(
-        "Total Expense", response["financials"]["total_expense"], is_currency=True
-    )
-    eb.add_summary_row("Profit", response["financials"]["profit"], is_currency=True)
+    eb = ExcelReportBuilder(f"{type.title()} Project Report")
+    proj_name = response["project"]["project_name"] if response.get("project") else "Portfolio"
+    eb.add_summary_row("Project", proj_name)
+    eb.add_summary_row("Report Type", type.title())
+    eb.add_summary_row("Overall Progress", f"{response['summary']['overall_progress']}%")
+    eb.add_summary_row("Completed Tasks", response['summary']['completed_tasks'])
+    eb.add_summary_row("Open Issues", response['summary']['open_issues'])
     eb.build_summary_sheet()
 
-    headers = ["Date", "Work Done", "Weather", "Remarks"]
+    headers = ["Date", "Work Done", "Issues Reported", "Site Location"]
     rows = [
-        [str(r["date"]), r["work_done"], r["weather"], r["remarks"]]
+        [
+            str(r["date"]),
+            r["work_done"] or "",
+            r["issues"] or "",
+            r["site_location"] or "",
+        ]
         for r in response["daily_reports"]
     ]
-    eb.add_data_sheet("Daily Reports", headers, rows)
+    eb.add_data_sheet("Daily Logs", headers, rows)
 
     stream = eb.build()
 
@@ -3510,19 +3156,18 @@ async def export_project_report_excel(
     )
 
 
-# ===================== BUSINESS INTELLIGENCE KPIs =====================
 @router.get("/business-intelligence")
 async def business_intelligence_kpis(
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _check_tenant_access(current_user)
     if current_user.company_id is None:
         raise HTTPException(
             status_code=403,
             detail="Super Admin cannot access company business intelligence",
         )
 
-    # Revenue (owner invoices)
     revenue = await db.scalar(
         select(func.sum(Invoice.total_amount))
         .join(m.Project, m.Project.id == Invoice.project_id)
@@ -3533,26 +3178,28 @@ async def business_intelligence_kpis(
         )
     )
 
-    # Expenditure (all expenses)
     expense = await db.scalar(
         select(func.sum(Expense.amount))
         .join(m.Project, m.Project.id == Expense.project_id)
         .where(m.Project.company_id == current_user.company_id)
     )
 
+    documented_reports = await db.scalar(
+        select(func.count(m.DailySiteReport.id))
+        .join(m.Project, m.DailySiteReport.project_id == m.Project.id)
+        .where(m.Project.company_id == current_user.company_id)
+    )
+
+    active_sites = await db.scalar(
+        select(func.count(m.Project.id)).where(
+            m.Project.status == ProjectStatus.ONGOING.value,
+            m.Project.company_id == current_user.company_id,
+        )
+    )
+
     revenue_val = float(revenue or 0)
     expense_val = float(expense or 0)
     net_profit = revenue_val - expense_val
-
-    # Activity Log
-    documented_reports = await db.scalar(select(func.count(m.DailySiteReport.id)))
-
-    # Efficiency (Active Sites)
-    active_sites = await db.scalar(
-        select(func.count(m.Project.id)).where(
-            m.Project.status == ProjectStatus.ONGOING.value
-        )
-    )
 
     return {
         "revenue_focus": net_profit,
@@ -3562,14 +3209,14 @@ async def business_intelligence_kpis(
     }
 
 
-# ===================== WORK CATEGORY SUMMARY =====================
 @router.get("/work-category")
 async def work_category_summary(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
 
     result = await db.execute(
         select(
@@ -3599,22 +3246,20 @@ async def work_category_summary(
     return {"work_categories": categories}
 
 
-# ===================== QUARTERLY AUDIT SUMMARY =====================
 @router.get("/audit-summary")
 async def quarterly_audit_summary(
     project_id: int,
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
 
-    # Calculate current quarter bounds
     today = date.today()
     current_quarter = (today.month - 1) // 3 + 1
     start_month = 3 * current_quarter - 2
     start_date = date(today.year, start_month, 1)
 
-    # High Priority Issues in Quarter
     critical_issues = await db.scalar(
         select(func.count(m.Issue.id)).where(
             m.Issue.project_id == project_id,
@@ -3623,7 +3268,6 @@ async def quarterly_audit_summary(
         )
     )
 
-    # Audit trail activities
     audit_logs = await db.scalar(
         select(func.count(ActivityLog.id)).where(
             ActivityLog.entity == "project",
@@ -3632,7 +3276,6 @@ async def quarterly_audit_summary(
         )
     )
 
-    # Expense Audits
     quarterly_expenses = await db.scalar(
         select(func.sum(Expense.amount)).where(
             Expense.project_id == project_id, Expense.expense_date >= start_date
@@ -3650,29 +3293,24 @@ async def quarterly_audit_summary(
     }
 
 
-# ===================== COMMERCIAL & BOQ EXECUTION ======================
-
-
 @router.get("/commercial-execution")
 async def commercial_execution_analytics(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     from app.models.boq import BOQ
 
-    # BOQ Items
     boq_items = (
         (await db.execute(select(BOQ).where(BOQ.project_id == project_id)))
         .scalars()
         .all()
     )
 
-    # Planned Cost from BOQ
     boq_total_planned_cost = sum(float(item.total_cost or 0) for item in boq_items)
 
-    # Final Measurements
     measurements = (
         (
             await db.execute(
@@ -3686,7 +3324,6 @@ async def commercial_execution_analytics(
         .all()
     )
 
-    # Actual Certified Amount
     actual_certified_amount = sum(
         float(getattr(meas, "total_amount", 0) or 0) for meas in measurements
     )
@@ -3713,14 +3350,14 @@ async def commercial_execution_analytics(
     }
 
 
-# ===================== CONTRACTOR EXECUTION =====================
 @router.get("/contractor-execution")
 async def contractor_execution_analytics(
     project_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+    current_user: User = Depends(require_permission("reports.view")),
 ):
-    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    _check_tenant_access(current_user)
+    await _validate_project_access_404(db, project_id, current_user)
     from app.models.billing import RABill
 
     bills = (
@@ -3759,7 +3396,7 @@ async def contractor_execution_analytics(
 #     end_date: date,
 #     email: str,
 #     background_tasks: BackgroundTasks,
-#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+#     current_user: User = Depends(require_permission("reports.export")),
 #     db: AsyncSession = Depends(get_db_session),
 # ):
 #     await assert_project_access(db, project_id=project_id, current_user=current_user)
@@ -3823,7 +3460,7 @@ async def contractor_execution_analytics(
 #     start_date: date,
 #     end_date: date,
 #     phone: str,
-#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+#     current_user: User = Depends(require_permission("reports.export")),
 #     db: AsyncSession = Depends(get_db_session),
 # ):
 #     await assert_project_access(db, project_id=project_id, current_user=current_user)
@@ -3848,7 +3485,7 @@ async def contractor_execution_analytics(
 #     report_date: date,
 #     email: str,
 #     background_tasks: BackgroundTasks,
-#     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
+#     current_user: User = Depends(require_permission("reports.export")),
 #     db: AsyncSession = Depends(get_db_session),
 # ):
 #     await assert_project_access(db, project_id=project_id, current_user=current_user)

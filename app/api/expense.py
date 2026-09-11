@@ -27,31 +27,14 @@ from app.models.boq import BOQ
 from app.models.material import Supplier
 from sqlalchemy import select, func
 from decimal import Decimal
-
 from fastapi.responses import StreamingResponse
-from app.models.user import User, UserRole
+import io
+import csv
+
+from app.models.company import Company
+from app.models.user import User
 from app.utils.boq_calc import recalculate_boq_actuals
 from app.core.dependencies import require_permission
-
-EXPENSE_READ_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.ACCOUNTANT,
-        UserRole.CLIENT,
-    ]
-]
-
-EXPENSE_WRITE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.ACCOUNTANT,
-    ]
-]
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
@@ -145,7 +128,12 @@ async def create_expense(
         # DR GST Input Account (if GST exists) -> assuming no gst field for now on Expense, UI says "GST"
         # CR Bank/Cash/Vendor Payable
         # We will dynamically find Expense account or fallback
-        expense_acc = await db.scalar(select(Account).where(Account.code == 'GENERAL_EXPENSE'))
+        expense_acc = await db.scalar(
+            select(Account).where(
+                Account.code == 'GENERAL_EXPENSE',
+                Account.company_id == project.company_id,
+            )
+        )
         if not expense_acc:
             raise HTTPException(status_code=400, detail="GENERAL_EXPENSE account is not configured.")
 
@@ -208,25 +196,40 @@ async def list_expenses(
     status: Optional[str] = Query(None),
     from_date: Optional[date] = Query(None),
     to_date: Optional[date] = Query(None),
+    company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=100),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
     is_sa = _check_tenant_access(current_user)
+    if not is_sa:
+        effective_company_id = current_user.company_id
+    else:
+        if company_id is not None:
+            comp = await db.get(Company, company_id)
+            if not comp:
+                raise NotFoundError("Company not found")
+            effective_company_id = company_id
+        else:
+            effective_company_id = None
+
     query = select(Expense).join(Project, Expense.project_id == Project.id)
 
-    if not is_sa:
-        query = query.where(Project.company_id == current_user.company_id)
+    if effective_company_id is not None:
+        query = query.where(Project.company_id == effective_company_id)
 
     if vendor_id:
         supplier = await db.get(Supplier, vendor_id)
-        if not supplier or (not is_sa and supplier.company_id != current_user.company_id):
+        if not supplier or (effective_company_id is not None and supplier.company_id != effective_company_id):
             raise NotFoundError("Vendor not found")
 
     if category:
         query = query.where(Expense.category == category)
     if project_id:
+        proj = await db.get(Project, project_id)
+        if not proj or (effective_company_id is not None and proj.company_id != effective_company_id):
+            raise NotFoundError("Project not found")
         query = query.where(Expense.project_id == project_id)
     if from_date:
         query = query.where(Expense.expense_date >= from_date)
@@ -332,6 +335,9 @@ async def update_expense(
     if owner_txn:
         owner_txn.amount = obj.amount
         owner_txn.description = obj.description
+        if payload.project_id:
+            owner_txn.project_id = target_project.id
+            owner_txn.owner_id = target_project.owner_id
 
     try:
         if accounting_changed:
@@ -380,7 +386,12 @@ async def update_expense(
                 raise HTTPException(status_code=500, detail="Reversal journal unbalanced")
 
             # 3. Create Corrected Journal
-            expense_acc = await db.scalar(select(Account).where(Account.code == 'GENERAL_EXPENSE'))
+            expense_acc = await db.scalar(
+                select(Account).where(
+                    Account.code == 'GENERAL_EXPENSE',
+                    Account.company_id == target_project.company_id,
+                )
+            )
             if not expense_acc:
                 raise HTTPException(status_code=400, detail="GENERAL_EXPENSE account is not configured.")
             cash_acc = await get_primary_cash_account(db, company_id=target_project.company_id)
@@ -647,10 +658,22 @@ from datetime import datetime
 
 @router.get("/dashboard", response_model=ExpenseDashboardOut)
 async def get_dashboard(
+    company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
     is_sa = _check_tenant_access(current_user)
+    if not is_sa:
+        effective_company_id = current_user.company_id
+    else:
+        if company_id is not None:
+            comp = await db.get(Company, company_id)
+            if not comp:
+                raise NotFoundError("Company not found")
+            effective_company_id = company_id
+        else:
+            effective_company_id = None
+
     # Total Expense
     tot_q = select(func.sum(Expense.amount)).join(Project, Expense.project_id == Project.id)
 
@@ -669,10 +692,10 @@ async def get_dashboard(
         .group_by(Expense.category)
     )
 
-    if not is_sa:
-        tot_q = tot_q.where(Project.company_id == current_user.company_id)
-        mon_q = mon_q.where(Project.company_id == current_user.company_id)
-        cat_q = cat_q.where(Project.company_id == current_user.company_id)
+    if effective_company_id is not None:
+        tot_q = tot_q.where(Project.company_id == effective_company_id)
+        mon_q = mon_q.where(Project.company_id == effective_company_id)
+        cat_q = cat_q.where(Project.company_id == effective_company_id)
 
     total_expense = float(await db.scalar(tot_q) or 0.0)
     monthly_expense = float(await db.scalar(mon_q) or 0.0)
@@ -691,8 +714,8 @@ async def get_dashboard(
         .group_by(Expense.expense_date)
         .order_by(Expense.expense_date.asc())
     )
-    if not is_sa:
-        trend_q = trend_q.where(Project.company_id == current_user.company_id)
+    if effective_company_id is not None:
+        trend_q = trend_q.where(Project.company_id == effective_company_id)
 
     trend_res = await db.execute(trend_q)
     trend_rows = trend_res.all()
@@ -706,8 +729,8 @@ async def get_dashboard(
             .order_by(Expense.expense_date.asc())
             .limit(30)
         )
-        if not is_sa:
-            fallback_q = fallback_q.where(Project.company_id == current_user.company_id)
+        if effective_company_id is not None:
+            fallback_q = fallback_q.where(Project.company_id == effective_company_id)
         trend_rows = (await db.execute(fallback_q)).all()
 
     trend = [
@@ -728,8 +751,8 @@ async def get_dashboard(
             func.lower(Approval.status) == "pending",
         )
     )
-    if not is_sa:
-        pending_appr_q = pending_appr_q.where(Project.company_id == current_user.company_id)
+    if effective_company_id is not None:
+        pending_appr_q = pending_appr_q.where(Project.company_id == effective_company_id)
 
     pending_approval_count = int(await db.scalar(pending_appr_q) or 0)
 
@@ -756,10 +779,22 @@ async def get_dashboard(
 
 @router.get("/project-allocations", response_model=ProjectAllocationsOut)
 async def get_project_allocations(
+    company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
     is_sa = _check_tenant_access(current_user)
+    if not is_sa:
+        effective_company_id = current_user.company_id
+    else:
+        if company_id is not None:
+            comp = await db.get(Company, company_id)
+            if not comp:
+                raise NotFoundError("Company not found")
+            effective_company_id = company_id
+        else:
+            effective_company_id = None
+
     # Group by project
     res_q = (
         select(Project.id, Project.project_name, func.sum(Expense.amount))
@@ -770,9 +805,9 @@ async def get_project_allocations(
         .join(Project, Expense.project_id == Project.id)
     )
 
-    if not is_sa:
-        res_q = res_q.where(Project.company_id == current_user.company_id)
-        rec_q = rec_q.where(Project.company_id == current_user.company_id)
+    if effective_company_id is not None:
+        res_q = res_q.where(Project.company_id == effective_company_id)
+        rec_q = rec_q.where(Project.company_id == effective_company_id)
 
     res = await db.execute(res_q.group_by(Project.id, Project.project_name))
     projects = []
@@ -802,14 +837,26 @@ async def get_project_allocations(
 
 @router.get("/ledger", response_model=list[ExpenseLedgerRow])
 async def get_expense_ledger(
+    company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
     is_sa = _check_tenant_access(current_user)
+    if not is_sa:
+        effective_company_id = current_user.company_id
+    else:
+        if company_id is not None:
+            comp = await db.get(Company, company_id)
+            if not comp:
+                raise NotFoundError("Company not found")
+            effective_company_id = company_id
+        else:
+            effective_company_id = None
+
     from app.core.enums import AccountType
     acc_q = select(Account.id).where(or_(Account.name.ilike('%Expense%'), Account.type == AccountType.EXPENSE.value))
-    if not is_sa:
-        acc_q = acc_q.where(Account.company_id == current_user.company_id)
+    if effective_company_id is not None:
+        acc_q = acc_q.where(Account.company_id == effective_company_id)
     expense_accs = (await db.execute(acc_q)).scalars().all()
 
     if not expense_accs:
@@ -856,28 +903,55 @@ async def import_expenses(
     errors = 0
     for row in reader:
         proj_id = row.get("project_id") or row.get("Project ID")
-        if proj_id:
+        if not proj_id:
+            errors += 1
+            continue
+        try:
+            pid = int(proj_id)
+            proj = await db.get(Project, pid)
+            if not proj or (not is_sa and proj.company_id != current_user.company_id):
+                errors += 1
+                continue
+        except (ValueError, TypeError):
+            errors += 1
+            continue
+
+        boq_id = row.get("boq_item_id") or row.get("BOQ Item ID")
+        if boq_id:
             try:
-                pid = int(proj_id)
-                proj = await db.get(Project, pid)
-                if not proj or (not is_sa and proj.company_id != current_user.company_id):
+                bid = int(boq_id)
+                boq = await db.get(BOQ, bid)
+                if not boq or boq.project_id != proj.id:
                     errors += 1
                     continue
             except (ValueError, TypeError):
                 errors += 1
                 continue
+
         valid += 1
     return {"valid_records": valid, "errors": errors, "message": "Import preview successful"}
 
 @router.get("/export")
 async def export_expenses(
+    company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.export")),
 ):
     is_sa = _check_tenant_access(current_user)
-    query = select(Expense, Project.project_name).join(Project, Expense.project_id == Project.id)
     if not is_sa:
-        query = query.where(Project.company_id == current_user.company_id)
+        effective_company_id = current_user.company_id
+    else:
+        if company_id is not None:
+            comp = await db.get(Company, company_id)
+            if not comp:
+                raise NotFoundError("Company not found")
+            effective_company_id = company_id
+        else:
+            effective_company_id = None
+
+    query = select(Expense, Project.project_name).join(Project, Expense.project_id == Project.id)
+    if effective_company_id is not None:
+        query = query.where(Project.company_id == effective_company_id)
     expenses = (await db.execute(query.order_by(Expense.expense_date.desc()))).all()
 
     output = io.StringIO()

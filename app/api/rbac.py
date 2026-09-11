@@ -8,7 +8,12 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.default_role_permissions import assign_default_role_permissions
-from app.core.dependencies import require_roles, require_super_admin
+from app.core.dependencies import (
+    get_effective_user_permissions,
+    has_permission,
+    require_permission,
+    require_super_admin,
+)
 from app.core.rbac_seed import seed_permissions
 from app.db.session import get_db_session
 from app.models.rbac import Permission, Role, RolePermission, UserPermissionOverride, RBACAuditLog
@@ -140,8 +145,53 @@ class UserOverrideUpdate(BaseSchema):
 
 
 # =========================================================
-# RBAC INTERNAL HELPERS FOR TENANT ISOLATION
+# RBAC INTERNAL HELPERS FOR TENANT ISOLATION & SECURITY
 # =========================================================
+
+def _require_tenant_context(current_user: User) -> None:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant context required",
+        )
+
+
+async def _validate_permission_boundary(
+    db: AsyncSession,
+    caller: User,
+    requested_permissions: list[str],
+) -> None:
+    """
+    Validates that a non-SA caller does not grant permissions outside their
+    own effective permissions boundary.
+    Prevents privilege escalation via role permissions or user overrides.
+    """
+    if getattr(caller, "is_super_admin", False) is True:
+        return
+
+    caller_effective = await get_effective_user_permissions(db, caller)
+
+    for perm in requested_permissions:
+        if perm == "*":
+            if "*" not in caller_effective:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot grant wildcard '*' permission outside your effective permissions",
+                )
+        elif perm.endswith(".*"):
+            if "*" not in caller_effective and perm not in caller_effective:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Cannot grant wildcard '{perm}' permission outside your effective permissions",
+                )
+        else:
+            if not has_permission(caller_effective, perm):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Cannot grant permission '{perm}' outside your effective permissions boundary",
+                )
+
 
 async def _validate_role_exists(
     db: AsyncSession,
@@ -155,6 +205,7 @@ async def _validate_role_exists(
     if role_name in ROLES:
         return
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     # Check company-specific role
     if current_user.company_id is not None:
         c_role = await db.scalar(
@@ -164,6 +215,14 @@ async def _validate_role_exists(
             )
         )
         if c_role:
+            return
+    elif is_sa:
+        any_role = await db.scalar(
+            select(Role).where(
+                Role.name == role_name,
+            )
+        )
+        if any_role:
             return
 
     # Check system / global role in DB
@@ -197,7 +256,9 @@ async def _get_or_create_company_role(
     Under Admin-driven model, newly created company roles start with permissions = []
     unless copy_defaults_if_created is explicitly requested for custom global templates.
     """
-    if current_user.company_id is None and current_user.is_super_admin:
+    _require_tenant_context(current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if current_user.company_id is None and is_sa:
         return None
 
     company_id = current_user.company_id
@@ -311,10 +372,11 @@ async def _fetch_role_permissions_list(
 @router.get("/permissions")
 async def get_permissions(
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.view")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     result = await db.execute(
         select(Permission).order_by(
             Permission.module,
@@ -338,12 +400,14 @@ async def get_permissions(
 @router.get("/roles")
 async def get_roles(
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.view")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     stmt = select(Role)
-    if not current_user.is_super_admin:
+    if not is_sa:
         stmt = stmt.where(
             (Role.company_id == current_user.company_id) | (Role.company_id.is_(None)) | (Role.is_system == True)
         )
@@ -378,10 +442,12 @@ async def get_roles(
 async def create_role(
     payload: RoleCreate,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.create")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     role_name = payload.name.strip()
     if not role_name:
         raise HTTPException(
@@ -391,7 +457,7 @@ async def create_role(
 
     # Built-in role collision check (case-insensitive)
     built_in_lower = {r.lower() for r in ROLES}
-    if role_name.lower() in built_in_lower and not current_user.is_super_admin:
+    if role_name.lower() in built_in_lower and not is_sa:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot create custom role matching built-in role name '{role_name}'",
@@ -411,11 +477,11 @@ async def create_role(
         )
 
     new_role = Role(
-        company_id=current_user.company_id if not current_user.is_super_admin else None,
+        company_id=current_user.company_id if not is_sa else None,
         name=role_name,
         display_name=payload.display_name.strip() if payload.display_name else role_name,
         description=payload.description.strip() if payload.description else None,
-        is_system=False if not current_user.is_super_admin else True,
+        is_system=False if not is_sa else True,
     )
     db.add(new_role)
     await db.flush()
@@ -459,10 +525,12 @@ async def create_role(
 async def delete_custom_role(
     role: str,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.delete")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     role_clean = role.strip()
 
     # 1. Built-in / system roles cannot be deleted (case-insensitive check)
@@ -475,7 +543,7 @@ async def delete_custom_role(
 
     # 2. Check if role exists for this company
     stmt = select(Role).where(func.lower(Role.name) == role_clean.lower())
-    if not current_user.is_super_admin:
+    if not is_sa:
         stmt = stmt.where(Role.company_id == current_user.company_id)
 
     target_role = await db.scalar(stmt)
@@ -496,7 +564,7 @@ async def delete_custom_role(
         func.lower(User.role) == role_clean.lower(),
         User.is_deleted == False,
     )
-    if not current_user.is_super_admin:
+    if not is_sa:
         user_stmt = user_stmt.where(User.company_id == current_user.company_id)
 
     assigned_count = await db.scalar(user_stmt) or 0
@@ -540,11 +608,13 @@ async def delete_custom_role(
 async def get_role_permissions(
     role: str,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.view")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await _validate_role_exists(db, role, current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
 
     company_role = None
     if current_user.company_id is not None:
@@ -552,6 +622,13 @@ async def get_role_permissions(
             select(Role).where(
                 Role.name == role,
                 Role.company_id == current_user.company_id,
+            )
+        )
+    elif is_sa:
+        company_role = await db.scalar(
+            select(Role).where(
+                Role.name == role,
+                Role.company_id.is_(None),
             )
         )
 
@@ -572,10 +649,11 @@ async def add_role_permissions(
     role: str,
     payload: RolePermissionAdd,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.edit")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await _validate_role_exists(db, role, current_user)
 
     perms_to_add = payload.permissions or []
@@ -592,6 +670,9 @@ async def add_role_permissions(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown permission code(s): {', '.join(invalid_codes)}",
         )
+
+    # Validate privilege boundary
+    await _validate_permission_boundary(db, current_user, perms_to_add)
 
     # Scoped company role (starts with zero implicit permissions)
     company_role = await _get_or_create_company_role(
@@ -664,10 +745,11 @@ async def update_role_permissions(
     role: str,
     payload: RolePermissionUpdate,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.edit")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await _validate_role_exists(db, role, current_user)
 
     # Validate all requested permissions exist in DB
@@ -682,6 +764,9 @@ async def update_role_permissions(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown permission code(s): {', '.join(invalid_codes)}",
         )
+
+    # Validate privilege boundary BEFORE modifying database
+    await _validate_permission_boundary(db, current_user, payload.permissions)
 
     permission_ids = [p.id for p in valid_permissions]
 
@@ -753,10 +838,11 @@ async def delete_single_role_permission(
     role: str,
     permission: str,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.edit")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await _validate_role_exists(db, role, current_user)
 
     target_perm = await db.scalar(select(Permission).where(Permission.code == permission))
@@ -822,10 +908,11 @@ async def delete_bulk_role_permissions(
     role: str,
     payload: RolePermissionDelete,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.edit")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await _validate_role_exists(db, role, current_user)
 
     perms_to_remove = payload.permissions or []
@@ -898,10 +985,11 @@ async def delete_bulk_role_permissions(
 async def reset_role_defaults(
     role: str,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.edit")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await _validate_role_exists(db, role, current_user)
 
     if current_user.company_id is not None:
@@ -950,13 +1038,16 @@ async def reset_role_defaults(
 async def get_user_permission_overrides(
     user_id: int,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.view")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     # Database-level tenant query filtering (prevents cross-tenant existence leakage)
     stmt = select(User).where(User.id == user_id, User.is_deleted == False)
-    if not current_user.is_super_admin:
+    if not is_sa:
         stmt = stmt.where(User.company_id == current_user.company_id)
 
     target_user = await db.scalar(stmt)
@@ -989,13 +1080,16 @@ async def update_user_permission_overrides(
     user_id: int,
     payload: UserOverrideUpdate,
     current_user: User = Depends(
-        require_roles([UserRole.ADMIN.value])
+        require_permission("roles.edit")
     ),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     # Database-level tenant query filtering (prevents cross-tenant existence leakage)
     stmt = select(User).where(User.id == user_id, User.is_deleted == False)
-    if not current_user.is_super_admin:
+    if not is_sa:
         stmt = stmt.where(User.company_id == current_user.company_id)
 
     target_user = await db.scalar(stmt)
@@ -1005,19 +1099,33 @@ async def update_user_permission_overrides(
             detail="User not found",
         )
 
-    # Self-escalation check
-    if not current_user.is_super_admin and current_user.id == target_user.id:
+    # Self-escalation check: Admins cannot modify their own permission overrides
+    if not is_sa and current_user.id == target_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admins cannot modify their own permission overrides",
         )
 
-    # Fetch permissions by code
+    # Fetch permissions by code and validate against catalog
     perm_codes = [item.permission for item in payload.overrides]
-    res = await db.execute(
-        select(Permission).where(Permission.code.in_(perm_codes))
-    )
-    perms = {p.code: p.id for p in res.scalars().all()}
+    if perm_codes:
+        res = await db.execute(
+            select(Permission).where(Permission.code.in_(perm_codes))
+        )
+        perms = {p.code: p.id for p in res.scalars().all()}
+        invalid_codes = [c for c in perm_codes if c not in perms]
+        if invalid_codes:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown permission code(s): {', '.join(invalid_codes)}",
+            )
+    else:
+        perms = {}
+
+    # Validate privilege boundary for any granted permission
+    granted_perms = [item.permission for item in payload.overrides if item.is_granted]
+    if granted_perms:
+        await _validate_permission_boundary(db, current_user, granted_perms)
 
     # Delete existing overrides for this user
     await db.execute(
@@ -1122,7 +1230,9 @@ async def get_rbac_audit_logs(
     actor_id: Optional[int] = Query(None, description="Filter by actor user ID"),
     target_type: Optional[str] = Query(None, description="Filter by target type"),
     company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
-    current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
+    current_user: User = Depends(
+        require_permission("roles.view")
+    ),
     db: AsyncSession = Depends(get_db_session),
 ):
     """
@@ -1131,10 +1241,13 @@ async def get_rbac_audit_logs(
     - Super Admins can query all records or filter by company_id.
     - Deterministic ordering by newest records first (created_at DESC, id DESC).
     """
+    _require_tenant_context(current_user)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+
     query = select(RBACAuditLog)
 
     # Server-side tenant boundary enforcement
-    if not current_user.is_super_admin:
+    if not is_sa:
         query = query.where(RBACAuditLog.company_id == current_user.company_id)
     else:
         if company_id is not None:

@@ -34,10 +34,20 @@ async def get_mock_db_session():
     # Mock for `await db.scalar(...)` used in email/mobile checks
     mock_session.scalar.return_value = None
     
-    # Allow executing queries to return a mock result that evaluates to None
-    mock_result = MagicMock()
-    mock_result.scalar_one_or_none.return_value = None
-    mock_session.execute.return_value = mock_result
+    # Allow executing queries to return a mock result that evaluates to None or permissions catalog
+    def mock_execute(stmt, *args, **kwargs):
+        res = MagicMock()
+        res.scalar_one_or_none.return_value = None
+        stmt_str = str(stmt)
+        if "user_permission_overrides" in stmt_str or "is_granted" in stmt_str:
+            res.scalars.return_value.all.return_value = []
+            res.all.return_value = []
+        else:
+            res.scalars.return_value.all.return_value = ["users.create", "users.view", "users.edit", "users.delete"]
+            res.all.return_value = []
+        return res
+
+    mock_session.execute.side_effect = mock_execute
     
     yield mock_session
 
@@ -158,4 +168,4 @@ def test_users_create_normal_user_rejected():
     
     # normal_user role is ProjectManager, which does not have Admin/Super Admin permission
     assert res.status_code == 403
-    assert "Insufficient permissions" in res.json()["detail"]
+    assert "Insufficient permissions" in str(res.json()["detail"])

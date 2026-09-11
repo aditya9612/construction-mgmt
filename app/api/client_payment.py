@@ -2096,16 +2096,28 @@ async def verify_client_payment(
                 db.add(txn)
 
                 # Auto post journal
-                await auto_post_journal(
-                    db=db,
-                    amount=payment.amount,
-                    debit_code="1001",  # Cash/Bank
-                    credit_code="1200",  # Accounts Receivable
-                    description=f"Client payment {payment.payment_no} verified",
-                    # reference_type="client_payment",
-                    # reference_id=payment.id,
-                    # created_by=current_user.id,
+                target_company_id = (
+                    getattr(payment.invoice, "company_id", None)
+                    or current_user.company_id
                 )
+                if not target_company_id and payment.project_id:
+                    from app.models.project import Project
+                    proj = await db.get(Project, payment.project_id)
+                    if proj:
+                        target_company_id = proj.company_id
+
+                if target_company_id:
+                    try:
+                        await auto_post_journal(
+                            db=db,
+                            amount=payment.amount,
+                            debit_code="1001",  # Cash/Bank
+                            credit_code="1200",  # Accounts Receivable
+                            description=f"Client payment {payment.payment_no} verified",
+                            company_id=target_company_id,
+                        )
+                    except (ValueError, Exception):
+                        pass
 
             # Notify client
             if payment.client_user_id:

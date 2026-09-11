@@ -31,7 +31,6 @@ from app.cache.redis import (
 from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
-    require_roles,
     require_permission,
 )
 from app.db.session import get_db_session
@@ -143,26 +142,6 @@ from app.schemas.material import (
 from app.core.logger import logger
 from app.utils.common import assert_project_access
 from app.utils.helpers import PermissionDeniedError
-
-MATERIAL_READ_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.ACCOUNTANT,
-        UserRole.CLIENT,
-    ]
-]
-
-MATERIAL_WRITE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-    ]
-]
 
 router = APIRouter(prefix="/materials", tags=["materials"])
 VERSION_KEY = "cache_version:materials"
@@ -1024,12 +1003,9 @@ async def material_summary(
         except Exception:
             raise NotFoundError("Project not found")
 
-    if current_user.company_id is None:
-        return {
-            "total_materials": 0,
-            "total_stock_value": 0.0,
-            "total_pending_payments": 0.0,
-        }
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
 
     from decimal import Decimal
     from fastapi import HTTPException
@@ -1037,8 +1013,9 @@ async def material_summary(
     try:
         material_filter = [
             Material.is_deleted == False,
-            Project.company_id == current_user.company_id,
         ]
+        if not is_sa:
+            material_filter.append(Project.company_id == current_user.company_id)
 
         if project_id is not None:
             material_filter.append(Material.project_id == project_id)
@@ -1099,15 +1076,18 @@ async def list_suppliers(
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    query = select(Supplier).where(Supplier.is_deleted == False)
+    if not is_sa:
+        query = query.where(Supplier.company_id == current_user.company_id)
+
     rows = (
         (
             await db.execute(
-                select(Supplier)
-                .where(
-                    Supplier.is_deleted == False,
-                    Supplier.company_id == current_user.company_id,
-                )
-                .order_by(Supplier.id.desc())
+                query.order_by(Supplier.id.desc())
                 .offset(skip)
                 .limit(limit)
             )
@@ -1558,8 +1538,9 @@ async def get_material_alerts(
         except Exception:
             raise NotFoundError("Project not found")
 
-    if current_user.company_id is None:
-        return []
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
 
     query = (
         select(
@@ -1584,9 +1565,10 @@ async def get_material_alerts(
         .join(Project, Project.id == Material.project_id)
         .where(
             Material.is_deleted == False,
-            Project.company_id == current_user.company_id,
         )
     )
+    if not is_sa:
+        query = query.where(Project.company_id == current_user.company_id)
 
     # Project Filter
     if project_id is not None:
@@ -1643,11 +1625,6 @@ async def create_po(
         raise NotFoundError("Project not found")
     if payload.quantity <= 0 or payload.rate <= 0:
         raise HTTPException(400, "Quantity and rate must be greater than 0")
-
-    if current_user.role != UserRole.ADMIN.value and payload.project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(403, "Access denied")
 
     material = await db.get(Material, payload.material_id)
     if not material:
@@ -1711,17 +1688,8 @@ async def get_po(
         )
     except Exception:
         raise NotFoundError("PO not found")
-    po = await db.get(PurchaseOrder, id)
 
-    if not po or po.is_deleted:
-        raise HTTPException(404, "PO not found")
-
-    if current_user.role != UserRole.ADMIN.value and po.project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(403, "Access denied")
-
-    return build_po_response(po)
+    return build_po_response(_po)
 
 
 # ==============================================================
@@ -1743,8 +1711,9 @@ async def list_po(
         except Exception:
             raise NotFoundError("Project not found")
 
-    if current_user.company_id is None:
-        return []
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
 
     limit = min(max(limit, 1), 100)
 
@@ -1753,10 +1722,11 @@ async def list_po(
         .join(Project, Project.id == PurchaseOrder.project_id)
         .where(
             PurchaseOrder.is_deleted == False,
-            Project.company_id == current_user.company_id,
         )
         .order_by(PurchaseOrder.id.desc())
     )
+    if not is_sa:
+        query = query.where(Project.company_id == current_user.company_id)
 
     if project_id is not None:
         query = query.where(PurchaseOrder.project_id == project_id)
@@ -1778,24 +1748,15 @@ async def update_po(
     current_user: User = Depends(require_permission("purchase_orders.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    _po = await db.get(PurchaseOrder, id)
-    if not _po or _po.is_deleted:
+    obj = await db.get(PurchaseOrder, id)
+    if not obj or obj.is_deleted:
         raise NotFoundError("PO not found")
     try:
         await assert_project_access(
-            db, project_id=_po.project_id, current_user=current_user
+            db, project_id=obj.project_id, current_user=current_user
         )
     except Exception:
         raise NotFoundError("PO not found")
-    obj = await db.get(PurchaseOrder, id)
-
-    if not obj or obj.is_deleted:
-        raise HTTPException(404, "PO not found")
-
-    if current_user.role != UserRole.ADMIN.value and obj.project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(403, "Access denied")
 
     if obj.status in ["PENDING", "APPROVED"]:
         raise HTTPException(
@@ -1844,24 +1805,15 @@ async def delete_po(
     current_user: User = Depends(require_permission("purchase_orders.delete")),
 ):
 
-    _po = await db.get(PurchaseOrder, id)
-    if not _po or _po.is_deleted:
+    obj = await db.get(PurchaseOrder, id)
+    if not obj or obj.is_deleted:
         raise NotFoundError("PO not found")
     try:
         await assert_project_access(
-            db, project_id=_po.project_id, current_user=current_user
+            db, project_id=obj.project_id, current_user=current_user
         )
     except Exception:
         raise NotFoundError("PO not found")
-    obj = await db.get(PurchaseOrder, id)
-
-    if not obj or obj.is_deleted:
-        raise HTTPException(status_code=404, detail="PO not found")
-
-    if current_user.role != UserRole.ADMIN.value and obj.project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(status_code=403, detail="Access denied")
 
     if obj.status in ["PENDING", "APPROVED"]:
         raise HTTPException(
@@ -1897,10 +1849,6 @@ async def project_transactions(
     await assert_project_access(db, project_id=project_id, current_user=current_user)
     limit = min(max(limit, 1), 100)
     offset = max(offset, 0)
-    if current_user.role != UserRole.ADMIN.value and project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(403, "Access denied")
 
     project = await db.get(Project, project_id)
     if not project:
@@ -1961,11 +1909,6 @@ async def get_material_transactions(
     material = await db.get(Material, material_id)
     if not material or material.is_deleted:
         raise HTTPException(404, "Material not found")
-
-    if current_user.role != UserRole.ADMIN.value and material.project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(403, "Access denied")
 
     result = await db.execute(
         select(
@@ -2050,15 +1993,6 @@ async def create_transfer(
             raise HTTPException(
                 status_code=400,
                 detail="Source and destination project cannot be same",
-            )
-
-        if current_user.role != UserRole.ADMIN.value and (
-            payload.from_project_id not in (current_user.allowed_projects or [])
-            or payload.to_project_id not in (current_user.allowed_projects or [])
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied",
             )
 
         from_project = await db.get(Project, payload.from_project_id)
@@ -2171,13 +2105,6 @@ async def list_transfers(
     skip = max(skip, 0)
     limit = min(max(limit, 1), 100)
 
-    if (
-        project_id is not None
-        and current_user.role != UserRole.ADMIN.value
-        and (project_id not in (current_user.allowed_projects or []))
-    ):
-        raise HTTPException(403, "Access denied")
-
     FromProject = aliased(Project)
     ToProject = aliased(Project)
 
@@ -2281,12 +2208,6 @@ async def get_transfer(
     except Exception:
         raise NotFoundError("Transfer not found")
 
-    if current_user.role != UserRole.ADMIN.value and (
-        _tr.from_project_id not in (current_user.allowed_projects or [])
-        and _tr.to_project_id not in (current_user.allowed_projects or [])
-    ):
-        raise HTTPException(403, "Access denied")
-
     material = await db.get(Material, _tr.material_id)
     if not material:
         raise HTTPException(status_code=404, detail="Material not found")
@@ -2364,12 +2285,6 @@ async def update_transfer_status(
             )
         except Exception:
             raise NotFoundError("Transfer not found")
-
-        if current_user.role != UserRole.ADMIN.value and (
-            obj.from_project_id not in (current_user.allowed_projects or [])
-            and obj.to_project_id not in (current_user.allowed_projects or [])
-        ):
-            raise HTTPException(403, "Access denied")
 
         if obj.status == "COMPLETED":
             raise HTTPException(
@@ -3537,8 +3452,9 @@ async def get_all_inventory(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("inventory.view")),
 ):
-    if current_user.company_id is None:
-        return []
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
 
     query = (
         select(
@@ -3555,9 +3471,10 @@ async def get_all_inventory(
         .join(Project, Project.id == Material.project_id)
         .where(
             Material.is_deleted == False,
-            Project.company_id == current_user.company_id,
         )
     )
+    if not is_sa:
+        query = query.where(Project.company_id == current_user.company_id)
 
     result = await db.execute(query)
 
@@ -3614,11 +3531,9 @@ async def get_inventory_valuation(
         except Exception:
             raise NotFoundError("Project not found")
 
-    if current_user.company_id is None:
-        return {
-            "project_id": project_id,
-            "total_value": 0.0,
-        }
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
 
     query = (
         select(
@@ -3629,9 +3544,11 @@ async def get_inventory_valuation(
         .join(Project, Project.id == Material.project_id)
         .where(
             Material.is_deleted == False,
-            Project.company_id == current_user.company_id,
         )
     )
+
+    if not is_sa:
+        query = query.where(Project.company_id == current_user.company_id)
 
     if project_id is not None:
         query = query.where(Material.project_id == project_id)
@@ -3727,6 +3644,7 @@ async def logs(
     current_user: User = Depends(require_permission("materials.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     if project_id:
         try:
             await assert_project_access(
@@ -3734,16 +3652,9 @@ async def logs(
             )
         except Exception:
             raise NotFoundError("Project not found")
-    else:
+    elif not is_sa:
         raise PermissionDeniedError("Global query without project_id not permitted")
     limit = min(max(limit, 1), 100)
-
-    if (
-        project_id is not None
-        and current_user.role != UserRole.ADMIN.value
-        and (project_id not in (current_user.allowed_projects or []))
-    ):
-        raise HTTPException(403, "Access denied")
 
     query = (
         select(
@@ -3761,10 +3672,6 @@ async def logs(
 
     if project_id is not None:
         query = query.where(MaterialTransaction.project_id == project_id)
-    elif current_user.role != UserRole.ADMIN.value:
-        query = query.where(
-            MaterialTransaction.project_id.in_(current_user.allowed_projects or [])
-        )
 
     if type is not None:
         query = query.where(MaterialTransaction.type == type.value)
@@ -3841,11 +3748,6 @@ async def material_report(
         raise PermissionDeniedError("Global query without project_id not permitted")
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
-
-    if current_user.role != UserRole.ADMIN.value and project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(403, "Access denied")
 
     query = (
         select(Material)
@@ -4606,11 +4508,6 @@ async def export_pdf(
     else:
         raise PermissionDeniedError("Global query without project_id not permitted")
     try:
-        if current_user.role != UserRole.ADMIN.value and project_id not in (
-            current_user.allowed_projects or []
-        ):
-            raise HTTPException(403, "Access denied")
-
         query = (
             select(Material, Supplier.supplier_name, Unit.name)
             .join(Supplier, Supplier.id == Material.supplier_id, isouter=True)
@@ -4679,11 +4576,6 @@ async def export_excel(
     else:
         raise PermissionDeniedError("Global query without project_id not permitted")
     try:
-        if current_user.role != UserRole.ADMIN.value and project_id not in (
-            current_user.allowed_projects or []
-        ):
-            raise HTTPException(403, "Access denied")
-
         project = await db.get(Project, project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
@@ -4826,11 +4718,6 @@ async def create_material(
             status_code=404,
             detail="Project not found",
         )
-
-    if current_user.role != UserRole.ADMIN.value and payload.project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(403, "Access denied")
 
     # ================= SUPPLIER VALIDATION =================
 
@@ -5081,8 +4968,9 @@ async def list_materials(
         except Exception:
             raise NotFoundError("Project not found")
 
-    if current_user.company_id is None:
-        return []
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
 
     query = (
         select(
@@ -5101,9 +4989,11 @@ async def list_materials(
         .join(Project, Project.id == Material.project_id)
         .where(
             Material.is_deleted == False,
-            Project.company_id == current_user.company_id,
         )
     )
+
+    if not is_sa:
+        query = query.where(Project.company_id == current_user.company_id)
 
     if project_id is not None:
         query = query.where(
@@ -5138,12 +5028,6 @@ async def download_procurement_report_pdf(
     db: AsyncSession = Depends(get_db_session),
 ):
     await assert_project_access(db, project_id=project_id, current_user=current_user)
-    if (
-        current_user.role != UserRole.ADMIN.value
-        and current_user.allowed_projects
-        and project_id not in current_user.allowed_projects
-    ):
-        raise HTTPException(status_code=403, detail="Access denied")
 
     project = await db.scalar(select(Project).where(Project.id == project_id))
     if not project:
@@ -5296,14 +5180,6 @@ async def get_material(
 
     obj, supplier_name = row
 
-    if current_user.role != UserRole.ADMIN.value and obj.project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied",
-        )
-
     return build_material_response(
         obj,
         supplier_name=supplier_name,
@@ -5344,21 +5220,6 @@ async def update_material(
         raise HTTPException(
             status_code=404,
             detail="Material not found",
-        )
-
-    # =====================================================
-    # PROJECT ACCESS VALIDATION
-    # =====================================================
-
-    if (
-        hasattr(current_user, "allowed_projects")
-        and current_user.role != UserRole.ADMIN.value
-        and current_user.allowed_projects
-        and obj.project_id not in current_user.allowed_projects
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied",
         )
 
     update_data = payload.model_dump(exclude_unset=True)
@@ -5608,14 +5469,6 @@ async def delete_material(
         raise HTTPException(
             status_code=404,
             detail="Material not found",
-        )
-
-    if current_user.role != UserRole.ADMIN.value and obj.project_id not in (
-        current_user.allowed_projects or []
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied",
         )
 
     try:

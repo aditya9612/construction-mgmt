@@ -33,7 +33,7 @@ from app.schemas.chat import (
     SendMessage,
 )
 from app.models.user import User
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_current_active_user, require_permission
 import json
 from pathlib import Path
 from PIL import Image
@@ -68,32 +68,69 @@ DOCUMENT_TYPES = {
 ALLOWED_TYPES = IMAGE_TYPES | VIDEO_TYPES | DOCUMENT_TYPES
 
 
-async def validate_membership(chat_id: int, user_id: int, db: AsyncSession):
+def _require_tenant_context(current_user: User) -> None:
+    if getattr(current_user, "is_super_admin", False) is True:
+        return
+    if current_user.company_id is None:
+        raise HTTPException(403, "Tenant context required")
+
+
+async def validate_membership(chat_id: int, user_or_id: User | int, db: AsyncSession):
+    user_id = user_or_id.id if isinstance(user_or_id, User) else user_or_id
+    is_sa = getattr(user_or_id, "is_super_admin", False) is True if isinstance(user_or_id, User) else False
+
+    chat = await db.get(ChatSession, chat_id)
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+
     result = await db.execute(
         select(ChatMember).where(
-            ChatMember.chat_id == chat_id, ChatMember.user_id == user_id
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == user_id,
+            ChatMember.is_deleted == False,
         )
     )
-    if not result.scalar():
-        raise HTTPException(403, "Not a member of this chat")
+    member = result.scalar()
+
+    if not member:
+        if is_sa:
+            return None
+        raise HTTPException(404, "Chat not found")
+    return member
 
 
-async def validate_admin(chat_id: int, user_id: int, db: AsyncSession):
+async def validate_admin(chat_id: int, user_or_id: User | int, db: AsyncSession, current_user: User | None = None):
+    user_id = user_or_id.id if isinstance(user_or_id, User) else user_or_id
+    is_sa = False
+    if isinstance(user_or_id, User):
+        is_sa = getattr(user_or_id, "is_super_admin", False) is True
+    elif current_user:
+        is_sa = getattr(current_user, "is_super_admin", False) is True
+
+    if is_sa:
+        return None
+
     result = await db.execute(
         select(ChatMember).where(
-            ChatMember.chat_id == chat_id, ChatMember.user_id == user_id
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id == user_id,
+            ChatMember.is_deleted == False,
         )
     )
     member = result.scalar()
 
     if not member or member.role != MemberRole.ADMIN:
         raise HTTPException(403, "Admin access required")
+    return member
 
 
-async def validate_group(chat_id: int, db: AsyncSession):
+async def validate_group(chat_id: int, db: AsyncSession, current_user: User | None = None):
     chat = await db.get(ChatSession, chat_id)
 
-    if not chat or chat.type != ChatType.GROUP:
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+
+    if chat.type != ChatType.GROUP:
         raise HTTPException(400, "Group chat required")
 
     return chat
@@ -105,7 +142,7 @@ router = APIRouter(prefix="/chats", tags=["Chat"])
 @router.post("/private/{user_id}")
 async def create_private_chat(
     user_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.create')),
     db: AsyncSession = Depends(get_db_session),
 ):
     # check if chat already exists (FIXED)
@@ -121,14 +158,19 @@ async def create_private_chat(
     #     )
     # )
 
+    _require_tenant_context(current_user)
     if user_id == current_user.id:
         raise HTTPException(400, "Cannot create chat with yourself")
 
     # CHECK TARGET USER EXISTS
     target = await db.get(User, user_id)
 
-    if not target:
+    if not target or target.is_deleted or not target.is_active:
         raise HTTPException(404, "User not found")
+
+    if getattr(current_user, "is_super_admin", False) is not True:
+        if target.company_id != current_user.company_id:
+            raise HTTPException(404, "User not found")
 
     existing = await db.execute(
         select(ChatSession)
@@ -169,10 +211,11 @@ async def send_message(
     request: Request,
     chat_id: int,
     payload: SendMessage,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.create')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
 
     #  2. VALIDATE PARENT MESSAGE CHAT
@@ -329,7 +372,7 @@ async def send_message(
 @router.post("/chat")
 async def upload_chat_file(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.create')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
@@ -337,6 +380,7 @@ async def upload_chat_file(
     # MIME VALIDATION
     # =========================
 
+    _require_tenant_context(current_user)
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(400, "Invalid file type")
 
@@ -504,10 +548,11 @@ async def upload_chat_file(
 async def mark_delivered(
     request: Request,
     message_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     msg = await db.get(ChatMessage, message_id)
 
     if not msg:
@@ -572,10 +617,11 @@ async def get_messages(
     chat_id: int,
     limit: int = 20,
     cursor: int | None = None,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     if limit > 100:
         limit = 100
 
@@ -833,10 +879,11 @@ async def get_messages(
 @router.get("/messages/{message_id}/replies", response_model=list[ReplyOut])
 async def get_replies(
     message_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
     # check parent exists
+    _require_tenant_context(current_user)
     parent = await db.get(ChatMessage, message_id)
 
     if not parent:
@@ -885,10 +932,11 @@ async def get_replies(
 
 @router.get("/pinned", response_model=list[ChatListEnhancedOut])
 async def get_pinned_chats(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     result = await db.execute(
         select(
             ChatSession,
@@ -973,9 +1021,10 @@ async def get_pinned_chats(
 @router.get("/{chat_id}/unread")
 async def unread_count(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
 
     count = await db.scalar(
@@ -1000,10 +1049,11 @@ async def unread_count(
 @router.get("/messages/{message_id}/reads", response_model=list[MessageReadUserOut])
 async def get_message_reads(
     message_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     msg = await db.get(ChatMessage, message_id)
 
     if not msg:
@@ -1039,10 +1089,11 @@ async def get_message_reads(
 @router.post("/group")
 async def create_group(
     payload: CreateGroup,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.create')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     member_ids = payload.member_ids
     name = payload.name
 
@@ -1050,7 +1101,14 @@ async def create_group(
         member_ids.append(current_user.id)
 
     # VALIDATE USERS EXIST
-    users = await db.execute(select(User.id).where(User.id.in_(member_ids)))
+    group_query = select(User.id).where(
+        User.id.in_(member_ids),
+        User.is_deleted == False,
+        User.is_active == True,
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        group_query = group_query.where(User.company_id == current_user.company_id)
+    users = await db.execute(group_query)
 
     valid_ids = set(users.scalars().all())
 
@@ -1080,10 +1138,11 @@ async def get_chat_users(
     search: str | None = None,
     role: str | None = None,
     limit: int = 50,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     if limit > 100:
         limit = 100
 
@@ -1092,6 +1151,8 @@ async def get_chat_users(
         User.is_active == True,
         User.id != current_user.id,
     )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(User.company_id == current_user.company_id)
 
     if search:
         like = f"%{search.strip()}%"
@@ -1158,10 +1219,11 @@ async def get_chat_users(
 async def search_chat_users(
     q: str,
     limit: int = 20,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     if limit > 100:
         limit = 100
 
@@ -1172,18 +1234,21 @@ async def search_chat_users(
 
     like = f"%{q}%"
 
+    search_query = select(User).where(
+        User.is_deleted == False,
+        User.is_active == True,
+        User.id != current_user.id,
+        or_(
+            User.full_name.ilike(like),
+            User.mobile.ilike(like),
+            User.email.ilike(like),
+        ),
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        search_query = search_query.where(User.company_id == current_user.company_id)
+
     result = await db.execute(
-        select(User)
-        .where(
-            User.is_deleted == False,
-            User.is_active == True,
-            User.id != current_user.id,
-            or_(
-                User.full_name.ilike(like),
-                User.mobile.ilike(like),
-                User.email.ilike(like),
-            ),
-        )
+        search_query
         .order_by(User.full_name.asc())
         .limit(limit)
     )
@@ -1203,10 +1268,11 @@ async def search_chat_users(
 
 @router.get("/enhanced", response_model=list[ChatListEnhancedOut])
 async def get_enhanced_chat_list(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     unread_subquery = (
         select(
             ChatMessage.chat_id.label("chat_id"),
@@ -1322,10 +1388,11 @@ async def get_enhanced_chat_list(
 @router.delete("/{chat_id}")
 async def delete_chat(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.delete')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     result = await db.execute(
         select(ChatMember).where(
             ChatMember.chat_id == chat_id,
@@ -1350,10 +1417,11 @@ async def delete_chat(
 @router.post("/{chat_id}/restore")
 async def restore_chat(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     result = await db.execute(
         select(ChatMember).where(
             ChatMember.chat_id == chat_id,
@@ -1378,10 +1446,11 @@ async def restore_chat(
 async def add_multiple_members(
     chat_id: int,
     payload: ChatMemberAddPayload,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
 
     await validate_admin(chat_id, current_user.id, db)
@@ -1391,13 +1460,14 @@ async def add_multiple_members(
     if not member_ids:
         raise HTTPException(400, "member_ids required")
 
-    users = await db.execute(
-        select(User.id).where(
-            User.id.in_(member_ids),
-            User.is_deleted == False,
-            User.is_active == True,
-        )
+    bulk_query = select(User.id).where(
+        User.id.in_(member_ids),
+        User.is_deleted == False,
+        User.is_active == True,
     )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        bulk_query = bulk_query.where(User.company_id == current_user.company_id)
+    users = await db.execute(bulk_query)
 
     valid_user_ids = set(users.scalars().all())
 
@@ -1445,10 +1515,11 @@ async def add_multiple_members(
 async def remove_multiple_members(
     chat_id: int,
     payload: ChatMemberAddPayload,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
 
     await validate_admin(chat_id, current_user.id, db)
@@ -1479,10 +1550,11 @@ async def remove_multiple_members(
 @router.get("/messages/mentions", response_model=list[MentionMessageOut])
 async def get_mentions(
     limit: int = 50,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     if limit > 100:
         limit = 100
 
@@ -1540,10 +1612,11 @@ async def mention_users(
     chat_id: int,
     q: str = "",
     limit: int = 20,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     if limit > 100:
         limit = 100
 
@@ -1591,17 +1664,22 @@ async def mention_users(
 async def add_member(
     chat_id: int,
     user_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
 
     await validate_admin(chat_id, current_user.id, db)
 
     target = await db.get(User, user_id)
 
-    if not target:
+    if not target or target.is_deleted or not target.is_active:
         raise HTTPException(404, "User not found")
+
+    if getattr(current_user, "is_super_admin", False) is not True:
+        if target.company_id != current_user.company_id:
+            raise HTTPException(404, "User not found")
 
     existing = await db.execute(
         select(ChatMember).where(
@@ -1621,10 +1699,11 @@ async def add_member(
 async def remove_member(
     chat_id: int,
     user_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
     #  only admin can remove
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
 
     chat = await db.get(ChatSession, chat_id)
@@ -1671,9 +1750,10 @@ async def remove_member(
 @router.get("/group/{chat_id}/members")
 async def group_members(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
 
     await validate_membership(chat_id, current_user.id, db)
@@ -1710,9 +1790,10 @@ async def update_group(
     chat_id: int,
     name: str | None = None,
     avatar_url: str | None = None,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
 
     await validate_admin(chat_id, current_user.id, db)
@@ -1736,9 +1817,10 @@ async def update_group(
 @router.get("/{chat_id}", response_model=ChatInfoOut)
 async def get_chat_info(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
 
     chat = await db.get(ChatSession, chat_id)
@@ -1783,9 +1865,10 @@ async def get_chat_info(
 async def mute_chat(
     chat_id: int,
     muted: bool,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     member = await db.execute(
         select(ChatMember).where(
             ChatMember.chat_id == chat_id, ChatMember.user_id == current_user.id
@@ -1808,9 +1891,10 @@ async def mute_chat(
 async def archive_chat(
     chat_id: int,
     archived: bool,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     member = await db.execute(
         select(ChatMember).where(
             ChatMember.chat_id == chat_id, ChatMember.user_id == current_user.id
@@ -1834,9 +1918,10 @@ async def typing(
     request: Request,
     chat_id: int,
     is_typing: bool,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.create')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
     redis = getattr(request.app.state, "redis", None)
 
@@ -1861,9 +1946,10 @@ async def typing(
 async def typing_users(
     chat_id: int,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
 
     redis = getattr(request.app.state, "redis", None)
@@ -1905,10 +1991,11 @@ async def typing_users(
 
 @router.get("/", response_model=list[ChatListOut])
 async def get_chat_list(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     unread_subquery = (
         select(
             ChatMessage.chat_id.label("chat_id"),
@@ -1977,10 +2064,11 @@ async def get_chat_list(
 async def kick_member(
     chat_id: int,
     user_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
 
     chat = await db.get(ChatSession, chat_id)
@@ -2022,10 +2110,11 @@ async def kick_member(
 @router.post("/group/{chat_id}/leave")
 async def leave_group(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
     obj = await db.execute(
         select(ChatMember).where(
@@ -2084,9 +2173,10 @@ async def leave_group(
 async def transfer_admin(
     chat_id: int,
     new_admin_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_group(chat_id, db)
     #  ensure current user is admin
     await validate_admin(chat_id, current_user.id, db)
@@ -2132,10 +2222,11 @@ async def react_message(
     message_id: int,
     reaction: str,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.create')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     msg = await db.get(ChatMessage, message_id)
 
     if not msg:
@@ -2193,13 +2284,16 @@ async def edit_message(
     request: Request,  #  ADD THIS
     message_id: int,
     new_text: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     msg = await db.get(ChatMessage, message_id)
 
     if not msg:
         raise HTTPException(404, "ChatMessage not found")
+
+    await validate_membership(msg.chat_id, current_user, db)
 
     if msg.sender_id != current_user.id:
         raise HTTPException(403, "Not allowed")
@@ -2236,9 +2330,10 @@ async def edit_message(
 async def delete_message(
     request: Request,  #  ADD THIS
     message_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.delete')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     msg = await db.get(ChatMessage, message_id)
 
     if not msg:
@@ -2273,7 +2368,20 @@ async def delete_message(
 
 
 @router.get("/users/{user_id}/status")
-async def user_status(user_id: int, request: Request):
+async def user_status(
+    user_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("chat.view")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    _require_tenant_context(current_user)
+
+    target = await db.get(User, user_id)
+    if not target or target.is_deleted or not target.is_active:
+        raise HTTPException(404, "User not found")
+    if getattr(current_user, "is_super_admin", False) is not True:
+        if target.company_id != current_user.company_id:
+            raise HTTPException(404, "User not found")
     redis = getattr(request.app.state, "redis", None)
 
     if not redis:
@@ -2292,9 +2400,10 @@ async def user_status(user_id: int, request: Request):
 async def search_messages(
     chat_id: int,
     query: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
 
     Parent = aliased(ChatMessage)
@@ -2389,10 +2498,11 @@ async def search_messages(
 @router.post("/messages/{message_id}/pin")
 async def pin_message(
     message_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     msg = await db.get(ChatMessage, message_id)
 
     if not msg:
@@ -2435,9 +2545,10 @@ async def pin_message(
 @router.get("/{chat_id}/pinned", response_model=list[MessageOut])
 async def pinned_messages(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
 
     result = await db.execute(
@@ -2490,10 +2601,11 @@ async def pinned_messages(
 @router.post("/messages/{message_id}/unpin")
 async def unpin_message(
     message_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     msg = await db.get(ChatMessage, message_id)
 
     if not msg:
@@ -2524,10 +2636,11 @@ async def unpin_message(
 @router.post("/{chat_id}/pin")
 async def pin_chat(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     result = await db.execute(
         select(ChatMember).where(
             ChatMember.chat_id == chat_id,
@@ -2551,10 +2664,11 @@ async def pin_chat(
 @router.post("/{chat_id}/unpin")
 async def unpin_chat(
     chat_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.edit')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     result = await db.execute(
         select(ChatMember).where(
             ChatMember.chat_id == chat_id,
@@ -2580,11 +2694,12 @@ async def forward_message(
     message_id: int,
     target_chat_id: int,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.create')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
     # original message
+    _require_tenant_context(current_user)
     result = await db.execute(
         select(ChatMessage)
         .options(selectinload(ChatMessage.attachments))
@@ -2597,10 +2712,10 @@ async def forward_message(
         raise HTTPException(404, "Original message not found")
 
     # must belong to source chat
-    await validate_membership(original.chat_id, current_user.id, db)
+    await validate_membership(original.chat_id, current_user, db)
 
     # must belong to target chat
-    await validate_membership(target_chat_id, current_user.id, db)
+    await validate_membership(target_chat_id, current_user, db)
 
     # cannot forward deleted message
     if original.is_deleted:
@@ -2686,10 +2801,11 @@ async def forward_message(
 async def active_users(
     chat_id: int,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
 
     redis = getattr(request.app.state, "redis", None)
@@ -2706,10 +2822,11 @@ async def active_users(
 async def get_user_states(
     chat_id: int,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission('chat.view')),
     db: AsyncSession = Depends(get_db_session),
 ):
 
+    _require_tenant_context(current_user)
     await validate_membership(chat_id, current_user.id, db)
 
     redis = getattr(request.app.state, "redis", None)

@@ -191,6 +191,9 @@ async def process_staff_salary(
     if not staff:
         raise HTTPException(status_code=404, detail="Staff user not found")
 
+    if staff.company_id is None:
+        raise HTTPException(status_code=400, detail="Staff user has no company assigned")
+
     if staff.role not in get_allowed_staff_roles():
         raise HTTPException(status_code=400, detail="Invalid staff user")
 

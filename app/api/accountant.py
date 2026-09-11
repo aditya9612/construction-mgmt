@@ -411,7 +411,10 @@ async def create_account(
         if "Duplicate" in str(e) or "UNIQUE" in str(e).upper() or "1062" in str(e):
             # Return existing account with same code
             existing = await db.scalar(
-                select(Account).where(Account.code == payload.code)
+                select(Account).where(
+                    Account.code == payload.code,
+                    Account.company_id == current_user.company_id,
+                )
             )
             if existing:
                 out = AccountOut.from_orm(existing)
@@ -2971,13 +2974,21 @@ async def create_tds_deduction(
                 vb_obj = await db.get(VendorBill, payload.vendor_bill_id)
                 if vb_obj and vb_obj.company_id:
                     target_company_id = vb_obj.company_id
-            tds_acc = await resolve_tax_accounts(db, 'tds_payable', company_id=target_company_id)
-            if not tds_acc:
-                raise HTTPException(status_code=400, detail="TDS payable account is not configured.")
-                
-            vendor_acc = await db.scalar(select(Account).where(Account.code == "VENDOR_PAYABLE"))
-            if not vendor_acc:
-                raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
+            if target_company_id is not None:
+                tds_acc = await resolve_tax_accounts(db, 'tds_payable', company_id=target_company_id)
+                if not tds_acc:
+                    raise HTTPException(status_code=400, detail="TDS payable account is not configured.")
+                vendor_acc = await db.scalar(
+                    select(Account).where(
+                        Account.code == "VENDOR_PAYABLE",
+                        Account.company_id == target_company_id,
+                    )
+                )
+                if not vendor_acc:
+                    raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
+            else:
+                tds_acc = None
+                vendor_acc = None
             
             if tds_acc and vendor_acc:
                 je = JournalEntry(

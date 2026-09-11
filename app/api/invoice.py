@@ -29,6 +29,7 @@ from app.core.logger import logger
 from app.db.session import get_db_session
 from app.models.accountant import JournalEntry, JournalLine, Account
 from app.models.billing import RABill
+from app.models.company import Company
 from app.models.expense import Expense
 from app.models.final_measurement import FinalMeasurement
 from app.models.invoice import Invoice, Transaction
@@ -37,7 +38,7 @@ from app.models.notification import Notification
 from app.models.owner import Owner, OwnerTransaction
 from app.models.project import Project, ProjectMember, Task
 from app.models.quotation import QuotationMaster, QuotationStatus
-from app.models.user import User, ActivityLog, UserAttendance, UserRole
+from app.models.user import User, ActivityLog, UserAttendance
 import app.schemas.invoice as s
 from app.schemas.invoice import (
     AnalyticsSummaryOut,
@@ -58,32 +59,10 @@ from app.utils.accounting import (
     get_accounts_receivable,
     get_primary_cash_account,
     get_revenue_account,
+    resolve_tax_accounts,
 )
 from app.utils.common import assert_project_access, create_system_alert
 from app.utils.helpers import InvalidStateError, NotFoundError, PermissionDeniedError, ValidationError
-
-# Legacy role definitions kept for backward compatibility; active route decisions use DB-driven permissions.
-INVOICE_READ_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.ACCOUNTANT,
-        UserRole.SITE_ENGINEER,
-        UserRole.CLIENT,
-    ]
-]
-
-INVOICE_WRITE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.ACCOUNTANT,
-    ]
-]
-
-PAYMENT_ROLES = INVOICE_WRITE_ROLES + [UserRole.CLIENT.value]
 
 router = APIRouter(prefix="/invoices", tags=["invoices"])
 
@@ -92,22 +71,57 @@ def _is_super_admin(user: User) -> bool:
     return getattr(user, "is_super_admin", False) is True
 
 
+def _check_tenant_access(current_user: User) -> None:
+    if not _is_super_admin(current_user):
+        if getattr(current_user, "company_id", None) is None:
+            raise PermissionDeniedError("Company access required")
+
+
+async def _resolve_scope_company_id(
+    db: AsyncSession,
+    current_user: User,
+    company_id_query: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve effective company_id for listing / summary queries.
+
+    - Super Admin with company_id_query: validates Company exists; if not found, raises 404.
+    - Super Admin without company_id_query: returns None (unfiltered global scope).
+    - Non-Super Admin: always returns current_user.company_id (company_id_query ignored).
+    """
+    _check_tenant_access(current_user)
+    if _is_super_admin(current_user):
+        if company_id_query is not None:
+            comp = await db.get(Company, company_id_query)
+            if not comp:
+                raise NotFoundError("Company not found")
+            return company_id_query
+        return None
+    return current_user.company_id
+
+
 async def _get_invoice_or_404(
     db: AsyncSession,
     *,
     invoice_id: int,
     current_user: User,
+    for_update: bool = False,
 ) -> tuple[Invoice, Project]:
     """Resolve Invoice -> Project -> Company ownership chain and verify access.
 
     Masks foreign/nonexistent/inaccessible invoices as 404 Not Found.
     """
-    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id))
+    _check_tenant_access(current_user)
+    is_super = _is_super_admin(current_user)
+
+    stmt = select(Invoice).where(Invoice.id == invoice_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+
+    invoice = await db.scalar(stmt)
     if not invoice:
         raise NotFoundError("Invoice not found")
 
-    is_super = _is_super_admin(current_user)
-    if not is_super and current_user.company_id is not None:
+    if not is_super:
         if invoice.company_id is not None and invoice.company_id != current_user.company_id:
             raise NotFoundError("Invoice not found")
 
@@ -118,10 +132,71 @@ async def _get_invoice_or_404(
     except (NotFoundError, PermissionDeniedError):
         raise NotFoundError("Invoice not found")
 
-    if not is_super and current_user.company_id is not None and project.company_id != current_user.company_id:
+    if not is_super and project.company_id != current_user.company_id:
         raise NotFoundError("Invoice not found")
 
     return invoice, project
+
+
+async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
+    je = JournalEntry(
+        entry_type="Invoice",
+        journal_number=f"J-INV-{invoice.id}",
+        entry_date=date.today(),
+        description=invoice.description or f"Invoice {invoice.id} posted",
+        status="Posted",
+    )
+    db.add(je)
+    await db.flush()
+
+    target_company_id = invoice.company_id
+    if target_company_id is None and invoice.project_id:
+        proj = await db.get(Project, invoice.project_id)
+        if proj:
+            target_company_id = proj.company_id
+
+    try:
+        ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
+        rev_acc = await get_revenue_account(db, company_id=target_company_id)
+    except (ValueError, Exception):
+        # AR or Revenue account not configured — skip journal lines
+        return
+
+    # DR AR
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=ar_acc.id,
+            debit=invoice.total_amount,
+            credit=Decimal(0),
+        )
+    )
+
+    # CR Revenue
+    revenue_amount = invoice.amount
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=rev_acc.id,
+            debit=Decimal(0),
+            credit=revenue_amount,
+        )
+    )
+
+    # CR GST Payable if any
+    if invoice.gst_amount > 0 and target_company_id is not None:
+        try:
+            gst_acc = await resolve_tax_accounts(db, "output_gst", company_id=target_company_id)
+            db.add(
+                JournalLine(
+                    entry_id=je.id,
+                    account_id=gst_acc.id,
+                    debit=Decimal(0),
+                    credit=invoice.gst_amount,
+                )
+            )
+        except (ValueError, Exception):
+            pass
 
 
 # ------------------ 1. CREATE MANUAL INVOICE ------------------
@@ -134,6 +209,8 @@ async def create_invoice(
     current_user: User = Depends(require_permission("invoices.create")),
 ):
     """Create a new manual invoice."""
+    _check_tenant_access(current_user)
+
     # Validate Project with tenant/project access masking
     project = await assert_project_access_masked(
         db, project_id=payload.project_id, current_user=current_user
@@ -149,7 +226,7 @@ async def create_invoice(
         .join(User, User.id == ProjectMember.user_id)
         .where(
             ProjectMember.project_id == payload.project_id,
-            User.role == UserRole.CLIENT.value,
+            func.lower(User.role) == "client",
             User.is_active == True,
             User.is_deleted == False,
         )
@@ -214,6 +291,8 @@ async def create_invoice(
         db.add(invoice)
         await db.flush()
 
+        await _post_invoice_journal(db, invoice)
+
         owner_txn = OwnerTransaction(
             owner_id=payload.owner_id,
             project_id=payload.project_id,
@@ -261,6 +340,8 @@ async def create_invoice_from_quotation(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.create")),
 ):
+    _check_tenant_access(current_user)
+
     # 1. Get quotation
     quotation = await db.get(QuotationMaster, quotation_id)
     if not quotation or not getattr(quotation, "project_id", None):
@@ -383,17 +464,16 @@ async def create_invoice_from_quotation(
 
 @router.get("", response_model=list[InvoiceOut])
 async def list_invoices(
+    company_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.view")),
 ):
-    is_super = _is_super_admin(current_user)
-    if is_super:
-        stmt = select(Invoice).where(Invoice.pending_amount > 0)
-    else:
-        stmt = select(Invoice).where(
-            Invoice.pending_amount > 0,
-            Invoice.company_id == current_user.company_id,
-        )
+    eff_comp_id = await _resolve_scope_company_id(db, current_user, company_id)
+
+    stmt = select(Invoice).where(Invoice.pending_amount > 0)
+    if eff_comp_id is not None:
+        stmt = stmt.where(Invoice.company_id == eff_comp_id)
+
     rows = (await db.execute(stmt)).scalars().all()
     return [InvoiceOut.model_validate(r) for r in rows]
 
@@ -408,6 +488,7 @@ async def get_by_date_range(
     current_user: User = Depends(require_permission("invoices.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _check_tenant_access(current_user)
     start_dt = datetime.combine(start, time.min)
     end_dt = datetime.combine(end, time.max)
 
@@ -455,15 +536,15 @@ async def update_invoice(
     for k, v in payload.model_dump(exclude_unset=True).items():
         setattr(obj, k, v)
 
-    amount = Decimal(obj.amount or 0)
-    gst_percent = Decimal(obj.gst_percent or 0)
-    tax_percent = Decimal(obj.tax_percent or 0)
+    amount = Decimal(str(obj.amount or 0))
+    gst_percent = Decimal(str(obj.gst_percent or 0))
+    tax_percent = Decimal(str(obj.tax_percent or 0))
 
-    obj.gst_amount = (amount * gst_percent) / 100
-    obj.tax_amount = (amount * tax_percent) / 100
-    obj.total_amount = amount + obj.gst_amount + obj.tax_amount
+    obj.gst_amount = (amount * gst_percent) / Decimal("100")
+    obj.tax_amount = (amount * tax_percent) / Decimal("100")
+    obj.total_amount = amount + obj.gst_amount - obj.tax_amount
 
-    obj.pending_amount = obj.total_amount - (obj.paid_amount or 0)
+    obj.pending_amount = obj.total_amount - Decimal(str(obj.paid_amount or 0))
 
     try:
         await db.commit()
@@ -492,6 +573,9 @@ async def delete_invoice(
 
     obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
 
+    if obj.status in (InvoiceStatus.PAID, InvoiceStatus.PARTIAL) or (obj.paid_amount and obj.paid_amount > 0):
+        raise ValidationError("Cannot delete an invoice that is paid, partially paid, or has recorded payments.")
+
     try:
         await db.delete(obj)
         await db.commit()
@@ -514,6 +598,7 @@ async def get_by_project(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.view")),
 ):
+    _check_tenant_access(current_user)
     await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
     is_super = _is_super_admin(current_user)
     stmt = select(Invoice).where(Invoice.project_id == project_id)
@@ -538,6 +623,7 @@ async def get_by_type(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.view")),
 ):
+    _check_tenant_access(current_user)
     is_super = _is_super_admin(current_user)
     stmt = select(Invoice).where(Invoice.type == type)
     if not is_super:
@@ -561,7 +647,9 @@ async def mark_paid(
     current_user: User = Depends(require_permission("invoices.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    invoice, project = await _get_invoice_or_404(
+        db, invoice_id=id, current_user=current_user, for_update=True
+    )
 
     if invoice.pending_amount <= 0:
         raise ValidationError("Already paid")
@@ -667,69 +755,6 @@ async def generate_invoice_pdf(
     )
 
 
-async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
-    je = JournalEntry(
-        entry_type="Invoice",
-        journal_number=f"J-INV-{invoice.id}",
-        entry_date=date.today(),
-        description=invoice.description or f"Invoice {invoice.id} posted",
-        status="Posted",
-    )
-    db.add(je)
-    await db.flush()
-
-    target_company_id = invoice.company_id
-    if target_company_id is None and invoice.project_id:
-        proj = await db.get(Project, invoice.project_id)
-        if proj:
-            target_company_id = proj.company_id
-
-    try:
-        ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
-        rev_acc = await get_revenue_account(db, company_id=target_company_id)
-    except (ValueError, Exception):
-        # AR or Revenue account not configured — skip journal lines
-        return
-
-    # DR AR
-    db.add(
-        JournalLine(
-            entry_id=je.id,
-            account_id=ar_acc.id,
-            debit=invoice.total_amount,
-            credit=Decimal(0),
-        )
-    )
-
-    # CR Revenue
-    revenue_amount = invoice.amount
-    db.add(
-        JournalLine(
-            entry_id=je.id,
-            account_id=rev_acc.id,
-            debit=Decimal(0),
-            credit=revenue_amount,
-        )
-    )
-
-    # CR GST Payable if any
-    if invoice.gst_amount > 0 and target_company_id is not None:
-        from app.utils.accounting import resolve_tax_accounts
-
-        try:
-            gst_acc = await resolve_tax_accounts(db, "output_gst", company_id=target_company_id)
-            db.add(
-                JournalLine(
-                    entry_id=je.id,
-                    account_id=gst_acc.id,
-                    debit=Decimal(0),
-                    credit=invoice.gst_amount,
-                )
-            )
-        except (ValueError, Exception):
-            pass
-
-
 # ------------------ 12. CREATE LABOUR INVOICE ------------------
 
 
@@ -739,6 +764,8 @@ async def create_labour_invoice(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.create")),
 ):
+    _check_tenant_access(current_user)
+
     # 0. Validate dates
     if payload.end_date < payload.start_date:
         raise ValidationError("end_date must be >= start_date")
@@ -752,6 +779,7 @@ async def create_labour_invoice(
         db, project_id=project_id, current_user=current_user
     )
 
+    comp_id = project.company_id or current_user.company_id
     description = f"Labour invoice ({start_date} to {end_date})"
 
     # 2. Prevent duplicate invoice for same range
@@ -760,7 +788,7 @@ async def create_labour_invoice(
             Invoice.project_id == project_id,
             Invoice.type == InvoiceType.LABOUR,
             Invoice.description == description,
-            Invoice.company_id == (project.company_id or current_user.company_id),
+            Invoice.company_id == comp_id,
         )
     )
     if existing_invoice:
@@ -782,13 +810,13 @@ async def create_labour_invoice(
         )
 
     # 4. Calculate total securely
-    total_amount = sum(Decimal(e.amount or 0) for e in expenses)
+    total_amount = sum(Decimal(str(e.amount or 0)) for e in expenses)
     expense_ids = [e.id for e in expenses]
 
     try:
         # 6. Create invoice
         obj = Invoice(
-            company_id=project.company_id or current_user.company_id,
+            company_id=comp_id,
             project_id=project_id,
             owner_id=project.owner_id,
             type=InvoiceType.LABOUR,
@@ -844,9 +872,13 @@ async def create_material_invoice(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.create")),
 ):
+    _check_tenant_access(current_user)
+
     project = await assert_project_access_masked(
         db, project_id=project_id, current_user=current_user
     )
+
+    comp_id = project.company_id or current_user.company_id
 
     result = await db.execute(
         select(Expense).where(
@@ -859,12 +891,32 @@ async def create_material_invoice(
     if not expenses:
         raise NotFoundError("No material expenses found")
 
-    total_amount = sum(Decimal(e.amount or 0) for e in expenses)
-    expense_ids = [e.id for e in expenses]
+    # Exclude material expenses that were already invoiced
+    existing_invoices = (
+        await db.execute(
+            select(Invoice).where(
+                Invoice.project_id == project_id,
+                Invoice.type == InvoiceType.MATERIAL,
+                Invoice.status != InvoiceStatus.CANCELLED,
+            )
+        )
+    ).scalars().all()
+
+    already_invoiced_ids = set()
+    for inv in existing_invoices:
+        if inv.linked_expense_ids:
+            already_invoiced_ids.update(inv.linked_expense_ids)
+
+    unbilled_expenses = [e for e in expenses if e.id not in already_invoiced_ids]
+    if not unbilled_expenses:
+        raise ValidationError("All material expenses have already been invoiced")
+
+    total_amount = sum(Decimal(str(e.amount or 0)) for e in unbilled_expenses)
+    expense_ids = [e.id for e in unbilled_expenses]
 
     try:
         obj = Invoice(
-            company_id=project.company_id or current_user.company_id,
+            company_id=comp_id,
             project_id=project_id,
             owner_id=project.owner_id,
             type=InvoiceType.MATERIAL,
@@ -919,6 +971,7 @@ async def create_invoice_from_measurement(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.create")),
 ):
+    _check_tenant_access(current_user)
     logger.info(f"Creating owner invoice from measurement_id={measurement_id}")
 
     # 1. Get measurement
@@ -945,7 +998,7 @@ async def create_invoice_from_measurement(
         raise ValidationError("Owner invoice already exists")
 
     try:
-        total_amount = Decimal(measurement.total_amount)
+        total_amount = Decimal(str(measurement.total_amount or 0))
 
         # 4. Create invoice
         obj = Invoice(
@@ -1008,6 +1061,7 @@ async def payment_summary(
     current_user: User = Depends(require_permission("invoices.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _check_tenant_access(current_user)
     await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
 
     is_super = _is_super_admin(current_user)
@@ -1035,6 +1089,7 @@ async def analytics_summary(
     current_user: User = Depends(require_permission("invoices.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _check_tenant_access(current_user)
     await assert_project_access_masked(db, project_id=project_id, current_user=current_user)
 
     is_super = _is_super_admin(current_user)
@@ -1098,7 +1153,9 @@ async def pay_invoice(
     current_user: User = Depends(require_permission("invoices.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    invoice, project = await _get_invoice_or_404(
+        db, invoice_id=id, current_user=current_user, for_update=True
+    )
 
     if amount <= 0:
         raise ValidationError("Invalid payment amount")
@@ -1138,6 +1195,7 @@ async def pay_invoice(
         entry_date=date.today(),
         description=f"Payment received for Invoice {invoice.id}",
         status="Posted",
+        created_by=current_user.id,
     )
     db.add(je)
     await db.flush()
@@ -1148,21 +1206,22 @@ async def pay_invoice(
         if proj:
             target_company_id = proj.company_id
 
-    try:
-        ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
-        cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
-        db.add(
-            JournalLine(
-                entry_id=je.id, account_id=cash_acc.id, debit=amount, credit=Decimal(0)
+    if target_company_id is not None:
+        try:
+            ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
+            cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
+            db.add(
+                JournalLine(
+                    entry_id=je.id, account_id=cash_acc.id, debit=amount, credit=Decimal(0)
+                )
             )
-        )
-        db.add(
-            JournalLine(
-                entry_id=je.id, account_id=ar_acc.id, debit=Decimal(0), credit=amount
+            db.add(
+                JournalLine(
+                    entry_id=je.id, account_id=ar_acc.id, debit=Decimal(0), credit=amount
+                )
             )
-        )
-    except (ValueError, Exception):
-        pass
+        except (ValueError, Exception):
+            pass
 
     await db.commit()
 
@@ -1193,57 +1252,31 @@ async def invoice_transactions(
 
 @router.get("/receivables/summary", response_model=ReceivablesSummaryOut)
 async def receivable_summary(
+    company_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.view")),
 ):
-    is_super = _is_super_admin(current_user)
+    eff_comp_id = await _resolve_scope_company_id(db, current_user, company_id)
 
-    if is_super:
-        inv_total = await db.scalar(select(func.sum(Invoice.total_amount))) or 0
-        inv_paid = await db.scalar(select(func.sum(Invoice.paid_amount))) or 0
-        inv_pending = await db.scalar(select(func.sum(Invoice.pending_amount))) or 0
-        rabill_total = (
-            await db.scalar(
-                select(func.sum(RABill.total_amount)).where(RABill.status == "Approved")
-            )
-            or 0
-        )
-    else:
-        inv_total = (
-            await db.scalar(
-                select(func.sum(Invoice.total_amount)).where(
-                    Invoice.company_id == current_user.company_id
-                )
-            )
-            or 0
-        )
-        inv_paid = (
-            await db.scalar(
-                select(func.sum(Invoice.paid_amount)).where(
-                    Invoice.company_id == current_user.company_id
-                )
-            )
-            or 0
-        )
-        inv_pending = (
-            await db.scalar(
-                select(func.sum(Invoice.pending_amount)).where(
-                    Invoice.company_id == current_user.company_id
-                )
-            )
-            or 0
-        )
-        rabill_total = (
-            await db.scalar(
-                select(func.sum(RABill.total_amount))
-                .join(Project, Project.id == RABill.project_id)
-                .where(
-                    RABill.status == "Approved",
-                    Project.company_id == current_user.company_id,
-                )
-            )
-            or 0
-        )
+    inv_total_stmt = select(func.sum(Invoice.total_amount))
+    inv_paid_stmt = select(func.sum(Invoice.paid_amount))
+    inv_pending_stmt = select(func.sum(Invoice.pending_amount))
+    rabill_stmt = (
+        select(func.sum(RABill.total_amount))
+        .join(Project, Project.id == RABill.project_id)
+        .where(RABill.status == "Approved")
+    )
+
+    if eff_comp_id is not None:
+        inv_total_stmt = inv_total_stmt.where(Invoice.company_id == eff_comp_id)
+        inv_paid_stmt = inv_paid_stmt.where(Invoice.company_id == eff_comp_id)
+        inv_pending_stmt = inv_pending_stmt.where(Invoice.company_id == eff_comp_id)
+        rabill_stmt = rabill_stmt.where(Project.company_id == eff_comp_id)
+
+    inv_total = (await db.scalar(inv_total_stmt)) or 0
+    inv_paid = (await db.scalar(inv_paid_stmt)) or 0
+    inv_pending = (await db.scalar(inv_pending_stmt)) or 0
+    rabill_total = (await db.scalar(rabill_stmt)) or 0
 
     rabill_paid = 0
     rabill_pending = rabill_total
@@ -1267,15 +1300,16 @@ async def receivable_summary(
 
 @router.get("/receivables/aging")
 async def receivable_aging(
+    company_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.view")),
 ):
-    today = date.today()
+    eff_comp_id = await _resolve_scope_company_id(db, current_user, company_id)
 
-    is_super = _is_super_admin(current_user)
+    today = date.today()
     stmt = select(Invoice).where(Invoice.pending_amount > 0)
-    if not is_super:
-        stmt = stmt.where(Invoice.company_id == current_user.company_id)
+    if eff_comp_id is not None:
+        stmt = stmt.where(Invoice.company_id == eff_comp_id)
 
     rows = (await db.execute(stmt)).scalars().all()
 
@@ -1308,16 +1342,21 @@ async def get_client_ledger(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.view")),
 ):
+    _check_tenant_access(current_user)
     owner = await db.get(Owner, client_id)
     if not owner:
         raise NotFoundError("Client not found")
 
     is_super = _is_super_admin(current_user)
-    if not is_super and current_user.company_id is not None and owner.company_id != current_user.company_id:
+    if not is_super and owner.company_id != current_user.company_id:
         raise NotFoundError("Client not found")
 
+    target_company_id = owner.company_id or current_user.company_id
+    if target_company_id is None:
+        raise PermissionDeniedError("Company access required")
+
     try:
-        ar_acc = await get_accounts_receivable(db)
+        ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
         ar_acc_id = ar_acc.id
     except (ValueError, Exception):
         return ClientLedgerResponse(
@@ -1334,8 +1373,11 @@ async def get_client_ledger(
     rows = result.all()
 
     inv_stmt = select(Invoice.id).where(Invoice.owner_id == client_id)
-    if not is_super and current_user.company_id is not None:
+    if not is_super:
         inv_stmt = inv_stmt.where(Invoice.company_id == current_user.company_id)
+    elif target_company_id is not None:
+        inv_stmt = inv_stmt.where(Invoice.company_id == target_company_id)
+
     invoices = (await db.execute(inv_stmt)).scalars().all()
     rabills: list[int] = []
 
@@ -1392,21 +1434,24 @@ async def get_client_ledger(
 
 @router.get("/receivables/collections", response_model=list[CollectionOut])
 async def get_collections(
+    company_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.view")),
 ):
-    is_super = _is_super_admin(current_user)
-    if is_super:
-        stmt = select(Transaction).where(Transaction.type == "receipt")
-    else:
+    eff_comp_id = await _resolve_scope_company_id(db, current_user, company_id)
+
+    if eff_comp_id is not None:
         stmt = (
             select(Transaction)
             .join(Project, Project.id == Transaction.project_id)
             .where(
                 Transaction.type == "receipt",
-                Project.company_id == current_user.company_id,
+                Project.company_id == eff_comp_id,
             )
         )
+    else:
+        stmt = select(Transaction).where(Transaction.type == "receipt")
+
     txns = (await db.execute(stmt)).scalars().all()
     res = []
     for t in txns:
@@ -1433,45 +1478,53 @@ async def create_manual_receivable(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.create")),
 ):
+    _check_tenant_access(current_user)
+
     owner = await db.get(Owner, payload.client_id)
     if not owner:
         raise NotFoundError("Client not found")
 
     is_super = _is_super_admin(current_user)
-    if not is_super and current_user.company_id is not None and owner.company_id != current_user.company_id:
+    if not is_super and owner.company_id != current_user.company_id:
         raise NotFoundError("Client not found")
+
+    target_company_id = owner.company_id or current_user.company_id
+    if target_company_id is None:
+        raise PermissionDeniedError("Company access required")
+
+    try:
+        ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
+        rev_acc = await get_revenue_account(db, company_id=target_company_id)
+    except (ValueError, Exception) as exc:
+        raise ValidationError(f"Accounting configuration missing: {exc}")
 
     je = JournalEntry(
         entry_type="Manual Receivable",
-        journal_number=f"J-MAN-REC-{payload.client_id}-{date.today().strftime('%Y%m%d')}",
+        journal_number=f"J-MAN-REC-{payload.client_id}-{date.today().strftime('%Y%m%d%H%M%S')}",
         entry_date=payload.due_date,
         description=payload.description,
         status="Posted",
+        created_by=current_user.id,
     )
     db.add(je)
     await db.flush()
 
-    try:
-        ar_acc = await get_accounts_receivable(db)
-        rev_acc = await get_revenue_account(db)
-        db.add(
-            JournalLine(
-                entry_id=je.id,
-                account_id=ar_acc.id,
-                debit=Decimal(str(payload.amount)),
-                credit=Decimal(0),
-            )
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=ar_acc.id,
+            debit=Decimal(str(payload.amount)),
+            credit=Decimal(0),
         )
-        db.add(
-            JournalLine(
-                entry_id=je.id,
-                account_id=rev_acc.id,
-                debit=Decimal(0),
-                credit=Decimal(str(payload.amount)),
-            )
+    )
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=rev_acc.id,
+            debit=Decimal(0),
+            credit=Decimal(str(payload.amount)),
         )
-    except (ValueError, Exception):
-        pass
+    )
 
     await db.commit()
     return {"message": "Manual receivable posted", "journal_id": je.id}
@@ -1484,17 +1537,48 @@ async def create_manual_receivable(
 async def import_receivables(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_permission("invoices.create")),
+    current_user: User = Depends(require_permission("invoices.upload")),
 ):
+    _check_tenant_access(current_user)
+
     content = await file.read()
     decoded = content.decode("utf-8")
     reader = csv.DictReader(io.StringIO(decoded))
 
     valid = 0
     errors = 0
+    is_super = _is_super_admin(current_user)
+    tenant_comp_id = current_user.company_id
+
     for row in reader:
-        if row:
+        if not row:
+            continue
+
+        is_row_valid = True
+
+        if row.get("project_id"):
+            try:
+                pid = int(row["project_id"])
+                proj = await db.get(Project, pid)
+                if not proj or (not is_super and proj.company_id != tenant_comp_id):
+                    is_row_valid = False
+            except (ValueError, TypeError):
+                is_row_valid = False
+
+        owner_ref = row.get("client_id") or row.get("owner_id")
+        if is_row_valid and owner_ref:
+            try:
+                oid = int(owner_ref)
+                owner = await db.get(Owner, oid)
+                if not owner or (not is_super and owner.company_id != tenant_comp_id):
+                    is_row_valid = False
+            except (ValueError, TypeError):
+                is_row_valid = False
+
+        if is_row_valid:
             valid += 1
+        else:
+            errors += 1
 
     return {
         "valid_records": valid,
@@ -1508,17 +1592,19 @@ async def import_receivables(
 
 @router.get("/receivables/export")
 async def export_receivables(
+    company_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.export")),
 ):
+    eff_comp_id = await _resolve_scope_company_id(db, current_user, company_id)
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["ID", "Amount"])
 
-    is_super = _is_super_admin(current_user)
     stmt = select(Invoice).where(Invoice.pending_amount > 0)
-    if not is_super:
-        stmt = stmt.where(Invoice.company_id == current_user.company_id)
+    if eff_comp_id is not None:
+        stmt = stmt.where(Invoice.company_id == eff_comp_id)
 
     invoices = (await db.execute(stmt)).scalars().all()
     for inv in invoices:
@@ -1537,25 +1623,28 @@ async def export_receivables(
 
 @router.get("/receivables/collections/export")
 async def export_collections(
+    company_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.export")),
 ):
+    eff_comp_id = await _resolve_scope_company_id(db, current_user, company_id)
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Invoice", "Amount Received"])
 
-    is_super = _is_super_admin(current_user)
-    if is_super:
-        stmt = select(Transaction).where(Transaction.type == "receipt")
-    else:
+    if eff_comp_id is not None:
         stmt = (
             select(Transaction)
             .join(Project, Project.id == Transaction.project_id)
             .where(
                 Transaction.type == "receipt",
-                Project.company_id == current_user.company_id,
+                Project.company_id == eff_comp_id,
             )
         )
+    else:
+        stmt = select(Transaction).where(Transaction.type == "receipt")
+
     txns = (await db.execute(stmt)).scalars().all()
     for t in txns:
         writer.writerow([f"INV-{t.invoice_id}" if t.invoice_id else "N/A", float(t.amount or 0)])
@@ -1577,20 +1666,26 @@ async def export_client_ledger(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.export")),
 ):
+    _check_tenant_access(current_user)
+
     owner = await db.get(Owner, client_id)
     if not owner:
         raise NotFoundError("Client not found")
 
     is_super = _is_super_admin(current_user)
-    if not is_super and current_user.company_id is not None and owner.company_id != current_user.company_id:
+    if not is_super and owner.company_id != current_user.company_id:
         raise NotFoundError("Client not found")
 
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Date", "Particulars", "Debit", "Credit", "Balance"])
 
+    target_company_id = owner.company_id or current_user.company_id
+    if target_company_id is None:
+        raise PermissionDeniedError("Company access required")
+
     try:
-        ar_acc = await get_accounts_receivable(db)
+        ar_acc = await get_accounts_receivable(db, company_id=target_company_id)
         ar_acc_id = ar_acc.id
     except (ValueError, Exception):
         ar_acc_id = None
@@ -1605,8 +1700,11 @@ async def export_client_ledger(
         rows = result.all()
 
         inv_stmt = select(Invoice.id).where(Invoice.owner_id == client_id)
-        if not is_super and current_user.company_id is not None:
+        if not is_super:
             inv_stmt = inv_stmt.where(Invoice.company_id == current_user.company_id)
+        elif target_company_id is not None:
+            inv_stmt = inv_stmt.where(Invoice.company_id == target_company_id)
+
         invoices = (await db.execute(inv_stmt)).scalars().all()
         valid_jnums = set([f"J-INV-{i}" for i in invoices])
 
@@ -1653,6 +1751,8 @@ async def send_invoice(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("invoices.edit")),
 ):
+    _check_tenant_access(current_user)
+
     # =====================================================
     # GET INVOICE WITH TENANT & PROJECT AUTHORIZATION
     # =====================================================
@@ -1661,57 +1761,37 @@ async def send_invoice(
     )
 
     # =====================================================
-    # VALIDATE CLIENT (SAME COMPANY & CLIENT ROLE)
+    # VALIDATE CLIENT (SAME COMPANY & CLIENT ROLE DOMAIN RULE)
     # =====================================================
     client = await db.get(User, payload.client_user_id)
     if not client:
-        raise HTTPException(
-            status_code=404,
-            detail="Client not found.",
-        )
+        raise NotFoundError("Client not found.")
 
     is_super = _is_super_admin(current_user)
-    if not is_super and current_user.company_id is not None and client.company_id != current_user.company_id:
-        raise HTTPException(
-            status_code=404,
-            detail="Client not found.",
-        )
+    if not is_super and client.company_id != current_user.company_id:
+        raise NotFoundError("Client not found.")
 
-    if client.role.lower() != "client":
-        raise HTTPException(
-            status_code=400,
-            detail="Selected user is not a client.",
-        )
+    # Guardrail 1: Legitimate domain invariant that recipient must be a Client
+    if str(client.role).lower() != "client":
+        raise ValidationError("Selected user is not a client.")
 
     # =====================================================
     # VALIDATE FINANCIALS
     # =====================================================
     if invoice.total_amount <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Invoice amount must be greater than zero.",
-        )
+        raise ValidationError("Invoice amount must be greater than zero.")
 
     if invoice.pending_amount <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Invoice has no pending amount.",
-        )
+        raise ValidationError("Invoice has no pending amount.")
 
     # =====================================================
     # STATUS VALIDATION
     # =====================================================
     if invoice.status == InvoiceStatus.CANCELLED:
-        raise HTTPException(
-            status_code=400,
-            detail="Cancelled invoice cannot be sent.",
-        )
+        raise ValidationError("Cancelled invoice cannot be sent.")
 
     if invoice.status == InvoiceStatus.PAID:
-        raise HTTPException(
-            status_code=400,
-            detail="Paid invoice cannot be sent.",
-        )
+        raise ValidationError("Paid invoice cannot be sent.")
 
     # =====================================================
     # PREVENT DUPLICATE SEND
@@ -1725,10 +1805,7 @@ async def send_invoice(
     )
 
     if existing_notification:
-        raise HTTPException(
-            status_code=400,
-            detail="Invoice has already been sent to this client.",
-        )
+        raise ValidationError("Invoice has already been sent to this client.")
 
     # =====================================================
     # CREATE NOTIFICATION

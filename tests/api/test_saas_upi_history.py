@@ -79,14 +79,35 @@ class MockResult:
         return ScalarsResult()
     def scalar_one_or_none(self):
         return self.data[0] if self.data else None
+    def all(self):
+        return self.data
 
 
 class MockHistorySession:
     def __init__(self):
         self.transactions = {}
 
+    async def scalar(self, stmt):
+        stmt_str = str(stmt).lower()
+        if "role" in stmt_str and "company_id" in stmt_str:
+            try:
+                params = stmt.compile().params
+                if params.get("name_1") and params.get("name_1") != "Admin":
+                    return None
+            except Exception:
+                pass
+            class MockRole:
+                id = 1
+                name = "Admin"
+            return MockRole()
+        return None
+
     async def execute(self, stmt):
         stmt_str = str(stmt).lower()
+        if "override" in stmt_str:
+            return MockResult([])
+        if "role_permission" in stmt_str or "permissions" in stmt_str:
+            return MockResult(["saas_billing.view", "saas_billing.create"])
         if "manual_payment_transactions" in stmt_str:
             txns = list(self.transactions.values())
             try:
@@ -228,14 +249,14 @@ def test_normal_tenant_user_denied_history(mock_db):
 
 
 def test_super_admin_denied_tenant_history_endpoints(mock_db):
+    """Verify Super Admin has global visibility to tenant history endpoints under canonical SA semantics."""
     app.dependency_overrides[get_current_active_user] = lambda: super_admin
-    # require_tenant_admin will reject because company_id is None / is_super_admin is True
     app.dependency_overrides[get_db_session] = lambda: mock_db
     res1 = client.get("/api/v1/saas-billing/upi/transactions")
-    assert res1.status_code == 403
+    assert res1.status_code == 200
 
     res2 = client.get("/api/v1/saas-billing/upi/transactions/TXN-A-PENDING")
-    assert res2.status_code == 403
+    assert res2.status_code == 200
     clear_overrides()
 
 

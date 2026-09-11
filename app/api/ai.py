@@ -9,8 +9,14 @@ from app.core.dependencies import get_current_active_user, get_request_redis, re
 from app.db.session import get_db_session
 from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.models.ai_prediction import AIPrediction
+from app.models.company import Company
 from app.models.user import User
-from app.schemas.ai_prediction import AIPredictRequest, AIPredictResponse, AIPredictionOut
+from app.schemas.ai_prediction import (
+    AIPredictRequest,
+    AIPredictResponse,
+    AIPredictionOut,
+    AIPredictionUpdate,
+)
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.utils.helpers import NotFoundError
 
@@ -24,7 +30,9 @@ router = APIRouter(
     ],
 )
 
-VERSION_KEY = "cache_version:ai_predictions"
+
+def _get_version_key(company_scope: Any) -> str:
+    return f"cache_version:ai_predictions:{company_scope}"
 
 
 def _check_tenant_access(current_user: User) -> bool:
@@ -56,13 +64,16 @@ async def predict(
     if not is_sa:
         target_company_id = current_user.company_id
     else:
-        if current_user.company_id is not None:
-            target_company_id = current_user.company_id
-        else:
+        target_id = payload.company_id if payload.company_id is not None else current_user.company_id
+        if target_id is None:
             raise HTTPException(
                 status_code=400,
-                detail="Super Admin must provide active company context to create AI predictions",
+                detail="Super Admin must provide active company context or target company_id to create AI predictions",
             )
+        target_company = await db.get(Company, target_id)
+        if not target_company:
+            raise NotFoundError("Company not found")
+        target_company_id = target_id
 
     prediction = _placeholder_predict(payload.module_name, payload.prompt)
     obj = AIPrediction(
@@ -74,7 +85,9 @@ async def predict(
     )
     db.add(obj)
     await db.flush()
-    await bump_cache_version(redis, VERSION_KEY)
+    await bump_cache_version(redis, _get_version_key(target_company_id))
+    if is_sa:
+        await bump_cache_version(redis, _get_version_key("sa"))
     return AIPredictResponse(module_name=obj.module_name, prediction=obj.prediction)
 
 
@@ -84,13 +97,27 @@ async def list_predictions(
     offset: int = Query(0, ge=0),
     module_name: Optional[str] = None,
     search: Optional[str] = None,
+    company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
     current_user: User = Depends(require_permission("ai.view")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
     is_sa = _check_tenant_access(current_user)
-    version = await get_cache_version(redis, VERSION_KEY)
-    company_scope = current_user.company_id if not is_sa else "sa"
+    if not is_sa:
+        effective_company_id = current_user.company_id
+        company_scope = current_user.company_id
+    else:
+        if company_id is not None:
+            comp = await db.get(Company, company_id)
+            if not comp:
+                raise NotFoundError("Company not found")
+            effective_company_id = company_id
+            company_scope = f"sa:{company_id}"
+        else:
+            effective_company_id = None
+            company_scope = "sa"
+
+    version = await get_cache_version(redis, _get_version_key(company_scope))
     cache_key = f"cache:ai:list:{company_scope}:{version}:{limit}:{offset}:{module_name}:{search}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
@@ -99,9 +126,9 @@ async def list_predictions(
     query = select(AIPrediction)
     count_query = select(func.count()).select_from(AIPrediction)
 
-    if not is_sa:
-        query = query.where(AIPrediction.company_id == current_user.company_id)
-        count_query = count_query.where(AIPrediction.company_id == current_user.company_id)
+    if effective_company_id is not None:
+        query = query.where(AIPrediction.company_id == effective_company_id)
+        count_query = count_query.where(AIPrediction.company_id == effective_company_id)
 
     if module_name:
         query = query.where(AIPrediction.module_name == module_name)
@@ -132,8 +159,8 @@ async def get_prediction(
     redis=Depends(get_request_redis),
 ):
     is_sa = _check_tenant_access(current_user)
-    version = await get_cache_version(redis, VERSION_KEY)
     company_scope = current_user.company_id if not is_sa else "sa"
+    version = await get_cache_version(redis, _get_version_key(company_scope))
     cache_key = f"cache:ai:get:{company_scope}:{version}:{prediction_id}"
     cached = await cache_get_json(redis, cache_key)
     if cached is not None:
@@ -155,7 +182,7 @@ async def get_prediction(
 @router.put("/{prediction_id}", response_model=AIPredictionOut)
 async def update_prediction(
     prediction_id: int,
-    payload: Dict[str, Any],
+    payload: AIPredictionUpdate,
     current_user: User = Depends(require_permission("ai.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
@@ -169,16 +196,16 @@ async def update_prediction(
     if obj is None:
         raise NotFoundError("Prediction not found")
 
-    module_name = payload.get("module_name")
-    if module_name is not None:
-        obj.module_name = module_name
-    if "prompt" in payload:
-        obj.prompt = payload.get("prompt")
-    if "prediction" in payload and payload.get("prediction") is not None:
-        obj.prediction = payload["prediction"]
+    if payload.module_name is not None:
+        obj.module_name = payload.module_name
+    if payload.prompt is not None:
+        obj.prompt = payload.prompt
+    if payload.prediction is not None:
+        obj.prediction = payload.prediction
 
     await db.flush()
-    await bump_cache_version(redis, VERSION_KEY)
+    await bump_cache_version(redis, _get_version_key(obj.company_id))
+    await bump_cache_version(redis, _get_version_key("sa"))
     return AIPredictionOut.model_validate(obj)
 
 
@@ -198,7 +225,9 @@ async def delete_prediction(
     if obj is None:
         raise NotFoundError("Prediction not found")
 
+    comp_id = obj.company_id
     await db.delete(obj)
     await db.flush()
-    await bump_cache_version(redis, VERSION_KEY)
+    await bump_cache_version(redis, _get_version_key(comp_id))
+    await bump_cache_version(redis, _get_version_key("sa"))
     return None

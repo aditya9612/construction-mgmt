@@ -118,6 +118,7 @@ MODULES = [
     "settings",
     "ai",
     "master_data",
+    "saas_billing",
 ]
 
 
@@ -204,6 +205,32 @@ MODULE_ACTIONS = {
         "create",
         "edit",
         "delete",
+    ],
+    "reports": [
+        "view",
+        "export",
+    ],
+    "users": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+    ],
+    "roles": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+    ],
+    "chat": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+    ],
+    "saas_billing": [
+        "view",
+        "create",
     ],
 }
 

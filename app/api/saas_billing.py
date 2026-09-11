@@ -29,7 +29,7 @@ from app.schemas.saas_billing import (
 )
 
 from app.db.session import get_db_session
-from app.core.dependencies import get_current_active_user, require_tenant_admin
+from app.core.dependencies import require_permission
 from app.models.user import User
 from app.core.config import settings
 from app.services.billing.mock_provider import MockPaymentProvider
@@ -37,6 +37,16 @@ from app.services.billing.razorpay_provider import RazorpayPaymentProvider
 from app.services.billing.billing_service import BillingService
 
 router = APIRouter(prefix="/saas-billing", tags=["SaaS Billing"])
+
+
+def _require_tenant_context(current_user: User) -> None:
+    if getattr(current_user, "is_super_admin", False) is True:
+        return
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Tenant context required",
+        )
 
 
 def get_billing_service() -> BillingService:
@@ -48,21 +58,25 @@ def get_billing_service() -> BillingService:
         provider = MockPaymentProvider()
     return BillingService(provider)
 
+
 class CheckoutRequest(BaseModel):
     plan_id: int
     success_url: str
     cancel_url: str
 
+
 class CheckoutResponse(BaseModel):
     checkout_url: str
+
 
 @router.post("/checkout", response_model=CheckoutResponse)
 async def create_checkout(
     request: CheckoutRequest,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("saas_billing.create")),
     db: AsyncSession = Depends(get_db_session),
     billing_service: BillingService = Depends(get_billing_service)
 ):
+    _require_tenant_context(current_user)
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company to create checkout")
 
@@ -75,6 +89,7 @@ async def create_checkout(
         cancel_url=request.cancel_url
     )
     return {"checkout_url": checkout_url}
+
 
 @router.post("/webhook")
 async def webhook(
@@ -90,27 +105,31 @@ async def webhook(
 
 @router.get("/me", response_model=SubscriptionSummaryOut)
 async def get_tenant_billing_summary(
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session),
     entitlement_service: EntitlementService = Depends(get_entitlement_service)
 ):
+    _require_tenant_context(current_user)
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company")
 
     entitlements = await entitlement_service.get_company_entitlements(db, current_user.company_id)
     return entitlements
 
+
 @router.get("/usage", response_model=UsageLimitsOut)
 async def get_tenant_usage_limits(
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session),
     entitlement_service: EntitlementService = Depends(get_entitlement_service)
 ):
+    _require_tenant_context(current_user)
     if not current_user.company_id:
         raise HTTPException(status_code=403, detail="User must belong to a company")
 
     limits = await entitlement_service.get_limits(db, current_user.company_id)
     return limits
+
 
 @router.get("/plans", response_model=List[PlanOut])
 async def list_active_plans(
@@ -121,77 +140,93 @@ async def list_active_plans(
     plans = result.scalars().all()
     return plans
 
+
 @router.get("/invoices", response_model=List[SubscriptionInvoiceOut])
 async def list_invoices(
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    if not current_user.company_id:
-        raise HTTPException(status_code=403, detail="User must belong to a company")
-
-    result = await db.execute(
-        select(SubscriptionInvoice)
-        .where(SubscriptionInvoice.company_id == current_user.company_id)
-        .order_by(desc(SubscriptionInvoice.created_at))
-    )
+    _require_tenant_context(current_user)
+    query = select(SubscriptionInvoice)
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(SubscriptionInvoice.company_id == current_user.company_id)
+    query = query.order_by(desc(SubscriptionInvoice.created_at))
+    result = await db.execute(query)
     return result.scalars().all()
+
 
 @router.get("/invoices/{invoice_id}", response_model=SubscriptionInvoiceOut)
 async def get_invoice_detail(
     invoice_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    if not current_user.company_id:
-        raise HTTPException(status_code=403, detail="User must belong to a company")
-
-    result = await db.execute(
-        select(SubscriptionInvoice)
-        .where(
-            SubscriptionInvoice.id == invoice_id,
-            SubscriptionInvoice.company_id == current_user.company_id
-        )
-    )
+    _require_tenant_context(current_user)
+    query = select(SubscriptionInvoice).where(SubscriptionInvoice.id == invoice_id)
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(SubscriptionInvoice.company_id == current_user.company_id)
+    result = await db.execute(query)
     invoice = result.scalar_one_or_none()
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
     return invoice
 
+
 @router.get("/history", response_model=List[BillingHistoryOut])
 async def get_billing_history(
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
-    if not current_user.company_id:
-        raise HTTPException(status_code=403, detail="User must belong to a company")
-
-    # Find the subscription for the company to properly query ActivityLogs
-    sub_res = await db.execute(select(Subscription).where(Subscription.company_id == current_user.company_id))
-    subscription = sub_res.scalar_one_or_none()
-
-    if not subscription:
-        return []
-
-    # We want ActivityLogs for the Subscription entity.
-    # We might also want ActivityLogs for the Invoices, but we can query them separately or just stick to Subscription logs (which cover plan changes, payment succeeded/failed).
-    result = await db.execute(
-        select(ActivityLog)
-        .where(
-            ActivityLog.entity == "Subscription",
-            ActivityLog.entity_id == subscription.id
+    _require_tenant_context(current_user)
+    if getattr(current_user, "is_super_admin", False) is True:
+        if current_user.company_id:
+            sub_res = await db.execute(select(Subscription).where(Subscription.company_id == current_user.company_id))
+            subscription = sub_res.scalar_one_or_none()
+            if not subscription:
+                return []
+            result = await db.execute(
+                select(ActivityLog)
+                .where(
+                    ActivityLog.entity == "Subscription",
+                    ActivityLog.entity_id == subscription.id
+                )
+                .order_by(desc(ActivityLog.created_at))
+            )
+            return result.scalars().all()
+        else:
+            result = await db.execute(
+                select(ActivityLog)
+                .where(ActivityLog.entity == "Subscription")
+                .order_by(desc(ActivityLog.created_at))
+            )
+            return result.scalars().all()
+    else:
+        sub_res = await db.execute(select(Subscription).where(Subscription.company_id == current_user.company_id))
+        subscription = sub_res.scalar_one_or_none()
+        if not subscription:
+            return []
+        result = await db.execute(
+            select(ActivityLog)
+            .where(
+                ActivityLog.entity == "Subscription",
+                ActivityLog.entity_id == subscription.id
+            )
+            .order_by(desc(ActivityLog.created_at))
         )
-        .order_by(desc(ActivityLog.created_at))
-    )
-    return result.scalars().all()
+        return result.scalars().all()
 
 
 @router.get("/upi/qr-code", response_model=UPIQRCodeOut)
 async def generate_subscription_upi_qr(
     plan_id: int,
-    current_user: User = Depends(require_tenant_admin),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="User must belong to a company to generate UPI QR")
+
     # 1. Authoritative active plan
     result = await db.execute(select(Plan).where(Plan.id == plan_id, Plan.is_active == True))
     plan = result.scalar_one_or_none()
@@ -262,13 +297,13 @@ async def generate_subscription_upi_qr(
 @router.get("/upi/qr-image", responses={200: {"content": {"image/png": {}}}})
 async def get_subscription_upi_qr_image(
     plan_id: int,
-    current_user: User = Depends(require_tenant_admin),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """
-    Returns the dynamic UPI QR Code directly as a PNG image stream.
-    Allows viewing/scanning the QR code directly in Swagger UI or browser.
-    """
+    _require_tenant_context(current_user)
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="User must belong to a company to generate UPI QR image")
+
     # 1. Authoritative active plan
     result = await db.execute(select(Plan).where(Plan.id == plan_id, Plan.is_active == True))
     plan = result.scalar_one_or_none()
@@ -306,12 +341,13 @@ async def get_subscription_upi_qr_image(
 @router.get("/upi/checkout-preview", response_class=HTMLResponse)
 async def get_subscription_upi_checkout_preview(
     plan_id: int,
-    current_user: User = Depends(require_tenant_admin),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """
-    Renders an interactive HTML Checkout Preview with live scannable QR Code.
-    """
+    _require_tenant_context(current_user)
+    if not current_user.company_id:
+        raise HTTPException(status_code=400, detail="User must belong to a company to view checkout preview")
+
     result = await db.execute(select(Plan).where(Plan.id == plan_id, Plan.is_active == True))
     plan = result.scalar_one_or_none()
     if not plan:
@@ -386,9 +422,10 @@ async def get_subscription_upi_checkout_preview(
 @router.post("/upi/submit", response_model=UPISubmitResponse)
 async def submit_subscription_upi_utr(
     request: UPISubmitRequest,
-    current_user: User = Depends(require_tenant_admin),
+    current_user: User = Depends(require_permission("saas_billing.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     utr = request.utr_reference.strip()
     if not utr or len(utr) < 6 or len(utr) > 50 or not utr.isalnum():
         raise HTTPException(
@@ -397,17 +434,18 @@ async def submit_subscription_upi_utr(
         )
 
     # 1. Authoritative transaction lookup strictly scoped by company_id
-    result = await db.execute(
-        select(ManualPaymentTransaction).where(
-            ManualPaymentTransaction.transaction_reference == request.transaction_reference,
-            ManualPaymentTransaction.company_id == current_user.company_id,
-        )
+    query = select(ManualPaymentTransaction).where(
+        ManualPaymentTransaction.transaction_reference == request.transaction_reference,
     )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(ManualPaymentTransaction.company_id == current_user.company_id)
+
+    result = await db.execute(query)
     txn = result.scalar_one_or_none()
     if not txn:
         raise HTTPException(
             status_code=404,
-            detail="Payment transaction not found for this tenant",
+            detail="Payment transaction not found",
         )
 
     if txn.status != "pending":
@@ -440,7 +478,7 @@ async def submit_subscription_upi_utr(
         entity="ManualPaymentTransaction",
         entity_id=txn.id,
         details={
-            "company_id": current_user.company_id,
+            "company_id": txn.company_id,
             "transaction_reference": txn.transaction_reference,
             "utr_reference": utr,
             "amount": float(txn.amount),
@@ -478,15 +516,17 @@ async def list_tenant_upi_transactions(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     status: Optional[str] = Query(None, description="Filter by transaction status (pending, verified, rejected)"),
-    current_user: User = Depends(require_tenant_admin),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     query = (
         select(ManualPaymentTransaction)
         .options(selectinload(ManualPaymentTransaction.plan))
-        .where(ManualPaymentTransaction.company_id == current_user.company_id)
-        .order_by(desc(ManualPaymentTransaction.id))
     )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(ManualPaymentTransaction.company_id == current_user.company_id)
+    query = query.order_by(desc(ManualPaymentTransaction.id))
     if status:
         query = query.where(ManualPaymentTransaction.status == status.strip().lower())
 
@@ -517,23 +557,27 @@ async def list_tenant_upi_transactions(
 @router.get("/upi/transactions/{reference}", response_model=ManualPaymentHistoryOut)
 async def get_tenant_upi_transaction_detail(
     reference: str,
-    current_user: User = Depends(require_tenant_admin),
+    current_user: User = Depends(require_permission("saas_billing.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    _require_tenant_context(current_user)
     clean_ref = reference.strip()
-    result = await db.execute(
+    query = (
         select(ManualPaymentTransaction)
         .options(selectinload(ManualPaymentTransaction.plan))
         .where(
             ManualPaymentTransaction.transaction_reference == clean_ref,
-            ManualPaymentTransaction.company_id == current_user.company_id,
         )
     )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        query = query.where(ManualPaymentTransaction.company_id == current_user.company_id)
+
+    result = await db.execute(query)
     txn = result.scalar_one_or_none()
     if not txn:
         raise HTTPException(
             status_code=404,
-            detail="Payment transaction not found for this tenant",
+            detail="Payment transaction not found",
         )
 
     return ManualPaymentHistoryOut(

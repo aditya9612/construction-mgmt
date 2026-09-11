@@ -4,7 +4,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import desc, func, select
-from app.core.dependencies import get_current_user, require_permission, require_roles
+from app.core.dependencies import get_current_user, require_permission
 from app.core.enums import (
     AttendanceStatus,
     OTPolicyType,
@@ -406,11 +406,18 @@ async def check_out(
             journal_number = f"J-EXP-{expense_id}"
             existing_je = await db.scalar(select(JournalEntry).where(JournalEntry.journal_number == journal_number))
 
-            expense_acc = await db.scalar(select(Account).where(Account.code == "LABOUR_EXPENSE"))
+            target_company_id = attendance.company_id or (project.company_id if project else None) or (current_user.company_id if current_user else None)
+            expense_query = select(Account).where(Account.code == "LABOUR_EXPENSE")
+            wages_query = select(Account).where(Account.code == "WAGES_PAYABLE")
+            if target_company_id is not None:
+                expense_query = expense_query.where(Account.company_id == target_company_id)
+                wages_query = wages_query.where(Account.company_id == target_company_id)
+
+            expense_acc = await db.scalar(expense_query)
             if not expense_acc:
                 raise HTTPException(status_code=400, detail="LABOUR_EXPENSE account is not configured.")
 
-            wages_payable_acc = await db.scalar(select(Account).where(Account.code == "WAGES_PAYABLE"))
+            wages_payable_acc = await db.scalar(wages_query)
             if not wages_payable_acc:
                 raise HTTPException(status_code=400, detail="WAGES_PAYABLE account is not configured.")
 
