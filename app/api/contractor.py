@@ -1,40 +1,26 @@
 from typing import Optional
+from decimal import Decimal
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select
-from decimal import Decimal
-from datetime import date
-from app.core.dependencies import get_current_active_user, require_roles, require_permission
-from app.models.user import User, UserRole
+from sqlalchemy.exc import IntegrityError
+
+from app.core.dependencies import require_permission
+from app.models.user import User
 from app.db.session import get_db_session
 from app.models.contractor import Contractor, ContractorProject
-from app.models.project import Project, ProjectMember
+from app.models.project import Project
 from app.models.expense import Expense
 from app.models.owner import OwnerTransaction
 from app.schemas.contractor import ContractorCreate, ContractorUpdate, ContractorOut
 from app.models.invoice import Invoice
 from app.core.logger import logger
-from app.utils.common import assert_project_access, generate_business_id , validate_contractor_access
-from app.utils.helpers import NotFoundError, PermissionDeniedError
+from app.utils.common import assert_project_access, generate_business_id, validate_contractor_access
+from app.utils.helpers import NotFoundError
 from app.utils.pagination import PaginationParams
-from sqlalchemy.exc import IntegrityError
 
-
-CONTRACTOR_CREATE_ROLES = [UserRole.ADMIN, UserRole.PROJECT_MANAGER]
-
-CONTRACTOR_READ_ROLES = [
-    UserRole.ADMIN,
-    UserRole.PROJECT_MANAGER,
-    UserRole.ACCOUNTANT,
-]
-
-CONTRACTOR_PAYMENT_ROLES = [
-    UserRole.ADMIN,
-    UserRole.ACCOUNTANT,
-]
-
-CONTRACTOR_DELETE_ROLES = [UserRole.ADMIN]
 
 router = APIRouter(prefix="/contractors", tags=["Contractors"])
 
@@ -66,8 +52,25 @@ async def create_contractor(
 ):
     logger.info(f"Creating contractor name={data.name}")
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    target_company_id = getattr(data, "company_id", None) or current_user.company_id
+    if not target_company_id:
+        raise HTTPException(
+            status_code=400, detail="Company context required to create contractor"
+        )
+
+    if is_sa and getattr(data, "company_id", None):
+        from app.models.company import Company
+
+        company = await db.get(Company, target_company_id)
+        if not company:
+            raise HTTPException(status_code=404, detail="Company not found")
+
     payload = data.model_dump()
-    payload["company_id"] = current_user.company_id
+    payload["company_id"] = target_company_id
 
     for _ in range(3):  # retry for race condition safety
         try:
@@ -96,21 +99,17 @@ async def pending_report(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
     params = PaginationParams(limit=limit, offset=offset).normalized()
 
-    query = select(Contractor).where(Contractor.company_id == current_user.company_id)
-    count_query = select(func.count()).select_from(Contractor).where(Contractor.company_id == current_user.company_id)
-
-    # Calculate payment_pending directly in database
-    pending_amount = (Contractor.total_work_assigned - Contractor.payment_given)
-
-    if current_user.role != UserRole.ADMIN:
-        query = (
-            query.join(ContractorProject, Contractor.id == ContractorProject.contractor_id)
-            .join(ProjectMember, ContractorProject.project_id == ProjectMember.project_id)
-            .where(ProjectMember.user_id == current_user.id)
-            .distinct()
-        )
+    query = select(Contractor)
+    if not is_sa:
+        query = query.where(Contractor.company_id == current_user.company_id)
+    elif current_user.company_id is not None:
+        query = query.where(Contractor.company_id == current_user.company_id)
 
     query = query.limit(params.limit).offset(params.offset)
 
@@ -118,10 +117,8 @@ async def pending_report(
     contractors = result.scalars().all()
 
     output = []
-
     for c in contractors:
         pending = (c.total_work_assigned or 0) - (c.payment_given or 0)
-
         if pending > 0:
             output.append(
                 {
@@ -142,19 +139,17 @@ async def list_contractors(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
     params = PaginationParams(limit=limit, offset=offset, search=search).normalized()
 
     query = select(Contractor)
-    if current_user.company_id is not None:
+    if not is_sa:
         query = query.where(Contractor.company_id == current_user.company_id)
-
-    if current_user.role != UserRole.ADMIN:
-        query = (
-            query.join(ContractorProject, Contractor.id == ContractorProject.contractor_id)
-            .join(ProjectMember, ContractorProject.project_id == ProjectMember.project_id)
-            .where(ProjectMember.user_id == current_user.id)
-            .distinct()
-        )
+    elif current_user.company_id is not None:
+        query = query.where(Contractor.company_id == current_user.company_id)
 
     if params.search:
         query = query.where(Contractor.name.ilike(f"%{params.search}%"))
@@ -173,14 +168,7 @@ async def get_contractor(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-
-    if not contractor:
-        logger.warning(f"Contractor not found id={contractor_id}")
-        raise NotFoundError("Contractor not found")
-
-    await validate_contractor_access(db, contractor_id, current_user)
-
+    contractor = await validate_contractor_access(db, contractor_id, current_user)
     return build_response(contractor)
 
 
@@ -193,10 +181,16 @@ async def update_contractor(
 ):
     logger.info(f"Updating contractor id={contractor_id}")
 
-    contractor = await db.get(Contractor, contractor_id)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
 
-    if not contractor or contractor.company_id != current_user.company_id:
+    contractor = await db.get(Contractor, contractor_id)
+    if not contractor:
         logger.warning(f"Contractor not found for update id={contractor_id}")
+        raise NotFoundError("Contractor not found")
+
+    if not is_sa and contractor.company_id != current_user.company_id:
         raise NotFoundError("Contractor not found")
 
     update_data = data.model_dump(exclude_unset=True)
@@ -215,7 +209,6 @@ async def update_contractor(
         raise
 
     await db.refresh(contractor)
-
     logger.info(f"Contractor updated id={contractor_id}")
 
     return build_response(contractor)
@@ -223,15 +216,22 @@ async def update_contractor(
 
 @router.delete("/{contractor_id}")
 async def delete_contractor(
-    contractor_id: int, db: AsyncSession = Depends(get_db_session),
+    contractor_id: int,
+    db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.delete")),
 ):
     logger.info(f"Deleting contractor id={contractor_id}")
 
-    contractor = await db.get(Contractor, contractor_id)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
 
-    if not contractor or contractor.company_id != current_user.company_id:
+    contractor = await db.get(Contractor, contractor_id)
+    if not contractor:
         logger.warning(f"Contractor not found for delete id={contractor_id}")
+        raise NotFoundError("Contractor not found")
+
+    if not is_sa and contractor.company_id != current_user.company_id:
         raise NotFoundError("Contractor not found")
 
     if (contractor.payment_given or 0) > 0:
@@ -259,6 +259,10 @@ async def assign_project(
 ):
     logger.info(f"Assigning contractor={contractor_id} to project={project_id}")
 
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
     contractor = await db.get(Contractor, contractor_id)
     project = await db.get(Project, project_id)
 
@@ -268,11 +272,20 @@ async def assign_project(
         )
         raise NotFoundError("Contractor/Project not found")
 
-    if current_user.company_id is not None and contractor.company_id != current_user.company_id:
-        logger.warning(
-            f"Cross-tenant contractor assignment blocked contractor_id={contractor_id} caller_company={current_user.company_id}"
+    if not is_sa:
+        if contractor.company_id != current_user.company_id:
+            logger.warning(
+                f"Cross-tenant contractor assignment blocked contractor_id={contractor_id} caller_company={current_user.company_id}"
+            )
+            raise NotFoundError("Contractor not found")
+        if project.company_id != current_user.company_id:
+            raise NotFoundError("Project not found")
+
+    if contractor.company_id != project.company_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Contractor and project must belong to the same company",
         )
-        raise NotFoundError("Contractor not found")
 
     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
@@ -307,13 +320,7 @@ async def contractor_payments(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-
-    if not contractor:
-        logger.warning(f"Contractor not found for delete id={contractor_id}")
-        raise NotFoundError("Contractor not found")
-
-    await validate_contractor_access(db, contractor_id, current_user)
+    contractor = await validate_contractor_access(db, contractor_id, current_user)
 
     total = float(contractor.total_work_assigned or 0)
     paid = float(contractor.payment_given or 0)
@@ -325,6 +332,7 @@ async def contractor_payments(
         "payment_given": paid,
         "payment_pending": pending,
     }
+
 
 @router.post("/{contractor_id}/pay")
 async def pay_contractor(
@@ -338,16 +346,57 @@ async def pay_contractor(
         f"Contractor payment initiated contractor_id={contractor_id} amount={amount}"
     )
 
-    contractor = await db.get(Contractor, contractor_id)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+
+    stmt = (
+        select(Contractor)
+        .where(Contractor.id == contractor_id)
+        .with_for_update()
+    )
+    res = await db.execute(stmt)
+    contractor = res.scalar_one_or_none()
     if not contractor:
         logger.warning(f"Contractor not found for payment id={contractor_id}")
         raise NotFoundError("Contractor not found")
 
-    await validate_contractor_access(db, contractor_id, current_user)
+    if not is_sa and contractor.company_id != current_user.company_id:
+        raise NotFoundError("Contractor not found")
+
+    await validate_contractor_access(db, contractor, current_user)
+
+    project = await db.get(Project, project_id)
+    if not project:
+        logger.warning(
+            f"Project not found for contractor payment project_id={project_id}"
+        )
+        raise NotFoundError("Project not found")
+
+    if not is_sa and project.company_id != current_user.company_id:
+        raise NotFoundError("Project not found")
+
+    if contractor.company_id != project.company_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Contractor and project must belong to the same company",
+        )
+
     await assert_project_access(db, project_id=project_id, current_user=current_user)
 
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be positive")
+    cp_stmt = select(ContractorProject).where(
+        ContractorProject.contractor_id == contractor.id,
+        ContractorProject.project_id == project_id,
+    )
+    cp_res = await db.execute(cp_stmt)
+    if not cp_res.scalar_one_or_none():
+        raise HTTPException(
+            status_code=400,
+            detail="Contractor is not assigned to this project",
+        )
 
     total_work = Decimal(contractor.total_work_assigned or 0)
     paid = Decimal(contractor.payment_given or 0)
@@ -358,17 +407,11 @@ async def pay_contractor(
 
     contractor.payment_given = paid + amount
 
-    project = await db.get(Project, project_id)
-    if not project:
-        logger.warning(
-            f"Project not found for contractor payment project_id={project_id}"
-        )
-        raise NotFoundError("Project not found")
-
+    contractor_ref = contractor.contractor_id or str(contractor.id)
     expense = Expense(
         project_id=project_id,
         category="Contractor",
-        description=f"Payment to contractor - {contractor.id}",
+        description=f"Payment to contractor - {contractor_ref}",
         amount=amount,
         expense_date=date.today(),
         payment_mode="bank",
@@ -398,22 +441,22 @@ async def pay_contractor(
         "paid_total": float(contractor.payment_given),
     }
 
+
 @router.get("/{contractor_id}/projects")
 async def contractor_projects(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-    if not contractor:
-        raise NotFoundError("Contractor not found")
-
-    await validate_contractor_access(db, contractor_id, current_user)
+    contractor = await validate_contractor_access(db, contractor_id, current_user)
 
     result = await db.execute(
         select(Project)
         .join(ContractorProject, ContractorProject.project_id == Project.id)
-        .where(ContractorProject.contractor_id == contractor_id)
+        .where(
+            ContractorProject.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
+        )
     )
 
     projects = result.scalars().all()
@@ -427,22 +470,20 @@ async def contractor_projects(
         for p in projects
     ]
 
+
 @router.get("/{contractor_id}/bills")
 async def contractor_bills(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-    if not contractor:
-        raise NotFoundError("Contractor not found")
-
-    await validate_contractor_access(db, contractor_id, current_user)
+    contractor = await validate_contractor_access(db, contractor_id, current_user)
 
     result = await db.execute(
         select(Invoice).where(
+            Invoice.company_id == contractor.company_id,
             Invoice.type == "contractor",
-            Invoice.reference_id == contractor_id,
+            Invoice.reference_id == contractor.id,
         )
     )
 
@@ -458,17 +499,14 @@ async def contractor_bills(
         for inv in invoices
     ]
 
+
 @router.get("/{contractor_id}/performance")
 async def contractor_performance(
     contractor_id: int,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-    if not contractor:
-        raise NotFoundError("Contractor not found")
-
-    await validate_contractor_access(db, contractor_id, current_user)
+    contractor = await validate_contractor_access(db, contractor_id, current_user)
 
     total_work = float(contractor.total_work_assigned or 0)
     paid = float(contractor.payment_given or 0)
@@ -492,23 +530,29 @@ async def contractor_ledger(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-    if not contractor:
-        raise NotFoundError("Contractor not found")
+    contractor = await validate_contractor_access(db, contractor_id, current_user)
 
-    await validate_contractor_access(db, contractor_id, current_user)
+    desc_filters = [Expense.description.contains(f"- {contractor.id}")]
+    if contractor.contractor_id:
+        desc_filters.append(Expense.description.contains(contractor.contractor_id))
+
+    from sqlalchemy import or_
 
     expenses = await db.execute(
-        select(Expense).where(
+        select(Expense)
+        .join(Project, Project.id == Expense.project_id)
+        .where(
+            Project.company_id == contractor.company_id,
             Expense.category == "Contractor",
-            Expense.description.contains(contractor.contractor_id),
+            or_(*desc_filters),
         )
     )
 
     invoices = await db.execute(
         select(Invoice).where(
+            Invoice.company_id == contractor.company_id,
             Invoice.type == "contractor",
-            Invoice.reference_id == contractor_id,
+            Invoice.reference_id == contractor.id,
         )
     )
 
@@ -534,9 +578,10 @@ async def contractor_ledger(
             }
         )
 
-    ledger.sort(key=lambda x: x["date"])
+    ledger.sort(key=lambda x: str(x["date"]))
 
     return ledger
+
 
 @router.get("/{contractor_id}/work-summary")
 async def contractor_work_summary(
@@ -544,11 +589,7 @@ async def contractor_work_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("contractors.view")),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-    if not contractor:
-        raise NotFoundError("Contractor not found")
-
-    await validate_contractor_access(db, contractor_id, current_user)
+    contractor = await validate_contractor_access(db, contractor_id, current_user)
 
     total_work = float(contractor.total_work_assigned or 0)
     paid = float(contractor.payment_given or 0)
@@ -570,38 +611,49 @@ async def contractor_dashboard(
     current_user: User = Depends(require_permission("contractors.view")),
 ):
     from app.models.billing import RABill
-    from app.utils.common import validate_contractor_access
     from sqlalchemy import func
+    from datetime import date, timedelta
 
-    #  access control
-    await validate_contractor_access(db, contractor_id, current_user)
+    contractor = await validate_contractor_access(db, contractor_id, current_user)
 
     # ======================
     # AMOUNTS
     # ======================
     total = await db.scalar(
-        select(func.sum(RABill.total_amount)).where(
-            RABill.contractor_id == contractor_id
+        select(func.sum(RABill.total_amount))
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
         )
     ) or 0
 
     pending = await db.scalar(
-        select(func.sum(RABill.total_amount)).where(
-            RABill.contractor_id == contractor_id,
+        select(func.sum(RABill.total_amount))
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status.in_(["Draft", "Submitted"]),
         )
     ) or 0
 
     approved = await db.scalar(
-        select(func.sum(RABill.total_amount)).where(
-            RABill.contractor_id == contractor_id,
+        select(func.sum(RABill.total_amount))
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status == "Approved",
         )
     ) or 0
 
     paid = await db.scalar(
-        select(func.sum(RABill.total_amount)).where(
-            RABill.contractor_id == contractor_id,
+        select(func.sum(RABill.total_amount))
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status == "Paid",
         )
     ) or 0
@@ -610,28 +662,44 @@ async def contractor_dashboard(
     #  NUMBER OF BILLS
     # ======================
     total_bills = await db.scalar(
-        select(func.count()).where(
-            RABill.contractor_id == contractor_id
+        select(func.count())
+        .select_from(RABill)
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
         )
     ) or 0
 
     pending_bills = await db.scalar(
-        select(func.count()).where(
-            RABill.contractor_id == contractor_id,
+        select(func.count())
+        .select_from(RABill)
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status.in_(["Draft", "Submitted"]),
         )
     ) or 0
 
     approved_bills = await db.scalar(
-        select(func.count()).where(
-            RABill.contractor_id == contractor_id,
+        select(func.count())
+        .select_from(RABill)
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status == "Approved",
         )
     ) or 0
 
     paid_bills = await db.scalar(
-        select(func.count()).where(
-            RABill.contractor_id == contractor_id,
+        select(func.count())
+        .select_from(RABill)
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status == "Paid",
         )
     ) or 0
@@ -640,8 +708,11 @@ async def contractor_dashboard(
     # LAST PAYMENT DATE
     # ======================
     last_payment_date = await db.scalar(
-        select(func.max(RABill.bill_date)).where(
-            RABill.contractor_id == contractor_id,
+        select(func.max(RABill.bill_date))
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status == "Paid",
         )
     )
@@ -649,46 +720,42 @@ async def contractor_dashboard(
     # ======================
     #  OVERDUE BILLS
     # ======================
-    from datetime import date, timedelta
-
     overdue_threshold = date.today() - timedelta(days=30)
 
     overdue_amount = await db.scalar(
-        select(func.sum(RABill.total_amount)).where(
-            RABill.contractor_id == contractor_id,
+        select(func.sum(RABill.total_amount))
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status.in_(["Submitted", "Approved"]),
             RABill.bill_date < overdue_threshold,
         )
     ) or 0
 
     overdue_count = await db.scalar(
-        select(func.count()).where(
-            RABill.contractor_id == contractor_id,
+        select(func.count())
+        .select_from(RABill)
+        .join(Project, Project.id == RABill.project_id)
+        .where(
+            RABill.contractor_id == contractor.id,
+            Project.company_id == contractor.company_id,
             RABill.status.in_(["Submitted", "Approved"]),
             RABill.bill_date < overdue_threshold,
         )
     ) or 0
 
     return {
-        # 🔹 basic
-        "contractor_id": contractor_id,
-
-        # amounts
+        "contractor_id": contractor.id,
         "total_amount": float(total),
         "pending_amount": float(pending),
         "approved_amount": float(approved),
         "paid_amount": float(paid),
-
-        #  counts
         "total_bills": total_bills,
         "pending_bills": pending_bills,
         "approved_bills": approved_bills,
         "paid_bills": paid_bills,
-
-        #  last payment
         "last_payment_date": last_payment_date,
-
-        #  overdue
         "overdue_amount": float(overdue_amount),
         "overdue_count": overdue_count,
     }

@@ -330,27 +330,20 @@ async def get_effective_user_permissions(
             )
         )
         if company_role is not None:
-            if user.role not in ROLES:
-                res = await db.execute(
-                    select(Permission.code)
-                    .join(RolePermission, RolePermission.permission_id == Permission.id)
-                    .where(
-                        (RolePermission.role_id == company_role.id)
-                        | (
-                            (RolePermission.role == user.role)
-                            & RolePermission.role_id.is_(None)
-                        )
+            res = await db.execute(
+                select(Permission.code)
+                .join(RolePermission, RolePermission.permission_id == Permission.id)
+                .where(
+                    (RolePermission.role_id == company_role.id)
+                    | (
+                        (RolePermission.role == user.role)
+                        & RolePermission.role_id.is_(None)
                     )
                 )
-            else:
-                res = await db.execute(
-                    select(Permission.code)
-                    .join(RolePermission, RolePermission.permission_id == Permission.id)
-                    .where(RolePermission.role_id == company_role.id)
-                )
+            )
             effective_permissions = set(res.scalars().all())
-        elif user.role not in ROLES:
-            # Fallback only for ad-hoc custom/test roles created directly with role_id is None
+        else:
+            # Fallback for roles created directly with role_id is None
             res = await db.execute(
                 select(Permission.code)
                 .join(RolePermission, RolePermission.permission_id == Permission.id)
@@ -360,7 +353,7 @@ async def get_effective_user_permissions(
                 )
             )
             effective_permissions = set(res.scalars().all())
-    elif user.role not in ROLES:
+    else:
         # Fallback for un-scoped standalone test/custom roles created with role_id is None
         res = await db.execute(
             select(Permission.code)

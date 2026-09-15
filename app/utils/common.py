@@ -78,45 +78,41 @@ async def assert_task_project(db: AsyncSession, task_id: int | None, project_id:
         raise ValidationError("Task does not belong to the specified project")
 
 
+from fastapi import HTTPException
+
+
 async def validate_contractor_access(
     db,
-    contractor_id: int,
+    contractor_id,
     current_user,
 ):
     """
-    Ensure user has access to contractor via project mapping
+    Ensure user has access to contractor within tenant scope.
+    Accepts either an int contractor_id or an already-fetched Contractor model instance.
+    Returns the validated Contractor instance.
     """
-    if getattr(current_user, "is_super_admin", False):
-        return
+    is_sa = getattr(current_user, "is_super_admin", False) is True
 
     from app.models.contractor import Contractor
-    contractor = await db.get(Contractor, contractor_id)
+
+    if isinstance(contractor_id, Contractor):
+        contractor = contractor_id
+    else:
+        contractor = await db.get(Contractor, int(contractor_id))
+
     if not contractor:
         raise NotFoundError("Contractor not found")
-    if current_user.company_id is not None and contractor.company_id != current_user.company_id:
+
+    if is_sa:
+        return contractor
+
+    if current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    if contractor.company_id != current_user.company_id:
         raise NotFoundError("Contractor not found")
 
-    result = await db.execute(
-        select(ContractorProject.project_id).where(
-            ContractorProject.contractor_id == contractor_id
-        )
-    )
-    contractor_project_ids = [r[0] for r in result.all()]
-
-    if current_user.role == UserRole.ADMIN.value:
-        return
-
-    # If contractor has no project assignments yet, company-level access suffices
-    if not contractor_project_ids:
-        return
-
-    result = await db.execute(
-        select(ProjectMember.project_id).where(ProjectMember.user_id == current_user.id)
-    )
-    user_project_ids = [r[0] for r in result.all()]
-
-    if not set(contractor_project_ids).intersection(set(user_project_ids)):
-        raise PermissionDeniedError("Access denied")
+    return contractor
 
 
 async def generate_business_id(

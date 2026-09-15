@@ -28,8 +28,12 @@ from app.models.quotation import (
     QuotationLabour,
 )
 
-from app.models.user import User, ActivityLog, UserRole
+from app.models.user import User, ActivityLog
+from app.utils.common import assert_project_access
+from app.core.dependencies import get_effective_user_permissions
+from sqlalchemy import and_, or_
 from app.models.owner import Owner
+from app.models.company import Company
 from app.core.dependencies import get_current_active_user, require_permission
 
 import app.schemas.quotation as s
@@ -128,53 +132,286 @@ def calculate_item(unit, length, width, height, rate):
 # =========================================================
 
 
-async def get_quotation_or_404(quotation_id: int, db: AsyncSession, current_user):
+def _is_super_admin(current_user: Optional[User]) -> bool:
+    return getattr(current_user, "is_super_admin", False) is True
 
-    result = await db.execute(
-        select(QuotationMaster)
-        .options(
-            selectinload(QuotationMaster.items).selectinload(
-                QuotationItem.measurements
-            ),
-            selectinload(QuotationMaster.labour_items),
-            selectinload(QuotationMaster.material_items),
-            selectinload(QuotationMaster.extra_charge_items),
+
+def assert_company_context(current_user: User) -> bool:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    return is_sa
+
+
+async def is_client_user(db: AsyncSession, current_user: User) -> bool:
+    if _is_super_admin(current_user):
+        return False
+    perms = await get_effective_user_permissions(db, current_user)
+    if perms and any(p in perms for p in ("quotations.create", "quotations.edit", "quotations.manage", "quotations.delete", "*")):
+        return False
+    has_own = await db.scalar(
+        select(func.count(QuotationMaster.id)).where(
+            QuotationMaster.client_user_id == current_user.id
         )
-        .where(QuotationMaster.id == quotation_id)
     )
+    if has_own and has_own > 0:
+        return True
+    return False
 
+
+async def get_client_or_404(
+    db: AsyncSession, client_user_id: int, current_user: User
+) -> User:
+    is_sa = assert_company_context(current_user)
+    stmt = select(User).where(
+        User.id == client_user_id,
+        User.is_deleted == False,
+    )
+    if not is_sa:
+        stmt = stmt.where(User.company_id == current_user.company_id)
+    client = (await db.execute(stmt)).scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found.")
+    if not client.is_active:
+        raise HTTPException(status_code=400, detail="Selected client is inactive.")
+    return client
+
+
+async def get_quotation_or_404(
+    quotation_id: int,
+    db: AsyncSession,
+    current_user: User,
+    with_for_update: bool = False,
+    load_relations: bool = True,
+) -> QuotationMaster:
+    is_sa = assert_company_context(current_user)
+
+    stmt = select(QuotationMaster).where(QuotationMaster.id == quotation_id)
+    if not is_sa:
+        is_client = await is_client_user(db, current_user)
+        if is_client:
+            stmt = stmt.where(
+                QuotationMaster.company_id == current_user.company_id,
+                QuotationMaster.client_user_id == current_user.id,
+            )
+        else:
+            stmt = stmt.where(QuotationMaster.company_id == current_user.company_id)
+
+    if with_for_update:
+        stmt = stmt.with_for_update()
+
+    # Authorize primary row before loading nested collections
+    result = await db.execute(stmt)
     quotation = result.scalars().first()
 
     if not quotation:
-        raise HTTPException(404, "Quotation not found")
+        raise HTTPException(status_code=404, detail="Quotation not found")
 
-    # Super Admin cross-company visibility
-    if getattr(current_user, "is_super_admin", False) is True:
-        return quotation
-
-    # Tenant / Client Validation
-    if current_user.role == UserRole.CLIENT or current_user.role == "Client":
-        if quotation.client_user_id != current_user.id:
-            raise HTTPException(status_code=404, detail="Quotation not found")
-    else:
-        # Standard tenant users must belong to the company that owns the quotation
-        if not current_user.company_id or quotation.company_id != current_user.company_id:
-            raise HTTPException(status_code=404, detail="Quotation not found")
+    if load_relations:
+        rel_stmt = (
+            select(QuotationMaster)
+            .where(QuotationMaster.id == quotation.id)
+            .options(
+                selectinload(QuotationMaster.items).selectinload(
+                    QuotationItem.measurements
+                ),
+                selectinload(QuotationMaster.labour_items),
+                selectinload(QuotationMaster.material_items),
+                selectinload(QuotationMaster.extra_charge_items),
+            )
+        )
+        await db.execute(rel_stmt)
 
     return quotation
 
 
-async def generate_quotation_no(db: AsyncSession):
+async def get_labour_or_404(
+    db: AsyncSession,
+    labour_id: int,
+    company_id: Optional[int],
+    current_user: User,
+) -> Labour:
+    is_sa = _is_super_admin(current_user)
+    stmt = select(Labour).where(Labour.id == labour_id)
+    target_comp = company_id if (is_sa and company_id is not None) else current_user.company_id
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        stmt = stmt.where(Labour.company_id == current_user.company_id)
+    elif target_comp is not None:
+        stmt = stmt.where(Labour.company_id == target_comp)
+    obj = (await db.execute(stmt)).scalar_one_or_none()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Labour not found")
+    return obj
 
+
+async def get_material_or_404(
+    db: AsyncSession,
+    material_id: int,
+    company_id: Optional[int],
+    current_user: User,
+) -> Material:
+    is_sa = _is_super_admin(current_user)
+    stmt = select(Material).join(Project, Material.project_id == Project.id).where(
+        Material.id == material_id,
+        Material.is_deleted == False,
+    )
+    target_comp = company_id if (is_sa and company_id is not None) else current_user.company_id
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        stmt = stmt.where(Project.company_id == current_user.company_id)
+    elif target_comp is not None:
+        stmt = stmt.where(Project.company_id == target_comp)
+    obj = (await db.execute(stmt)).scalar_one_or_none()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Material not found")
+    return obj
+
+
+async def get_equipment_or_404(
+    db: AsyncSession,
+    equipment_id: int,
+    company_id: Optional[int],
+    current_user: User,
+) -> Equipment:
+    is_sa = _is_super_admin(current_user)
+    target_comp = company_id if (is_sa and company_id is not None) else current_user.company_id
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    obj = await db.scalar(
+        select(Equipment).where(
+            Equipment.id == equipment_id,
+            Equipment.is_deleted == False,
+        )
+    )
+    if not obj:
+        raise HTTPException(status_code=404, detail="Equipment not found")
+
+    if target_comp is not None:
+        if obj.company_id is not None:
+            if obj.company_id != target_comp:
+                raise HTTPException(status_code=404, detail="Equipment not found")
+            if obj.project_id is not None:
+                proj_valid = await db.scalar(
+                    select(Project.id).where(
+                        Project.id == obj.project_id,
+                        Project.company_id == target_comp,
+                    )
+                )
+                if not proj_valid:
+                    raise HTTPException(status_code=404, detail="Equipment not found")
+        else:
+            if obj.project_id is None:
+                raise HTTPException(status_code=404, detail="Equipment not found")
+            proj_comp = await db.scalar(
+                select(Project.company_id).where(Project.id == obj.project_id)
+            )
+            if proj_comp != target_comp:
+                raise HTTPException(status_code=404, detail="Equipment not found")
+
+    return obj
+
+
+async def get_project_or_404(
+    db: AsyncSession,
+    project_id: int,
+    company_id: Optional[int],
+    current_user: User,
+) -> Project:
+    is_sa = _is_super_admin(current_user)
+    stmt = select(Project).where(Project.id == project_id)
+    target_comp = company_id if (is_sa and company_id is not None) else current_user.company_id
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        stmt = stmt.where(Project.company_id == current_user.company_id)
+    elif target_comp is not None:
+        stmt = stmt.where(Project.company_id == target_comp)
+    obj = (await db.execute(stmt)).scalar_one_or_none()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not is_sa:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+    return obj
+
+
+async def get_contractor_or_404(
+    db: AsyncSession,
+    contractor_id: int,
+    company_id: Optional[int],
+    current_user: User,
+) -> Contractor:
+    is_sa = _is_super_admin(current_user)
+    stmt = select(Contractor).where(Contractor.id == contractor_id)
+    target_comp = company_id if (is_sa and company_id is not None) else current_user.company_id
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        stmt = stmt.where(Contractor.company_id == current_user.company_id)
+    elif target_comp is not None:
+        stmt = stmt.where(Contractor.company_id == target_comp)
+    obj = (await db.execute(stmt)).scalar_one_or_none()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Contractor not found")
+    return obj
+
+
+async def get_owner_or_404(
+    db: AsyncSession,
+    owner_id: int,
+    company_id: Optional[int],
+    current_user: User,
+) -> Owner:
+    is_sa = _is_super_admin(current_user)
+    stmt = select(Owner).where(Owner.id == owner_id)
+    target_comp = company_id if (is_sa and company_id is not None) else current_user.company_id
+    if not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        stmt = stmt.where(Owner.company_id == current_user.company_id)
+    elif target_comp is not None:
+        stmt = stmt.where(Owner.company_id == target_comp)
+    obj = (await db.execute(stmt)).scalar_one_or_none()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Owner not found")
+    return obj
+
+
+async def generate_quotation_no(db: AsyncSession) -> str:
     year = datetime.now().year
+    prefix = f"QT/{year}/"
+    result = await db.execute(
+        select(QuotationMaster.quotation_no)
+        .where(QuotationMaster.quotation_no.like(f"{prefix}%"))
+        .order_by(QuotationMaster.id.desc())
+        .limit(20)
+    )
+    existing_nos = result.scalars().all()
+    max_num = 0
+    for qno in existing_nos:
+        try:
+            num = int(qno.split("/")[-1])
+            if num > max_num:
+                max_num = num
+        except (ValueError, IndexError):
+            pass
+    if max_num == 0:
+        result_max = await db.execute(select(func.max(QuotationMaster.id)))
+        last_id = result_max.scalar() or 0
+        max_num = last_id
 
-    result = await db.execute(select(func.max(QuotationMaster.id)))
-
-    last_id = result.scalar()
-
-    next_id = (last_id or 0) + 1
-
-    return f"QT/{year}/{next_id:04d}"
+    candidate_num = max_num + 1
+    while True:
+        candidate = f"{prefix}{candidate_num:04d}"
+        exists_count = await db.scalar(
+            select(func.count(QuotationMaster.id)).where(QuotationMaster.quotation_no == candidate)
+        )
+        if not exists_count:
+            return candidate
+        candidate_num += 1
 
 
 def create_styled_table(data, col_widths, highlight_last_row=False):
@@ -1045,35 +1282,26 @@ async def create_quotation(
         # VALIDATE CLIENT
         # =====================================================
 
-        client = await db.get(User, payload.client_user_id)
+        is_super = assert_company_context(current_user)
 
-        if not client:
-            raise HTTPException(
-                status_code=404,
-                detail="Client not found."
-            )
+        client = await get_client_or_404(db, payload.client_user_id, current_user)
 
-        if client.role != UserRole.CLIENT and client.role != "Client":
+        role_str = getattr(client, "role", None)
+        role_name = getattr(role_str, "value", role_str)
+        if str(role_name).lower() not in ("client", "userrole.client"):
             raise HTTPException(
                 status_code=400,
                 detail="Selected user is not a Client."
             )
 
-        if not client.is_active:
-            raise HTTPException(
-                status_code=400,
-                detail="Selected client is inactive."
-            )
-
-        is_super = getattr(current_user, "is_super_admin", False) is True
         if not is_super:
-            if client.company_id != current_user.company_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Client not found."
-                )
             target_company_id = current_user.company_id
         else:
+            if not client.company_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Client user must be associated with a valid company.",
+                )
             target_company_id = client.company_id
 
         # =====================================================
@@ -1242,17 +1470,12 @@ async def create_quotation(
                 )
 
             if labour_data.labour_id:
-
-                labour = await db.get(
-                    Labour,
+                labour = await get_labour_or_404(
+                    db,
                     labour_data.labour_id,
+                    target_company_id,
+                    current_user,
                 )
-
-                if not labour or (target_company_id and labour.company_id != target_company_id):
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Labour ID {labour_data.labour_id} not found."
-                    )
 
         # =====================================================
         # VALIDATE MATERIAL IDs
@@ -1273,25 +1496,12 @@ async def create_quotation(
                 )
 
             if material_data.material_id:
-
-                material = await db.get(
-                    Material,
+                material = await get_material_or_404(
+                    db,
                     material_data.material_id,
+                    target_company_id,
+                    current_user,
                 )
-
-                if not material:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Material ID {material_data.material_id} not found."
-                    )
-
-                if target_company_id and material.project_id:
-                    mat_proj = await db.get(Project, material.project_id)
-                    if not mat_proj or mat_proj.company_id != target_company_id:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Material ID {material_data.material_id} not found."
-                        )
 
         # =====================================================
         # VALIDATE EQUIPMENT IDs
@@ -1312,121 +1522,29 @@ async def create_quotation(
                 )
 
             if extra_data.equipment_id:
-
-                equipment = await db.get(
-                    Equipment,
+                equipment = await get_equipment_or_404(
+                    db,
                     extra_data.equipment_id,
+                    target_company_id,
+                    current_user,
                 )
 
-                if not equipment:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Equipment ID {extra_data.equipment_id} not found."
-                    )
-
-                if target_company_id and equipment.project_id:
-                    eq_proj = await db.get(Project, equipment.project_id)
-                    if not eq_proj or eq_proj.company_id != target_company_id:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Equipment ID {extra_data.equipment_id} not found."
-                        )
-
         # =====================================================
-        # GENERATE QUOTATION NUMBER
-        # =====================================================
-
-        quotation_no = await generate_quotation_no(db)
-
-                # =====================================================
-        # CREATE QUOTATION MASTER
-        # =====================================================
-
-        quotation = QuotationMaster(
-
-            quotation_no=quotation_no,
-            company_id=target_company_id,
-
-            # CLIENT
-            client_user_id=payload.client_user_id,
-            client_name=payload.client_name,
-            company_name=payload.company_name,
-            mobile_number=payload.mobile_number,
-            email=payload.email,
-            billing_address=payload.billing_address,
-            site_address=payload.site_address,
-            gst_number=payload.gst_number,
-
-            # PROJECT
-            project_name=payload.project_name,
-            project_type=payload.project_type,
-            project_start_date=payload.project_start_date,
-            project_end_date=payload.project_end_date,
-            engineer_name=payload.engineer_name,
-            work_order_no=payload.work_order_no,
-
-            # TAX
-            gst_percent=payload.gst_percent,
-            cgst_percent=payload.cgst_percent,
-            sgst_percent=payload.sgst_percent,
-            tds_percent=payload.tds_percent,
-            discount_amount=payload.discount_amount,
-            advance_paid=payload.advance_paid,
-
-            # PAYMENT
-            payment_mode=payment_mode,
-            upi_id=payload.upi_id,
-            bank_name=payload.bank_name,
-            account_holder_name=payload.account_holder_name,
-            account_number=payload.account_number,
-            ifsc_code=payload.ifsc_code,
-            due_date=payload.due_date,
-
-            # EXTRA
-            notes=payload.notes,
-            terms_conditions=payload.terms_conditions,
-        )
-
-        db.add(quotation)
-
-        # =====================================================
-        # CREATE QUOTATION ITEMS
+        # PRE-VALIDATE MEASUREMENTS & TOTALS
         # =====================================================
 
         for item_data in payload.items:
-
             if item_data.rate <= 0:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Rate must be greater than zero for '{item_data.title}'."
                 )
-
             if not item_data.measurements:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Measurements are required for '{item_data.title}'."
                 )
-
-            item = QuotationItem(
-                quotation=quotation,
-                item_type=item_data.item_type,
-                title=item_data.title,
-                description=item_data.description,
-                unit=item_data.unit,
-                rate=item_data.rate,
-            )
-
-            db.add(item)
-
-            total_quantity = 0.0
-            total_amount = 0.0
-
-            # =================================================
-            # CREATE MEASUREMENTS
-            # =================================================
-
             for measurement_data in item_data.measurements:
-
                 if (
                     (measurement_data.length or 0) <= 0
                     or (measurement_data.width or 0) <= 0
@@ -1434,235 +1552,231 @@ async def create_quotation(
                 ):
                     raise HTTPException(
                         status_code=400,
-                        detail=(
-                            f"Invalid measurement values for "
-                            f"'{item_data.title}'."
-                        ),
+                        detail=f"Invalid measurement values for '{item_data.title}'."
                     )
 
-                result = calculate_item(
+        # =====================================================
+        # CREATE QUOTATION MASTER WITH CONCURRENCY RETRY
+        # =====================================================
+
+        max_attempts = 5
+        created_quotation_id = None
+
+        for attempt in range(max_attempts):
+            quotation_no = await generate_quotation_no(db)
+
+            quotation = QuotationMaster(
+                quotation_no=quotation_no,
+                company_id=target_company_id,
+
+                # CLIENT
+                client_user_id=payload.client_user_id,
+                client_name=payload.client_name,
+                company_name=payload.company_name,
+                mobile_number=payload.mobile_number,
+                email=payload.email,
+                billing_address=payload.billing_address,
+                site_address=payload.site_address,
+                gst_number=payload.gst_number,
+
+                # PROJECT
+                project_name=payload.project_name,
+                project_type=payload.project_type,
+                project_start_date=payload.project_start_date,
+                project_end_date=payload.project_end_date,
+                engineer_name=payload.engineer_name,
+                work_order_no=payload.work_order_no,
+
+                # TAX
+                gst_percent=payload.gst_percent,
+                cgst_percent=payload.cgst_percent,
+                sgst_percent=payload.sgst_percent,
+                tds_percent=payload.tds_percent,
+                discount_amount=payload.discount_amount,
+                advance_paid=payload.advance_paid,
+
+                # PAYMENT
+                payment_mode=payment_mode,
+                upi_id=payload.upi_id,
+                bank_name=payload.bank_name,
+                account_holder_name=payload.account_holder_name,
+                account_number=payload.account_number,
+                ifsc_code=payload.ifsc_code,
+                due_date=payload.due_date,
+
+                # EXTRA
+                notes=payload.notes,
+                terms_conditions=payload.terms_conditions,
+            )
+
+            db.add(quotation)
+
+            # CREATE QUOTATION ITEMS
+            for item_data in payload.items:
+                item = QuotationItem(
+                    quotation=quotation,
+                    item_type=item_data.item_type,
+                    title=item_data.title,
+                    description=item_data.description,
                     unit=item_data.unit,
-                    length=measurement_data.length,
-                    width=measurement_data.width,
-                    height=measurement_data.height,
                     rate=item_data.rate,
                 )
+                db.add(item)
 
-                measurement = MeasurementDetail(
-                    quotation_item=item,
-                    length=measurement_data.length,
-                    width=measurement_data.width,
-                    height=measurement_data.height,
-                    unit=measurement_data.unit,
-                    cubic_feet=result["cubic_feet"],
-                    cubic_meter=result["cubic_meter"],
-                    brass=result["brass"],
-                    quantity=result["quantity"],
-                    formula_used=result["formula"],
+                total_quantity = 0.0
+                total_amount = 0.0
+
+                for measurement_data in item_data.measurements:
+                    result = calculate_item(
+                        unit=item_data.unit,
+                        length=measurement_data.length,
+                        width=measurement_data.width,
+                        height=measurement_data.height,
+                        rate=item_data.rate,
+                    )
+                    measurement = MeasurementDetail(
+                        quotation_item=item,
+                        length=measurement_data.length,
+                        width=measurement_data.width,
+                        height=measurement_data.height,
+                        unit=measurement_data.unit,
+                        cubic_feet=result["cubic_feet"],
+                        cubic_meter=result["cubic_meter"],
+                        brass=result["brass"],
+                        quantity=result["quantity"],
+                        formula_used=result["formula"],
+                    )
+                    db.add(measurement)
+                    total_quantity += result["quantity"]
+                    total_amount += result["amount"]
+
+                item.quantity = round(total_quantity, 2)
+                item.amount = round(total_amount, 2)
+
+            await db.flush()
+
+            # CREATE LABOUR ITEMS
+            for labour_data in payload.labour_items:
+                amount = calculate_labour_amount(
+                    labour_count=labour_data.labour_count,
+                    daily_wage=labour_data.daily_wage,
+                    labour_days=labour_data.labour_days,
+                    overtime_hours=labour_data.overtime_hours,
+                    overtime_rate=labour_data.overtime_rate,
                 )
+                labour_item = QuotationLabour(
+                    quotation=quotation,
+                    labour_id=labour_data.labour_id,
+                    skill_type=labour_data.skill_type,
+                    labour_count=labour_data.labour_count,
+                    daily_wage=labour_data.daily_wage,
+                    labour_days=labour_data.labour_days,
+                    overtime_hours=labour_data.overtime_hours,
+                    overtime_rate=labour_data.overtime_rate,
+                    amount=amount,
+                    notes=labour_data.notes,
+                )
+                db.add(labour_item)
 
-                db.add(measurement)
+            # CREATE MATERIAL ITEMS
+            for material_data in payload.material_items:
+                estimated_amount = round(
+                    material_data.estimated_quantity * material_data.estimated_rate,
+                    2,
+                )
+                material_item = QuotationMaterial(
+                    quotation=quotation,
+                    material_id=material_data.material_id,
+                    material_name=material_data.material_name,
+                    category=material_data.category,
+                    unit=material_data.unit,
+                    estimated_quantity=material_data.estimated_quantity,
+                    estimated_rate=material_data.estimated_rate,
+                    estimated_amount=estimated_amount,
+                    notes=material_data.notes,
+                )
+                db.add(material_item)
 
-                total_quantity += result["quantity"]
-                total_amount += result["amount"]
+            # CREATE EXTRA CHARGES
+            for extra_data in payload.extra_charge_items:
+                amount = round(extra_data.quantity * extra_data.rate, 2)
+                extra_charge = QuotationExtraCharge(
+                    quotation=quotation,
+                    equipment_id=extra_data.equipment_id,
+                    expense_type=extra_data.expense_type,
+                    description=extra_data.description,
+                    quantity=extra_data.quantity,
+                    rate=extra_data.rate,
+                    amount=amount,
+                    notes=extra_data.notes,
+                )
+                db.add(extra_charge)
 
-            item.quantity = round(total_quantity, 2)
-            item.amount = round(total_amount, 2)
+            await db.flush()
 
-        # =====================================================
-        # FLUSH MASTER + ITEMS
-        # =====================================================
-
-        await db.flush()
-
-                # =====================================================
-        # CREATE LABOUR ITEMS
-        # =====================================================
-
-        for labour_data in payload.labour_items:
-
-            amount = calculate_labour_amount(
-                labour_count=labour_data.labour_count,
-                daily_wage=labour_data.daily_wage,
-                labour_days=labour_data.labour_days,
-                overtime_hours=labour_data.overtime_hours,
-                overtime_rate=labour_data.overtime_rate,
+            # LOAD RELATIONSHIPS & TOTALS
+            await db.refresh(
+                quotation,
+                attribute_names=[
+                    "items",
+                    "labour_items",
+                    "material_items",
+                    "extra_charge_items",
+                ],
             )
 
-            labour_item = QuotationLabour(
-                quotation=quotation,
-                labour_id=labour_data.labour_id,
-                skill_type=labour_data.skill_type,
-                labour_count=labour_data.labour_count,
-                daily_wage=labour_data.daily_wage,
-                labour_days=labour_data.labour_days,
-                overtime_hours=labour_data.overtime_hours,
-                overtime_rate=labour_data.overtime_rate,
-                amount=amount,
-                notes=labour_data.notes,
+            calculate_quotation_totals(quotation)
+
+            if quotation.discount_amount < 0:
+                raise HTTPException(status_code=400, detail="Discount amount cannot be negative.")
+            if quotation.discount_amount > quotation.subtotal:
+                raise HTTPException(status_code=400, detail="Discount amount cannot exceed subtotal.")
+            if quotation.advance_paid < 0:
+                raise HTTPException(status_code=400, detail="Advance amount cannot be negative.")
+            if quotation.advance_paid > quotation.grand_total:
+                raise HTTPException(status_code=400, detail="Advance paid cannot exceed grand total.")
+
+            quotation.balance_due = round(quotation.grand_total - quotation.advance_paid, 2)
+            await db.flush()
+
+            db.add(
+                ActivityLog(
+                    action="CREATE_QUOTATION",
+                    entity="quotation",
+                    entity_id=quotation.id,
+                    performed_by=current_user.id,
+                    details={
+                        "quotation_no": quotation.quotation_no,
+                        "client_id": quotation.client_user_id,
+                        "client_name": quotation.client_name,
+                        "status": quotation.status.value,
+                        "subtotal": quotation.subtotal,
+                        "grand_total": quotation.grand_total,
+                    },
+                )
             )
+            await db.flush()
 
-            db.add(labour_item)
-
-        # =====================================================
-        # CREATE MATERIAL ITEMS
-        # =====================================================
-
-        for material_data in payload.material_items:
-
-            estimated_amount = round(
-                material_data.estimated_quantity
-                * material_data.estimated_rate,
-                2,
-            )
-
-            material_item = QuotationMaterial(
-                quotation=quotation,
-                material_id=material_data.material_id,
-                material_name=material_data.material_name,
-                category=material_data.category,
-                unit=material_data.unit,
-                estimated_quantity=material_data.estimated_quantity,
-                estimated_rate=material_data.estimated_rate,
-                estimated_amount=estimated_amount,
-                notes=material_data.notes,
-            )
-
-            db.add(material_item)
-
-        # =====================================================
-        # CREATE EXTRA CHARGES
-        # =====================================================
-
-        for extra_data in payload.extra_charge_items:
-
-            amount = round(
-                extra_data.quantity * extra_data.rate,
-                2,
-            )
-
-            extra_charge = QuotationExtraCharge(
-                quotation=quotation,
-                equipment_id=extra_data.equipment_id,
-                expense_type=extra_data.expense_type,
-                description=extra_data.description,
-                quantity=extra_data.quantity,
-                rate=extra_data.rate,
-                amount=amount,
-                notes=extra_data.notes,
-            )
-
-            db.add(extra_charge)
-
-        # =====================================================
-        # SAVE ALL CHILD RECORDS
-        # =====================================================
-
-        await db.flush()
-
-        # =====================================================
-        # LOAD RELATIONSHIPS
-        # =====================================================
-
-        await db.refresh(
-            quotation,
-            attribute_names=[
-                "items",
-                "labour_items",
-                "material_items",
-                "extra_charge_items",
-            ],
-        )
-
-        # =====================================================
-        # CALCULATE TOTALS
-        # =====================================================
-
-        calculate_quotation_totals(quotation)
-
-        # =====================================================
-        # VALIDATE TOTALS
-        # =====================================================
-
-        if quotation.discount_amount < 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Discount amount cannot be negative."
-            )
-
-        if quotation.discount_amount > quotation.subtotal:
-            raise HTTPException(
-                status_code=400,
-                detail="Discount amount cannot exceed subtotal."
-            )
-
-        if quotation.advance_paid < 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Advance amount cannot be negative."
-            )
-
-        if quotation.advance_paid > quotation.grand_total:
-            raise HTTPException(
-                status_code=400,
-                detail="Advance paid cannot exceed grand total."
-            )
-
-        quotation.balance_due = round(
-            quotation.grand_total - quotation.advance_paid,
-            2,
-        )
-
-        # =====================================================
-        # SAVE UPDATED TOTALS
-        # =====================================================
-
-        await db.flush()
-                # =====================================================
-        # ACTIVITY LOG
-        # =====================================================
-
-        db.add(
-            ActivityLog(
-                action="CREATE_QUOTATION",
-                entity="quotation",
-                entity_id=quotation.id,
-                performed_by=current_user.id,
-                details={
-                    "quotation_no": quotation.quotation_no,
-                    "client_id": quotation.client_user_id,
-                    "client_name": quotation.client_name,
-                    "status": quotation.status.value,
-                    "subtotal": quotation.subtotal,
-                    "grand_total": quotation.grand_total,
-                },
-            )
-        )
-
-        # =====================================================
-        # SAVE ACTIVITY LOG
-        # =====================================================
-
-        await db.flush()
-
-        # =====================================================
-        # COMMIT TRANSACTION
-        # =====================================================
-
-        await db.commit()
-
-        # =====================================================
-        # REFRESH QUOTATION
-        # =====================================================
-
-        await db.refresh(quotation)
-
-        # =====================================================
-        # RETURN COMPLETE OBJECT
-        # =====================================================
+            try:
+                await db.commit()
+                created_quotation_id = quotation.id
+                break
+            except IntegrityError as e:
+                await db.rollback()
+                err_msg = str(e).lower()
+                if (
+                    "quotation_no" in err_msg
+                    or "duplicate" in err_msg
+                    or "unique" in err_msg
+                ) and attempt < max_attempts - 1:
+                    logger.warning(
+                        f"Quotation number collision on {quotation_no}, retrying attempt {attempt + 1}"
+                    )
+                    continue
+                raise
 
         return await get_quotation_or_404(
-            quotation.id,
+            created_quotation_id,
             db,
             current_user,
         )
@@ -1717,9 +1831,27 @@ async def list_quotations(
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(50, ge=1, le=200, description="Max records to return"),
     project_id: Optional[int] = Query(None, description="Filter by project ID"),
+    company_id: Optional[int] = Query(None, description="Filter by company ID (Super Admin only)"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.view")),
 ):
+    is_sa = assert_company_context(current_user)
+    target_company_id = company_id if is_sa else current_user.company_id
+
+    if is_sa and company_id is not None:
+        comp = await db.scalar(select(Company).where(Company.id == company_id, Company.is_active == True))
+        if not comp:
+            raise HTTPException(status_code=404, detail="Company not found")
+
+    if project_id:
+        if not is_sa:
+            await get_project_or_404(db, project_id, current_user.company_id, current_user)
+        else:
+            proj = await db.scalar(select(Project).where(Project.id == project_id))
+            if not proj or (target_company_id is not None and proj.company_id != target_company_id):
+                raise HTTPException(status_code=404, detail="Project not found")
+
+    is_client = await is_client_user(db, current_user)
 
     query = select(QuotationMaster).options(
         selectinload(QuotationMaster.items).selectinload(QuotationItem.measurements),
@@ -1728,14 +1860,16 @@ async def list_quotations(
         selectinload(QuotationMaster.extra_charge_items),
     )
 
-    if getattr(current_user, "is_super_admin", False) is True:
-        pass
-    elif current_user.role == UserRole.CLIENT or current_user.role == "Client":
-        query = query.where(QuotationMaster.client_user_id == current_user.id)
-    elif current_user.company_id:
-        query = query.where(QuotationMaster.company_id == current_user.company_id)
+    if is_sa:
+        if target_company_id is not None:
+            query = query.where(QuotationMaster.company_id == target_company_id)
+    elif is_client:
+        query = query.where(
+            QuotationMaster.company_id == current_user.company_id,
+            QuotationMaster.client_user_id == current_user.id,
+        )
     else:
-        return []
+        query = query.where(QuotationMaster.company_id == target_company_id)
 
     if project_id:
         query = query.where(QuotationMaster.project_id == project_id)
@@ -1775,7 +1909,7 @@ async def update_quotation(
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # ONLY DRAFT QUOTATION CAN BE UPDATED
@@ -1838,7 +1972,7 @@ async def delete_quotation(
     current_user: User = Depends(require_permission("quotations.delete")),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # APPROVED CHECK
@@ -1877,7 +2011,7 @@ async def add_quotation_item(
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # APPROVED CHECK
@@ -1986,19 +2120,24 @@ async def update_quotation_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
-
-    result = await db.execute(
+    is_sa = assert_company_context(current_user)
+    stmt = (
         select(QuotationItem)
         .options(selectinload(QuotationItem.measurements))
         .where(QuotationItem.id == item_id)
     )
+    if not is_sa:
+        stmt = stmt.join(QuotationMaster, QuotationItem.quotation_id == QuotationMaster.id).where(
+            QuotationMaster.company_id == current_user.company_id
+        )
 
+    result = await db.execute(stmt)
     item = result.scalars().first()
 
     if not item:
         raise HTTPException(status_code=404, detail="Quotation item not found")
 
-    quotation = await get_quotation_or_404(item.quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(item.quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # ONLY DRAFT QUOTATION CAN BE MODIFIED
@@ -2154,15 +2293,20 @@ async def delete_quotation_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
+    is_sa = assert_company_context(current_user)
+    stmt = select(QuotationItem).where(QuotationItem.id == item_id)
+    if not is_sa:
+        stmt = stmt.join(QuotationMaster, QuotationItem.quotation_id == QuotationMaster.id).where(
+            QuotationMaster.company_id == current_user.company_id
+        )
 
-    result = await db.execute(select(QuotationItem).where(QuotationItem.id == item_id))
-
+    result = await db.execute(stmt)
     item = result.scalars().first()
 
     if not item:
-        raise HTTPException(404, "Quotation item not found")
+        raise HTTPException(status_code=404, detail="Quotation item not found")
 
-    quotation = await get_quotation_or_404(item.quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(item.quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # APPROVED CHECK
@@ -2218,7 +2362,7 @@ async def approve_quotation(
     current_user: User = Depends(require_permission("quotations.approve")),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # Already approved
     if quotation.is_approved:
@@ -2267,7 +2411,7 @@ async def reject_quotation(
     current_user: User = Depends(require_permission("quotations.approve")),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # Quotation must be sent first
     if quotation.status == QuotationStatus.DRAFT:
@@ -2330,16 +2474,7 @@ async def convert_to_bill(
     # unique constraint on RABill.quotation_id cannot fully close,
     # the double-conversion race).
 
-    lock_result = await db.execute(
-        select(QuotationMaster)
-        .where(QuotationMaster.id == quotation_id)
-        .with_for_update()
-    )
-    locked = lock_result.scalars().first()
-    if not locked:
-        raise HTTPException(404, "Quotation not found")
-
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # APPROVAL CHECK
 
@@ -2352,18 +2487,10 @@ async def convert_to_bill(
         raise HTTPException(400, "Already converted to bill")
 
     # VALIDATE PROJECT
-
-    project = await db.get(Project, project_id)
-
-    if not project or project.company_id != quotation.company_id:
-        raise HTTPException(404, "Project not found")
+    project = await get_project_or_404(db, project_id, quotation.company_id, current_user)
 
     # VALIDATE CONTRACTOR
-
-    contractor = await db.get(Contractor, contractor_id)
-
-    if not contractor or contractor.company_id != quotation.company_id:
-        raise HTTPException(404, "Contractor not found")
+    contractor = await get_contractor_or_404(db, contractor_id, quotation.company_id, current_user)
 
     # PREPARE AMOUNTS
 
@@ -2459,16 +2586,7 @@ async def convert_to_work_order(
     # LOCK THE QUOTATION ROW (see note in convert_to_bill)
     # =====================================================
 
-    lock_result = await db.execute(
-        select(QuotationMaster)
-        .where(QuotationMaster.id == quotation_id)
-        .with_for_update()
-    )
-    locked = lock_result.scalars().first()
-    if not locked:
-        raise HTTPException(404, "Quotation not found")
-
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # APPROVAL CHECK
@@ -2488,19 +2606,13 @@ async def convert_to_work_order(
     # VALIDATE PROJECT
     # =====================================================
 
-    project = await db.get(Project, project_id)
-
-    if not project or project.company_id != quotation.company_id:
-        raise HTTPException(404, "Project not found")
+    project = await get_project_or_404(db, project_id, quotation.company_id, current_user)
 
     # =====================================================
     # VALIDATE CONTRACTOR
     # =====================================================
 
-    contractor = await db.get(Contractor, contractor_id)
-
-    if not contractor or contractor.company_id != quotation.company_id:
-        raise HTTPException(404, "Contractor not found")
+    contractor = await get_contractor_or_404(db, contractor_id, quotation.company_id, current_user)
 
     # =====================================================
     # GENERATE WORK ORDER NUMBER
@@ -2585,7 +2697,7 @@ async def add_labour_item(
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     if quotation.is_approved:
         raise HTTPException(
@@ -2594,13 +2706,9 @@ async def add_labour_item(
         )
 
     if payload.labour_id:
-        labour = await db.get(Labour, payload.labour_id)
-
-        if not labour or (quotation.company_id and labour.company_id != quotation.company_id):
-            raise HTTPException(
-                status_code=404,
-                detail="Labour not found"
-            )
+        labour = await get_labour_or_404(
+            db, payload.labour_id, quotation.company_id, current_user
+        )
 
     amount = calculate_labour_amount(
         labour_count=payload.labour_count,
@@ -2662,13 +2770,14 @@ async def update_labour_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
-
-    result = await db.execute(
-        select(QuotationLabour).where(
-            QuotationLabour.id == labour_item_id
+    is_sa = assert_company_context(current_user)
+    stmt = select(QuotationLabour).where(QuotationLabour.id == labour_item_id)
+    if not is_sa:
+        stmt = stmt.join(QuotationMaster, QuotationLabour.quotation_id == QuotationMaster.id).where(
+            QuotationMaster.company_id == current_user.company_id
         )
-    )
 
+    result = await db.execute(stmt)
     labour_item = result.scalars().first()
 
     if not labour_item:
@@ -2681,6 +2790,7 @@ async def update_labour_item(
         labour_item.quotation_id,
         db,
         current_user,
+        with_for_update=True,
     )
 
     # =====================================================
@@ -2701,13 +2811,9 @@ async def update_labour_item(
         payload.labour_id is not None
         and payload.labour_id != labour_item.labour_id
     ):
-        labour = await db.get(Labour, payload.labour_id)
-
-        if not labour or (quotation.company_id and labour.company_id != quotation.company_id):
-            raise HTTPException(
-                status_code=404,
-                detail="Labour not found"
-            )
+        labour = await get_labour_or_404(
+            db, payload.labour_id, quotation.company_id, current_user
+        )
 
     # =====================================================
     # UPDATE FIELDS
@@ -2773,17 +2879,20 @@ async def delete_labour_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
+    is_sa = assert_company_context(current_user)
+    stmt = select(QuotationLabour).where(QuotationLabour.id == labour_item_id)
+    if not is_sa:
+        stmt = stmt.join(QuotationMaster, QuotationLabour.quotation_id == QuotationMaster.id).where(
+            QuotationMaster.company_id == current_user.company_id
+        )
 
-    result = await db.execute(
-        select(QuotationLabour).where(QuotationLabour.id == labour_item_id)
-    )
-
+    result = await db.execute(stmt)
     labour_item = result.scalars().first()
 
     if not labour_item:
-        raise HTTPException(404, "Labour item not found")
+        raise HTTPException(status_code=404, detail="Labour item not found")
 
-    quotation = await get_quotation_or_404(labour_item.quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(labour_item.quotation_id, db, current_user, with_for_update=True)
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
@@ -2814,7 +2923,7 @@ async def add_material_item(
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # APPROVED CHECK
@@ -2831,22 +2940,9 @@ async def add_material_item(
     # =====================================================
 
     if payload.material_id:
-
-        material = await db.get(Material, payload.material_id)
-
-        if not material:
-            raise HTTPException(
-                status_code=404,
-                detail="Material not found"
-            )
-
-        if quotation.company_id and material.project_id:
-            mat_proj = await db.get(Project, material.project_id)
-            if not mat_proj or mat_proj.company_id != quotation.company_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Material not found"
-                )
+        material = await get_material_or_404(
+            db, payload.material_id, quotation.company_id, current_user
+        )
 
     # =====================================================
     # CALCULATE AMOUNT
@@ -2920,13 +3016,14 @@ async def update_material_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
-
-    result = await db.execute(
-        select(QuotationMaterial).where(
-            QuotationMaterial.id == material_item_id
+    is_sa = assert_company_context(current_user)
+    stmt = select(QuotationMaterial).where(QuotationMaterial.id == material_item_id)
+    if not is_sa:
+        stmt = stmt.join(QuotationMaster, QuotationMaterial.quotation_id == QuotationMaster.id).where(
+            QuotationMaster.company_id == current_user.company_id
         )
-    )
 
+    result = await db.execute(stmt)
     material_item = result.scalars().first()
 
     if not material_item:
@@ -2935,7 +3032,7 @@ async def update_material_item(
             detail="Material item not found"
         )
 
-    quotation = await get_quotation_or_404(material_item.quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(material_item.quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # APPROVED CHECK
@@ -2952,22 +3049,9 @@ async def update_material_item(
     # =====================================================
 
     if payload.material_id:
-
-        material = await db.get(Material, payload.material_id)
-
-        if not material:
-            raise HTTPException(
-                status_code=404,
-                detail="Material not found"
-            )
-
-        if quotation.company_id and material.project_id:
-            mat_proj = await db.get(Project, material.project_id)
-            if not mat_proj or mat_proj.company_id != quotation.company_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Material not found"
-                )
+        material = await get_material_or_404(
+            db, payload.material_id, quotation.company_id, current_user
+        )
 
     # =====================================================
     # UPDATE FIELDS
@@ -3033,17 +3117,20 @@ async def delete_material_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
+    is_sa = assert_company_context(current_user)
+    stmt = select(QuotationMaterial).where(QuotationMaterial.id == material_item_id)
+    if not is_sa:
+        stmt = stmt.join(QuotationMaster, QuotationMaterial.quotation_id == QuotationMaster.id).where(
+            QuotationMaster.company_id == current_user.company_id
+        )
 
-    result = await db.execute(
-        select(QuotationMaterial).where(QuotationMaterial.id == material_item_id)
-    )
-
+    result = await db.execute(stmt)
     material_item = result.scalars().first()
 
     if not material_item:
-        raise HTTPException(404, "Material item not found")
+        raise HTTPException(status_code=404, detail="Material item not found")
 
-    quotation = await get_quotation_or_404(material_item.quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(material_item.quotation_id, db, current_user, with_for_update=True)
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
@@ -3091,7 +3178,7 @@ async def add_extra_charge(
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
 
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     if quotation.is_approved:
         raise HTTPException(
@@ -3104,22 +3191,9 @@ async def add_extra_charge(
     # ================================================
 
     if payload.equipment_id:
-
-        equipment = await db.get(Equipment, payload.equipment_id)
-
-        if not equipment:
-            raise HTTPException(
-                status_code=404,
-                detail="Equipment not found",
-            )
-
-        if quotation.company_id and equipment.project_id:
-            eq_proj = await db.get(Project, equipment.project_id)
-            if not eq_proj or eq_proj.company_id != quotation.company_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Equipment not found",
-                )
+        equipment = await get_equipment_or_404(
+            db, payload.equipment_id, quotation.company_id, current_user
+        )
 
     amount = payload.quantity * payload.rate
 
@@ -3162,13 +3236,14 @@ async def update_extra_charge(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
-
-    result = await db.execute(
-        select(QuotationExtraCharge).where(
-            QuotationExtraCharge.id == extra_charge_id
+    is_sa = assert_company_context(current_user)
+    stmt = select(QuotationExtraCharge).where(QuotationExtraCharge.id == extra_charge_id)
+    if not is_sa:
+        stmt = stmt.join(QuotationMaster, QuotationExtraCharge.quotation_id == QuotationMaster.id).where(
+            QuotationMaster.company_id == current_user.company_id
         )
-    )
 
+    result = await db.execute(stmt)
     extra_charge = result.scalars().first()
 
     if not extra_charge:
@@ -3177,7 +3252,7 @@ async def update_extra_charge(
             detail="Extra charge not found",
         )
 
-    quotation = await get_quotation_or_404(extra_charge.quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(extra_charge.quotation_id, db, current_user, with_for_update=True)
 
     # =====================================================
     # APPROVED CHECK
@@ -3194,22 +3269,9 @@ async def update_extra_charge(
     # =====================================================
 
     if payload.equipment_id is not None:
-
-        equipment = await db.get(Equipment, payload.equipment_id)
-
-        if not equipment:
-            raise HTTPException(
-                status_code=404,
-                detail="Equipment not found",
-            )
-
-        if quotation.company_id and equipment.project_id:
-            eq_proj = await db.get(Project, equipment.project_id)
-            if not eq_proj or eq_proj.company_id != quotation.company_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Equipment not found",
-                )
+        equipment = await get_equipment_or_404(
+            db, payload.equipment_id, quotation.company_id, current_user
+        )
 
     # =====================================================
     # UPDATE FIELDS
@@ -3251,17 +3313,20 @@ async def delete_extra_charge(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.edit")),
 ):
+    is_sa = assert_company_context(current_user)
+    stmt = select(QuotationExtraCharge).where(QuotationExtraCharge.id == extra_charge_id)
+    if not is_sa:
+        stmt = stmt.join(QuotationMaster, QuotationExtraCharge.quotation_id == QuotationMaster.id).where(
+            QuotationMaster.company_id == current_user.company_id
+        )
 
-    result = await db.execute(
-        select(QuotationExtraCharge).where(QuotationExtraCharge.id == extra_charge_id)
-    )
-
+    result = await db.execute(stmt)
     extra_charge = result.scalars().first()
 
     if not extra_charge:
-        raise HTTPException(404, "Extra charge not found")
+        raise HTTPException(status_code=404, detail="Extra charge not found")
 
-    quotation = await get_quotation_or_404(extra_charge.quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(extra_charge.quotation_id, db, current_user, with_for_update=True)
 
     if quotation.is_approved:
         raise HTTPException(400, "Approved quotation cannot be modified")
@@ -3346,16 +3411,7 @@ async def convert_quotation_to_project(
     current_user: User = Depends(require_permission("quotations.manage")),
 ):
     # LOCK THE QUOTATION ROW (see note in convert_to_bill)
-    lock_result = await db.execute(
-        select(QuotationMaster)
-        .where(QuotationMaster.id == quotation_id)
-        .with_for_update()
-    )
-    locked = lock_result.scalars().first()
-    if not locked:
-        raise HTTPException(404, "Quotation not found")
-
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     if not quotation.is_approved:
         raise HTTPException(
@@ -3365,7 +3421,10 @@ async def convert_quotation_to_project(
 
     # Check if a project already exists for this quotation
     result = await db.execute(
-        select(Project).where(Project.quotation_id == quotation_id)
+        select(Project).where(
+            Project.quotation_id == quotation_id,
+            Project.company_id == quotation.company_id,
+        )
     )
     existing_project = result.scalars().first()
 
@@ -3375,10 +3434,7 @@ async def convert_quotation_to_project(
             detail="A project has already been created for this quotation",
         )
 
-    owner = await db.get(Owner, payload.owner_id)
-
-    if not owner or owner.company_id != quotation.company_id:
-        raise HTTPException(status_code=404, detail="Owner not found")
+    owner = await get_owner_or_404(db, payload.owner_id, quotation.company_id, current_user)
 
     business_id = await generate_business_id(db, Project, "business_id", "PRJ")
 
@@ -3446,7 +3502,7 @@ async def send_quotation(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("quotations.assign")),
 ):
-    quotation = await get_quotation_or_404(quotation_id, db, current_user)
+    quotation = await get_quotation_or_404(quotation_id, db, current_user, with_for_update=True)
 
     # Client validation
     if not quotation.client_user_id:
