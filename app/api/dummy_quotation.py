@@ -62,13 +62,14 @@ def calculate_dummy_item_measurements(unit: str, length: float, width: float, he
         quantity = cubic_ft if cubic_ft > 0 else 1
         formula = "custom"
         
+    quantity = round(quantity, 2)
     amount = quantity * rate
     
     return {
         "cubic_feet": round(cubic_ft, 2),
         "cubic_meter": round(cubic_meter, 2),
         "brass": round(brass, 2),
-        "quantity": round(quantity, 2),
+        "quantity": quantity,
         "amount": round(amount, 2),
         "formula": formula,
     }
@@ -169,7 +170,7 @@ async def preview_dummy_quotation(
         if item_in.measurements:
             for m in item_in.measurements:
                 calc = calculate_dummy_item_measurements(
-                    m.unit or "ft", m.length or 0, m.width or 0, m.height or 0, item_in.rate
+                    item_in.unit or "ft", m.length or 0, m.width or 0, m.height or 0, item_in.rate
                 )
                 item_qty += calc["quantity"]
                 item_amount += calc["amount"]
@@ -285,7 +286,7 @@ async def create_dummy_quotation(
         if item_in.measurements:
             for m in item_in.measurements:
                 calc = calculate_dummy_item_measurements(
-                    m.unit or "ft", m.length or 0, m.width or 0, m.height or 0, item_in.rate
+                    item_in.unit or "ft", m.length or 0, m.width or 0, m.height or 0, item_in.rate
                 )
                 db_measurement = DummyMeasurementDetail(
                     dummy_quotation_item_id=db_item.id,
@@ -413,7 +414,7 @@ async def update_dummy_quotation(
             if measurements:
                 for m in measurements:
                     calc = calculate_dummy_item_measurements(
-                        m.get("unit") or "ft", 
+                        item_data.get("unit") or "ft", 
                         m.get("length") or 0, 
                         m.get("width") or 0, 
                         m.get("height") or 0, 

@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db_session
 from app.models.settings import CompanySettings, UserSettings
 from app.schemas.settings import CompanySettingsOut, CompanySettingsUpdate, UserSettingsUpdate, UserSettingsOut
-from app.models.user import User
+from app.models.user import User, ActivityLog
 from app.core.dependencies import get_current_active_user, require_permission
 from app.schemas.user import UserOut
 from datetime import date
@@ -374,14 +374,34 @@ async def update_company_settings(
     if not settings:
         settings = CompanySettings(company_id=current_user.company_id)
         db.add(settings)
+        await db.flush()
 
     update_data = payload.model_dump(
         exclude_unset=True
     )
 
+    changed_fields = []
+
     for key, value in update_data.items():
         if key != "company_id":
+            old_value = getattr(settings, key, None)
+            if old_value != value:
+                changed_fields.append(key)
             setattr(settings, key, value)
+
+    if changed_fields:
+        db.add(
+            ActivityLog(
+                action="COMPANY_SETTINGS_UPDATED",
+                entity="company_settings",
+                entity_id=settings.id,
+                performed_by=current_user.id,
+                details={
+                    "changed_fields": changed_fields,
+                    "message": "Company settings updated"
+                }
+            )
+        )
 
     await db.commit()
     await db.refresh(settings)

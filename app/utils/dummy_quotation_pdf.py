@@ -403,14 +403,45 @@ def generate_dummy_quotation_pdf(
     )
 
     # Render callbacks
+    def draw_watermark(canvas, doc):
+        if not logo_path:
+            return
+        try:
+            from PIL import Image as PILImage
+            from reportlab.lib.utils import ImageReader
+            
+            img = PILImage.open(logo_path).convert("RGBA")
+            alpha = img.split()[3]
+            alpha = alpha.point(lambda p: p * 0.1)
+            img.putalpha(alpha)
+            watermark = ImageReader(img)
+            
+            img_w, img_h = img.size
+            aspect = img_h / float(img_w)
+            new_w = 400
+            new_h = new_w * aspect
+            if new_h > 400:
+                new_h = 400
+                new_w = new_h / aspect
+                
+            x = (A4[0] - new_w) / 2
+            y = (A4[1] - new_h) / 2
+            
+            canvas.saveState()
+            canvas.drawImage(watermark, x, y, width=new_w, height=new_h, mask='auto')
+            canvas.restoreState()
+        except Exception:
+            pass
+
     def draw_first_page(canvas, doc):
+        draw_watermark(canvas, doc)
         canvas.saveState()
         header_table.wrapOn(canvas, doc.width, doc.topMargin)
         header_table.drawOn(canvas, doc.leftMargin, A4[1] - 90)
         canvas.restoreState()
 
     def draw_later_pages(canvas, doc):
-        pass  # No header on subsequent pages
+        draw_watermark(canvas, doc)
 
     # =====================================================
     # SIGNATURE + FOOTER (content-aware, normal flow)
