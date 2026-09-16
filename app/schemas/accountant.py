@@ -539,3 +539,49 @@ class FixedAssetOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+# --- New Report Schemas ---
+
+class PayablesAgingBucket(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    total_billed: Decimal
+    total_paid: Decimal
+    total_outstanding: Decimal
+    not_due: Decimal
+    days_1_30: Decimal
+    days_31_60: Decimal
+    days_61_90: Decimal
+    days_90_plus: Decimal
+
+class VendorPayablesAgingOut(BaseModel):
+    as_of_date: date
+    total_billed: Decimal
+    total_paid: Decimal
+    total_outstanding: Decimal
+    overdue_amount: Decimal
+    not_due_total: Decimal
+    days_1_30_total: Decimal
+    days_31_60_total: Decimal
+    days_61_90_total: Decimal
+    days_90_plus_total: Decimal
+    vendors: list[PayablesAgingBucket]
+
+class BillingReconciliationItem(BaseModel):
+    billing_id: int
+    billing_type: str # 'invoice' or 'ra_bill'
+    reference_number: str
+    billed_amount: Decimal
+    paid_amount: Decimal
+    outstanding_amount: Decimal
+    status: str
+    client_name: Optional[str] = None
+    project_name: Optional[str] = None
+    discrepancy: bool
+
+class BillingReconciliationOut(BaseModel):
+    total_billed: Decimal
+    total_received: Decimal
+    total_outstanding: Decimal
+    total_unallocated_advances: Decimal
+    items: list[BillingReconciliationItem]
