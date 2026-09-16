@@ -3464,3 +3464,256 @@ async def import_gst(
         valid_records=valid,
         errors=errors
     )
+
+# ================= NEW REPORTS =================
+
+from app.schemas.accountant import VendorPayablesAgingOut, PayablesAgingBucket, BillingReconciliationOut, BillingReconciliationItem
+from app.models.accountant import VendorBill
+from app.models.billing import RABill
+from app.models.invoice import Invoice, Transaction
+from app.models.project import Project
+from app.models.material import Supplier
+from sqlalchemy import case, literal_column
+
+@router.get("/reports/vendor-aging", response_model=VendorPayablesAgingOut)
+async def vendor_payables_aging(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    supplier_id: Optional[int] = None,
+    project_id: Optional[int] = None,
+    as_of_date: Optional[date] = None,
+):
+    from sqlalchemy import and_, or_
+    from datetime import date, timedelta
+    
+    today = as_of_date or date.today()
+    date_30 = today - timedelta(days=30)
+    date_60 = today - timedelta(days=60)
+    date_90 = today - timedelta(days=90)
+    
+    outst_val = case((VendorBill.total_amount - VendorBill.amount_paid > 0, VendorBill.total_amount - VendorBill.amount_paid), else_=0)
+    
+    query = select(
+        Supplier.id.label("vendor_id"),
+        func.max(Supplier.supplier_name).label("vendor_name"),
+        func.sum(VendorBill.total_amount).label("total_billed"),
+        func.sum(VendorBill.amount_paid).label("total_paid"),
+        func.sum(outst_val).label("total_outstanding"),
+        func.sum(
+            case((or_(VendorBill.due_date == None, VendorBill.due_date >= today), outst_val), else_=0)
+        ).label("not_due"),
+        func.sum(
+            case((and_(VendorBill.due_date < today, VendorBill.due_date >= date_30), outst_val), else_=0)
+        ).label("days_1_30"),
+        func.sum(
+            case((and_(VendorBill.due_date < date_30, VendorBill.due_date >= date_60), outst_val), else_=0)
+        ).label("days_31_60"),
+        func.sum(
+            case((and_(VendorBill.due_date < date_60, VendorBill.due_date >= date_90), outst_val), else_=0)
+        ).label("days_61_90"),
+        func.sum(
+            case((VendorBill.due_date < date_90, outst_val), else_=0)
+        ).label("days_90_plus")
+    ).outerjoin(Supplier, VendorBill.supplier_id == Supplier.id).where(VendorBill.status != "REJECTED")
+    
+    if supplier_id:
+        query = query.where(VendorBill.supplier_id == supplier_id)
+    if project_id:
+        query = query.where(VendorBill.project_id == project_id)
+        
+    query = query.group_by(Supplier.id)
+        
+    result = await db.execute(query)
+    rows = result.all()
+    
+    vendors = []
+    total_billed = Decimal("0")
+    total_paid = Decimal("0")
+    total_outstanding = Decimal("0")
+    not_due_total = Decimal("0")
+    days_1_30_total = Decimal("0")
+    days_31_60_total = Decimal("0")
+    days_61_90_total = Decimal("0")
+    days_90_plus_total = Decimal("0")
+    
+    for row in rows:
+        vendor_id = row.vendor_id
+        # Supplier.id can be null if missing due to outerjoin, though supplier_id is not null in DB
+        if not vendor_id: continue
+        
+        vb = Decimal(str(row.total_billed or 0))
+        vp = Decimal(str(row.total_paid or 0))
+        vo = Decimal(str(row.total_outstanding or 0))
+        vnd = Decimal(str(row.not_due or 0))
+        vd1 = Decimal(str(row.days_1_30 or 0))
+        vd31 = Decimal(str(row.days_31_60 or 0))
+        vd61 = Decimal(str(row.days_61_90 or 0))
+        vd90 = Decimal(str(row.days_90_plus or 0))
+        
+        total_billed += vb
+        total_paid += vp
+        total_outstanding += vo
+        not_due_total += vnd
+        days_1_30_total += vd1
+        days_31_60_total += vd31
+        days_61_90_total += vd61
+        days_90_plus_total += vd90
+        
+        vendors.append(PayablesAgingBucket(
+            vendor_id=vendor_id,
+            vendor_name=row.vendor_name or "Unknown",
+            total_billed=vb,
+            total_paid=vp,
+            total_outstanding=vo,
+            not_due=vnd,
+            days_1_30=vd1,
+            days_31_60=vd31,
+            days_61_90=vd61,
+            days_90_plus=vd90,
+        ))
+
+    return VendorPayablesAgingOut(
+        as_of_date=today,
+        total_billed=total_billed,
+        total_paid=total_paid,
+        total_outstanding=total_outstanding,
+        overdue_amount=total_outstanding - not_due_total,
+        not_due_total=not_due_total,
+        days_1_30_total=days_1_30_total,
+        days_31_60_total=days_31_60_total,
+        days_61_90_total=days_61_90_total,
+        days_90_plus_total=days_90_plus_total,
+        vendors=vendors
+    )
+
+@router.get("/reports/billing-reconciliation", response_model=BillingReconciliationOut)
+async def billing_vs_payments_reconciliation(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
+    project_id: Optional[int] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+):
+    from sqlalchemy.orm import selectinload
+    from datetime import datetime, time, timedelta
+    
+    # 1. SUMMARY TOTALS
+    inv_sum_q = select(
+        func.sum(Invoice.total_amount).label('tot'),
+        func.sum(Invoice.paid_amount).label('paid'),
+        func.sum(Invoice.pending_amount).label('pend')
+    ).where(Invoice.status != "CANCELLED")
+    
+    ra_sum_q = select(
+        func.sum(RABill.total_amount).label('tot'),
+        func.sum(case((RABill.status == "Paid", RABill.total_amount), else_=0)).label('paid')
+    ).where(RABill.status != "CANCELLED")
+    
+    unalloc_q = select(func.sum(Transaction.amount)).where(
+        Transaction.type == "receipt",
+        Transaction.invoice_id == None,
+        Transaction.linked_to == None
+    )
+    
+    if project_id:
+        inv_sum_q = inv_sum_q.where(Invoice.project_id == project_id)
+        ra_sum_q = ra_sum_q.where(RABill.project_id == project_id)
+        unalloc_q = unalloc_q.where(Transaction.project_id == project_id)
+        
+    if start_date:
+        dt_start = datetime.combine(start_date, time.min)
+        inv_sum_q = inv_sum_q.where(Invoice.created_at >= dt_start)
+        ra_sum_q = ra_sum_q.where(RABill.bill_date >= start_date)
+        unalloc_q = unalloc_q.where(Transaction.created_at >= dt_start)
+        
+    if end_date:
+        dt_end = datetime.combine(end_date + timedelta(days=1), time.min)
+        inv_sum_q = inv_sum_q.where(Invoice.created_at < dt_end)
+        ra_sum_q = ra_sum_q.where(RABill.bill_date <= end_date)
+        unalloc_q = unalloc_q.where(Transaction.created_at < dt_end)
+
+    inv_sum_res = (await db.execute(inv_sum_q)).first()
+    ra_sum_res = (await db.execute(ra_sum_q)).first()
+    unalloc_res = await db.scalar(unalloc_q)
+    
+    total_billed = Decimal(str(inv_sum_res.tot or 0)) + Decimal(str(ra_sum_res.tot or 0))
+    total_received = Decimal(str(inv_sum_res.paid or 0)) + Decimal(str(ra_sum_res.paid or 0))
+    
+    inv_outst = Decimal(str(inv_sum_res.pend or 0))
+    ra_outst = Decimal(str(ra_sum_res.tot or 0)) - Decimal(str(ra_sum_res.paid or 0))
+    total_outstanding = inv_outst + ra_outst
+    
+    total_unallocated = Decimal(str(unalloc_res or 0))
+    
+    # 2. ITEMS PAGINATION
+    # Invoices count
+    inv_count_q = select(func.count(Invoice.id)).where(Invoice.status != "CANCELLED")
+    if project_id: inv_count_q = inv_count_q.where(Invoice.project_id == project_id)
+    if start_date: inv_count_q = inv_count_q.where(Invoice.created_at >= datetime.combine(start_date, time.min))
+    if end_date: inv_count_q = inv_count_q.where(Invoice.created_at < datetime.combine(end_date + timedelta(days=1), time.min))
+    inv_count = await db.scalar(inv_count_q) or 0
+    
+    items = []
+    
+    if skip < inv_count:
+        inv_limit = min(limit, inv_count - skip)
+        inv_q = select(Invoice, Project).outerjoin(Project, Invoice.project_id == Project.id).options(selectinload(Project.owner)).where(Invoice.status != "CANCELLED")
+        if project_id: inv_q = inv_q.where(Invoice.project_id == project_id)
+        if start_date: inv_q = inv_q.where(Invoice.created_at >= datetime.combine(start_date, time.min))
+        if end_date: inv_q = inv_q.where(Invoice.created_at < datetime.combine(end_date + timedelta(days=1), time.min))
+        
+        inv_q = inv_q.order_by(Invoice.id).offset(skip).limit(inv_limit)
+        inv_rows = (await db.execute(inv_q)).all()
+        for inv, proj in inv_rows:
+            tot = Decimal(str(inv.total_amount or 0))
+            paid = Decimal(str(inv.paid_amount or 0))
+            outst = Decimal(str(inv.pending_amount or 0))
+            items.append(BillingReconciliationItem(
+                billing_id=inv.id,
+                billing_type="invoice",
+                reference_number=inv.invoice_number or f"INV-{inv.id}",
+                billed_amount=tot,
+                paid_amount=paid,
+                outstanding_amount=outst,
+                status=inv.status.value if hasattr(inv.status, "value") else str(inv.status),
+                client_name=proj.owner.owner_name if proj and proj.owner else None,
+                project_name=proj.project_name if proj else None,
+                discrepancy=(outst != (tot - paid))
+            ))
+            
+    if len(items) < limit:
+        ra_skip = max(0, skip - inv_count)
+        ra_limit = limit - len(items)
+        ra_q = select(RABill, Project).outerjoin(Project, RABill.project_id == Project.id).options(selectinload(Project.owner)).where(RABill.status != "CANCELLED")
+        if project_id: ra_q = ra_q.where(RABill.project_id == project_id)
+        if start_date: ra_q = ra_q.where(RABill.bill_date >= start_date)
+        if end_date: ra_q = ra_q.where(RABill.bill_date <= end_date)
+        
+        ra_q = ra_q.order_by(RABill.id).offset(ra_skip).limit(ra_limit)
+        ra_rows = (await db.execute(ra_q)).all()
+        for ra, proj in ra_rows:
+            tot = Decimal(str(ra.total_amount or 0))
+            paid = tot if ra.status == "Paid" else Decimal("0")
+            outst = tot - paid
+            items.append(BillingReconciliationItem(
+                billing_id=ra.id,
+                billing_type="ra_bill",
+                reference_number=ra.bill_number or f"RA-{ra.id}",
+                billed_amount=tot,
+                paid_amount=paid,
+                outstanding_amount=outst,
+                status=str(ra.status),
+                client_name=proj.owner.owner_name if proj and proj.owner else None,
+                project_name=proj.project_name if proj else None,
+                discrepancy=False
+            ))
+
+    return BillingReconciliationOut(
+        total_billed=total_billed,
+        total_received=total_received,
+        total_outstanding=total_outstanding,
+        total_unallocated_advances=total_unallocated,
+        items=items
+    )
