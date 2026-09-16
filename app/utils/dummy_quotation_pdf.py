@@ -107,7 +107,7 @@ def generate_dummy_quotation_pdf(
         if os.path.exists(company_settings.company_logo):
             logo_path = company_settings.company_logo
 
-    title_para = Paragraph("<b>DUMMY QUOTATION</b>", title_style)
+    title_para = Paragraph("<b>QUOTATION</b>", title_style)
 
     # Quotation Info for Header Right Side
     quotation_no = data.get("dummy_quotation_no", "PREVIEW")
@@ -460,18 +460,44 @@ def generate_dummy_quotation_pdf(
         styles["BodyText"],
     )
 
-    # Spacer is outside KeepTogether so only signature+footer (~125pt) must
-    # fit together — the leading gap does NOT force the block to a new page.
-    elements.append(Spacer(1, 20))
-    elements.append(
-        KeepTogether(
-            [
-                signature_para,
-                Spacer(1, 15),
-                footer_table,
-            ]
-        )
-    )
+    # Combine signature and footer into a single Table to get exact height
+    gap_height = 15
+    bottom_table = Table([
+        [signature_para],
+        [Spacer(1, gap_height)],
+        [footer_table]
+    ], colWidths=[doc.width])
+    bottom_table.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+    ]))
+
+    tw, th = bottom_table.wrap(doc.width, doc.height)
+
+    from reportlab.platypus.flowables import Flowable
+    class BottomSpacer(Flowable):
+        def __init__(self, required_height, min_gap=20):
+            self.required_height = required_height
+            self.min_gap = min_gap
+            self.width = 0
+            self.height = 0
+
+        def wrap(self, availWidth, availHeight):
+            self.height = availHeight - self.required_height
+            if self.height < self.min_gap:
+                self.height = availHeight + 1
+            return (self.width, max(0, self.height))
+
+        def split(self, availWidth, availHeight):
+            return [Spacer(1, max(0, availHeight)), self]
+
+        def draw(self):
+            pass
+
+    elements.append(BottomSpacer(th))
+    elements.append(bottom_table)
 
     doc.build(elements, onFirstPage=draw_first_page, onLaterPages=draw_later_pages)
     
