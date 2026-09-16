@@ -111,6 +111,45 @@ async def create_vendor_bill(
     if existing:
         raise HTTPException(status_code=400, detail="Bill number already exists")
 
+    # Backend Validation for Financial Integrity
+    from decimal import Decimal, ROUND_HALF_UP
+
+    provided_gross = Decimal(str(payload.gross_amount or 0))
+    provided_gst_percent = Decimal(str(payload.gst_percent or 0))
+    provided_tds_percent = Decimal(str(payload.tds_percent or 0))
+
+    provided_gst_amount = Decimal(str(payload.gst_amount or 0))
+    provided_tds_amount = Decimal(str(payload.tds_amount or 0))
+    provided_advance = Decimal(str(payload.advance_paid or 0))
+    provided_total = Decimal(str(payload.total_amount or 0))
+
+    # Legacy payload check: existing tests/clients sometimes send only total_amount
+    is_legacy_payload = (
+        provided_gross == 0 and
+        provided_total != 0 and
+        provided_gst_percent == 0 and
+        provided_tds_percent == 0 and
+        provided_gst_amount == 0 and
+        provided_tds_amount == 0
+    )
+
+    if not is_legacy_payload:
+        expected_gst = (provided_gross * (provided_gst_percent / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        expected_tds = (provided_gross * (provided_tds_percent / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        expected_total = provided_gross + provided_gst_amount - provided_tds_amount - provided_advance
+
+        TAX_TOLERANCE = Decimal("1.00")
+        TOTAL_TOLERANCE = Decimal("0.00")
+
+        if abs(expected_gst - provided_gst_amount) > TAX_TOLERANCE:
+            raise HTTPException(status_code=400, detail="GST amount does not reconcile with gross amount and percentage")
+
+        if abs(expected_tds - provided_tds_amount) > TAX_TOLERANCE:
+            raise HTTPException(status_code=400, detail="TDS amount does not reconcile with gross amount and percentage")
+
+        if abs(expected_total - provided_total) > TOTAL_TOLERANCE:
+            raise HTTPException(status_code=400, detail="Total amount does not reconcile with components")
+
     bill = VendorBill(
         company_id=bill_company_id,
         supplier_id=payload.supplier_id,
