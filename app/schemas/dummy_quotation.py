@@ -67,6 +67,9 @@ class CreateDummyQuotation(BaseModel):
     cgst_percent: float = Field(0, ge=0, le=100)
     sgst_percent: float = Field(0, ge=0, le=100)
     
+    transport: Optional[float] = None
+    other: Optional[float] = None
+    
     notes: Optional[str] = None
     
     items: List[DummyQuotationItemCreate] = []
@@ -82,6 +85,9 @@ class UpdateDummyQuotation(BaseModel):
     gst_percent: Optional[float] = Field(None, ge=0, le=100)
     cgst_percent: Optional[float] = Field(None, ge=0, le=100)
     sgst_percent: Optional[float] = Field(None, ge=0, le=100)
+    
+    transport: Optional[float] = None
+    other: Optional[float] = None
     
     notes: Optional[str] = None
     
@@ -105,6 +111,8 @@ class DummyQuotationOut(BaseModel):
     sgst_percent: float
     cgst_amount: float
     sgst_amount: float
+    transport: Optional[float]
+    other: Optional[float]
     grand_total: float
     discount_amount: float
     tds_percent: float

@@ -45,6 +45,8 @@ class DummyQuotation(Base):
     tds_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
     advance_paid: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
     balance_due: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
+    transport: Mapped[Decimal | None] = mapped_column(DECIMAL(18, 2), nullable=True)
+    other: Mapped[Decimal | None] = mapped_column(DECIMAL(18, 2), nullable=True)
 
     notes: Mapped[str | None] = mapped_column(Text)
     

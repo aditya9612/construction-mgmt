@@ -236,3 +236,39 @@ def test_list_dummy_quotations():
         assert isinstance(data, list)
         assert len(data) >= 1
         assert "dummy_quotation_no" in data[0]
+def test_dummy_quotation_transport_other_calculations():
+    """Verify calculation for transport and other with Decimal arithmetic."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    with TestClient(app) as tc:
+        # Both NULL
+        payload = {
+            "items": [{"title": "T1", "rate": 10000.0}],
+            "cgst_percent": 9.0,
+            "sgst_percent": 9.0,
+        }
+        resp = tc.post("/api/v1/dummy-quotations/", json=payload)
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["grand_total"] == 11800.0
+        assert data["transport"] is None
+        assert data["other"] is None
+        q_id = data["id"]
+        
+        # Transport only
+        update_payload = {"transport": 500.0}
+        resp2 = tc.put(f"/api/v1/dummy-quotations/{q_id}", json=update_payload)
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["grand_total"] == 12300.0
+        assert data2["transport"] == 500.0
+        assert data2["other"] is None
+
+        # Transport and Other
+        update_payload2 = {"other": 300.0}
+        resp3 = tc.put(f"/api/v1/dummy-quotations/{q_id}", json=update_payload2)
+        assert resp3.status_code == 200
+        data3 = resp3.json()
+        assert data3["grand_total"] == 12600.0
+        assert data3["transport"] == 500.0
+        assert data3["other"] == 300.0

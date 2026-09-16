@@ -269,6 +269,8 @@ def generate_dummy_quotation_pdf(
     discount_amount = data.get("discount_amount", 0)
     tds_percent = data.get("tds_percent", 0)
     tds_amount = data.get("tds_amount", 0)
+    transport = data.get("transport") or 0
+    other = data.get("other") or 0
     grand_total = data.get("grand_total", 0)
     advance_paid = data.get("advance_paid", 0)
     balance_due = data.get("balance_due", 0)
@@ -280,6 +282,12 @@ def generate_dummy_quotation_pdf(
     if cgst_amount > 0 or sgst_amount > 0:
         total_data.append([f"CGST ({cgst_percent:.1f}%)", f"{cgst_amount:.2f}"])
         total_data.append([f"SGST ({sgst_percent:.1f}%)", f"{sgst_amount:.2f}"])
+        
+    if transport and transport > 0:
+        total_data.append(["Transport", f"{transport:.2f}"])
+        
+    if other and other > 0:
+        total_data.append(["Other Charges", f"{other:.2f}"])
         
     if discount_amount > 0:
         total_data.append(["Discount", f"-{discount_amount:.2f}"])

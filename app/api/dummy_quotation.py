@@ -85,6 +85,8 @@ def calculate_dummy_totals(
     discount_amount: float = 0.0,
     tds_percent: float = 0.0,
     advance_paid: float = 0.0,
+    transport: float = None,
+    other: float = None,
 ):
     # Convert all inputs to Decimal for exact precision
     subtotal_d = Decimal(str(subtotal))
@@ -94,6 +96,8 @@ def calculate_dummy_totals(
     discount_amount_d = Decimal(str(discount_amount))
     tds_percent_d = Decimal(str(tds_percent))
     advance_paid_d = Decimal(str(advance_paid))
+    transport_d = Decimal(str(transport or 0.0))
+    other_d = Decimal(str(other or 0.0))
     
     cgst_amount_d = (subtotal_d * cgst_percent_d) / Decimal('100')
     sgst_amount_d = (subtotal_d * sgst_percent_d) / Decimal('100')
@@ -106,7 +110,7 @@ def calculate_dummy_totals(
         sgst_percent_d = gst_percent_d / Decimal('2')
 
     tds_amount_d = (subtotal_d * tds_percent_d) / Decimal('100')
-    grand_total_d = subtotal_d + cgst_amount_d + sgst_amount_d - discount_amount_d - tds_amount_d
+    grand_total_d = subtotal_d + cgst_amount_d + sgst_amount_d + transport_d + other_d - discount_amount_d - tds_amount_d
     balance_due_d = grand_total_d - advance_paid_d
 
     return {
@@ -211,6 +215,8 @@ async def preview_dummy_quotation(
         0.0,
         0.0,
         0.0,
+        payload.transport,
+        payload.other,
     )
     
     return {
@@ -261,6 +267,8 @@ async def create_dummy_quotation(
         discount_amount=0.0,
         tds_percent=0.0,
         advance_paid=0.0,
+        transport=payload.transport,
+        other=payload.other,
         notes=payload.notes,
     )
     
@@ -319,6 +327,8 @@ async def create_dummy_quotation(
         new_quote.discount_amount,
         new_quote.tds_percent,
         new_quote.advance_paid,
+        new_quote.transport,
+        new_quote.other,
     )
     
     new_quote.subtotal = round(subtotal, 2)
@@ -453,6 +463,8 @@ async def update_dummy_quotation(
         quotation.discount_amount,
         quotation.tds_percent,
         quotation.advance_paid,
+        quotation.transport,
+        quotation.other,
     )
     
     quotation.cgst_percent = totals["cgst_percent"]
