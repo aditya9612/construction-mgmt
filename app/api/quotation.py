@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from typing import Optional
+import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from starlette import status
@@ -294,23 +295,17 @@ async def get_equipment_or_404(
         if obj.company_id is not None:
             if obj.company_id != target_comp:
                 raise HTTPException(status_code=404, detail="Equipment not found")
-            if obj.project_id is not None:
-                proj_valid = await db.scalar(
-                    select(Project.id).where(
-                        Project.id == obj.project_id,
-                        Project.company_id == target_comp,
-                    )
+        elif obj.project_id is not None:
+            proj_valid = await db.scalar(
+                select(Project.id).where(
+                    Project.id == obj.project_id,
+                    Project.company_id == target_comp,
                 )
-                if not proj_valid:
-                    raise HTTPException(status_code=404, detail="Equipment not found")
-        else:
-            if obj.project_id is None:
-                raise HTTPException(status_code=404, detail="Equipment not found")
-            proj_comp = await db.scalar(
-                select(Project.company_id).where(Project.id == obj.project_id)
             )
-            if proj_comp != target_comp:
+            if not proj_valid:
                 raise HTTPException(status_code=404, detail="Equipment not found")
+        else:
+            raise HTTPException(status_code=404, detail="Equipment not found")
 
     return obj
 
@@ -380,38 +375,65 @@ async def get_owner_or_404(
     return obj
 
 
-async def generate_quotation_no(db: AsyncSession) -> str:
-    year = datetime.now().year
-    prefix = f"QT/{year}/"
-    result = await db.execute(
-        select(QuotationMaster.quotation_no)
-        .where(QuotationMaster.quotation_no.like(f"{prefix}%"))
-        .order_by(QuotationMaster.id.desc())
-        .limit(20)
-    )
-    existing_nos = result.scalars().all()
-    max_num = 0
-    for qno in existing_nos:
-        try:
-            num = int(qno.split("/")[-1])
-            if num > max_num:
-                max_num = num
-        except (ValueError, IndexError):
-            pass
-    if max_num == 0:
-        result_max = await db.execute(select(func.max(QuotationMaster.id)))
-        last_id = result_max.scalar() or 0
-        max_num = last_id
+_quotation_no_lock = asyncio.Lock()
+_in_flight_quotation_numbers: set[str] = set()
 
-    candidate_num = max_num + 1
-    while True:
-        candidate = f"{prefix}{candidate_num:04d}"
-        exists_count = await db.scalar(
-            select(func.count(QuotationMaster.id)).where(QuotationMaster.quotation_no == candidate)
-        )
-        if not exists_count:
-            return candidate
-        candidate_num += 1
+
+async def generate_quotation_no(db: AsyncSession) -> str:
+    async with _quotation_no_lock:
+        dialect_name = getattr(getattr(db, "bind", None), "dialect", None)
+        dialect_str = getattr(dialect_name, "name", "")
+        got_db_lock = False
+        if "mysql" in str(dialect_str).lower():
+            try:
+                lock_res = await db.scalar(text("SELECT GET_LOCK('infrapilot_quotation_seq', 5)"))
+                if lock_res == 1:
+                    got_db_lock = True
+            except Exception:
+                pass
+
+        try:
+            year = datetime.now().year
+            prefix = f"QT/{year}/"
+            result = await db.execute(
+                select(QuotationMaster.quotation_no)
+                .where(QuotationMaster.quotation_no.like(f"{prefix}%"))
+                .order_by(QuotationMaster.id.desc())
+                .limit(50)
+            )
+            existing_nos = result.scalars().all()
+            max_num = 0
+            for qno in existing_nos:
+                try:
+                    num = int(qno.split("/")[-1])
+                    if num > max_num:
+                        max_num = num
+                except (ValueError, IndexError):
+                    pass
+            if max_num == 0:
+                result_max = await db.execute(select(func.max(QuotationMaster.id)))
+                last_id = result_max.scalar() or 0
+                max_num = last_id
+
+            candidate_num = max_num + 1
+            while True:
+                candidate = f"{prefix}{candidate_num:04d}"
+                if candidate in _in_flight_quotation_numbers:
+                    candidate_num += 1
+                    continue
+                exists_count = await db.scalar(
+                    select(func.count(QuotationMaster.id)).where(QuotationMaster.quotation_no == candidate)
+                )
+                if not exists_count:
+                    _in_flight_quotation_numbers.add(candidate)
+                    return candidate
+                candidate_num += 1
+        finally:
+            if got_db_lock:
+                try:
+                    await db.execute(text("SELECT RELEASE_LOCK('infrapilot_quotation_seq')"))
+                except Exception:
+                    pass
 
 
 def create_styled_table(data, col_widths, highlight_last_row=False):
@@ -1286,14 +1308,6 @@ async def create_quotation(
 
         client = await get_client_or_404(db, payload.client_user_id, current_user)
 
-        role_str = getattr(client, "role", None)
-        role_name = getattr(role_str, "value", role_str)
-        if str(role_name).lower() not in ("client", "userrole.client"):
-            raise HTTPException(
-                status_code=400,
-                detail="Selected user is not a Client."
-            )
-
         if not is_super:
             target_company_id = current_user.company_id
         else:
@@ -1760,9 +1774,11 @@ async def create_quotation(
             try:
                 await db.commit()
                 created_quotation_id = quotation.id
+                _in_flight_quotation_numbers.discard(quotation_no)
                 break
             except IntegrityError as e:
                 await db.rollback()
+                _in_flight_quotation_numbers.discard(quotation_no)
                 err_msg = str(e).lower()
                 if (
                     "quotation_no" in err_msg
@@ -1773,6 +1789,9 @@ async def create_quotation(
                         f"Quotation number collision on {quotation_no}, retrying attempt {attempt + 1}"
                     )
                     continue
+                raise
+            except Exception:
+                _in_flight_quotation_numbers.discard(quotation_no)
                 raise
 
         return await get_quotation_or_404(
@@ -3397,7 +3416,7 @@ async def generate_pdf(
 # CONVERT QUOTATION TO PROJECT
 # =========================================================
 
-from app.core.enums import ProjectStatus
+from app.core.enums import ProjectStatus, ProjectType
 
 
 @router.post(
@@ -3438,11 +3457,21 @@ async def convert_quotation_to_project(
 
     business_id = await generate_business_id(db, Project, "business_id", "PRJ")
 
+    project_type_enum = None
+    if quotation.project_type:
+        try:
+            project_type_enum = ProjectType(quotation.project_type)
+        except Exception:
+            try:
+                project_type_enum = ProjectType(quotation.project_type.upper())
+            except Exception:
+                project_type_enum = None
+
     project = Project(
         business_id=business_id,
         company_id=quotation.company_id,
         project_name=quotation.project_name,
-        type=quotation.project_type,
+        type=project_type_enum,
         site_address=quotation.site_address,
         start_date=quotation.project_start_date,
         end_date=quotation.project_end_date,

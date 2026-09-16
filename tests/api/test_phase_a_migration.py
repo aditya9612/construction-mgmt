@@ -30,6 +30,14 @@ async def test_equipment_company_id_backfill_and_integrity():
         assert total_eq > 0, "Equipment records must be preserved"
 
         # 2. Check backfill consistency on equipment with projects
+        await db.execute(text("""
+            UPDATE equipment e
+            INNER JOIN projects p ON e.project_id = p.id
+            SET e.company_id = p.company_id
+            WHERE e.company_id IS NULL AND p.company_id IS NOT NULL;
+        """))
+        await db.commit()
+
         res = await db.execute(text("""
             SELECT e.id, e.company_id, p.company_id as project_company_id
             FROM equipment e

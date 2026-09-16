@@ -459,19 +459,19 @@ async def test_batch_h_custom_role_dynamic_lifecycle_payroll():
             proj_id = d_data["proj_a"].id
             today = date.today()
 
-            # 1. Test payroll.view lifecycle
+            # 1. Test labour.view lifecycle
             res = await ac.get(f"/api/v1/labour/payroll?project_id={proj_id}&month={today.month}&year={today.year}", headers=headers)
             assert res.status_code == 403
 
             async with AsyncSessionLocal() as db:
-                p_pview = (await db.execute(select(Permission).where(Permission.code == "payroll.view"))).scalar_one()
+                p_pview = (await db.execute(select(Permission).where(Permission.code == "labour.view"))).scalar_one()
                 db.add(RolePermission(role=role_name, role_id=role_id, permission_id=p_pview.id))
                 await db.commit()
 
             res = await ac.get(f"/api/v1/labour/payroll?project_id={proj_id}&month={today.month}&year={today.year}", headers=headers)
             assert res.status_code == 200
 
-            # 2. Test payroll.approve lifecycle
+            # 2. Test labour.approve lifecycle
             payroll_id = d_data["payroll_a"].id
             labour_id = d_data["labour_a"].id
             pay_payload = {
@@ -486,7 +486,7 @@ async def test_batch_h_custom_role_dynamic_lifecycle_payroll():
             assert res.status_code == 403
 
             async with AsyncSessionLocal() as db:
-                p_papp = (await db.execute(select(Permission).where(Permission.code == "payroll.approve"))).scalar_one()
+                p_papp = (await db.execute(select(Permission).where(Permission.code == "labour.approve"))).scalar_one()
                 db.add(RolePermission(role=role_name, role_id=role_id, permission_id=p_papp.id))
                 await db.commit()
 
@@ -512,7 +512,7 @@ async def test_batch_h_custom_role_dynamic_lifecycle_attendance():
             assert res.status_code == 403
 
             async with AsyncSessionLocal() as db:
-                p_att = (await db.execute(select(Permission).where(Permission.code == "attendance.view"))).scalar_one()
+                p_att = (await db.execute(select(Permission).where(Permission.code == "labour.view"))).scalar_one()
                 db.add(RolePermission(role=role_name, role_id=role_id, permission_id=p_att.id))
                 await db.commit()
 

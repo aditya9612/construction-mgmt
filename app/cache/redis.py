@@ -15,6 +15,10 @@ async def create_redis_client(redis_url: str) -> Redis:
 
 def _dumps(value: Any) -> bytes:
     # Prefer orjson for speed; fall back to std json if needed.
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    elif hasattr(value, "dict") and callable(value.dict):
+        value = value.dict()
     return orjson.dumps(value, default=str)
 
 

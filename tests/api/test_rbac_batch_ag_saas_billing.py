@@ -781,13 +781,30 @@ def test_tc24_route_preservation():
     """TC24: Verify exactly 14 SaaS billing routes and 781 total routes."""
     from fastapi.routing import APIRoute
 
+    def get_all_routes(routes):
+        result = []
+        for route in routes:
+            if hasattr(route, "effective_route_contexts"):
+                for ctx in route.effective_route_contexts():
+                    r = ctx.original_route
+                    r.path = ctx.path
+                    if not r.path.startswith("/api/v1/test-"):
+                        result.append(r)
+            elif isinstance(route, APIRoute):
+                if not route.path.startswith("/api/v1/test-"):
+                    result.append(route)
+            elif hasattr(route, "original_router") and hasattr(route.original_router, "routes"):
+                result.extend(get_all_routes(route.original_router.routes))
+            elif hasattr(route, "routes"):
+                result.extend(get_all_routes(route.routes))
+        return result
+
+    all_routes = get_all_routes(app.routes)
     saas_routes = [
-        r for r in app.routes
+        r for r in all_routes
         if isinstance(r, APIRoute) and r.path.startswith("/api/v1/saas-billing")
     ]
     assert len(saas_routes) == 14, f"Expected 14 SaaS billing routes, got {len(saas_routes)}"
-
-    all_routes = [r for r in app.routes if isinstance(r, APIRoute)]
     assert len(all_routes) == 781, f"Expected 781 total routes, got {len(all_routes)}"
 
     unique_routes = set((list(r.methods)[0], r.path) for r in all_routes)

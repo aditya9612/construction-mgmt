@@ -106,7 +106,16 @@ class MockHistorySession:
         stmt_str = str(stmt).lower()
         if "override" in stmt_str:
             return MockResult([])
-        if "role_permission" in stmt_str or "permissions" in stmt_str:
+        if "role_permission" in stmt_str:
+            try:
+                params = stmt.compile().params
+                role_val = params.get("role_1") or params.get("role")
+                if role_val and role_val != UserRole.ADMIN.value and role_val != "Admin":
+                    return MockResult([])
+            except Exception:
+                pass
+            return MockResult(["saas_billing.view", "saas_billing.create"])
+        if "permissions" in stmt_str:
             return MockResult(["saas_billing.view", "saas_billing.create"])
         if "manual_payment_transactions" in stmt_str:
             txns = list(self.transactions.values())

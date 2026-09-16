@@ -1142,7 +1142,8 @@ async def availability_report(
     if project_id:
         eq_stmt = eq_stmt.where(Equipment.project_id == project_id)
 
-    eq_stmt = eq_stmt.limit(limit).offset(offset)
+    # Do not apply SQL limit/offset before Python-side is_available filtering
+    eq_stmt = eq_stmt.order_by(Equipment.id.asc())
 
     # Get all active equipments (optionally filtered)
     equipments = (await db.execute(eq_stmt)).scalars().all()
@@ -1213,7 +1214,7 @@ async def availability_report(
             )
         )
 
-    return response
+    return response[offset : offset + limit]
 
 
 # ========== ALLOCATION ===========
@@ -1792,7 +1793,12 @@ async def list_equipment(
 
     result = await db.execute(query)
 
-    items = [EquipmentOut.model_validate(row[0]) for row in result.all()]
+    items = []
+    for row in result.all():
+        eq_obj = row[0]
+        eq_out = EquipmentOut.model_validate(eq_obj)
+        eq_out.status = await calculate_equipment_status(db, eq_obj)
+        items.append(eq_out)
 
     total = await db.scalar(count_query)
 
@@ -4369,7 +4375,7 @@ async def equipment_alerts(
     if project_id:
         stmt = stmt.where(Equipment.project_id == project_id)
 
-    stmt = stmt.limit(limit).offset(offset)
+    stmt = stmt.order_by(Equipment.id.asc())
 
     result = await db.execute(stmt)
     rows = result.scalars().all()
@@ -4417,7 +4423,7 @@ async def equipment_alerts(
             }
         )
 
-    return alerts
+    return alerts[offset : offset + limit]
 
 
 # ================== AUDIT LOGS ==================
@@ -5348,55 +5354,88 @@ async def list_transfer_history(
     if equipment_id:
         query = query.where(EquipmentAuditLog.equipment_id == equipment_id)
 
-    count_stmt = select(func.count()).select_from(query.subquery())
-    total = await db.scalar(count_stmt)
+    if project_id:
+        stmt = query.order_by(EquipmentAuditLog.created_at.desc())
+        result = await db.execute(stmt)
+        all_logs = result.scalars().all()
 
-    stmt = (
-        query.order_by(EquipmentAuditLog.created_at.desc()).limit(limit).offset(offset)
-    )
+        filtered_logs = []
+        for log in all_logs:
+            old_values = safe_parse(log.old_values) if log.old_values else {}
+            new_values = safe_parse(log.new_values) if log.new_values else {}
+            from_project = old_values.get("project_id")
+            to_project = new_values.get("project_id")
+            if from_project == project_id or to_project == project_id:
+                filtered_logs.append((log, from_project, to_project))
 
-    result = await db.execute(stmt)
-    logs = result.scalars().all()
+        total = len(filtered_logs)
+        paged_candidates = filtered_logs[offset : offset + limit]
 
-    equipment_ids = set()
-    project_ids = set()
-    user_ids = set()
+        equipment_ids = set()
+        project_ids = set()
+        user_ids = set()
+        parsed_logs = []
 
-    parsed_logs = []
+        for log, from_project, to_project in paged_candidates:
+            equipment_ids.add(log.equipment_id)
+            if from_project:
+                project_ids.add(from_project)
+            if to_project:
+                project_ids.add(to_project)
+            if log.user_id:
+                user_ids.add(log.user_id)
 
-    for log in logs:
-        old_values = safe_parse(log.old_values) if log.old_values else {}
-        new_values = safe_parse(log.new_values) if log.new_values else {}
+            parsed_logs.append(
+                {
+                    "id": log.id,
+                    "equipment_id": log.equipment_id,
+                    "from_project_id": from_project,
+                    "to_project_id": to_project,
+                    "transferred_by": log.user_id,
+                    "transferred_at": log.created_at,
+                    "ip_address": log.ip_address,
+                }
+            )
+    else:
+        count_stmt = select(func.count()).select_from(query.subquery())
+        total = await db.scalar(count_stmt)
 
-        from_project = old_values.get("project_id")
-        to_project = new_values.get("project_id")
-
-        if project_id:
-            if from_project != project_id and to_project != project_id:
-                continue
-
-        equipment_ids.add(log.equipment_id)
-
-        if from_project:
-            project_ids.add(from_project)
-
-        if to_project:
-            project_ids.add(to_project)
-
-        if log.user_id:
-            user_ids.add(log.user_id)
-
-        parsed_logs.append(
-            {
-                "id": log.id,
-                "equipment_id": log.equipment_id,
-                "from_project_id": from_project,
-                "to_project_id": to_project,
-                "transferred_by": log.user_id,
-                "transferred_at": log.created_at,
-                "ip_address": log.ip_address,
-            }
+        stmt = (
+            query.order_by(EquipmentAuditLog.created_at.desc()).limit(limit).offset(offset)
         )
+        result = await db.execute(stmt)
+        logs = result.scalars().all()
+
+        equipment_ids = set()
+        project_ids = set()
+        user_ids = set()
+        parsed_logs = []
+
+        for log in logs:
+            old_values = safe_parse(log.old_values) if log.old_values else {}
+            new_values = safe_parse(log.new_values) if log.new_values else {}
+            from_project = old_values.get("project_id")
+            to_project = new_values.get("project_id")
+
+            equipment_ids.add(log.equipment_id)
+            if from_project:
+                project_ids.add(from_project)
+            if to_project:
+                project_ids.add(to_project)
+            if log.user_id:
+                user_ids.add(log.user_id)
+
+            parsed_logs.append(
+                {
+                    "id": log.id,
+                    "equipment_id": log.equipment_id,
+                    "from_project_id": from_project,
+                    "to_project_id": to_project,
+                    "transferred_by": log.user_id,
+                    "transferred_at": log.created_at,
+                    "ip_address": log.ip_address,
+                }
+            )
 
     equipment_map = {}
     if equipment_ids:

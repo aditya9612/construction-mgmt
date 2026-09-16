@@ -772,7 +772,25 @@ async def test_tc27_super_admin_global_visibility():
 async def test_tc28_route_preservation_and_ast_verification():
     from fastapi.routing import APIRoute
 
-    api_routes = [r for r in app.routes if isinstance(r, APIRoute)]
+    def get_all_routes(routes):
+        result = []
+        for route in routes:
+            if hasattr(route, "effective_route_contexts"):
+                for ctx in route.effective_route_contexts():
+                    r = ctx.original_route
+                    r.path = ctx.path
+                    if not r.path.startswith("/api/v1/test-"):
+                        result.append(r)
+            elif isinstance(route, APIRoute):
+                if not route.path.startswith("/api/v1/test-"):
+                    result.append(route)
+            elif hasattr(route, "original_router") and hasattr(route.original_router, "routes"):
+                result.extend(get_all_routes(route.original_router.routes))
+            elif hasattr(route, "routes"):
+                result.extend(get_all_routes(route.routes))
+        return result
+
+    api_routes = get_all_routes(app.routes)
     chat_routes = [r for r in api_routes if r.endpoint.__module__ == "app.api.chat"]
 
     assert len(chat_routes) == 45, f"Expected exactly 45 chat routes, found {len(chat_routes)}"

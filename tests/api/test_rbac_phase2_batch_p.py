@@ -97,23 +97,25 @@ async def setup_batch_p_data():
         await db.flush()
 
         # 3. Company Settings
-        # Ensure company settings exists and points to our test salary & cash accounts
-        first_cs = await db.scalar(select(CompanySettings))
+        # Ensure company settings exists and points to our test salary & cash accounts for comp_a
+        cs_a = await db.scalar(select(CompanySettings).where(CompanySettings.company_id == comp_a.id))
+        created_cs_a = False
         orig_salary_id = None
         orig_cash_id = None
-        if first_cs:
-            orig_salary_id = first_cs.staff_salary_account_id
-            orig_cash_id = first_cs.primary_cash_account_id
-            first_cs.staff_salary_account_id = acc_salary_a.id
-            first_cs.primary_cash_account_id = acc_cash_a.id
+        if cs_a:
+            orig_salary_id = cs_a.staff_salary_account_id
+            orig_cash_id = cs_a.primary_cash_account_id
+            cs_a.staff_salary_account_id = acc_salary_a.id
+            cs_a.primary_cash_account_id = acc_cash_a.id
         else:
-            first_cs = CompanySettings(
+            created_cs_a = True
+            cs_a = CompanySettings(
                 company_id=comp_a.id,
                 company_name=f"Brand_CompA_{uid}",
                 staff_salary_account_id=acc_salary_a.id,
                 primary_cash_account_id=acc_cash_a.id,
             )
-            db.add(first_cs)
+            db.add(cs_a)
         await db.flush()
 
         # 4. Users
@@ -510,11 +512,14 @@ async def setup_batch_p_data():
                 o_ids = [owner_a1.id, owner_b1.id]
 
                 # Restore settings
-                if first_cs:
-                    db_cs = await clean_db.get(CompanySettings, first_cs.id)
-                    if db_cs:
-                        db_cs.staff_salary_account_id = orig_salary_id
-                        db_cs.primary_cash_account_id = orig_cash_id
+                if cs_a:
+                    if created_cs_a:
+                        await clean_db.execute(delete(CompanySettings).where(CompanySettings.company_id == comp_a.id))
+                    else:
+                        db_cs = await clean_db.get(CompanySettings, cs_a.id)
+                        if db_cs:
+                            db_cs.staff_salary_account_id = orig_salary_id
+                            db_cs.primary_cash_account_id = orig_cash_id
 
                 await clean_db.execute(delete(UserPermissionOverride).where(UserPermissionOverride.user_id.in_(u_ids)))
                 await clean_db.execute(delete(RolePermission).where(RolePermission.role_id.in_(r_ids)))

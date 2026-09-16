@@ -459,16 +459,17 @@ async def test_super_admin_operations():
             assert r_create_bad_comp.status_code == 404
 
             # 7. Non-SA specifying foreign company_id in POST body -> forced to own company
+            unique_prompt = f"attempt cross tenant {uuid.uuid4().hex[:8]}"
             r_non_sa_override = await ac.post(
                 "/api/v1/ai/predict",
                 headers=_auth(d["tok_all"]),
-                json={"module_name": "tenant_test", "prompt": "attempt cross tenant", "company_id": d["comp_b"].id},
+                json={"module_name": "tenant_test", "prompt": unique_prompt, "company_id": d["comp_b"].id},
             )
             assert r_non_sa_override.status_code == 200
             # Verify in DB that it was saved under comp_a, NOT comp_b
             async with AsyncSessionLocal() as db:
                 created_row = (await db.execute(
-                    select(AIPrediction).where(AIPrediction.prompt == "attempt cross tenant")
+                    select(AIPrediction).where(AIPrediction.prompt == unique_prompt)
                 )).scalar_one()
                 assert created_row.company_id == d["comp_a"].id
 
@@ -603,7 +604,26 @@ async def test_cache_version_isolation():
 # ==============================================================================
 def test_route_preservation():
     """Verify exactly 5 AI routes, 5 unique method+path, 0 duplicates, and 781 total APIRoutes."""
-    ai_routes = [r for r in app.routes if isinstance(r, APIRoute) and r.path.startswith("/api/v1/ai")]
+    def get_all_routes(routes):
+        result = []
+        for route in routes:
+            if hasattr(route, "effective_route_contexts"):
+                for ctx in route.effective_route_contexts():
+                    r = ctx.original_route
+                    r.path = ctx.path
+                    if not r.path.startswith("/api/v1/test-"):
+                        result.append(r)
+            elif isinstance(route, APIRoute):
+                if not route.path.startswith("/api/v1/test-"):
+                    result.append(route)
+            elif hasattr(route, "original_router") and hasattr(route.original_router, "routes"):
+                result.extend(get_all_routes(route.original_router.routes))
+            elif hasattr(route, "routes"):
+                result.extend(get_all_routes(route.routes))
+        return result
+
+    all_api_routes = get_all_routes(app.routes)
+    ai_routes = [r for r in all_api_routes if isinstance(r, APIRoute) and r.path.startswith("/api/v1/ai")]
     assert len(ai_routes) == 5, f"Expected 5 AI routes, got {len(ai_routes)}"
 
     unique_routes = set((list(r.methods)[0], r.path) for r in ai_routes)
@@ -618,7 +638,6 @@ def test_route_preservation():
     }
     assert unique_routes == expected_routes
 
-    all_api_routes = [r for r in app.routes if isinstance(r, APIRoute)]
     assert len(all_api_routes) == 781, f"Expected total 781 APIRoutes, got {len(all_api_routes)}"
 
 

@@ -383,14 +383,34 @@ async def test_tc18_sa_delete_nonexistent_company():
             assert r.status_code not in (401, 403)
 
 
+def get_all_routes(routes):
+    from fastapi.routing import APIRoute
+    result = []
+    for route in routes:
+        if hasattr(route, "effective_route_contexts"):
+            for ctx in route.effective_route_contexts():
+                r = ctx.original_route
+                r.path = ctx.path
+                if not r.path.startswith("/api/v1/test-"):
+                    result.append(r)
+        elif isinstance(route, APIRoute):
+            if not route.path.startswith("/api/v1/test-"):
+                result.append(route)
+        elif hasattr(route, "original_router") and hasattr(route.original_router, "routes"):
+            result.extend(get_all_routes(route.original_router.routes))
+        elif hasattr(route, "routes"):
+            result.extend(get_all_routes(route.routes))
+    return result
+
+
 def test_tc19_route_preservation():
     '''TC19: Exactly 40 SA routes, 781 total routes, 0 duplicates.'''
     from fastapi.routing import APIRoute
-    sa_routes = [r for r in app.routes if isinstance(r, APIRoute) and r.path.startswith('/api/v1/superadmin')]
+    all_routes = get_all_routes(app.routes)
+    sa_routes = [r for r in all_routes if isinstance(r, APIRoute) and r.path.startswith('/api/v1/superadmin')]
     assert len(sa_routes) == 40, f'Expected 40 SA routes, got {len(sa_routes)}'
     unique_sa = set((list(r.methods)[0], r.path) for r in sa_routes)
     assert len(unique_sa) == 40, f'Expected 40 unique, got {len(unique_sa)}'
-    all_routes = [r for r in app.routes if isinstance(r, APIRoute)]
     assert len(all_routes) == 781, f'Total routes changed: expected 781, got {len(all_routes)}'
 
 
@@ -409,7 +429,7 @@ def test_tc21_endpoint_table_completeness():
     '''TC21: ALL_ENDPOINTS covers all 40 registered superadmin routes exactly.'''
     from fastapi.routing import APIRoute
     registered = set()
-    for r in app.routes:
+    for r in get_all_routes(app.routes):
         if isinstance(r, APIRoute) and r.path.startswith('/api/v1/superadmin'):
             for m in r.methods: registered.add((m, r.path))
     covered = {(m, t) for m, t, _, _ in ALL_ENDPOINTS}

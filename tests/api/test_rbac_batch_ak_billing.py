@@ -926,7 +926,25 @@ async def test_dynamic_permission_lifecycle():
 # 16. Route Preservation Verification
 # ==============================================================================
 def test_route_preservation():
-    routes = [r for r in app.routes if isinstance(r, APIRoute)]
+    def get_all_routes(routes):
+        result = []
+        for route in routes:
+            if hasattr(route, "effective_route_contexts"):
+                for ctx in route.effective_route_contexts():
+                    r = ctx.original_route
+                    r.path = ctx.path
+                    if not r.path.startswith("/api/v1/test-"):
+                        result.append(r)
+            elif isinstance(route, APIRoute):
+                if not route.path.startswith("/api/v1/test-"):
+                    result.append(route)
+            elif hasattr(route, "original_router") and hasattr(route.original_router, "routes"):
+                result.extend(get_all_routes(route.original_router.routes))
+            elif hasattr(route, "routes"):
+                result.extend(get_all_routes(route.routes))
+        return result
+
+    routes = get_all_routes(app.routes)
     billing_routes = [r for r in routes if r.path.startswith("/api/v1/billing")]
 
     unique_methods_paths = set()

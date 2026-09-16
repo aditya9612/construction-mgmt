@@ -1006,10 +1006,6 @@ async def material_summary(
     is_sa = getattr(current_user, "is_super_admin", False) is True
     if not is_sa and current_user.company_id is None:
         raise HTTPException(status_code=403, detail="Company context required")
-
-    from decimal import Decimal
-    from fastapi import HTTPException
-
     try:
         material_filter = [
             Material.is_deleted == False,

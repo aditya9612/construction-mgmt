@@ -1115,7 +1115,25 @@ async def test_29_dynamic_db_permission_grant():
 @pytest.mark.asyncio
 async def test_30_route_preservation():
     """Verify exactly 28 invoice routes and 781 total application routes."""
-    routes = [r for r in app.routes if isinstance(r, APIRoute)]
+    def get_all_routes(routes):
+        result = []
+        for route in routes:
+            if hasattr(route, "effective_route_contexts"):
+                for ctx in route.effective_route_contexts():
+                    r = ctx.original_route
+                    r.path = ctx.path
+                    if not r.path.startswith("/api/v1/test-"):
+                        result.append(r)
+            elif isinstance(route, APIRoute):
+                if not route.path.startswith("/api/v1/test-"):
+                    result.append(route)
+            elif hasattr(route, "original_router") and hasattr(route.original_router, "routes"):
+                result.extend(get_all_routes(route.original_router.routes))
+            elif hasattr(route, "routes"):
+                result.extend(get_all_routes(route.routes))
+        return result
+
+    routes = get_all_routes(app.routes)
     invoice_routes = [r for r in routes if r.path.startswith("/api/v1/invoices")]
 
     assert len(invoice_routes) == 28, f"Expected 28 invoice routes, got {len(invoice_routes)}"

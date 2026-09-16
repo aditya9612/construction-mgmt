@@ -127,32 +127,32 @@ async def generate_business_id(
     Generic, race-condition safe business ID generator.
     Works for PRJ, CNT, MAT, etc.
     """
-
     column = getattr(model, column_name)
 
+    # Get all IDs starting with prefix to find the max numeric suffix
+    result = await db.execute(
+        select(column).where(column.like(f"{prefix}%"))
+    )
+    all_ids = result.scalars().all()
+
+    max_number = 0
+    for id_val in all_ids:
+        if id_val and id_val.startswith(prefix):
+            suffix = id_val[len(prefix):]
+            if suffix.isdigit():
+                max_number = max(max_number, int(suffix))
+
+    candidate_number = max_number + 1
+
     for _ in range(max_retries):
-        #  Get latest ID with prefix
-        result = await db.execute(
-            select(func.max(column)).where(column.like(f"{prefix}%"))
-        )
-        last_id = result.scalar()
+        new_id = f"{prefix}{str(candidate_number).zfill(padding)}"
 
-        if last_id:
-            try:
-                last_number = int(last_id.replace(prefix, ""))
-            except ValueError:
-                last_number = 0
-            new_number = last_number + 1
-        else:
-            new_number = 1
-
-        new_id = f"{prefix}{str(new_number).zfill(padding)}"
-
-        #  Check if already exists (extra safety)
+        # Check if already exists (extra safety)
         exists = await db.scalar(select(func.count()).where(column == new_id))
-
         if not exists:
             return new_id
+
+        candidate_number += 1
 
     # If still failing
     raise Exception("Unable to generate unique business ID after retries")

@@ -143,11 +143,17 @@ async def list_work_orders(
     if not is_sa:
         query = query.where(Project.company_id == current_user.company_id)
 
-        effective_perms = await get_effective_user_permissions(db, current_user)
-        has_manage = has_permission(effective_perms, "work_orders.manage")
+        is_admin = (
+            getattr(current_user, "is_super_admin", False) is True
+            or current_user.role == "Admin"
+            or getattr(current_user.role, "value", None) == "Admin"
+        )
+        if not is_admin:
+            effective_perms = await get_effective_user_permissions(db, current_user)
+            has_manage = has_permission(effective_perms, "work_orders.manage")
 
-        if not has_manage:
-            query = query.where(Project.members.any(user_id=current_user.id))
+            if not has_manage:
+                query = query.where(Project.members.any(user_id=current_user.id))
 
     result = await db.execute(query.order_by(WorkOrder.id.desc()))
     rows = result.scalars().all()

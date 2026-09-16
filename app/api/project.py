@@ -986,9 +986,24 @@ class ProjectsService:
             if status == s.ProjectStatus.DELAYED:
 
                 base_query = base_query.where(
+                    or_(
+                        m.Project.status == s.ProjectStatus.DELAYED,
+                        and_(
+                            m.Project.status == s.ProjectStatus.ONGOING,
+                            m.Project.end_date.is_not(None),
+                            m.Project.end_date < today,
+                        ),
+                    )
+                )
+
+            elif status == s.ProjectStatus.ONGOING:
+
+                base_query = base_query.where(
                     m.Project.status == s.ProjectStatus.ONGOING,
-                    m.Project.end_date.is_not(None),
-                    m.Project.end_date < today,
+                    or_(
+                        m.Project.end_date.is_(None),
+                        m.Project.end_date >= today,
+                    ),
                 )
 
             else:
@@ -5000,6 +5015,9 @@ async def export_dsr_excel(
     current_user: User = Depends(require_permission("dsr.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if start_date and end_date and end_date < start_date:
+        raise BadRequestError("end_date cannot be before start_date")
+
     logger.info(f"Exporting DSR Excel project_id={project_id}")
     project = await _get_scoped_project(db, project_id, current_user, load_relations=False)
 
@@ -5023,9 +5041,6 @@ async def export_dsr_excel(
     query = query.order_by(m.DailySiteReport.report_date.desc())
     result = await db.execute(query)
     rows = result.all()
-
-    if not rows:
-        raise NotFoundError("No DSR data found")
 
     project_name = project.project_name if project else str(project_id)
     wb = Workbook()
@@ -5951,7 +5966,6 @@ async def list_activities(
             selectinload(m.WorkActivity.boq_item),
             selectinload(m.WorkActivity.engineer),
         )
-        count_stmt = select(func.count()).select_from(m.WorkActivity)
         filters = [
             m.WorkActivity.project_id == project_id,
         ]
@@ -5964,9 +5978,6 @@ async def list_activities(
             await _validate_scoped_engineer(db, engineer_id, project_id, current_user)
             filters.append(m.WorkActivity.engineer_id == engineer_id)
 
-        if status is not None:
-            filters.append(m.WorkActivity.status == status)
-
         if search:
             search = search.strip()
             filters.append(
@@ -5976,6 +5987,40 @@ async def list_activities(
                 )
             )
 
+        # When status filter is requested, we must filter by the *computed*
+        # status (calculate_activity_status) rather than the DB column,
+        # because the DB column can go stale when date.today() advances
+        # past end_date.  Fetch all matching activities, compute status in
+        # Python, filter, then paginate manually.
+        if status is not None:
+            stmt = stmt.where(*filters)
+            stmt = stmt.order_by(m.WorkActivity.created_at.desc())
+            result = await db.execute(stmt)
+            all_activities = result.scalars().unique().all()
+
+            # Compute status and filter in Python
+            filtered = []
+            for act in all_activities:
+                computed = calculate_activity_status(act)
+                if computed == status:
+                    act_out = s.WorkActivityResponse.model_validate(act)
+                    act_out.status = computed
+                    filtered.append(act_out)
+
+            total_count = len(filtered)
+            response_data = filtered[offset : offset + limit]
+
+            return s.WorkActivityListResponse(
+                success=True,
+                limit=limit,
+                offset=offset,
+                page_count=len(response_data),
+                total_count=total_count,
+                data=response_data,
+            )
+
+        # No status filter — use efficient DB-level pagination
+        count_stmt = select(func.count()).select_from(m.WorkActivity)
         stmt = stmt.where(*filters)
         count_stmt = count_stmt.where(*filters)
         stmt = stmt.order_by(m.WorkActivity.created_at.desc())
@@ -7487,88 +7532,58 @@ async def project_progress_summary(
     try:
         project = await _get_scoped_project_for_wp(db, project_id, current_user)
 
-        summary_stmt = select(
-            func.count(m.WorkActivity.id).label("total_activities"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            m.WorkActivity.status == WorkActivityStatus.COMPLETED,
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("completed_activities"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            m.WorkActivity.status == WorkActivityStatus.ON_TRACK,
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("on_track_activities"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            m.WorkActivity.status == WorkActivityStatus.DELAY,
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("delayed_activities"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            m.WorkActivity.status == WorkActivityStatus.NOT_STARTED,
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("not_started_activities"),
-            func.coalesce(
-                func.sum(m.WorkActivity.planned_quantity),
-                Decimal("0.00"),
-            ).label("planned_quantity"),
-            func.coalesce(
-                func.sum(m.WorkActivity.total_completed),
-                Decimal("0.00"),
-            ).label("completed_quantity"),
-            func.coalesce(
-                func.sum(m.WorkActivity.remaining_quantity),
-                Decimal("0.00"),
-            ).label("remaining_quantity"),
-            func.coalesce(
-                func.avg(m.WorkActivity.completion_percentage),
-                Decimal("0.00"),
-            ).label("average_progress"),
-        ).where(
-            m.WorkActivity.project_id == project_id,
+        # Fetch all activities for the project and compute status in Python
+        # so the counts match the dynamically calculated status returned by
+        # list_activities and other endpoints.
+        all_stmt = (
+            select(m.WorkActivity)
+            .where(m.WorkActivity.project_id == project_id)
+        )
+        all_result = await db.execute(all_stmt)
+        activities = all_result.scalars().all()
+
+        total_activities = len(activities)
+        completed_activities = 0
+        on_track_activities = 0
+        delayed_activities = 0
+        not_started_activities = 0
+        planned_quantity = Decimal("0.00")
+        completed_quantity = Decimal("0.00")
+        remaining_quantity = Decimal("0.00")
+        total_completion_pct = Decimal("0.00")
+
+        for act in activities:
+            st = calculate_activity_status(act)
+            if st == WorkActivityStatus.COMPLETED:
+                completed_activities += 1
+            elif st == WorkActivityStatus.ON_TRACK:
+                on_track_activities += 1
+            elif st == WorkActivityStatus.DELAY:
+                delayed_activities += 1
+            else:
+                not_started_activities += 1
+
+            if act.planned_quantity:
+                planned_quantity += act.planned_quantity
+            if act.total_completed:
+                completed_quantity += act.total_completed
+            if act.remaining_quantity:
+                remaining_quantity += act.remaining_quantity
+            if act.completion_percentage:
+                total_completion_pct += act.completion_percentage
+
+        average_progress = (
+            (total_completion_pct / Decimal(total_activities)).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+            if total_activities > 0
+            else Decimal("0.00")
         )
 
-        result = await db.execute(summary_stmt)
-        (
-            total_activities,
-            completed_activities,
-            on_track_activities,
-            delayed_activities,
-            not_started_activities,
-            planned_quantity,
-            completed_quantity,
-            remaining_quantity,
-            average_progress,
-        ) = result.one()
+        planned_quantity = planned_quantity.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        completed_quantity = completed_quantity.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        remaining_quantity = remaining_quantity.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
         if planned_quantity > Decimal("0"):
             overall_progress = (
@@ -7588,19 +7603,11 @@ async def project_progress_summary(
             on_track_activities=on_track_activities,
             delayed_activities=delayed_activities,
             not_started_activities=not_started_activities,
-            planned_quantity=Decimal(str(planned_quantity or 0)).quantize(
-                Decimal("0.01")
-            ),
-            completed_quantity=Decimal(str(completed_quantity or 0)).quantize(
-                Decimal("0.01")
-            ),
-            remaining_quantity=Decimal(str(remaining_quantity or 0)).quantize(
-                Decimal("0.01")
-            ),
+            planned_quantity=planned_quantity,
+            completed_quantity=completed_quantity,
+            remaining_quantity=remaining_quantity,
             overall_progress_percentage=overall_progress,
-            average_activity_progress=Decimal(str(average_progress or 0)).quantize(
-                Decimal("0.01")
-            ),
+            average_activity_progress=average_progress,
         )
 
         logger.info(
@@ -7668,13 +7675,6 @@ async def get_delayed_activities(
 
         filters = [
             m.WorkActivity.project_id == project_id,
-            or_(
-                m.WorkActivity.status == WorkActivityStatus.DELAY,
-                and_(
-                    m.WorkActivity.end_date < date.today(),
-                    m.WorkActivity.status != WorkActivityStatus.COMPLETED,
-                ),
-            ),
         ]
 
         if engineer_id:
@@ -7684,9 +7684,6 @@ async def get_delayed_activities(
         if work_order_id:
             await _validate_scoped_work_order(db, work_order_id, project_id, current_user)
             filters.append(m.WorkActivity.work_order_id == work_order_id)
-
-        count_stmt = select(func.count(m.WorkActivity.id)).where(*filters)
-        total_count = await db.scalar(count_stmt)
 
         stmt = (
             select(m.WorkActivity)
@@ -7699,12 +7696,18 @@ async def get_delayed_activities(
                 m.WorkActivity.end_date.asc(),
                 m.WorkActivity.created_at.asc(),
             )
-            .offset(offset)
-            .limit(limit)
         )
 
         result = await db.execute(stmt)
-        activities = result.scalars().all()
+        all_activities = result.scalars().all()
+
+        # Filter strictly by dynamic calculated status
+        delayed_candidates = [
+            act for act in all_activities
+            if calculate_activity_status(act) == WorkActivityStatus.DELAY
+        ]
+        total_count = len(delayed_candidates)
+        activities = delayed_candidates[offset : offset + limit]
 
         delayed_list = []
         for activity in activities:
@@ -7739,7 +7742,7 @@ async def get_delayed_activities(
                     start_date=activity.start_date,
                     end_date=activity.end_date,
                     delayed_days=delayed_days,
-                    status=activity.status,
+                    status=WorkActivityStatus.DELAY,
                 )
             )
 
@@ -7751,7 +7754,7 @@ async def get_delayed_activities(
             limit=limit,
             offset=offset,
             page_count=page_count,
-            total_count=total_count or 0,
+            total_count=total_count,
             data=delayed_list,
         )
 
@@ -7789,6 +7792,10 @@ async def get_delayed_activities(
 @work_progress_router.get("/reports/pdf")
 async def work_progress_pdf_report(
     project_id: int = Query(..., gt=0),
+    work_order_id: int | None = Query(default=None, gt=0),
+    engineer_id: int | None = Query(default=None, gt=0),
+    status: WorkActivityStatus | None = None,
+    search: str | None = Query(default=None, max_length=100),
     current_user: User = Depends(require_permission("work_progress.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -7796,12 +7803,38 @@ async def work_progress_pdf_report(
     try:
         project = await _get_scoped_project_for_wp(db, project_id, current_user)
 
+        filters = [
+            m.WorkActivity.project_id == project_id,
+        ]
+
+        if work_order_id is not None:
+            await _validate_scoped_work_order(db, work_order_id, project_id, current_user)
+            filters.append(m.WorkActivity.work_order_id == work_order_id)
+
+        if engineer_id is not None:
+            await _validate_scoped_engineer(db, engineer_id, project_id, current_user)
+            filters.append(m.WorkActivity.engineer_id == engineer_id)
+
+        if search:
+            search = search.strip()
+            filters.append(
+                or_(
+                    m.WorkActivity.activity_name.ilike(f"%{search}%"),
+                    m.WorkActivity.discipline.ilike(f"%{search}%"),
+                )
+            )
+
         activity_result = await db.execute(
             select(m.WorkActivity)
-            .where(m.WorkActivity.project_id == project_id)
+            .where(*filters)
             .order_by(m.WorkActivity.created_at.desc())
         )
         activities = activity_result.scalars().all()
+
+        if status is not None:
+            activities = [
+                act for act in activities if calculate_activity_status(act) == status
+            ]
 
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(
@@ -7843,11 +7876,8 @@ async def work_progress_pdf_report(
             completed_qty = Decimal(str(activity.total_completed or 0))
             remaining_qty = Decimal(str(activity.remaining_quantity or 0))
             completion_pct = Decimal(str(activity.completion_percentage or 0))
-            status_value = (
-                activity.status.value
-                if hasattr(activity.status, "value")
-                else str(activity.status or "UNKNOWN")
-            )
+            computed_status = calculate_activity_status(activity)
+            status_value = computed_status.value
             total_planned += planned_qty
             total_completed += completed_qty
 
@@ -7862,7 +7892,7 @@ async def work_progress_pdf_report(
                 ]
             )
 
-            if status_value == WorkActivityStatus.DELAY.value:
+            if computed_status == WorkActivityStatus.DELAY:
                 delayed_activities.append(activity)
 
         table = PdfTable(table_data)
@@ -8014,25 +8044,48 @@ async def work_progress_pdf_report(
 @work_progress_router.get("/reports/excel")
 async def work_progress_excel_report(
     project_id: int = Query(..., gt=0),
+    work_order_id: int | None = Query(default=None, gt=0),
+    engineer_id: int | None = Query(default=None, gt=0),
+    status: WorkActivityStatus | None = None,
+    search: str | None = Query(default=None, max_length=100),
     current_user: User = Depends(require_permission("work_progress.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
         project = await _get_scoped_project_for_wp(db, project_id, current_user)
 
-        project_name = (
-            getattr(project, "project_name", None)
-            or getattr(project, "name", None)
-            or getattr(project, "title", None)
-            or f"Project-{project.id}"
-        )
+        filters = [
+            m.WorkActivity.project_id == project_id,
+        ]
+
+        if work_order_id is not None:
+            await _validate_scoped_work_order(db, work_order_id, project_id, current_user)
+            filters.append(m.WorkActivity.work_order_id == work_order_id)
+
+        if engineer_id is not None:
+            await _validate_scoped_engineer(db, engineer_id, project_id, current_user)
+            filters.append(m.WorkActivity.engineer_id == engineer_id)
+
+        if search:
+            search = search.strip()
+            filters.append(
+                or_(
+                    m.WorkActivity.activity_name.ilike(f"%{search}%"),
+                    m.WorkActivity.discipline.ilike(f"%{search}%"),
+                )
+            )
 
         result = await db.execute(
             select(m.WorkActivity)
-            .where(m.WorkActivity.project_id == project_id)
+            .where(*filters)
             .order_by(m.WorkActivity.created_at.desc())
         )
         activities = result.scalars().all()
+
+        if status is not None:
+            activities = [
+                act for act in activities if calculate_activity_status(act) == status
+            ]
 
         wb = Workbook()
         ws = wb.active
@@ -8072,10 +8125,8 @@ async def work_progress_excel_report(
 
         row = 2
         for activity in activities:
-            status_value = (
-                activity.status.value
-                if hasattr(activity.status, "value")
-                else str(activity.status or "")
+            computed_status = calculate_activity_status(activity)
+            status_value = computed_status.value if hasattr(computed_status, "value") else str(computed_status or ""
             )
 
             ws.cell(
@@ -8135,10 +8186,7 @@ async def work_progress_excel_report(
             [
                 x
                 for x in activities
-                if (
-                    hasattr(x.status, "value")
-                    and x.status.value == WorkActivityStatus.DELAY.value
-                )
+                if calculate_activity_status(x) == WorkActivityStatus.DELAY
             ]
         )
 
@@ -8149,7 +8197,7 @@ async def work_progress_excel_report(
                 2,
             )
 
-        summary_sheet.append(["Project Name", project_name])
+        summary_sheet.append(["Project Name", project.project_name])
         summary_sheet.append(["Project ID", project.id])
         summary_sheet.append(["Total Activities", total_activities])
         summary_sheet.append(["Total Planned Qty", total_planned])
@@ -8169,13 +8217,10 @@ async def work_progress_excel_report(
         )
 
         for item in activities:
-            status_value = (
-                item.status.value
-                if hasattr(item.status, "value")
-                else str(item.status or "")
-            )
+            item_computed = calculate_activity_status(item)
+            status_value = item_computed.value if hasattr(item_computed, "value") else str(item_computed or "")
 
-            if status_value == WorkActivityStatus.DELAY.value:
+            if item_computed == WorkActivityStatus.DELAY:
                 delay_sheet.append(
                     [
                         item.activity_name or "",

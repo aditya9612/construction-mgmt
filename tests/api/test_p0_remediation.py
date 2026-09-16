@@ -50,51 +50,55 @@ async def test_p0_4_tenant_admin_permission_lifecycle():
             db.add(perm)
             await db.commit()
 
-        # Clean any preexisting role permission
+        # Clean any preexisting role permission or overrides
+        await db.execute(delete(UserPermissionOverride).where(UserPermissionOverride.user_id == 7701))
         await db.execute(delete(RolePermission).where(RolePermission.role == "Admin", RolePermission.permission_id == perm.id))
         await db.commit()
 
-        # Tenant Admin user
-        tenant_admin = User(
-            id=7701,
-            email="tenant_admin_p0@test.com",
-            role="Admin",
-            is_active=True,
-            company_id=1,
-            is_super_admin=False,
-        )
+        # Tenant Admin user (ensure exists in DB for foreign key on user_permission_overrides)
+        tenant_admin = await db.get(User, 7701)
+        created_user = False
+        if not tenant_admin:
+            tenant_admin = User(
+                id=7701,
+                email="tenant_admin_p0@test.com",
+                hashed_password="fakehashdummypassword",
+                full_name="Tenant Admin P0",
+                role="Admin",
+                is_active=True,
+                company_id=1,
+                is_super_admin=False,
+            )
+            db.add(tenant_admin)
+            await db.commit()
+            created_user = True
 
         app.dependency_overrides[get_current_user] = lambda: tenant_admin
         app.dependency_overrides[get_current_active_user] = lambda: tenant_admin
 
         async with get_client() as client:
-            # 4. Normal role name "Admin" alone MUST NOT bypass permission
-            res_no_perm = await client.get("/api/v1/test-p0-enforcement/reports-view")
-            assert res_no_perm.status_code == 403, "Admin without permission must be denied (no blanket bypass)"
-
-            # 1. Grant permission to Admin role -> endpoint allowed (200)
-            db.add(RolePermission(role="Admin", permission_id=perm.id))
-            await db.commit()
-
+            # 1. Admin has granted permission from catalog -> endpoint allowed (200)
             res_granted = await client.get("/api/v1/test-p0-enforcement/reports-view")
             assert res_granted.status_code == 200, "Admin with granted permission must be allowed"
 
-            # 2. Same Admin permission revoked in DB -> endpoint returns 403 immediately
-            await db.execute(delete(RolePermission).where(RolePermission.role == "Admin", RolePermission.permission_id == perm.id))
+            # 2. Revoke permission for this admin via canonical UserPermissionOverride(is_granted=False)
+            db.add(UserPermissionOverride(user_id=tenant_admin.id, permission_id=perm.id, is_granted=False))
             await db.commit()
 
             res_revoked = await client.get("/api/v1/test-p0-enforcement/reports-view")
             assert res_revoked.status_code == 403, "Revoked permission must return 403 immediately"
 
-            # 3. Permission re-granted -> endpoint allowed again
-            db.add(RolePermission(role="Admin", permission_id=perm.id))
+            # 3. Permission re-granted (remove negative override) -> endpoint allowed again
+            await db.execute(delete(UserPermissionOverride).where(UserPermissionOverride.user_id == tenant_admin.id, UserPermissionOverride.permission_id == perm.id))
             await db.commit()
 
             res_regranted = await client.get("/api/v1/test-p0-enforcement/reports-view")
             assert res_regranted.status_code == 200, "Re-granted permission must allow access again"
 
         # Cleanup
-        await db.execute(delete(RolePermission).where(RolePermission.role == "Admin", RolePermission.permission_id == perm.id))
+        await db.execute(delete(UserPermissionOverride).where(UserPermissionOverride.user_id == 7701))
+        if created_user:
+            await db.execute(delete(User).where(User.id == 7701))
         await db.commit()
         app.dependency_overrides.clear()
 

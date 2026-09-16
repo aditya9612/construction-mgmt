@@ -42,6 +42,18 @@ async def get_mock_db_session():
         if "user_permission_overrides" in stmt_str or "is_granted" in stmt_str:
             res.scalars.return_value.all.return_value = []
             res.all.return_value = []
+        elif "role_permissions" in stmt_str or "role_permission" in stmt_str:
+            try:
+                params = stmt.compile().params
+                role_val = params.get("role_1") or params.get("role")
+                if role_val and role_val != UserRole.ADMIN.value and role_val != "Admin":
+                    res.scalars.return_value.all.return_value = []
+                    res.all.return_value = []
+                    return res
+            except Exception:
+                pass
+            res.scalars.return_value.all.return_value = ["users.create", "users.view", "users.edit", "users.delete"]
+            res.all.return_value = []
         else:
             res.scalars.return_value.all.return_value = ["users.create", "users.view", "users.edit", "users.delete"]
             res.all.return_value = []

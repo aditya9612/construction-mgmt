@@ -236,9 +236,23 @@ class MockPeripheralSession:
                 return MockResult(filtered)
             return MockResult(items)
 
-        # RBAC permissions resolution for Tenant Admin
+        # RBAC permissions resolution
+        if "user_permission_overrides" in stmt_str:
+            return MockResult([])
+
+        if "permissions" in stmt_str and "role_permissions" not in stmt_str:
+            # Admin dynamic permissions catalog query
+            return MockResult([
+                "*",
+                "settings.view", "settings.edit",
+                "projects.view", "projects.create",
+                "documents.view", "documents.create",
+                "cad.view", "cad.create",
+                "payments.view", "payments.create",
+            ])
+
         if "role_permissions" in stmt_str:
-            return MockResult(["*"])
+            return MockResult([])
 
         return MockResult([])
 

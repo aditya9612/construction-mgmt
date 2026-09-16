@@ -3,7 +3,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
 
 from app.core.dependencies import get_current_active_user, get_effective_user_permissions
-from app.db.session import get_db_session
+from app.db.session import AsyncSessionLocal, get_db_session
 from app.main import app
 from app.models.company import Company
 from app.models.rbac import Permission, Role, RolePermission, UserPermissionOverride
@@ -60,6 +60,9 @@ async def test_module_e2e_flow_and_permission_types(module, perm_type, perm_code
         # Ensure clean initial state for Client role in Company 1
         app.dependency_overrides[get_current_active_user] = lambda: admin
         await client.post("/api/v1/rbac/roles/Client/reset-defaults")
+        async with AsyncSessionLocal() as db:
+            await db.execute(delete(RolePermission).where(RolePermission.role == "Client"))
+            await db.commit()
 
         # Step A: No permission -> Must return 403 Forbidden
         app.dependency_overrides[get_current_active_user] = lambda: target_user

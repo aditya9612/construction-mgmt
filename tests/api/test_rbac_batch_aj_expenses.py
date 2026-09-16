@@ -846,8 +846,10 @@ async def test_export_security():
             text_a = res_a.text
             assert d["proj_a"].project_name in text_a
             assert d["proj_b"].project_name not in text_a
-            assert str(d["exp_a"].id) in text_a
-            assert str(d["exp_b"].id) not in text_a
+            reader_a = list(csv.reader(io.StringIO(text_a)))
+            ids_a = [row[0] for row in reader_a[1:] if row]
+            assert str(d["exp_a"].id) in ids_a
+            assert str(d["exp_b"].id) not in ids_a
 
             # SA global export contains both
             res_sa_global = await ac.get("/api/v1/expenses/export", headers={"Authorization": f"Bearer {d['token_sa']}"})
@@ -855,8 +857,10 @@ async def test_export_security():
             text_sa = res_sa_global.text
             assert d["proj_a"].project_name in text_sa
             assert d["proj_b"].project_name in text_sa
-            assert str(d["exp_a"].id) in text_sa
-            assert str(d["exp_b"].id) in text_sa
+            reader_sa = list(csv.reader(io.StringIO(text_sa)))
+            ids_sa = [row[0] for row in reader_sa[1:] if row]
+            assert str(d["exp_a"].id) in ids_sa
+            assert str(d["exp_b"].id) in ids_sa
 
             # SA filtered export for comp_b
             res_sa_b = await ac.get(f"/api/v1/expenses/export?company_id={d['comp_b'].id}", headers={"Authorization": f"Bearer {d['token_sa']}"})
@@ -864,8 +868,10 @@ async def test_export_security():
             text_b = res_sa_b.text
             assert d["proj_b"].project_name in text_b
             assert d["proj_a"].project_name not in text_b
-            assert str(d["exp_b"].id) in text_b
-            assert str(d["exp_a"].id) not in text_b
+            reader_b = list(csv.reader(io.StringIO(text_b)))
+            ids_b = [row[0] for row in reader_b[1:] if row]
+            assert str(d["exp_b"].id) in ids_b
+            assert str(d["exp_a"].id) not in ids_b
 
 
 # ==============================================================================
@@ -1039,7 +1045,25 @@ async def test_idempotency_behavior():
 # ==============================================================================
 def test_route_preservation():
     """Verify exact route counts and preservation of total application endpoints."""
-    routes = [r for r in app.routes if isinstance(r, APIRoute)]
+    def get_all_routes(routes):
+        result = []
+        for route in routes:
+            if hasattr(route, "effective_route_contexts"):
+                for ctx in route.effective_route_contexts():
+                    r = ctx.original_route
+                    r.path = ctx.path
+                    if not r.path.startswith("/api/v1/test-"):
+                        result.append(r)
+            elif isinstance(route, APIRoute):
+                if not route.path.startswith("/api/v1/test-"):
+                    result.append(route)
+            elif hasattr(route, "original_router") and hasattr(route.original_router, "routes"):
+                result.extend(get_all_routes(route.original_router.routes))
+            elif hasattr(route, "routes"):
+                result.extend(get_all_routes(route.routes))
+        return result
+
+    routes = get_all_routes(app.routes)
     exp_routes = [r for r in routes if r.path.startswith("/api/v1/expenses")]
 
     assert len(exp_routes) == 16, f"Expected 16 expense routes, got {len(exp_routes)}"

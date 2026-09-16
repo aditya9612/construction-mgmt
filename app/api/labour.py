@@ -47,71 +47,150 @@ from app.models.accountant import JournalEntry, JournalLine, Account
 from app.models.project import ProjectOTPolicy
 
 
-async def get_user_project_ids(db, user):
-    if (
-        getattr(user, "is_super_admin", False)
-        or getattr(user, "role", None) == UserRole.SUPER_ADMIN.value
-    ):
+def _is_super_admin(user: Optional[User]) -> bool:
+    return getattr(user, "is_super_admin", False) is True
+
+
+def assert_company_context(current_user: User) -> bool:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    return is_sa
+
+
+async def get_user_project_ids(db: AsyncSession, user: User) -> list[int]:
+    if _is_super_admin(user):
         result = await db.execute(select(Project.id))
         return [r[0] for r in result.all()]
     if user.company_id is None:
         return []
-    if user.role == UserRole.ADMIN.value:
-        result = await db.execute(
-            select(Project.id).where(Project.company_id == user.company_id)
+
+    member_pids = (
+        await db.execute(
+            select(ProjectMember.project_id)
+            .join(Project, Project.id == ProjectMember.project_id)
+            .where(
+                ProjectMember.user_id == user.id,
+                Project.company_id == user.company_id,
+            )
         )
-        return [r[0] for r in result.all()]
+    ).scalars().all()
+
+    if member_pids:
+        return list(member_pids)
 
     result = await db.execute(
-        select(ProjectMember.project_id)
-        .join(Project, Project.id == ProjectMember.project_id)
-        .where(
-            ProjectMember.user_id == user.id,
-            Project.company_id == user.company_id,
-        )
+        select(Project.id).where(Project.company_id == user.company_id)
     )
     return [r[0] for r in result.all()]
 
 
-LABOUR_READ_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.ACCOUNTANT,
-        UserRole.CLIENT,
-    ]
-]
+async def _get_scoped_labour(
+    db: AsyncSession,
+    labour_id: int,
+    current_user: Optional[User] = None,
+    with_for_update: bool = False,
+) -> Optional[Labour]:
+    is_sa = _is_super_admin(current_user)
+    if current_user is not None and not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        stmt = select(Labour).where(
+            Labour.id == labour_id,
+            Labour.company_id == current_user.company_id,
+        )
+    else:
+        stmt = select(Labour).where(Labour.id == labour_id)
 
-LABOUR_WRITE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.CONTRACTOR,
-    ]
-]
+    stmt = stmt.options(
+        selectinload(Labour.labour_type),
+        selectinload(Labour.user),
+        selectinload(Labour.contractor),
+    )
 
-LABOUR_DELETE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-    ]
-]
+    if with_for_update:
+        stmt = stmt.with_for_update()
 
-PAYROLL_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.ACCOUNTANT,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-    ]
-]
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _get_scoped_contractor(
+    db: AsyncSession,
+    contractor_id: int,
+    current_user: Optional[User] = None,
+) -> Optional[Contractor]:
+    is_sa = _is_super_admin(current_user)
+    if current_user is not None and not is_sa:
+        if current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        stmt = select(Contractor).where(
+            Contractor.id == contractor_id,
+            Contractor.company_id == current_user.company_id,
+        )
+    else:
+        stmt = select(Contractor).where(Contractor.id == contractor_id)
+
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _get_scoped_labour_type(
+    db: AsyncSession,
+    labour_type_id: int,
+    current_user: Optional[User] = None,
+) -> Optional[LabourType]:
+    is_sa = _is_super_admin(current_user)
+    if current_user is not None and not is_sa:
+        if current_user.company_id is not None:
+            stmt = select(LabourType).where(
+                LabourType.id == labour_type_id,
+                or_(LabourType.company_id == current_user.company_id, LabourType.company_id.is_(None)),
+            )
+        else:
+            stmt = select(LabourType).where(LabourType.id == labour_type_id)
+    else:
+        stmt = select(LabourType).where(LabourType.id == labour_type_id)
+
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _get_scoped_bank_account(
+    db: AsyncSession,
+    bank_account_id: int,
+    current_user: Optional[User] = None,
+) -> Optional["BankAccount"]:
+    from app.models.accountant import BankAccount, Account
+    is_sa = _is_super_admin(current_user)
+    stmt = (
+        select(BankAccount)
+        .join(Account, Account.id == BankAccount.account_id)
+        .where(BankAccount.id == bank_account_id)
+    )
+    if current_user is not None and not is_sa and current_user.company_id is not None:
+        stmt = stmt.where(Account.company_id == current_user.company_id)
+
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def _get_scoped_project(
+    db: AsyncSession,
+    project_id: int,
+    current_user: Optional[User] = None,
+) -> Optional[Project]:
+    is_sa = _is_super_admin(current_user)
+    if current_user is not None and not is_sa and current_user.company_id is not None:
+        stmt = select(Project).where(
+            Project.id == project_id,
+            Project.company_id == current_user.company_id,
+        )
+    else:
+        stmt = select(Project).where(Project.id == project_id)
+
+    result = await db.execute(stmt)
+    return result.scalar_one_or_none()
 
 router = APIRouter(
     prefix="/labour", tags=["labour"], dependencies=[default_rate_limiter_dependency()]
@@ -129,7 +208,10 @@ async def create_labour(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    if current_user.company_id is None:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    if is_sa and current_user.company_id is None:
         raise HTTPException(
             status_code=403,
             detail="Super Admin cannot create labour directly",
@@ -162,22 +244,20 @@ async def create_labour(
     contractor = None
 
     if payload.contractor_id:
-        contractor = await db.get(
-            Contractor,
+        contractor = await _get_scoped_contractor(
+            db,
             payload.contractor_id,
+            current_user,
         )
 
-        if not contractor or (
-            current_user_company_id is not None
-            and contractor.company_id != current_user_company_id
-        ):
+        if not contractor:
             raise NotFoundError("Contractor not found")
 
     # =========================================
     # ADD HERE
     # =========================================
 
-    labour_type = await db.get(LabourType, payload.labour_type_id)
+    labour_type = await _get_scoped_labour_type(db, payload.labour_type_id, current_user)
 
     if not labour_type:
         raise ValidationError("Invalid labour_type_id")
@@ -272,7 +352,10 @@ async def list_labour(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    if current_user.company_id is None:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    if is_sa and current_user.company_id is None:
         return PaginatedResponse[s.LabourOut](
             items=[],
             meta=PaginationMeta(total=0, limit=limit, offset=offset),
@@ -368,9 +451,10 @@ async def get_payroll_list(
     year: int,
     contractor_id: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db,
@@ -433,9 +517,10 @@ async def get_payroll_stats(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db, project_id=project_id, current_user=current_user
@@ -489,9 +574,10 @@ async def get_contractor_liability(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db, project_id=project_id, current_user=current_user
@@ -558,14 +644,17 @@ async def update_labour(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    if current_user.company_id is None:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    if is_sa and current_user.company_id is None:
         raise HTTPException(
             status_code=403,
             detail="Super Admin cannot update labour directly",
         )
-    obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
+    obj = await _get_scoped_labour(db, labour_id, current_user)
 
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Labour record not found")
 
     #  FIX: get ALL mappings
@@ -617,9 +706,10 @@ async def update_labour(
     # Labour Type validation
     if labour_type_id is not None:
 
-        labour_type = await db.get(
-            LabourType,
+        labour_type = await _get_scoped_labour_type(
+            db,
             labour_type_id,
+            current_user,
         )
 
         if not labour_type:
@@ -628,15 +718,13 @@ async def update_labour(
     # Contractor validation (optional)
     if contractor_id is not None:
 
-        contractor = await db.get(
-            Contractor,
+        contractor = await _get_scoped_contractor(
+            db,
             contractor_id,
+            current_user,
         )
 
-        if not contractor or (
-            current_user.company_id is not None
-            and contractor.company_id != current_user.company_id
-        ):
+        if not contractor:
             raise NotFoundError("Contractor not found")
 
     # PROFILE IMAGE UPDATE
@@ -708,14 +796,17 @@ async def delete_labour(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    if current_user.company_id is None:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    if is_sa and current_user.company_id is None:
         raise HTTPException(
             status_code=403,
             detail="Super Admin cannot delete labour directly",
         )
-    obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
+    obj = await _get_scoped_labour(db, labour_id, current_user)
 
-    if not obj or obj.company_id != current_user.company_id:
+    if not obj:
         raise NotFoundError("Labour record not found")
 
     #  FIX: multi-project validation
@@ -759,259 +850,6 @@ async def delete_labour(
     return {"message": "Labour deactivated successfully"}
 
 
-# @router.post("/assign-project", response_model=s.LabourProjectOut)
-# async def assign_labour_to_project(
-#     payload: s.LabourAssignProject,
-#     current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
-#     db: AsyncSession = Depends(get_db_session),
-# ):
-#     # check labour
-#     labour = await db.get(Labour, payload.labour_id)
-#     if not labour or (current_user.company_id is not None and labour.company_id != current_user.company_id):
-#         raise NotFoundError("Labour not found")
-
-#     # check project access
-#     await assert_project_access(
-#         db, project_id=payload.project_id, current_user=current_user
-#     )
-
-#     # prevent duplicate assignment
-#     existing = await db.scalar(
-#         select(LabourProject).where(
-#             LabourProject.labour_id == payload.labour_id,
-#             LabourProject.project_id == payload.project_id,
-#         )
-#     )
-
-#     if existing:
-#         raise ValidationError("Labour already assigned to this project")
-
-#     obj = LabourProject(
-#         labour_id=payload.labour_id,
-#         project_id=payload.project_id,
-#     )
-
-#     db.add(obj)
-
-#     # If user exists for this labour, also map in ProjectMember
-#     if labour.user_id:
-#         pm_exists = await db.scalar(
-#             select(ProjectMember).where(
-#                 ProjectMember.project_id == payload.project_id,
-#                 ProjectMember.user_id == labour.user_id,
-#             )
-#         )
-#         if not pm_exists:
-#             db.add(
-#                 ProjectMember(
-#                     project_id=payload.project_id,
-#                     user_id=labour.user_id,
-#                 )
-#             )
-
-#     await db.flush()
-#     await db.refresh(obj)
-
-#     return s.LabourProjectOut.model_validate(obj)
-
-
-# @router.put(
-#     "/attendance/{attendance_id}/check-out", response_model=UserAttendanceOut
-# )
-# async def check_out(
-#     attendance_id: int,
-#     latitude: float = Form(...),
-#     longitude: float = Form(...),
-#     location_address: str = Form(...),
-#     check_out_image: UploadFile = File(...),
-#     current_user: User = Depends(d.require_roles(LABOUR_WRITE_ROLES)),
-#     db: AsyncSession = Depends(get_db_session),
-#     redis=Depends(d.get_request_redis),
-# ):
-#     obj = await db.get(UserAttendance, attendance_id)
-#     if not obj:
-#         raise NotFoundError("Attendance not found")
-
-#     labour = await db.scalar(select(Labour).where(Labour.user_id == obj.user_id))
-#     if not labour:
-#         raise NotFoundError("Labour not found")
-
-#     await assert_project_access(
-#         db, project_id=obj.project_id, current_user=current_user
-#     )
-
-#     if obj.out_time:
-#         raise ValidationError("Already checked-out")
-
-#     #  ALWAYS USE IST SERVER TIME
-#     now = datetime.now(ZoneInfo("Asia/Kolkata"))
-#     out_time = now.time()
-
-#     if not obj.in_time:
-#         raise ValidationError("Check-in time missing")
-
-#     in_dt = datetime.combine(obj.attendance_date, obj.in_time)
-#     out_dt = datetime.combine(obj.attendance_date, out_time)
-
-#     if out_dt < in_dt:
-#         out_dt = out_dt + timedelta(days=1)
-
-#     total_hours = (out_dt - in_dt).total_seconds() / 3600
-
-#     if total_hours <= 0:
-#         raise ValidationError("Invalid time range")
-
-#     total_hours = round(total_hours, 2)
-
-#     # HALF-DAY LOGIC (UNCHANGED)
-#     if obj.status == AttendanceStatus.HALF_DAY:
-#         working_hours = Decimal("4")
-#         overtime_hours = Decimal("0")
-#     else:
-#         working_hours = min(Decimal(str(total_hours)), Decimal("8"))
-#         calculated_ot = Decimal(str(total_hours)) - working_hours
-#         overtime_hours = max( Decimal("0"), calculated_ot )
-
-#     if working_hours + overtime_hours > 24:
-#         raise ValidationError("Total hours > 24")
-
-#     # ==================================
-#     # PROJECT OT POLICY
-#     # ==================================
-
-#     project = await db.get(Project, obj.project_id)
-
-#     if not project:
-#         raise NotFoundError("Project not found")
-
-#     policy = await db.scalar(
-#         select(ProjectOTPolicy).where(
-#             ProjectOTPolicy.project_id == obj.project_id
-#         )
-#     )
-
-#     hourly_rate = labour.daily_wage_rate / Decimal("8")
-
-#     overtime_rate = Decimal("0")
-
-#     if policy and overtime_hours > 0:
-
-#         today = obj.attendance_date.weekday()
-
-#         # FIXED RATE
-#         if policy.policy_type == OTPolicyType.FIXED_RATE:
-
-#             overtime_rate = (
-#                 policy.fixed_ot_rate
-#                 or Decimal("0")
-#             )
-
-#         # MULTIPLIER
-#         else:
-
-#             multiplier = (
-#                 policy.normal_day_multiplier
-#                 or Decimal("1.5")
-#             )
-
-#             # Sunday
-#             if today == 6:
-#                 multiplier = (
-#                     policy.sunday_multiplier
-#                     or Decimal("2.0")
-#                 )
-
-#             # TODO: Holiday Calendar
-#             # Temporary manual holiday logic
-
-#             is_holiday = False
-
-#             if is_holiday:
-#                 multiplier = (
-#                     policy.holiday_multiplier
-#                     or Decimal("3.0")
-#                 )
-
-#             overtime_rate = hourly_rate * multiplier
-
-#     # ==================================
-#     # CHECKOUT IMAGE
-#     # ==================================
-
-#     check_out_path = await validate_and_save_image(
-#         check_out_image,
-#         "uploads/labour_attendance",
-#         "checkout"
-#     )
-#     obj.out_time = out_time
-#     obj.working_hours = working_hours
-#     obj.overtime_hours = overtime_hours
-#     obj.overtime_rate = overtime_rate
-#     obj.check_out_image = check_out_path
-
-#     obj.check_out_latitude = Decimal(str(latitude))
-#     obj.check_out_longitude = Decimal(str(longitude))
-#     obj.check_out_address = location_address
-
-#     # Auto-approve attendance upon checkout
-#     obj.is_approved = True
-#     obj.approved_by_id = current_user.id
-
-#     await db.flush()
-
-#     total_wage = hourly_rate * working_hours + overtime_rate * overtime_hours
-
-#     total_wage = total_wage.quantize(
-#         Decimal("0.01")
-#     )
-
-#     existing_expense = await db.scalar(
-#         select(Expense).where(
-#             Expense.project_id == obj.project_id,
-#             Expense.labour_id == labour.id,
-#             Expense.category == "Labour",
-#             Expense.expense_date == obj.attendance_date,
-#         )
-#     )
-
-#     if existing_expense:
-#         existing_expense.amount = total_wage
-#         expense = existing_expense
-#     else:
-#         expense = Expense(
-#             project_id=obj.project_id,
-#             labour_id=labour.id,
-#             category="Labour",
-#             description=f"Labour expense - {obj.attendance_date}",
-#             amount=total_wage,
-#             expense_date=obj.attendance_date,
-#             payment_mode="auto",
-#         )
-#         db.add(expense)
-#         await db.flush()
-
-#     if not project:
-#         raise NotFoundError("Project not found")
-
-#     db.add(
-#         OwnerTransaction(
-#             owner_id=project.owner_id,
-#             project_id=obj.project_id,
-#             type="debit",
-#             amount=total_wage,
-#             reference_type="labour",
-#             reference_id=expense.id,
-#             description=f"Labour expense ({obj.attendance_date})",
-#         )
-#     )
-
-#     await r.bump_cache_version(redis, ATTENDANCE_VERSION_KEY)
-#     await r.bump_cache_version(redis, "dashboard_version")
-
-#     await db.refresh(obj)
-#     return obj
-
-
 @router.get(
     "/{labour_id}/weekly-report",
     response_model=list[s.WeeklyReportOut],
@@ -1021,20 +859,11 @@ async def weekly_report(
     current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id is None:
-        return []
+    assert_company_context(current_user)
 
-    labour = (
-        await db.execute(
-            select(Labour)
-            .options(selectinload(Labour.labour_type))
-            .where(Labour.id == labour_id)
-        )
-    ).scalar_one_or_none()
+    labour = await _get_scoped_labour(db, labour_id, current_user)
 
-    if not labour or (
-        labour.company_id is not None and labour.company_id != current_user.company_id
-    ):
+    if not labour:
         raise NotFoundError("Labour not found")
 
     project_ids = (
@@ -1130,20 +959,11 @@ async def monthly_report(
 ):
     from app.utils.common import assert_project_access
 
-    if current_user.company_id is None:
-        return []
+    assert_company_context(current_user)
 
-    labour = (
-        await db.execute(
-            select(Labour)
-            .options(selectinload(Labour.labour_type))
-            .where(Labour.id == labour_id)
-        )
-    ).scalar_one_or_none()
+    labour = await _get_scoped_labour(db, labour_id, current_user)
 
-    if not labour or (
-        labour.company_id is not None and labour.company_id != current_user.company_id
-    ):
+    if not labour:
         raise NotFoundError("Labour not found")
 
     project_ids = (
@@ -1237,10 +1057,11 @@ async def monthly_report(
 @router.post("/payroll/generate", response_model=list[s.PayrollOut])
 async def generate_payroll(
     payload: s.PayrollGenerate,
-    current_user: User = Depends(d.require_permission("payroll.create")),
+    current_user: User = Depends(d.require_permission("labour.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    assert_company_context(current_user)
     logger.info(
         f"Generating payroll project={payload.project_id} month={payload.month} year={payload.year}"
     )
@@ -1459,7 +1280,7 @@ async def generate_payroll(
 @router.post("/payroll/lock", response_model=list[s.PayrollOut])
 async def lock_payroll(
     payload: s.PayrollLock,
-    current_user: User = Depends(d.require_permission("payroll.edit")),
+    current_user: User = Depends(d.require_permission("labour.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1470,7 +1291,10 @@ async def lock_payroll(
         raise HTTPException(status_code=400, detail="Duplicate IDs in payload")
 
     try:
-        if current_user.company_id is None:
+        is_sa = _is_super_admin(current_user)
+        if not is_sa and current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        if is_sa and current_user.company_id is None:
             raise HTTPException(
                 status_code=403, detail="Super Admin cannot lock payroll"
             )
@@ -1524,7 +1348,7 @@ async def lock_payroll(
 @router.post("/payroll/unlock", response_model=list[s.PayrollOut])
 async def unlock_payroll(
     payload: s.PayrollUnlock,
-    current_user: User = Depends(d.require_permission("payroll.edit")),
+    current_user: User = Depends(d.require_permission("labour.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
@@ -1535,7 +1359,10 @@ async def unlock_payroll(
         raise HTTPException(status_code=400, detail="Duplicate IDs in payload")
 
     try:
-        if current_user.company_id is None:
+        is_sa = _is_super_admin(current_user)
+        if not is_sa and current_user.company_id is None:
+            raise HTTPException(status_code=403, detail="Company context required")
+        if is_sa and current_user.company_id is None:
             raise HTTPException(
                 status_code=403, detail="Super Admin cannot unlock payroll"
             )
@@ -1589,11 +1416,11 @@ async def unlock_payroll(
 @router.post("/payroll/pay")
 async def pay_salary(
     payload: s.PayrollPayment,
-    current_user: User = Depends(d.require_permission("payroll.approve")),
+    current_user: User = Depends(d.require_permission("labour.approve")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db,
@@ -1666,10 +1493,11 @@ async def pay_salary(
     db.add(entry)
     await db.flush()  # get entry.id
 
-    labour_obj = await db.get(Labour, payload.labour_id)
+    labour_obj = await _get_scoped_labour(db, payload.labour_id, current_user)
+    if not labour_obj:
+        raise NotFoundError("Labour not found")
     target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
     if target_company_id is None:
-        from fastapi import HTTPException
         raise HTTPException(
             status_code=400, detail="Primary Cash Account not configured"
         )
@@ -1681,8 +1509,6 @@ async def pay_salary(
         )
     )
     if not wages_payable_acc:
-        from fastapi import HTTPException
-
         raise HTTPException(
             status_code=400, detail="WAGES_PAYABLE account is not configured."
         )
@@ -1692,8 +1518,6 @@ async def pay_salary(
     try:
         cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
     except ValueError:
-        from fastapi import HTTPException
-
         raise HTTPException(
             status_code=400, detail="Primary Cash Account not configured"
         )
@@ -1732,11 +1556,11 @@ async def pay_salary(
 @router.post("/advance")
 async def advance_payment(
     payload: s.AdvancePayment,
-    current_user: User = Depends(d.require_permission("payroll.create")),
+    current_user: User = Depends(d.require_permission("labour.create")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db,
@@ -1746,8 +1570,13 @@ async def advance_payment(
     except Exception:
         raise NotFoundError("Project not found")
 
-    labour = await db.get(Labour, payload.labour_id)
-    project = await db.get(Project, payload.project_id)
+    if payload.amount <= 0:
+        raise HTTPException(
+            status_code=400, detail="Advance amount must be greater than 0"
+        )
+
+    labour = await _get_scoped_labour(db, payload.labour_id, current_user)
+    project = await _get_scoped_project(db, payload.project_id, current_user)
 
     if not labour:
         raise NotFoundError("Labour not found")
@@ -1800,8 +1629,9 @@ async def attendance_dashboard(
     to_date: date,
     labour_id: int | None = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.require_permission("attendance.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db,
@@ -1823,7 +1653,7 @@ async def attendance_dashboard(
     labour = None
 
     if labour_id is not None:
-        labour = await db.get(Labour, labour_id)
+        labour = await _get_scoped_labour(db, labour_id, current_user)
 
         if not labour:
             raise HTTPException(
@@ -1978,6 +1808,7 @@ async def dashboard_stats(
     current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     today = date.today()
 
     project_ids = await get_user_project_ids(db, current_user)
@@ -2014,12 +1845,10 @@ async def get_labour_by_contractor(
     current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    contractor = await db.get(Contractor, contractor_id)
-    if not contractor or (
-        current_user.company_id is not None
-        and contractor.company_id != current_user.company_id
-    ):
-        return []
+    assert_company_context(current_user)
+    contractor = await _get_scoped_contractor(db, contractor_id, current_user)
+    if not contractor:
+        raise NotFoundError("Contractor not found")
     project_ids = await get_user_project_ids(db, current_user)
 
     result = await db.execute(
@@ -2053,6 +1882,7 @@ async def labour_skill_summary(
     current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db,
@@ -2084,7 +1914,7 @@ async def export_excel(
     project_id: int = Query(...),
     db: AsyncSession = Depends(get_db_session),
 ):
-
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db,
@@ -2134,9 +1964,9 @@ async def export_attendance_excel(
     from_date: date,
     to_date: date,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.require_permission("attendance.export")),
+    current_user: User = Depends(d.require_permission("labour.export")),
 ):
-
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db, project_id=project_id, current_user=current_user
@@ -2202,9 +2032,10 @@ async def export_payroll_excel(
     end_date: Optional[date] = None,
     labour_id: Optional[int] = None,
     format: Literal["excel", "pdf"] = Query("excel", description="Export format"),
-    current_user: User = Depends(d.require_permission("payroll.export")),
+    current_user: User = Depends(d.require_permission("labour.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     project_ids = await get_user_project_ids(db, current_user)
 
     query = select(LabourPayroll, Labour).join(
@@ -2333,9 +2164,10 @@ async def export_payroll_excel(
 @router.post("/wages", response_model=payroll_s.LabourWageOut)
 async def create_wage_record(
     payload: payroll_s.LabourWageGenerateRequest,
-    current_user: User = Depends(d.require_permission("payroll.create")),
+    current_user: User = Depends(d.require_permission("labour.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db, project_id=payload.project_id, current_user=current_user
@@ -2343,17 +2175,8 @@ async def create_wage_record(
     except Exception:
         raise NotFoundError("Project not found")
 
-    labour = (
-        await db.execute(
-            select(Labour)
-            .options(selectinload(Labour.labour_type))
-            .where(Labour.id == payload.labour_id)
-        )
-    ).scalar_one_or_none()
-    if not labour or (
-        current_user.company_id is not None
-        and labour.company_id != current_user.company_id
-    ):
+    labour = await _get_scoped_labour(db, payload.labour_id, current_user)
+    if not labour:
         raise NotFoundError("Labour not found")
 
     target_account_id = payload.bank_account_id
@@ -2362,11 +2185,7 @@ async def create_wage_record(
             raise HTTPException(
                 status_code=400, detail="bank_account_id is required for Bank Transfer"
             )
-        from app.models.accountant import BankAccount
-
-        bank_acc = await db.scalar(
-            select(BankAccount).where(BankAccount.id == payload.bank_account_id)
-        )
+        bank_acc = await _get_scoped_bank_account(db, payload.bank_account_id, current_user)
         if not bank_acc:
             raise NotFoundError("Bank account not found")
         target_account_id = bank_acc.account_id
@@ -2471,10 +2290,13 @@ async def list_wages(
     status: Optional[str] = None,
     labour_id: Optional[int] = None,
     project_id: Optional[int] = None,
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id is None:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    if is_sa and current_user.company_id is None:
         return PaginatedResponse(
             items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset)
         )
@@ -2559,20 +2381,18 @@ async def list_wages(
 @router.post("/wages/{id}/pay")
 async def pay_wage_record(
     id: int,
-    current_user: User = Depends(d.require_permission("payroll.approve")),
+    current_user: User = Depends(d.require_permission("labour.approve")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     wage_record = await db.scalar(
         select(LabourWageRecord).where(LabourWageRecord.id == id)
     )
     if not wage_record:
         raise NotFoundError("Wage record not found")
 
-    project = await db.get(Project, wage_record.project_id)
-    if not project or (
-        current_user.company_id is not None
-        and project.company_id != current_user.company_id
-    ):
+    project = await _get_scoped_project(db, wage_record.project_id, current_user)
+    if not project:
         raise NotFoundError("Wage record not found")
 
     try:
@@ -2614,7 +2434,9 @@ async def pay_wage_record(
     db.add(entry)
     await db.flush()
 
-    labour_obj = await db.get(Labour, wage_record.labour_id)
+    labour_obj = await _get_scoped_labour(db, wage_record.labour_id, current_user)
+    if not labour_obj:
+        raise NotFoundError("Labour not found")
     target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
 
     wages_query = select(Account).where(Account.code == "WAGES_PAYABLE")
@@ -2633,9 +2455,13 @@ async def pay_wage_record(
             )
         from app.models.accountant import BankAccount
 
-        bank_query = select(BankAccount).where(BankAccount.id == wage_record.bank_account_id)
+        bank_query = (
+            select(BankAccount)
+            .join(Account, Account.id == BankAccount.account_id)
+            .where(BankAccount.id == wage_record.bank_account_id)
+        )
         if target_company_id is not None:
-            bank_query = bank_query.where(BankAccount.company_id == target_company_id)
+            bank_query = bank_query.where(Account.company_id == target_company_id)
         bank_acc = await db.scalar(bank_query)
         if not bank_acc:
             raise NotFoundError("Bank account not found")
@@ -2673,9 +2499,10 @@ async def pay_wage_record(
 @router.get("/wages/stats", response_model=payroll_s.LabourWageStatsOut)
 async def get_wage_stats(
     project_id: int = Query(...),
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db, project_id=project_id, current_user=current_user
@@ -2718,16 +2545,10 @@ async def get_wage_stats(
 
 async def _get_active_labour_or_404(
     db: AsyncSession, labour_id: int, current_user: User
-):
-    if current_user.company_id is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Super Admin cannot access company labour directly",
-        )
-    obj = await db.scalar(select(Labour).where(Labour.id == labour_id))
-    if not obj or (
-        obj.company_id is not None and obj.company_id != current_user.company_id
-    ):
+) -> Labour:
+    assert_company_context(current_user)
+    obj = await _get_scoped_labour(db, labour_id, current_user)
+    if not obj:
         raise NotFoundError("Labour record not found")
     return obj
 
@@ -2759,14 +2580,11 @@ async def get_labour(
 ):
     from app.utils.common import assert_project_access
 
-    if current_user.company_id is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Super Admin cannot access company labour directly",
-        )
+    assert_company_context(current_user)
 
+    cid = current_user.company_id or "global"
     version = await r.get_cache_version(redis, VERSION_KEY)
-    cache_key = f"cache:labour:get:{version}:{current_user.company_id}:{labour_id}"
+    cache_key = f"cache:labour:get:{version}:{cid}:{labour_id}"
 
     #  CACHE HIT
     cached = await r.cache_get_json(redis, cache_key)
@@ -2774,19 +2592,9 @@ async def get_labour(
         return s.LabourOut.model_validate(cached)
 
     #  FETCH LABOUR
-    obj = await db.scalar(
-        select(Labour)
-        .options(
-            selectinload(Labour.user),
-            selectinload(Labour.contractor),
-            selectinload(Labour.labour_type),
-        )
-        .where(Labour.id == labour_id)
-    )
+    obj = await _get_scoped_labour(db, labour_id, current_user)
 
-    if not obj or (
-        obj.company_id is not None and obj.company_id != current_user.company_id
-    ):
+    if not obj:
         raise NotFoundError("Labour record not found")
 
     #  MANY-TO-MANY ACCESS CHECK
@@ -2830,9 +2638,10 @@ async def get_weekly_velocity(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db,
@@ -2892,9 +2701,10 @@ async def get_disbursement_history(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db, project_id=project_id, current_user=current_user
@@ -2931,9 +2741,11 @@ async def get_disbursement_history(
     if not labour_txn_map:
         return []
 
-    labour_result = await db.execute(
-        select(Labour).where(Labour.id.in_(list(labour_txn_map.keys())))
-    )
+    is_sa = _is_super_admin(current_user)
+    labour_stmt = select(Labour).where(Labour.id.in_(list(labour_txn_map.keys())))
+    if not is_sa and current_user.company_id is not None:
+        labour_stmt = labour_stmt.where(Labour.company_id == current_user.company_id)
+    labour_result = await db.execute(labour_stmt)
     labours = {l.id: l for l in labour_result.scalars().all()}
 
     output = []
@@ -2960,9 +2772,10 @@ async def get_fiscal_summary(
     project_id: int,
     month: int,
     year: int,
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db, project_id=project_id, current_user=current_user
@@ -3028,9 +2841,10 @@ async def get_fiscal_summary(
 async def get_payroll_momentum(
     project_id: int,
     months: int = Query(6, ge=1, le=12),
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db, project_id=project_id, current_user=current_user
@@ -3109,9 +2923,10 @@ async def get_aggregate_report(
     month: int,
     year: int,
     group_by: str = Query("monthly", pattern="^(daily|weekly|monthly)$"),
-    current_user: User = Depends(d.require_permission("payroll.view")),
+    current_user: User = Depends(d.require_permission("labour.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     try:
         await assert_project_access(
             db,

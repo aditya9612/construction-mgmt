@@ -224,12 +224,14 @@ async def setup_batch_k_data():
 
         # 8. Equipment
         eq_a = Equipment(
+            company_id=comp_a.id,
             project_id=proj_a.id,
             equipment_name=f"Excavator KA {uid}",
             equipment_code=f"EQ-KA-{uid}",
             rental_cost=Decimal("1500.00"),
         )
         eq_b = Equipment(
+            company_id=comp_b.id,
             project_id=proj_b.id,
             equipment_name=f"Excavator KB {uid}",
             equipment_code=f"EQ-KB-{uid}",
@@ -1217,28 +1219,35 @@ async def test_batch_k_client_user_access_and_isolation():
         # Grant quotations.view to Client role in DB
         async with AsyncSessionLocal() as db:
             perm = await db.scalar(select(Permission).where(Permission.code == "quotations.view"))
-            db.add(RolePermission(role="Client", permission_id=perm.id))
+            rp = RolePermission(role="Client", permission_id=perm.id)
+            db.add(rp)
             await db.commit()
+            rp_id = rp.id
 
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            token_client_a = d_data["tokens"]["client_a"]
-            headers_client_a = {"Authorization": f"Bearer {token_client_a}"}
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                token_client_a = d_data["tokens"]["client_a"]
+                headers_client_a = {"Authorization": f"Bearer {token_client_a}"}
 
-            # Client A can list own quotations
-            resp = await ac.get("/api/v1/quotations/", headers=headers_client_a)
-            assert resp.status_code == 200
-            items = resp.json()
-            for item in items:
-                assert item["client_user_id"] == d_data["client_user_a"].id
+                # Client A can list own quotations
+                resp = await ac.get("/api/v1/quotations/", headers=headers_client_a)
+                assert resp.status_code == 200
+                items = resp.json()
+                for item in items:
+                    assert item["client_user_id"] == d_data["client_user_a"].id
 
-            # Client A can get own quotation
-            resp_own = await ac.get(f"/api/v1/quotations/{d_data['qtn_a1'].id}", headers=headers_client_a)
-            assert resp_own.status_code == 200
+                # Client A can get own quotation
+                resp_own = await ac.get(f"/api/v1/quotations/{d_data['qtn_a1'].id}", headers=headers_client_a)
+                assert resp_own.status_code == 200
 
-            # Client A trying to get Client B's quotation -> 404
-            resp_foreign = await ac.get(f"/api/v1/quotations/{d_data['qtn_b1'].id}", headers=headers_client_a)
-            assert resp_foreign.status_code == 404
+                # Client A trying to get Client B's quotation -> 404
+                resp_foreign = await ac.get(f"/api/v1/quotations/{d_data['qtn_b1'].id}", headers=headers_client_a)
+                assert resp_foreign.status_code == 404
+        finally:
+            async with AsyncSessionLocal() as db:
+                await db.execute(delete(RolePermission).where(RolePermission.id == rp_id))
+                await db.commit()
 
 
 # ==============================================================================
