@@ -71,6 +71,9 @@ os.makedirs(
     exist_ok=True
 )
 
+from uuid import uuid4
+from app.api.user import log_user_changes, log_activity
+
 @router.put(
     "/profile",
     response_model=UserOut
@@ -90,8 +93,6 @@ async def update_profile(
     aadhaar_number: Optional[str] = Form(None),
 
     designation: Optional[str] = Form(None),
-
-    joining_date: Optional[date] = Form(None),
 
     # =========================================
     # FILE
@@ -120,36 +121,35 @@ async def update_profile(
     aadhaar_number = aadhaar_number or None
     designation = designation or None
 
+    data_for_audit = {}
+    updated_fields = []
+
     # =========================================
-    # VALIDATE + UPDATE TEXT FIELDS
+    # VALIDATE + PREPARE TEXT FIELDS
     # =========================================
 
     try:
         if full_name is not None:
-            current_user.full_name = validate_full_name(
+            data_for_audit["full_name"] = validate_full_name(
                 full_name
             )
 
         if address is not None:
-            current_user.address = address.strip()
+            data_for_audit["address"] = address.strip()
 
         if pan_number is not None:
-            current_user.pan_number = validate_pan(
+            data_for_audit["pan_number"] = validate_pan(
                 pan_number
             )
 
         if aadhaar_number is not None:
-            current_user.aadhaar_number = validate_aadhaar(
+            data_for_audit["aadhaar_number"] = validate_aadhaar(
                 aadhaar_number
             )
 
         if designation is not None:
-            current_user.designation = designation.strip()
+            data_for_audit["designation"] = designation.strip()
 
-        if joining_date is not None:
-            current_user.joining_date = validate_joining_date(
-                joining_date
-            )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -167,24 +167,12 @@ async def update_profile(
     # PROFILE IMAGE
     # =========================================
 
+    old_image_path = current_user.profile_image
+
     if remove_profile_image:
-
-        if (
-            current_user.profile_image
-            and os.path.exists(current_user.profile_image)
-        ):
-            os.remove(current_user.profile_image)
-
-        current_user.profile_image = None
+        data_for_audit["profile_image"] = None
 
     elif profile_image is not None:
-
-        # Remove old image if it exists
-        if (
-            current_user.profile_image
-            and os.path.exists(current_user.profile_image)
-        ):
-            os.remove(current_user.profile_image)
 
         file_path = await validate_and_save_image(
             file=profile_image,
@@ -192,7 +180,37 @@ async def update_profile(
             prefix="profile"
         )
 
-        current_user.profile_image = file_path
+        data_for_audit["profile_image"] = file_path
+
+    # =========================================
+    # AUDIT LOGGING
+    # =========================================
+    
+    change_group_id = str(uuid4())
+    await log_user_changes(db, current_user, data_for_audit, current_user.id, change_group_id)
+
+    for k, v in data_for_audit.items():
+        if hasattr(current_user, k) and getattr(current_user, k) != v:
+            setattr(current_user, k, v)
+            updated_fields.append(k)
+            
+    if (remove_profile_image or profile_image is not None) and old_image_path:
+        # Remove old image if it exists
+        if os.path.exists(old_image_path):
+            try:
+                os.remove(old_image_path)
+            except OSError:
+                pass
+
+    if updated_fields:
+        await log_activity(
+            db,
+            action="UPDATE_PROFILE",
+            entity="USER",
+            entity_id=current_user.id,
+            performed_by=current_user.id,
+            details={"fields_updated": updated_fields},
+        )
 
     # =========================================
     # SAVE
