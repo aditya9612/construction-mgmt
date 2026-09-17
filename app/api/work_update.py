@@ -51,7 +51,7 @@ from app.models.project import (
     WorkActivity,
 )
 
-from app.models.user import User, UserRole
+from app.models.user import User
 
 from app.models.work_update import (
     WorkUpdate,
@@ -69,45 +69,17 @@ from app.utils.common import (
     generate_business_id,
 )
 
-from app.core.dependencies import require_permission
+from app.core.dependencies import (
+    get_effective_user_permissions,
+    has_permission,
+    require_permission,
+)
 from app.utils.helpers import (
     NotFoundError,
     ValidationError,
 )
 
 from collections import defaultdict
-
-WORK_UPDATE_READ_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.CONTRACTOR,
-        UserRole.CLIENT,
-        UserRole.LABOUR,
-    ]
-]
-
-WORK_UPDATE_WRITE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.CONTRACTOR,
-        UserRole.LABOUR,
-    ]
-]
-
-WORK_UPDATE_DELETE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-    ]
-]
 
 # =====================================================
 # BATCH X TENANT SCOPING HELPERS
@@ -1333,18 +1305,17 @@ async def update_work_update(
     if obj.status == WorkUpdateStatus.SUBMITTED.value:
         raise ValidationError("Submitted work update cannot be updated.")
 
-    # FIX (Phase 1 / Section 7): "only creator can edit draft, Admin can
-    # override" — previously ANY user with a write role (including a
-    # different Contractor/Engineer on the same project) could edit
-    # someone else's draft. assert_project_access only confirms project
-    # membership, not ownership of this specific record.
+    # Creator can edit; non-creators require DB-driven work_updates.edit permission (or SA)
+    is_sa = getattr(current_user, "is_super_admin", False) is True
     is_owner = current_user.id == obj.created_by_id
-    is_admin = current_user.role == UserRole.ADMIN.value
-    if not is_owner and not is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the creator or an Admin can edit this work update.",
-        )
+
+    if not is_owner and not is_sa:
+        effective_perms = await get_effective_user_permissions(db, current_user)
+        if not has_permission(effective_perms, "work_updates.edit"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the creator or a user with work_updates.edit permission can edit this work update.",
+            )
 
     update_data = payload.model_dump(exclude_unset=True)
 

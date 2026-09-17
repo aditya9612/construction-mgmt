@@ -25,9 +25,9 @@ from app.core.enums import (
 )
 from app.db.session import get_db_session
 from app.core import dependencies as d
-from app.core.dependencies import require_permission
+from app.core.dependencies import require_permission, get_effective_user_permissions, has_permission
 from app.models.settings import UserSettings
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.models.owner import Owner
 from app.models.material import Supplier
 from app.models import project as m
@@ -60,7 +60,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 from app.models.approval import Approval
-from app.models.user import User, UserRole, ActivityLog
+from app.models.user import User, ActivityLog
 from app.models.owner import Owner
 from app.models.material import Supplier
 from app.cache import redis as r
@@ -114,16 +114,15 @@ from app.models.labour import Labour, LabourProject, LabourAttendance, LabourPay
 from app.core.enums import TaskStatus
 from app.models.contractor import Contractor, ContractorProject
 
-DASHBOARD_READ_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.ACCOUNTANT,
-        UserRole.CLIENT,
-    ]
-]
+def _is_super_admin(user: Optional[User]) -> bool:
+    return getattr(user, "is_super_admin", False) is True
+
+
+def assert_company_context(current_user: User) -> bool:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    return is_sa
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
@@ -134,20 +133,15 @@ CACHE_TTL = 300  #  5 min auto refresh
 # =========================================
 # HELPER
 # =========================================
-async def get_user_project_ids(db, user: User):
-    if getattr(user, "is_super_admin", False):
+async def get_user_project_ids(db: AsyncSession, user: User):
+    if _is_super_admin(user):
         result = await db.execute(select(m.Project.id))
         return [r[0] for r in result.all()]
     if user.company_id is None:
-        if user.role == UserRole.ADMIN.value:
-            result = await db.execute(select(m.Project.id))
-            return [r[0] for r in result.all()]
-        result = await db.execute(
-            select(m.ProjectMember.project_id)
-            .where(m.ProjectMember.user_id == user.id)
-        )
-        return [r[0] for r in result.all()]
-    if user.role == UserRole.ADMIN.value:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    effective_perms = await get_effective_user_permissions(db, user)
+    if has_permission(effective_perms, "dashboard.manage"):
         result = await db.execute(
             select(m.Project.id).where(m.Project.company_id == user.company_id)
         )
@@ -274,11 +268,7 @@ async def admin_dashboard(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    if current_user.company_id is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Super Admin cannot access tenant dashboard directly",
-        )
+    assert_company_context(current_user)
 
     async def logic():
         today = get_naive_local_now().date()
@@ -287,49 +277,50 @@ async def admin_dashboard(
         # 1. Project Overview
         # ==========================================
         pids = await get_user_project_ids(db, current_user)
-        project_stats = await db.execute(
-            select(
-                func.count(m.Project.id),
-                # Active: started, not completed, end date not crossed (or none)
-                func.sum(
-                    case(
+        project_stats_query = select(
+            func.count(m.Project.id),
+            # Active: started, not completed, end date not crossed (or none)
+            func.sum(
+                case(
+                    (
                         (
-                            (
-                                (m.Project.start_date <= today)
-                                & (
-                                    (m.Project.end_date == None)
-                                    | (m.Project.end_date >= today)
-                                )
-                                & (m.Project.status != ProjectStatus.COMPLETED.value)
-                            ),
-                            1,
+                            (m.Project.start_date <= today)
+                            & (
+                                (m.Project.end_date == None)
+                                | (m.Project.end_date >= today)
+                            )
+                            & (m.Project.status != ProjectStatus.COMPLETED.value)
                         ),
-                        else_=0,
-                    )
-                ),
-                # Completed
-                func.sum(
-                    case(
-                        (m.Project.status == ProjectStatus.COMPLETED.value, 1),
-                        else_=0,
-                    )
-                ),
-                # Delayed: end date crossed, not completed
-                func.sum(
-                    case(
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+            # Completed
+            func.sum(
+                case(
+                    (m.Project.status == ProjectStatus.COMPLETED.value, 1),
+                    else_=0,
+                )
+            ),
+            # Delayed: end date crossed, not completed
+            func.sum(
+                case(
+                    (
                         (
-                            (
-                                (m.Project.end_date != None)
-                                & (m.Project.end_date < today)
-                                & (m.Project.status != ProjectStatus.COMPLETED.value)
-                            ),
-                            1,
+                            (m.Project.end_date != None)
+                            & (m.Project.end_date < today)
+                            & (m.Project.status != ProjectStatus.COMPLETED.value)
                         ),
-                        else_=0,
-                    )
-                ),
-            ).where(m.Project.company_id == current_user.company_id)
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
         )
+        if not _is_super_admin(current_user):
+            project_stats_query = project_stats_query.where(m.Project.company_id == current_user.company_id)
+        project_stats = await db.execute(project_stats_query)
 
         total, active, completed, delayed = project_stats.one()
 
@@ -371,19 +362,19 @@ async def admin_dashboard(
             .where(
                 UserAttendance.attendance_date == today,
                 UserAttendance.status != "absent",
-                User.role == UserRole.LABOUR.value,
+                User.role == "Labour",
                 UserAttendance.project_id.in_(pids) if pids else False,
             )
         )
 
-        pending_approvals = await db.scalar(
-            select(func.count(Approval.id)).where(
-                Approval.status == "Pending",
+        appr_stmt = select(func.count(Approval.id)).where(Approval.status == "Pending")
+        if not _is_super_admin(current_user):
+            appr_stmt = appr_stmt.where(
                 Approval.requested_by.in_(
                     select(User.id).where(User.company_id == current_user.company_id)
-                ),
+                )
             )
-        )
+        pending_approvals = await db.scalar(appr_stmt)
 
         action_items = await db.scalar(
             select(func.count(Issue.id)).where(
@@ -421,11 +412,10 @@ async def admin_dashboard(
         # (optimized: avg progress fetched in ONE grouped
         #  query instead of N queries inside the loop)
         # ==========================================
-        projects_query = await db.execute(
-            select(m.Project)
-            .where(m.Project.company_id == current_user.company_id)
-            .order_by(m.Project.id.asc())
-        )
+        projects_stmt = select(m.Project).order_by(m.Project.id.asc())
+        if not _is_super_admin(current_user):
+            projects_stmt = projects_stmt.where(m.Project.company_id == current_user.company_id)
+        projects_query = await db.execute(projects_stmt)
         projects = projects_query.scalars().all()
 
         avg_progress_rows = await db.execute(
@@ -494,15 +484,10 @@ async def admin_dashboard(
         # ==========================================
         # Active Users
         # ==========================================
-        active_users = (
-            await db.scalar(
-                select(func.count(User.id)).where(
-                    User.is_active == True,
-                    User.company_id == current_user.company_id,
-                )
-            )
-            or 0
-        )
+        users_stmt = select(func.count(User.id)).where(User.is_active == True)
+        if not _is_super_admin(current_user):
+            users_stmt = users_stmt.where(User.company_id == current_user.company_id)
+        active_users = (await db.scalar(users_stmt)) or 0
 
         # ==========================================
         # 5. Recent Activities
@@ -571,7 +556,7 @@ async def admin_dashboard(
 
     return await cache_get_set(
         redis,
-        f"admin_dashboard:{current_user.company_id}",
+        f"admin_dashboard:{current_user.company_id or 'global'}",
         version,
         logic,
     )
@@ -586,8 +571,7 @@ async def engineer_dashboard(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    # if current_user.role != UserRole.SITE_ENGINEER:
-    #     return {"error": "Access denied"}
+    assert_company_context(current_user)
 
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
@@ -600,7 +584,7 @@ async def engineer_dashboard(
                 UserAttendance.project_id.in_(project_ids),
                 UserAttendance.attendance_date == today,
                 UserAttendance.status != "absent",
-                User.role == UserRole.LABOUR.value,
+                User.role == "Labour",
             )
         )
 
@@ -618,7 +602,7 @@ async def engineer_dashboard(
 
     version = await r.get_cache_version(redis, VERSION_KEY)
     return await cache_get_set(
-        redis, f"engineer_dashboard:{current_user.company_id}:{current_user.id}", version, logic
+        redis, f"engineer_dashboard:{current_user.company_id or 'global'}:{current_user.id}", version, logic
     )
 
 
@@ -631,8 +615,7 @@ async def manager_dashboard(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    # if current_user.role != UserRole.PROJECT_MANAGER:
-    #     return {"error": "Access denied"}
+    assert_company_context(current_user)
 
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
@@ -669,7 +652,7 @@ async def manager_dashboard(
 
     version = await r.get_cache_version(redis, VERSION_KEY)
     return await cache_get_set(
-        redis, f"manager_dashboard:{current_user.company_id}:{current_user.id}", version, logic
+        redis, f"manager_dashboard:{current_user.company_id or 'global'}:{current_user.id}", version, logic
     )
 
 
@@ -682,11 +665,8 @@ async def accountant_dashboard(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-    if current_user.company_id is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Super Admin cannot access accountant dashboard",
-        )
+    assert_company_context(current_user)
+
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
 
@@ -1029,7 +1009,7 @@ async def accountant_dashboard(
 
     version = await r.get_cache_version(redis, VERSION_KEY)
     return await cache_get_set(
-        redis, f"accountant_dashboard:{current_user.company_id}", version, logic
+        redis, f"accountant_dashboard:{current_user.company_id or 'global'}", version, logic
     )
 
 
@@ -1044,6 +1024,8 @@ async def pm_command_center(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    assert_company_context(current_user)
+
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
         today = get_naive_local_now().date()
@@ -1399,7 +1381,7 @@ async def pm_command_center(
 
     version = await r.get_cache_version(redis, VERSION_KEY)
     return await cache_get_set(
-        redis, f"pm_command_center:{current_user.company_id}:{current_user.id}", version, logic
+        redis, f"pm_command_center:{current_user.company_id or 'global'}:{current_user.id}", version, logic
     )
 
 
@@ -1408,6 +1390,7 @@ async def pm_summary(
     current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     project_ids = await get_user_project_ids(db, current_user)
     if not project_ids:
         return PMSummaryOut(
@@ -1535,6 +1518,7 @@ async def refresh_dashboard(
     current_user: User = Depends(require_permission("dashboard.manage")),
     redis=Depends(d.get_request_redis),
 ):
+    assert_company_context(current_user)
     await r.bump_cache_version(redis, VERSION_KEY)
     return {"message": "Dashboard cache invalidated successfully"}
 
@@ -1552,6 +1536,7 @@ async def export_dashboard(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    assert_company_context(current_user)
     dash_out = await accountant_dashboard(current_user=current_user, db=db, redis=redis)
 
     buffer = io.StringIO()
@@ -1622,11 +1607,11 @@ async def export_master_projects_csv(
     current_user: User = Depends(require_permission("dashboard.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id is None:
-        raise HTTPException(status_code=403, detail="Super Admin cannot export projects")
-    projects_query = await db.execute(
-        select(m.Project).where(m.Project.company_id == current_user.company_id)
-    )
+    assert_company_context(current_user)
+    stmt = select(m.Project)
+    if not _is_super_admin(current_user):
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    projects_query = await db.execute(stmt)
     projects = projects_query.scalars().all()
 
     buffer = io.StringIO()
@@ -1661,11 +1646,11 @@ async def export_master_projects_pdf(
     current_user: User = Depends(require_permission("dashboard.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id is None:
-        raise HTTPException(status_code=403, detail="Super Admin cannot export projects")
-    projects_query = await db.execute(
-        select(m.Project).where(m.Project.company_id == current_user.company_id)
-    )
+    assert_company_context(current_user)
+    stmt = select(m.Project)
+    if not _is_super_admin(current_user):
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    projects_query = await db.execute(stmt)
     projects = projects_query.scalars().all()
 
     buffer = io.BytesIO()
@@ -1756,6 +1741,8 @@ async def client_dashboard(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    assert_company_context(current_user)
+
     async def logic():
         project_ids = await get_user_project_ids(db, current_user)
 
@@ -2207,6 +2194,7 @@ async def labour_trend(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    assert_company_context(current_user)
     version = await r.get_cache_version(redis, VERSION_KEY)
     cache_key = f"dashboard:{version}:labour:{current_user.id}"
 
@@ -2239,6 +2227,7 @@ async def expense_trend(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    assert_company_context(current_user)
     version = await r.get_cache_version(redis, VERSION_KEY)
     cache_key = f"dashboard:{version}:expense:{current_user.id}"
 
@@ -2274,6 +2263,7 @@ async def dashboard_graph(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
+    assert_company_context(current_user)
 
     # =========================
     #  1. VALIDATION (ADD HERE - TOP)
@@ -2379,6 +2369,7 @@ async def expense_forecast(
     current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     project_ids = await get_user_project_ids(db, current_user)
 
     result = await db.execute(
@@ -2485,6 +2476,7 @@ async def advanced_forecast(
     current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     project_ids = await get_user_project_ids(db, current_user)
 
     if project_id:
@@ -2636,6 +2628,7 @@ async def ml_forecast(
     current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     project_ids = await get_user_project_ids(db, current_user)
 
     if project_id:
@@ -2737,6 +2730,7 @@ async def site_engineer_dashboard(
     redis=Depends(d.get_request_redis),
     project_id: Optional[int] = None,
 ):
+    assert_company_context(current_user)
     project_ids = await get_user_project_ids(db, current_user)
 
     if project_id is not None:
@@ -2751,7 +2745,10 @@ async def site_engineer_dashboard(
         ms_filter_cond = Milestone.project_id == project_id
         exp_filter_cond = Expense.project_id == project_id
 
-        project = await db.get(m.Project, project_id)
+        stmt = select(m.Project).where(m.Project.id == project_id)
+        if not _is_super_admin(current_user):
+            stmt = stmt.where(m.Project.company_id == current_user.company_id)
+        project = await db.scalar(stmt)
         if not project:
             raise NotFoundError("Project not found")
         project_name = project.project_name
@@ -2984,7 +2981,6 @@ from app.schemas.dashboard import (
     LabourActivityItem,
     LabourDetails,
 )
-from app.models.user import UserRole
 from app.core.enums import (
     TaskStatus,
     TaskPriority,
@@ -3011,14 +3007,9 @@ def _scope_to_project(query, column, project):
 )
 async def labour_dashboard(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.get_current_active_user),
+    current_user: User = Depends(require_permission("dashboard.view")),
 ):
-
-    if current_user.role != UserRole.LABOUR.value:
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized",
-        )
+    assert_company_context(current_user)
 
     today = date.today()
     current_month = today.month
@@ -3052,8 +3043,11 @@ async def labour_dashboard(
     project = None
     assigned_date = None
 
-    # Base filter for tenant isolation, only apply if user actually has a company_id (graceful for old data)
-    tenant_filter = (Project.company_id == current_user.company_id) if current_user.company_id else True
+    tenant_filter = (
+        True
+        if _is_super_admin(current_user)
+        else (Project.company_id == current_user.company_id)
+    )
 
     if user_settings and user_settings.default_project_id:
         row = (
@@ -3391,9 +3385,10 @@ async def get_labour_payments(
     time_filter: Optional[str] = None,
     page: int = 1,
     page_size: int = 10,
-    current_user: User = Depends(d.get_current_active_user),
+    current_user: User = Depends(require_permission("dashboard.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     labour_res = await db.execute(
         select(Labour).where(Labour.user_id == current_user.id)
     )
@@ -3555,9 +3550,10 @@ async def export_labour_payments(
     year: Optional[int] = None,
     time_filter: Optional[str] = None,
     export_format: str = Query("csv", description="csv or pdf"),
-    current_user: User = Depends(d.get_current_active_user),
+    current_user: User = Depends(require_permission("dashboard.export")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     labour_res = await db.execute(
         select(Labour).where(Labour.user_id == current_user.id)
     )

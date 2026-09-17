@@ -20,15 +20,32 @@ UPLOAD_DIR = "uploads/visualizations"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+async def _get_scoped_project(
+    db: AsyncSession,
+    project_id: int,
+    current_user: User,
+) -> Project:
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    query = select(Project).where(Project.id == project_id)
+    if not is_sa:
+        query = query.where(Project.company_id == current_user.company_id)
+
+    project = await db.scalar(query)
+    if not project:
+        raise NotFoundError("Project not found")
+    return project
+
+
 @router.get("/{id}/visualizations", response_model=List[VisualizationOut])
 async def list_visualizations(
     id: int,
     current_user: User = Depends(require_permission("projects.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    project = await db.get(Project, id)
-    if not project or (not current_user.is_super_admin and project.company_id != current_user.company_id):
-        raise NotFoundError("Project not found")
+    project = await _get_scoped_project(db, id, current_user)
 
     query = select(ProjectVisualization).where(ProjectVisualization.project_id == id).order_by(ProjectVisualization.created_at.desc())
     result = await db.execute(query)
@@ -44,9 +61,7 @@ async def upload_visualization(
     current_user: User = Depends(require_permission("projects.upload")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    project = await db.get(Project, id)
-    if not project or (not current_user.is_super_admin and project.company_id != current_user.company_id):
-        raise NotFoundError("Project not found")
+    project = await _get_scoped_project(db, id, current_user)
 
     file_ext = os.path.splitext(image_file.filename or "")[1].lower()
     if file_ext not in [".jpg", ".jpeg", ".png", ".webp"]:

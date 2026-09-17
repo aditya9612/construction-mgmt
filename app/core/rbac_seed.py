@@ -159,6 +159,15 @@ MODULE_ACTIONS = {
         "create",
         "approve",
     ],
+    "billing": [
+        "view",
+        "create",
+        "edit",
+        "delete",
+        "approve",
+        "export",
+        "pay",
+    ],
     "work_orders": [
         "view",
         "create",

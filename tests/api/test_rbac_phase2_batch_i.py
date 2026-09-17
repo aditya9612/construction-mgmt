@@ -151,11 +151,9 @@ async def setup_batch_i_data():
         await db.flush()
 
         # 6. Master data: ActivityType
-        act = (await db.execute(select(ActivityType).where(ActivityType.is_active == True))).scalars().first()
-        if not act:
-            act = ActivityType(name=f"Excavation_{uid}", category="Civil Work", is_active=True)
-            db.add(act)
-            await db.flush()
+        act = ActivityType(name=f"Excavation_{uid}", category="Civil Work", is_active=True, company_id=None)
+        db.add(act)
+        await db.flush()
 
         # 7. BOQ Groups and Items
         # Company A - Draft BOQ (for add_item, bulk_add_items, and update_actuals)
@@ -301,6 +299,7 @@ async def setup_batch_i_data():
             await clean_db.execute(delete(Task).where(Task.project_id.in_([proj_a.id, proj_b.id])))
             await clean_db.execute(delete(BOQ).where(BOQ.project_id.in_([proj_a.id, proj_b.id])))
             await clean_db.execute(delete(BOQGroup).where(BOQGroup.project_id.in_([proj_a.id, proj_b.id])))
+            await clean_db.execute(delete(ActivityType).where(ActivityType.id == act.id))
             await clean_db.execute(delete(Milestone).where(Milestone.project_id.in_([proj_a.id, proj_b.id])))
             await clean_db.execute(delete(ProjectMember).where(ProjectMember.project_id.in_([proj_a.id, proj_b.id])))
             await clean_db.execute(delete(Project).where(Project.id.in_([proj_a.id, proj_b.id])))
@@ -499,7 +498,7 @@ async def test_batch_i_custom_role_dynamic_lifecycle_export():
 
 @pytest.mark.asyncio
 async def test_batch_i_custom_role_dynamic_lifecycle_tasks_create():
-    """Verify dynamic lifecycle for tasks.create on generate_tasks_from_boq."""
+    """Verify dynamic lifecycle for boq.create on generate_tasks_from_boq and tasks.create denied."""
     async with setup_batch_i_data() as d_data:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -514,12 +513,21 @@ async def test_batch_i_custom_role_dynamic_lifecycle_tasks_create():
             res = await ac.post(f"/api/v1/boq/{boq_id}/generate-tasks?milestone_id={ms_id}", headers=headers)
             assert res.status_code == 403
 
+            # 2. tasks.create alone does NOT authorize it
             async with AsyncSessionLocal() as db:
                 p_tcreate = (await db.execute(select(Permission).where(Permission.code == "tasks.create"))).scalar_one()
                 db.add(RolePermission(role=role_name, role_id=role_id, permission_id=p_tcreate.id))
                 await db.commit()
 
-            # Now authorized
+            res_task = await ac.post(f"/api/v1/boq/{boq_id}/generate-tasks?milestone_id={ms_id}", headers=headers)
+            assert res_task.status_code == 403
+
+            # 3. Grant canonical boq.create -> now authorized
+            async with AsyncSessionLocal() as db:
+                p_bcreate = (await db.execute(select(Permission).where(Permission.code == "boq.create"))).scalar_one()
+                db.add(RolePermission(role=role_name, role_id=role_id, permission_id=p_bcreate.id))
+                await db.commit()
+
             res = await ac.post(f"/api/v1/boq/{boq_id}/generate-tasks?milestone_id={ms_id}", headers=headers)
             assert res.status_code == 200
             assert "task_id" in res.json()

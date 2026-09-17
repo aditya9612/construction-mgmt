@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 import tempfile
 import csv
 from fastapi import APIRouter, Depends, Query, UploadFile, File, HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 from reportlab.lib import colors
@@ -26,9 +26,9 @@ from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.utils.common import assert_project_access
 from app.models.boq import BOQ, BOQAudit, BOQGroup
 from app.models.settings import CompanySettings
-from app.models.master_data import ActivityType
+from app.models.master_data import ActivityType, Unit
 from app.models.project import Project, Task
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.schemas.base import PaginatedResponse, PaginationMeta
 from app.schemas.boq import (
     BOQCreate,
@@ -88,12 +88,70 @@ VERSION_KEY = "cache_version:boq"
 # ------------------ HELPERS ------------------
 
 
+def _is_super_admin(user: Optional[User]) -> bool:
+    return getattr(user, "is_super_admin", False) is True
+
+
+def assert_company_context(current_user: User) -> bool:
+    is_sa = _is_super_admin(current_user)
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+    return is_sa
+
+
 def calculate_cost(
     quantity: Decimal, unit_cost: Decimal, actual_cost: Decimal = Decimal(0)
 ):
     total = quantity * unit_cost
     variance = total - actual_cost
     return total, variance
+
+
+async def _get_scoped_activity_type(
+    db: AsyncSession,
+    activity_type_id: Optional[int],
+    current_user: User,
+) -> Optional[ActivityType]:
+    if activity_type_id is None:
+        return None
+    is_sa = assert_company_context(current_user)
+    stmt = select(ActivityType).where(
+        ActivityType.id == activity_type_id,
+        ActivityType.is_active == True,
+    )
+    if not is_sa:
+        stmt = stmt.where(
+            or_(
+                ActivityType.company_id == current_user.company_id,
+                ActivityType.company_id.is_(None),
+            )
+        )
+    activity = await db.scalar(stmt)
+    if not activity:
+        raise NotFoundError("Invalid activity type")
+    return activity
+
+
+async def _get_scoped_unit(
+    db: AsyncSession,
+    unit_id: Optional[int],
+    current_user: User,
+) -> Optional[Unit]:
+    if unit_id is None:
+        return None
+    is_sa = assert_company_context(current_user)
+    stmt = select(Unit).where(
+        Unit.id == unit_id,
+        Unit.is_active == True,
+    )
+    if not is_sa:
+        stmt = stmt.where(
+            or_(
+                Unit.company_id == current_user.company_id,
+                Unit.company_id.is_(None),
+            )
+        )
+    return await db.scalar(stmt)
 
 
 async def assert_project_access_masked(
@@ -106,12 +164,13 @@ async def assert_project_access_masked(
 
     Masks foreign/inaccessible projects as 404 Not Found.
     """
+    is_sa = assert_company_context(current_user)
+
     project = await db.scalar(select(Project).where(Project.id == project_id))
     if not project:
         raise NotFoundError("Project not found")
 
-    is_super = getattr(current_user, "is_super_admin", False) or getattr(current_user, "role", None) in ["Super Admin", "SuperAdmin"]
-    if not is_super and current_user.company_id is not None and project.company_id != current_user.company_id:
+    if not is_sa and project.company_id != current_user.company_id:
         raise NotFoundError("Project not found")
 
     try:
@@ -132,6 +191,7 @@ async def _get_boq_or_404(
 
     Masks foreign/nonexistent resources as 404 Not Found.
     """
+    assert_company_context(current_user)
     obj = await db.scalar(select(BOQ).where(BOQ.id == boq_id, BOQ.status != "Deleted"))
     if not obj:
         raise NotFoundError("BOQ item not found")
@@ -155,15 +215,11 @@ async def create_boq(
     project = await assert_project_access_masked(db, project_id=payload.project_id, current_user=current_user)
 
     # Master data validation
-    activity = await db.get(ActivityType, payload.activity_type_id)
-    if not activity:
-        raise NotFoundError("Invalid activity type")
+    activity = await _get_scoped_activity_type(db, payload.activity_type_id, current_user)
 
     unit_name = "unit"
     if activity.default_unit_id:
-        from app.models.master_data import Unit
-
-        unit_obj = await db.get(Unit, activity.default_unit_id)
+        unit_obj = await _get_scoped_unit(db, activity.default_unit_id, current_user)
         if unit_obj:
             unit_name = unit_obj.name
 
@@ -228,7 +284,7 @@ async def list_boq(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
 ):
-    is_super = getattr(current_user, "is_super_admin", False) or getattr(current_user, "role", None) in ["Super Admin", "SuperAdmin"]
+    is_super = assert_company_context(current_user)
 
     # If project_id is supplied, enforce project membership and mask foreign as 404
     if project_id is not None:
@@ -310,6 +366,7 @@ async def download_boq_template(
     current_user: User = Depends(require_permission("boq.view")),
     db: AsyncSession = Depends(get_db_session)
 ):
+    is_sa = assert_company_context(current_user)
     wb = Workbook()
     ws = wb.active
     ws.title = "BOQ Entry"
@@ -331,11 +388,19 @@ async def download_boq_template(
     # Fetch Activity Types with their Category and Default Unit
     from app.models.master_data import ActivityType
     from sqlalchemy.orm import selectinload
-    activities = (await db.execute(
+    act_stmt = (
         select(ActivityType)
         .options(selectinload(ActivityType.default_unit))
         .where(ActivityType.is_active == True)
-    )).scalars().all()
+    )
+    if not is_sa:
+        act_stmt = act_stmt.where(
+            or_(
+                ActivityType.company_id == current_user.company_id,
+                ActivityType.company_id.is_(None),
+            )
+        )
+    activities = (await db.execute(act_stmt)).scalars().all()
 
     # Create Reference Data Sheet
     ws_ref = wb.create_sheet(title="Reference Data")
@@ -374,6 +439,8 @@ async def import_boq_excel(
     current_user: User = Depends(require_permission("boq.create")),
     db: AsyncSession = Depends(get_db_session)
 ):
+    is_sa = assert_company_context(current_user)
+
     parent = await db.scalar(
         select(BOQ).where(BOQ.boq_group_id == group_id, BOQ.is_latest == True, BOQ.status != "Deleted")
     )
@@ -387,7 +454,15 @@ async def import_boq_excel(
     ws = wb["BOQ Entry"] if "BOQ Entry" in wb.sheetnames else wb.active
 
     from app.models.master_data import ActivityType
-    activities = (await db.execute(select(ActivityType).where(ActivityType.is_active == True))).scalars().all()
+    act_stmt = select(ActivityType).where(ActivityType.is_active == True)
+    if not is_sa:
+        act_stmt = act_stmt.where(
+            or_(
+                ActivityType.company_id == current_user.company_id,
+                ActivityType.company_id.is_(None),
+            )
+        )
+    activities = (await db.execute(act_stmt)).scalars().all()
 
     activity_map = {}
     valid_activity_types = []
@@ -531,16 +606,13 @@ async def update_boq(
         data = payload.model_dump(exclude_unset=True)
 
         if payload.activity_type_id is not None:
-            activity = await db.get(ActivityType, payload.activity_type_id)
-            if not activity:
-                raise NotFoundError("Invalid activity type")
+            activity = await _get_scoped_activity_type(db, payload.activity_type_id, current_user)
 
             obj.category = activity.category
             unit_name = "unit"
 
             if activity.default_unit_id:
-                from app.models.master_data import Unit
-                unit_obj = await db.get(Unit, activity.default_unit_id)
+                unit_obj = await _get_scoped_unit(db, activity.default_unit_id, current_user)
                 if unit_obj:
                     unit_name = unit_obj.name
 
@@ -861,14 +933,11 @@ async def add_item(
             "Approved BOQ cannot be modified. Create a new version first."
         )
 
-    activity = await db.get(ActivityType, payload.activity_type_id)
-    if not activity:
-        raise NotFoundError("Invalid activity type")
+    activity = await _get_scoped_activity_type(db, payload.activity_type_id, current_user)
 
     unit_name = "unit"
     if activity.default_unit_id:
-        from app.models.master_data import Unit
-        unit_obj = await db.get(Unit, activity.default_unit_id)
+        unit_obj = await _get_scoped_unit(db, activity.default_unit_id, current_user)
         if unit_obj:
             unit_name = unit_obj.name
 
@@ -970,16 +1039,13 @@ async def update_item(
     data = payload.model_dump(exclude_unset=True)
 
     if payload.activity_type_id is not None:
-        activity = await db.get(ActivityType, payload.activity_type_id)
-        if not activity:
-            raise NotFoundError("Invalid activity type")
+        activity = await _get_scoped_activity_type(db, payload.activity_type_id, current_user)
 
         obj.category = activity.category
         unit_name = "unit"
 
         if activity.default_unit_id:
-            from app.models.master_data import Unit
-            unit_obj = await db.get(Unit, activity.default_unit_id)
+            unit_obj = await _get_scoped_unit(db, activity.default_unit_id, current_user)
             if unit_obj:
                 unit_name = unit_obj.name
 
@@ -1041,14 +1107,11 @@ async def bulk_add_items(
 
     try:
         for item in payload.items:
-            activity = await db.get(ActivityType, item.activity_type_id)
-            if not activity:
-                raise NotFoundError("Invalid activity type")
+            activity = await _get_scoped_activity_type(db, item.activity_type_id, current_user)
 
             unit_name = "unit"
             if activity.default_unit_id:
-                from app.models.master_data import Unit
-                unit_obj = await db.get(Unit, activity.default_unit_id)
+                unit_obj = await _get_scoped_unit(db, activity.default_unit_id, current_user)
                 if unit_obj:
                     unit_name = unit_obj.name
 
@@ -1157,7 +1220,12 @@ async def create_version(
             "Only approved BOQ versions can create a new version."
         )
 
-    group = await db.get(BOQGroup, base.boq_group_id)
+    group = await db.scalar(
+        select(BOQGroup).where(
+            BOQGroup.id == base.boq_group_id,
+            BOQGroup.project_id == base.project_id,
+        )
+    )
     if not group:
         raise NotFoundError("BOQ group not found")
 
@@ -1443,7 +1511,7 @@ async def generate_tasks_from_boq(
     boq_id: int,
     milestone_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_permission("tasks.create")),
+    current_user: User = Depends(require_permission("boq.create")),
 ):
     boq, _ = await _get_boq_or_404(db, boq_id=boq_id, current_user=current_user)
 
@@ -1466,14 +1534,13 @@ async def generate_tasks_from_boq(
         from app.models.project import Milestone
 
         milestone = await db.scalar(
-            select(Milestone).where(Milestone.id == milestone_id)
+            select(Milestone).where(
+                Milestone.id == milestone_id,
+                Milestone.project_id == boq.project_id,
+            )
         )
         if not milestone:
             raise NotFoundError("Milestone not found")
-        if milestone.project_id != boq.project_id:
-            raise ValidationError(
-                "Milestone does not belong to the same project as the BOQ"
-            )
 
     task = Task(
         project_id=boq.project_id,

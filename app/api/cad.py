@@ -179,6 +179,10 @@ async def convert(
     current_user: User = Depends(require_permission("drawings.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files allowed")
 
@@ -212,8 +216,12 @@ async def logs(
     current_user: User = Depends(require_permission("drawings.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    is_sa = getattr(current_user, "is_super_admin", False) is True
+    if not is_sa and current_user.company_id is None:
+        raise HTTPException(status_code=403, detail="Company context required")
+
     query = select(CADConversion)
-    if not current_user.is_super_admin:
+    if not is_sa:
         query = query.where(CADConversion.company_id == current_user.company_id)
     query = query.order_by(CADConversion.id.desc())
     res = await db.execute(query)

@@ -47,8 +47,9 @@ from PIL import Image
 from app.core.dependencies import (
     get_current_active_user,
     get_request_redis,
-    require_roles,
     require_permission,
+    has_permission,
+    get_effective_user_permissions,
 )
 from app.utils.common import assert_project_access, assert_task_project
 import shutil
@@ -184,14 +185,16 @@ def get_pagination(
     return PaginationParams(limit=limit, offset=offset, search=search).normalized()
 
 
-def _check_batch_y_tenant_access(current_user: User) -> None:
-    is_sa = getattr(current_user, "is_super_admin", False) is True
-
-    if not is_sa and getattr(current_user, "company_id", None) is None:
+def assert_company_context(current_user: User) -> None:
+    if getattr(current_user, "company_id", None) is None and getattr(current_user, "is_super_admin", False) is not True:
         raise HTTPException(
-            status_code=403,
-            detail="User does not belong to any tenant company",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Company context required",
         )
+
+
+def _check_batch_y_tenant_access(current_user: User) -> None:
+    assert_company_context(current_user)
 
 
 async def _get_scoped_project(
@@ -391,6 +394,178 @@ async def _get_scoped_site_photo(
     return photo
 
 
+async def _get_scoped_qc(
+    db: AsyncSession,
+    qc_id: int,
+    current_user: User,
+    for_update: bool = False,
+) -> m.QCRecord:
+    assert_company_context(current_user)
+    stmt = (
+        select(m.QCRecord)
+        .join(m.Project, m.QCRecord.project_id == m.Project.id)
+        .where(m.QCRecord.id == qc_id)
+    )
+    if current_user.company_id is not None:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    elif getattr(current_user, "is_super_admin", False) is True:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    if for_update:
+        stmt = stmt.with_for_update()
+
+    qc = await db.scalar(stmt)
+    if not qc:
+        raise HTTPException(status_code=404, detail="QC record not found")
+
+    try:
+        await assert_project_access(db, project_id=qc.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="QC record not found")
+
+    return qc
+
+
+async def _get_scoped_safety_incident(
+    db: AsyncSession,
+    incident_id: int,
+    current_user: User,
+    for_update: bool = False,
+) -> m.SafetyIncident:
+    assert_company_context(current_user)
+    stmt = (
+        select(m.SafetyIncident)
+        .join(m.Project, m.SafetyIncident.project_id == m.Project.id)
+        .where(m.SafetyIncident.id == incident_id)
+    )
+    if current_user.company_id is not None:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    elif getattr(current_user, "is_super_admin", False) is True:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    if for_update:
+        stmt = stmt.with_for_update()
+
+    incident = await db.scalar(stmt)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Safety incident not found")
+
+    try:
+        await assert_project_access(db, project_id=incident.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Safety incident not found")
+
+    return incident
+
+
+async def _get_scoped_checklist(
+    db: AsyncSession,
+    checklist_id: int,
+    current_user: User,
+    for_update: bool = False,
+) -> m.Checklist:
+    assert_company_context(current_user)
+    stmt = (
+        select(m.Checklist)
+        .join(m.Project, m.Checklist.project_id == m.Project.id)
+        .where(m.Checklist.id == checklist_id)
+    )
+    if current_user.company_id is not None:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    elif getattr(current_user, "is_super_admin", False) is True:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    if for_update:
+        stmt = stmt.with_for_update()
+
+    checklist = await db.scalar(stmt)
+    if not checklist:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+
+    return checklist
+
+
+async def _get_scoped_checklist_item(
+    db: AsyncSession,
+    item_id: int,
+    current_user: User,
+    for_update: bool = False,
+) -> tuple[m.ChecklistItem, m.Checklist]:
+    assert_company_context(current_user)
+    stmt = (
+        select(m.ChecklistItem, m.Checklist)
+        .join(m.Checklist, m.ChecklistItem.checklist_id == m.Checklist.id)
+        .join(m.Project, m.Checklist.project_id == m.Project.id)
+        .where(m.ChecklistItem.id == item_id)
+    )
+    if current_user.company_id is not None:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    elif getattr(current_user, "is_super_admin", False) is True:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    if for_update:
+        stmt = stmt.with_for_update()
+
+    res = (await db.execute(stmt)).first()
+    if not res:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+
+    item, checklist = res
+    try:
+        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Checklist item not found")
+
+    return item, checklist
+
+
+async def _get_scoped_drawing(
+    db: AsyncSession,
+    drawing_id: int,
+    current_user: User,
+    for_update: bool = False,
+) -> m.DrawingDocument:
+    assert_company_context(current_user)
+    stmt = (
+        select(m.DrawingDocument)
+        .join(m.Project, m.DrawingDocument.project_id == m.Project.id)
+        .where(m.DrawingDocument.id == drawing_id)
+    )
+    if current_user.company_id is not None:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    elif getattr(current_user, "is_super_admin", False) is True:
+        pass
+    else:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    if for_update:
+        stmt = stmt.with_for_update()
+
+    drawing = await db.scalar(stmt)
+    if not drawing:
+        raise HTTPException(status_code=404, detail="Drawing not found")
+
+    try:
+        await assert_project_access(db, project_id=drawing.project_id, current_user=current_user)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Drawing not found")
+
+    return drawing
+
+
 
 router = APIRouter(
     prefix="/projects",
@@ -401,66 +576,7 @@ router = APIRouter(
 
 VERSION_KEY = "cache_version:projects"
 
-PROJECT_WRITE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
-PROJECT_DELETE_ROLES = [UserRole.ADMIN.value]
-
-TASK_WRITE_ROLES = [
-    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
-]
-TASK_DELETE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
-
-TASK_REQUEST_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.LABOUR,
-    ]
-]
-
-DSR_WRITE_ROLES = [
-    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.SITE_ENGINEER]
-]
-DSR_READ_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.CLIENT,
-    ]
-]
-DSR_DELETE_ROLES = [UserRole.ADMIN.value]
-DSR_APPROVE_ROLES = [
-    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.CLIENT]
-]
-
-ISSUE_CREATE_ROLES = [
-    r.value
-    for r in [
-        UserRole.ADMIN,
-        UserRole.PROJECT_MANAGER,
-        UserRole.SITE_ENGINEER,
-        UserRole.CLIENT,
-    ]
-]
-ISSUE_UPDATE_ROLES = [r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER]]
-ISSUE_DELETE_ROLES = [UserRole.ADMIN.value]
-
-FINANCIAL_ROLES = [
-    r.value for r in [UserRole.ADMIN, UserRole.PROJECT_MANAGER, UserRole.ACCOUNTANT]
-]
-
-READ_ROLES = [r.value for r in UserRole]
-
-DRAWING_WRITE_ROLES = TASK_WRITE_ROLES
-DRAWING_READ_ROLES = READ_ROLES
-
-DRAWING_DELETE_ROLES = [
-    UserRole.ADMIN.value,
-    UserRole.PROJECT_MANAGER.value,
-]
+# Legacy role constants removed in Batch BD in favor of DB-driven require_permission()
 
 
 class ProjectsRepository:
@@ -1506,10 +1622,8 @@ class TasksService:
         if getattr(current_user, "is_super_admin", False) is True:
             return
 
-        if current_user.role in (
-            UserRole.ADMIN.value,
-            UserRole.PROJECT_MANAGER.value,
-        ):
+        user_perms = await get_effective_user_permissions(db, current_user)
+        if has_permission(user_perms, "projects.edit"):
             return
 
         if any(a.user_id == current_user.id for a in task.assignments):
@@ -1581,7 +1695,12 @@ class TasksService:
         # MASTER DATA VALIDATION
         # =========================
         if payload.activity_type_id is not None:
-            activity = await db.get(ActivityType, payload.activity_type_id)
+            stmt_act = select(ActivityType).where(ActivityType.id == payload.activity_type_id)
+            if getattr(current_user, "is_super_admin", False) is not True:
+                if current_user.company_id is None:
+                    raise HTTPException(status_code=403, detail="Company context required")
+                stmt_act = stmt_act.where(ActivityType.company_id == current_user.company_id)
+            activity = await db.scalar(stmt_act)
             if not activity:
                 raise NotFoundError("Invalid activity type")
 
@@ -1802,6 +1921,16 @@ class TasksService:
 
         if data.get("milestone_id") is not None:
             await _get_scoped_milestone(db, project_id, data["milestone_id"], current_user)
+
+        if data.get("activity_type_id") is not None:
+            stmt_act = select(ActivityType).where(ActivityType.id == data["activity_type_id"])
+            if getattr(current_user, "is_super_admin", False) is not True:
+                if current_user.company_id is None:
+                    raise HTTPException(status_code=403, detail="Company context required")
+                stmt_act = stmt_act.where(ActivityType.company_id == current_user.company_id)
+            activity = await db.scalar(stmt_act)
+            if not activity:
+                raise NotFoundError("Invalid activity type")
 
         # =====================================
         # MEDIA FILES
@@ -3651,7 +3780,7 @@ async def get_task_alerts(
 async def assign_project_member(
     project_id: int,
     user_id: int,
-    current_user: User = Depends(require_permission("projects.edit")),
+    current_user: User = Depends(require_permission("projects.assign")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectMembersService = Depends(get_project_members_service),
@@ -3694,7 +3823,7 @@ async def list_project_members(
 async def remove_project_member(
     project_id: int,
     user_id: int,
-    current_user: User = Depends(require_permission("projects.edit")),
+    current_user: User = Depends(require_permission("projects.assign")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: ProjectMembersService = Depends(get_project_members_service),
@@ -4427,7 +4556,7 @@ async def create_comment(
     project_id: int,
     task_id: int,
     payload: s.CommentCreate,
-    current_user: User = Depends(require_permission("tasks.view")),
+    current_user: User = Depends(require_permission("tasks.edit")),
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(get_request_redis),
     service: TasksService = Depends(get_tasks_service),
@@ -4991,7 +5120,17 @@ async def delete_dsr_photo(
     current_user: User = Depends(require_permission("dsr.delete")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.DSRPhoto, photo_id)
+    assert_company_context(current_user)
+    stmt = (
+        select(m.DSRPhoto)
+        .join(m.DailySiteReport, m.DSRPhoto.dsr_id == m.DailySiteReport.id)
+        .join(m.Project, m.DailySiteReport.project_id == m.Project.id)
+        .where(m.DSRPhoto.id == photo_id)
+    )
+    if getattr(current_user, "is_super_admin", False) is not True:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+
+    obj = await db.scalar(stmt)
     if not obj:
         raise NotFoundError("Photo not found")
     await _get_scoped_dsr(db, obj.dsr_id, current_user, for_update=True)
@@ -5554,7 +5693,7 @@ def _check_batch_x_wp_tenant_access(current_user: User) -> bool:
     if not is_sa and getattr(current_user, "company_id", None) is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="User does not belong to any tenant company",
+            detail="Company context required",
         )
     return is_sa
 
@@ -6498,10 +6637,14 @@ async def add_daily_progress(
 
         work_order = None
         if activity.work_order_id:
-            work_order = await db.get(
-                WorkOrder,
-                activity.work_order_id,
+            stmt_wo = (
+                select(WorkOrder)
+                .join(m.Project, m.Project.id == WorkOrder.project_id)
+                .where(WorkOrder.id == activity.work_order_id)
             )
+            if getattr(current_user, "is_super_admin", False) is not True:
+                stmt_wo = stmt_wo.where(m.Project.company_id == current_user.company_id)
+            work_order = await db.scalar(stmt_wo)
             if work_order:
                 total_stmt = select(
                     func.coalesce(
@@ -6848,10 +6991,14 @@ async def update_daily_entry(
 
         work_order = None
         if activity.work_order_id:
-            work_order = await db.get(
-                WorkOrder,
-                activity.work_order_id,
+            stmt_wo = (
+                select(WorkOrder)
+                .join(m.Project, m.Project.id == WorkOrder.project_id)
+                .where(WorkOrder.id == activity.work_order_id)
             )
+            if getattr(current_user, "is_super_admin", False) is not True:
+                stmt_wo = stmt_wo.where(m.Project.company_id == current_user.company_id)
+            work_order = await db.scalar(stmt_wo)
             if work_order:
                 total_stmt = select(
                     func.coalesce(
@@ -7005,10 +7152,14 @@ async def delete_daily_entry(
 
         work_order = None
         if activity.work_order_id:
-            work_order = await db.get(
-                WorkOrder,
-                activity.work_order_id,
+            stmt_wo = (
+                select(WorkOrder)
+                .join(m.Project, m.Project.id == WorkOrder.project_id)
+                .where(WorkOrder.id == activity.work_order_id)
             )
+            if getattr(current_user, "is_super_admin", False) is not True:
+                stmt_wo = stmt_wo.where(m.Project.company_id == current_user.company_id)
+            work_order = await db.scalar(stmt_wo)
             if work_order:
                 total_stmt = select(
                     func.coalesce(
@@ -7313,8 +7464,9 @@ async def today_progress(
             stmt = stmt.where(m.Project.company_id == current_user.company_id)
             count_stmt = count_stmt.where(m.Project.company_id == current_user.company_id)
 
-        # Site Engineer -> only own entries
-        if current_user.role == UserRole.SITE_ENGINEER:
+        # Site Engineer / individual contributor -> only own entries
+        user_perms = await get_effective_user_permissions(db, current_user)
+        if not (has_permission(user_perms, "work_progress.edit") or has_permission(user_perms, "projects.edit") or is_sa):
             stmt = stmt.where(
                 m.WorkActivity.engineer_id == current_user.id,
             )
@@ -8325,8 +8477,7 @@ async def create_qc(
     current_user: User = Depends(require_permission("qc.create")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if current_user.company_id is None and not current_user.is_super_admin:
-        raise HTTPException(status_code=403, detail="User without company cannot create QC records")
+    assert_company_context(current_user)
 
     try:
         await assert_project_access(db, project_id=payload.project_id, current_user=current_user)
@@ -8352,14 +8503,7 @@ async def get_qc(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("qc.view")),
 ):
-    obj = await db.get(m.QCRecord, qc_id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="QC record not found")
-    try:
-        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="QC record not found")
-    return obj
+    return await _get_scoped_qc(db, qc_id, current_user)
 
 
 @qc_router.get("", response_model=PaginatedResponse[s.QCOut])
@@ -8372,6 +8516,7 @@ async def list_qc(
     current_user: User = Depends(require_permission("qc.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     if project_id is not None:
         try:
             await assert_project_access(db, project_id=project_id, current_user=current_user)
@@ -8385,10 +8530,10 @@ async def list_qc(
                 .join(m.Project, m.QCRecord.project_id == m.Project.id)
                 .where(m.Project.company_id == current_user.company_id)
             )
-        elif current_user.is_super_admin:
-            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+        elif getattr(current_user, "is_super_admin", False) is True:
+            query = select(m.QCRecord)
         else:
-            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+            raise HTTPException(status_code=403, detail="Company context required")
 
     if task_id:
         query = query.where(m.QCRecord.task_id == task_id)
@@ -8410,13 +8555,7 @@ async def update_qc(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("qc.edit")),
 ):
-    obj = await db.get(m.QCRecord, qc_id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="QC record not found")
-    try:
-        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="QC record not found")
+    obj = await _get_scoped_qc(db, qc_id, current_user, for_update=True)
 
     if data.project_id != obj.project_id:
         try:
@@ -8441,13 +8580,7 @@ async def delete_qc(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("qc.delete")),
 ):
-    obj = await db.get(m.QCRecord, qc_id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="QC record not found")
-    try:
-        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="QC record not found")
+    obj = await _get_scoped_qc(db, qc_id, current_user, for_update=True)
 
     await db.delete(obj)
     await db.commit()
@@ -8465,8 +8598,7 @@ async def create_incident(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("safety.create")),
 ):
-    if current_user.company_id is None and not current_user.is_super_admin:
-        raise HTTPException(status_code=403, detail="User without company cannot log safety incidents")
+    assert_company_context(current_user)
 
     try:
         await assert_project_access(db, project_id=data.project_id, current_user=current_user)
@@ -8487,14 +8619,7 @@ async def get_incident(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("safety.view")),
 ):
-    incident = await db.get(m.SafetyIncident, id)
-    if not incident:
-        raise HTTPException(status_code=404, detail="Safety incident not found")
-    try:
-        await assert_project_access(db, project_id=incident.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Safety incident not found")
-    return incident
+    return await _get_scoped_safety_incident(db, id, current_user)
 
 
 @safety_router.get("", response_model=PaginatedResponse[s.SafetyOut])
@@ -8506,6 +8631,7 @@ async def list_incidents(
     current_user: User = Depends(require_permission("safety.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     if project_id is not None:
         try:
             await assert_project_access(db, project_id=project_id, current_user=current_user)
@@ -8519,10 +8645,10 @@ async def list_incidents(
                 .join(m.Project, m.SafetyIncident.project_id == m.Project.id)
                 .where(m.Project.company_id == current_user.company_id)
             )
-        elif current_user.is_super_admin:
-            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+        elif getattr(current_user, "is_super_admin", False) is True:
+            query = select(m.SafetyIncident)
         else:
-            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+            raise HTTPException(status_code=403, detail="Company context required")
 
     if violation_type:
         query = query.where(m.SafetyIncident.violation_type == violation_type)
@@ -8542,13 +8668,7 @@ async def update_incident(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("safety.edit")),
 ):
-    obj = await db.get(m.SafetyIncident, id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="Safety incident not found")
-    try:
-        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Safety incident not found")
+    obj = await _get_scoped_safety_incident(db, id, current_user, for_update=True)
 
     if data.project_id != obj.project_id:
         try:
@@ -8573,13 +8693,7 @@ async def delete_incident(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("safety.delete")),
 ):
-    obj = await db.get(m.SafetyIncident, id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="Safety incident not found")
-    try:
-        await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Safety incident not found")
+    obj = await _get_scoped_safety_incident(db, id, current_user, for_update=True)
 
     await db.delete(obj)
     await db.commit()
@@ -8599,6 +8713,7 @@ async def list_logs(
     current_user: User = Depends(require_permission("checklists.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    assert_company_context(current_user)
     if project_id is not None:
         try:
             await assert_project_access(db, project_id=project_id, current_user=current_user)
@@ -8612,10 +8727,10 @@ async def list_logs(
                 .join(m.Project, m.ChecklistLog.project_id == m.Project.id)
                 .where(m.Project.company_id == current_user.company_id)
             )
-        elif current_user.is_super_admin:
-            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+        elif getattr(current_user, "is_super_admin", False) is True:
+            query = select(m.ChecklistLog)
         else:
-            return PaginatedResponse(items=[], meta=PaginationMeta(total=0, limit=limit, offset=offset))
+            raise HTTPException(status_code=403, detail="Company context required")
 
     count = await db.scalar(select(func.count()).select_from(query.subquery()))
     rows = (await db.execute(query.limit(limit).offset(offset))).scalars().all()
@@ -8632,8 +8747,7 @@ async def create_checklist(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.create")),
 ):
-    if current_user.company_id is None and not current_user.is_super_admin:
-        raise HTTPException(status_code=403, detail="User without company cannot create checklists")
+    assert_company_context(current_user)
 
     try:
         await assert_project_access(db, project_id=data.project_id, current_user=current_user)
@@ -8653,14 +8767,7 @@ async def get_checklist(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.view")),
 ):
-    checklist = await db.get(m.Checklist, id)
-    if not checklist:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    try:
-        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    return checklist
+    return await _get_scoped_checklist(db, id, current_user)
 
 
 @checklist_router.put("/{id}")
@@ -8670,13 +8777,7 @@ async def update_checklist(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.edit")),
 ):
-    checklist = await db.get(m.Checklist, id)
-    if not checklist:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    try:
-        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Checklist not found")
+    checklist = await _get_scoped_checklist(db, id, current_user, for_update=True)
 
     for key, value in data.dict(exclude_unset=True).items():
         setattr(checklist, key, value)
@@ -8692,13 +8793,7 @@ async def delete_checklist(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.delete")),
 ):
-    checklist = await db.get(m.Checklist, id)
-    if not checklist:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    try:
-        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Checklist not found")
+    checklist = await _get_scoped_checklist(db, id, current_user, for_update=True)
 
     await db.delete(checklist)
     await db.commit()
@@ -8711,13 +8806,7 @@ async def add_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.edit")),
 ):
-    checklist = await db.get(m.Checklist, data.checklist_id)
-    if not checklist:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    try:
-        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Checklist not found")
+    checklist = await _get_scoped_checklist(db, data.checklist_id, current_user)
 
     existing = await db.scalar(
         select(m.ChecklistItem).where(
@@ -8741,13 +8830,7 @@ async def get_items(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.view")),
 ):
-    checklist = await db.get(m.Checklist, id)
-    if not checklist:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    try:
-        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Checklist not found")
+    checklist = await _get_scoped_checklist(db, id, current_user)
 
     result = await db.execute(
         select(m.ChecklistItem)
@@ -8764,16 +8847,7 @@ async def update_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.edit")),
 ):
-    item = await db.get(m.ChecklistItem, item_id)
-    if not item:
-        raise HTTPException(status_code=404, detail="Checklist item not found")
-    checklist = await db.get(m.Checklist, item.checklist_id)
-    if not checklist:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    try:
-        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Checklist item not found")
+    item, checklist = await _get_scoped_checklist_item(db, item_id, current_user, for_update=True)
 
     for key, value in data.dict(exclude_unset=True).items():
         setattr(item, key, value)
@@ -8789,13 +8863,7 @@ async def list_items(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.view")),
 ):
-    checklist = await db.get(m.Checklist, checklist_id)
-    if not checklist:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    try:
-        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Checklist not found")
+    checklist = await _get_scoped_checklist(db, checklist_id, current_user)
 
     result = await db.execute(
         select(m.ChecklistItem)
@@ -8811,16 +8879,7 @@ async def delete_item(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.delete")),
 ):
-    item = await db.get(m.ChecklistItem, item_id)
-    if not item:
-        raise HTTPException(status_code=404, detail="Checklist item not found")
-    checklist = await db.get(m.Checklist, item.checklist_id)
-    if not checklist:
-        raise HTTPException(status_code=404, detail="Checklist not found")
-    try:
-        await assert_project_access(db, project_id=checklist.project_id, current_user=current_user)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Checklist item not found")
+    item, checklist = await _get_scoped_checklist_item(db, item_id, current_user, for_update=True)
 
     await db.delete(item)
     await db.commit()
@@ -8833,6 +8892,7 @@ async def list_checklists(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.view")),
 ):
+    assert_company_context(current_user)
     if project_id is not None:
         try:
             await assert_project_access(db, project_id=project_id, current_user=current_user)
@@ -8846,10 +8906,10 @@ async def list_checklists(
                 .join(m.Project, m.Checklist.project_id == m.Project.id)
                 .where(m.Project.company_id == current_user.company_id)
             )
-        elif current_user.is_super_admin:
-            return []
+        elif getattr(current_user, "is_super_admin", False) is True:
+            query = select(m.Checklist)
         else:
-            return []
+            raise HTTPException(status_code=403, detail="Company context required")
 
     return (await db.execute(query)).scalars().all()
 
@@ -8861,15 +8921,23 @@ async def execute_checklist(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("checklists.create")),
 ):
-    checklist = await db.scalar(
+    assert_company_context(current_user)
+    stmt = (
         select(m.Checklist)
         .options(selectinload(m.Checklist.items))
+        .join(m.Project, m.Checklist.project_id == m.Project.id)
         .where(m.Checklist.id == id)
     )
+    if current_user.company_id is not None:
+        stmt = stmt.where(m.Project.company_id == current_user.company_id)
+    elif getattr(current_user, "is_super_admin", False) is not True:
+        raise HTTPException(status_code=403, detail="Company context required")
+
+    checklist = await db.scalar(stmt)
     if not checklist:
         raise HTTPException(status_code=404, detail="Checklist not found")
 
-    # P1-3: Verify execution project matches checklist project
+    # Verify execution project matches checklist project
     if data.project_id != checklist.project_id:
         raise HTTPException(status_code=400, detail="Checklist does not belong to specified project")
 
@@ -9040,6 +9108,12 @@ async def create_folder(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("drawings.create")),
 ):
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
+    if data.parent_id:
+        parent = await _get_scoped_drawing(db, data.parent_id, current_user)
+        if parent.project_id != project_id or not parent.is_folder:
+            raise HTTPException(status_code=400, detail="Invalid parent folder")
+
     obj = m.DrawingDocument(
         project_id=project_id,
         drawing_name=data.folder_name,
@@ -9074,6 +9148,12 @@ async def upload_drawing(
     current_user: User = Depends(require_permission("drawings.upload")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
+    if parent_id:
+        parent = await _get_scoped_drawing(db, parent_id, current_user)
+        if parent.project_id != project_id or not parent.is_folder:
+            raise HTTPException(status_code=400, detail="Invalid parent folder")
+
     os.makedirs("uploads/drawings", exist_ok=True)
 
     await validate_drawing_file(file)
@@ -9190,10 +9270,7 @@ async def update_drawing(
     current_user: User = Depends(require_permission("drawings.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    obj = await db.get(m.DrawingDocument, id)
-
-    if not obj:
-        raise NotFoundError("Drawing not found")
+    obj = await _get_scoped_drawing(db, id, current_user, for_update=True)
 
     # ================= LOCK APPROVED DRAWINGS =================
 
@@ -9221,10 +9298,7 @@ async def get_drawing_approval_history(
     current_user: User = Depends(require_permission("drawings.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    drawing = await db.get(m.DrawingDocument, id)
-
-    if not drawing:
-        raise NotFoundError("Drawing not found")
+    drawing = await _get_scoped_drawing(db, id, current_user)
 
     result = await db.execute(
         select(Approval)
@@ -9267,6 +9341,7 @@ async def list_drawings(
     current_user: User = Depends(require_permission("drawings.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await _get_scoped_project(db, project_id, current_user, load_relations=False)
     stmt = select(m.DrawingDocument).where(m.DrawingDocument.project_id == project_id)
     count_stmt = (
         select(func.count())
@@ -9316,7 +9391,6 @@ async def list_drawings(
 # ===================== Version History =====================
 
 
-# @drawing_router.get("/versions", response_model=list[s.DrawingOut])
 @drawing_router.get("/{project_id}/versions", response_model=list[s.DrawingOut])
 async def get_versions(
     db: AsyncSession = Depends(get_db_session),
@@ -9326,9 +9400,21 @@ async def get_versions(
     skip: int = 0,
     limit: int = 50,
 ):
-    query = select(m.DrawingDocument)
     if project_id is not None:
-        query = query.where(m.DrawingDocument.project_id == project_id)
+        await _get_scoped_project(db, project_id, current_user, load_relations=False)
+        query = select(m.DrawingDocument).where(m.DrawingDocument.project_id == project_id)
+    else:
+        assert_company_context(current_user)
+        if current_user.company_id is not None:
+            query = (
+                select(m.DrawingDocument)
+                .join(m.Project, m.DrawingDocument.project_id == m.Project.id)
+                .where(m.Project.company_id == current_user.company_id)
+            )
+        elif getattr(current_user, "is_super_admin", False) is True:
+            query = select(m.DrawingDocument)
+        else:
+            raise HTTPException(status_code=403, detail="Company context required")
 
     if parent_id is not None:
         query = query.where(m.DrawingDocument.parent_id == parent_id)
@@ -9353,7 +9439,6 @@ async def get_versions(
 # ===================== Latest =====================
 
 
-# @drawing_router.get("/latest", response_model=list[s.DrawingOut])
 @drawing_router.get("/{project_id}/latest", response_model=list[s.DrawingOut])
 async def get_latest(
     db: AsyncSession = Depends(get_db_session),
@@ -9361,11 +9446,27 @@ async def get_latest(
     project_id: Optional[int] = None,
     parent_id: Optional[int] = Query(None),
 ):
-    query = select(m.DrawingDocument).where(
-        m.DrawingDocument.is_latest_version == True,
-    )
     if project_id is not None:
-        query = query.where(m.DrawingDocument.project_id == project_id)
+        await _get_scoped_project(db, project_id, current_user, load_relations=False)
+        query = select(m.DrawingDocument).where(
+            m.DrawingDocument.is_latest_version == True,
+            m.DrawingDocument.project_id == project_id,
+        )
+    else:
+        assert_company_context(current_user)
+        if current_user.company_id is not None:
+            query = (
+                select(m.DrawingDocument)
+                .join(m.Project, m.DrawingDocument.project_id == m.Project.id)
+                .where(
+                    m.DrawingDocument.is_latest_version == True,
+                    m.Project.company_id == current_user.company_id,
+                )
+            )
+        elif getattr(current_user, "is_super_admin", False) is True:
+            query = select(m.DrawingDocument).where(m.DrawingDocument.is_latest_version == True)
+        else:
+            raise HTTPException(status_code=403, detail="Company context required")
 
     if parent_id is not None:
         query = query.where(m.DrawingDocument.parent_id == parent_id)
@@ -9396,13 +9497,16 @@ async def delete_drawing(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("drawings.delete")),
 ):
-    obj = await db.get(m.DrawingDocument, id)
+    obj = await _get_scoped_drawing(db, id, current_user, for_update=True)
 
-    if not obj:
-        raise NotFoundError("Drawing not found")
+    if obj.approval_status == DocumentStatus.APPROVED:
+        raise ValidationError("Approved drawing cannot be deleted")
 
     if obj.file_url and os.path.exists(obj.file_url):
-        os.remove(obj.file_url)
+        try:
+            os.remove(obj.file_url)
+        except Exception:
+            pass
 
     await db.execute(
         delete(Approval).where(
@@ -9427,12 +9531,9 @@ async def download_document(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("drawings.download")),
 ):
-    doc = await db.get(m.DrawingDocument, id)
+    doc = await _get_scoped_drawing(db, id, current_user)
 
-    if not doc:
-        raise NotFoundError("Document not found")
-
-    if not os.path.exists(doc.file_url):
+    if not doc.file_url or not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
     return FileResponse(
@@ -9451,12 +9552,9 @@ async def view_document(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("drawings.view")),
 ):
-    doc = await db.get(m.DrawingDocument, id)
+    doc = await _get_scoped_drawing(db, id, current_user)
 
-    if not doc:
-        raise NotFoundError("Document not found")
-
-    if not os.path.exists(doc.file_url):
+    if not doc.file_url or not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
     media_type, _ = mimetypes.guess_type(doc.file_url)

@@ -199,7 +199,13 @@ async def setup_batch_b_data():
             display_name="Custom Attendance Role",
             is_system=False,
         )
-        db.add_all([role_dash_a, role_att_a])
+        role_labour_a = Role(
+            company_id=comp_a.id,
+            name="Labour",
+            display_name="Labour Role",
+            is_system=True,
+        )
+        db.add_all([role_dash_a, role_att_a, role_labour_a])
         await db.flush()
 
         # Fetch permissions from existing DB catalog
@@ -215,7 +221,9 @@ async def setup_batch_b_data():
         rp_dash = RolePermission(role=custom_dash_role, role_id=role_dash_a.id, permission_id=p_dash_view.id)
         # Grant attendance.view to role_att_a
         rp_att = RolePermission(role=custom_att_role, role_id=role_att_a.id, permission_id=p_att_view.id)
-        db.add_all([rp_dash, rp_att])
+        # Grant dashboard.view to role_labour_a for personal dashboard route
+        rp_labour = RolePermission(role="Labour", role_id=role_labour_a.id, permission_id=p_dash_view.id)
+        db.add_all([rp_dash, rp_att, rp_labour])
         await db.commit()
 
         data = {
