@@ -264,6 +264,11 @@ class EquipmentUsage(Base, TimestampMixin):
         nullable=True,
     )
 
+    fuel_cost: Mapped[Optional[Decimal]] = mapped_column(
+        DECIMAL(12, 2),
+        nullable=True,
+    )
+
 
 class EquipmentMaintenance(Base, TimestampMixin):
     __tablename__ = "equipment_maintenance"
@@ -378,6 +383,18 @@ class EquipmentRental(Base, TimestampMixin):
         nullable=False,
     )
 
+    client_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    invoice_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("invoices.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     client_name: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
@@ -487,6 +504,12 @@ class EquipmentPurchase(Base, TimestampMixin):
         nullable=False,
     )
 
+    supplier_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("suppliers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     vendor_name: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
@@ -521,4 +544,82 @@ class EquipmentPurchase(Base, TimestampMixin):
     notes: Mapped[Optional[str]] = mapped_column(
         Text,
         nullable=True,
+    )
+
+    # Rental-IN fields
+    start_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+    )
+    expected_end_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+    )
+    actual_return_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+    )
+    is_received: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+    is_returned: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+
+class EquipmentInspection(Base, TimestampMixin):
+    __tablename__ = "equipment_inspections"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    equipment_id: Mapped[int] = mapped_column(
+        ForeignKey("equipment.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    rental_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("equipment_rental.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    inspection_date: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+        default=date.today,
+    )
+
+    inspector_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    condition: Mapped[EquipmentCondition] = mapped_column(
+        SqlEnum(EquipmentCondition),
+        nullable=False,
+    )
+
+    damage_description: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    repair_cost: Mapped[Decimal] = mapped_column(
+        DECIMAL(10, 2),
+        nullable=False,
+        default=0,
+    )
+
+    remarks: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    equipment: Mapped["Equipment"] = relationship(
+        lazy="selectin",
     )

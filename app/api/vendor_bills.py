@@ -155,6 +155,7 @@ async def create_vendor_bill(
         supplier_id=payload.supplier_id,
         project_id=payload.project_id,
         purchase_order_id=payload.purchase_order_id,
+        equipment_purchase_id=payload.equipment_purchase_id,
         bill_number=payload.bill_number,
         bill_date=payload.bill_date,
         due_date=payload.due_date,
@@ -538,6 +539,7 @@ async def pay_vendor_bill(
 
     txn = Transaction(
         project_id=bill.project_id,
+        vendor_bill_id=bill.id,
         type="payment",
         amount=payload.amount,
         mode=payload.mode.value if hasattr(payload.mode, "value") else payload.mode,

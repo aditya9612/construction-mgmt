@@ -27,11 +27,11 @@ class Invoice(Base):
     project_id = Column(
         Integer,
         ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     owner_id = Column(
-        Integer, ForeignKey("owners.id", ondelete="CASCADE"), nullable=False, index=True
+        Integer, ForeignKey("owners.id", ondelete="CASCADE"), nullable=True, index=True
     )
 
     # Linked data
@@ -123,6 +123,7 @@ class Transaction(Base):
     # Relations
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
+    vendor_bill_id = Column(Integer, ForeignKey("vendor_bills.id", ondelete="SET NULL"), nullable=True, index=True)
     journal_entry_id = Column(Integer, ForeignKey("journal_entries.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Type: receipt (incoming) / payment (outgoing)
