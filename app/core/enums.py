@@ -217,6 +217,7 @@ class EquipmentStatus(str, Enum):
     RENTED = "RENTED"
     MAINTENANCE = "MAINTENANCE"
     DAMAGED = "DAMAGED"
+    INSPECTION_PENDING = "INSPECTION_PENDING"
 
 
 class AlertType(str, Enum):
@@ -253,6 +254,8 @@ class InvoiceType(str, Enum):
     LABOUR = "labour"
     MATERIAL = "material"
     CONTRACTOR = "contractor"
+    EQUIPMENT = "equipment"
+    RENTAL = "rental"
 
 
 class ProjectType(str, Enum):

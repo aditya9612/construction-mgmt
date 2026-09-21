@@ -428,6 +428,7 @@ class VendorBillCreate(BaseModel):
     supplier_id: int
     project_id: Optional[int] = None
     purchase_order_id: Optional[int] = None
+    equipment_purchase_id: Optional[int] = None
     bill_number: str
     bill_date: date
     due_date: date

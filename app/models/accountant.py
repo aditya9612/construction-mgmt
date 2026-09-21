@@ -270,6 +270,9 @@ class VendorBill(Base):
     purchase_order_id = Column(
         Integer, ForeignKey("purchase_orders.id"), nullable=True, index=True
     )
+    equipment_purchase_id = Column(
+        Integer, ForeignKey("equipment_purchase.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     bill_number = Column(String(50), unique=True, nullable=False, index=True)
     bill_date = Column(Date, nullable=False)

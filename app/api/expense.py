@@ -673,31 +673,112 @@ async def get_project_allocations(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("expenses.view")),
 ):
-    # Group by project
-    res_q = (
-        select(Project.id, Project.project_name, func.sum(Expense.amount))
-        .join(Expense, Expense.project_id == Project.id)
-    )
-    rec_q = (
-        select(Expense)
-        .join(Project, Expense.project_id == Project.id)
-    )
+    from app.models.equipment import EquipmentUsage, EquipmentRental, EquipmentMaintenance, Equipment
 
+    # We will compute actual allocations per project
+    projects_dict = {}
+
+    # 1. Base Expenses
+    base_expense_q = select(Project.id, Project.project_name, Expense.category, func.sum(Expense.amount)).join(Expense, Expense.project_id == Project.id)
     if current_user.company_id is not None:
-        res_q = res_q.where(Project.company_id == current_user.company_id)
-        rec_q = rec_q.where(Project.company_id == current_user.company_id)
+        base_expense_q = base_expense_q.where(Project.company_id == current_user.company_id)
 
-    res = await db.execute(res_q.group_by(Project.id, Project.project_name))
+    expense_res = await db.execute(base_expense_q.group_by(Project.id, Project.project_name, Expense.category))
+
+    for pid, pname, cat, amt in expense_res.all():
+        if pid not in projects_dict:
+            projects_dict[pid] = {"project_name": pname, "material": 0.0, "labour": 0.0, "equipment": 0.0, "other": 0.0}
+
+        amt_float = float(amt or 0)
+        cat_lower = cat.lower() if cat else ""
+
+        if "material" in cat_lower:
+            projects_dict[pid]["material"] += amt_float
+        elif "labour" in cat_lower or "labor" in cat_lower:
+            projects_dict[pid]["labour"] += amt_float
+        elif "equipment" in cat_lower:
+            projects_dict[pid]["equipment"] += amt_float
+        else:
+            projects_dict[pid]["other"] += amt_float
+
+    # 2. Equipment Usage
+    # We must NOT add EquipmentUsage.cost for Rental-IN equipment (it is already captured in the Rental-IN purchase amount).
+    # But we MUST add its fuel_cost.
+    from app.models.equipment import EquipmentPurchase
+    from app.core.enums import PurchaseType
+    from sqlalchemy import case
+
+    is_rented_in = Equipment.id.in_(
+        select(EquipmentPurchase.asset_id).where(
+            EquipmentPurchase.purchase_type == PurchaseType.RENT,
+            EquipmentPurchase.asset_id.isnot(None)
+        )
+    )
+
+    cost_to_add = case(
+        (is_rented_in, 0),
+        else_=func.coalesce(EquipmentUsage.cost, 0)
+    )
+
+    usage_q = select(
+        Equipment.project_id,
+        func.sum(cost_to_add + func.coalesce(EquipmentUsage.fuel_cost, 0))
+    ).join(
+        EquipmentUsage, EquipmentUsage.equipment_id == Equipment.id
+    ).where(Equipment.project_id.isnot(None))
+    if current_user.company_id is not None:
+        usage_q = usage_q.join(Project, Project.id == Equipment.project_id).where(Project.company_id == current_user.company_id)
+
+    usage_res = await db.execute(usage_q.group_by(Equipment.project_id))
+    for pid, amt in usage_res.all():
+        if pid not in projects_dict:
+            p = await db.get(Project, pid)
+            projects_dict[pid] = {"project_name": p.project_name if p else "Unknown", "material": 0.0, "labour": 0.0, "equipment": 0.0, "other": 0.0}
+        projects_dict[pid]["equipment"] += float(amt or 0)
+
+    # 3. Equipment Maintenance
+    maint_q = select(Equipment.project_id, func.sum(EquipmentMaintenance.cost)).join(EquipmentMaintenance, EquipmentMaintenance.equipment_id == Equipment.id).where(Equipment.project_id.isnot(None))
+    if current_user.company_id is not None:
+        maint_q = maint_q.join(Project, Project.id == Equipment.project_id).where(Project.company_id == current_user.company_id)
+
+    maint_res = await db.execute(maint_q.group_by(Equipment.project_id))
+    for pid, amt in maint_res.all():
+        if pid not in projects_dict:
+            p = await db.get(Project, pid)
+            projects_dict[pid] = {"project_name": p.project_name if p else "Unknown", "material": 0.0, "labour": 0.0, "equipment": 0.0, "other": 0.0}
+        projects_dict[pid]["equipment"] += float(amt or 0)
+
+
+    # 4. Rental IN (Equipment Purchase with type RENT)
+    from app.models.equipment import EquipmentPurchase
+    from app.core.enums import PurchaseType
+    rent_in_q = select(EquipmentPurchase.project_id, func.sum(EquipmentPurchase.total_amount)).where(EquipmentPurchase.purchase_type == PurchaseType.RENT, EquipmentPurchase.project_id.isnot(None))
+    if current_user.company_id is not None:
+        rent_in_q = rent_in_q.join(Project, Project.id == EquipmentPurchase.project_id).where(Project.company_id == current_user.company_id)
+
+    rent_in_res = await db.execute(rent_in_q.group_by(EquipmentPurchase.project_id))
+    for pid, amt in rent_in_res.all():
+        if pid not in projects_dict:
+            p = await db.get(Project, pid)
+            projects_dict[pid] = {"project_name": p.project_name if p else "Unknown", "material": 0.0, "labour": 0.0, "equipment": 0.0, "other": 0.0}
+        projects_dict[pid]["equipment"] += float(amt or 0)
+
     projects = []
-    for pid, pname, amt in res.all():
+
+    for pid, data in projects_dict.items():
+        total = data["material"] + data["labour"] + data["equipment"] + data["other"]
         projects.append(ProjectAllocationCard(
-            project_name=pname,
-            material_cost=float(amt) * 0.5,
-            labour_cost=float(amt) * 0.3,
-            equipment_cost=float(amt) * 0.1,
-            other_expense=float(amt) * 0.1,
-            total_allocated=float(amt)
+            project_name=data["project_name"],
+            material_cost=data["material"],
+            labour_cost=data["labour"],
+            equipment_cost=data["equipment"],
+            other_expense=data["other"],
+            total_allocated=total
         ))
+
+    rec_q = select(Expense).join(Project, Expense.project_id == Project.id)
+    if current_user.company_id is not None:
+        rec_q = rec_q.where(Project.company_id == current_user.company_id)
 
     recent = []
     expenses = (await db.execute(rec_q.order_by(Expense.created_at.desc()).limit(10))).scalars().all()
