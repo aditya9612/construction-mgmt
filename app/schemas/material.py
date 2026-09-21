@@ -294,6 +294,29 @@ class UsageMaterial(BaseSchema):
         return v
 
 
+
+# ================= USAGE REVERSAL =================
+class MaterialUsageReverse(BaseSchema):
+    quantity: Decimal = Field(
+        ...,
+        gt=0,
+        max_digits=18,
+        decimal_places=3,
+        description="The amount of material usage to reverse. Must be > 0."
+    )
+    reason: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Reason for reversing the usage transaction."
+    )
+
+    @field_validator("quantity")
+    def positive(cls, v):
+        if v <= 0:
+            raise ValueError("Must be greater than 0")
+        return v
+
 # ================= SUPPLIER =================
 class SupplierCreate(BaseSchema):
 

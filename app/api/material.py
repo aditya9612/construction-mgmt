@@ -20,6 +20,7 @@ from app.schemas.material import (
     MaterialReportSummary,
     TransferMaterial,
     TransferProject,
+    MaterialUsageReverse,
 )
 from app.cache.redis import (
     bump_cache_version,
@@ -2941,6 +2942,194 @@ async def usage(
         minimum_stock_level=float(obj.minimum_stock_level),
         alert_type=alert_type,
     )
+
+
+# ================= USAGE REVERSAL =================
+
+@router.post("/usage/{transaction_id}/reverse", response_model=MessageResponse)
+async def reverse_usage(
+    transaction_id: int,
+    data: MaterialUsageReverse,
+    current_user: User = Depends(require_permission("inventory.create")),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    import json
+    import hashlib
+
+    request_hash = None
+    if idempotency_key:
+        payload_dict = data.model_dump(mode="json")
+        payload_dict["transaction_id"] = transaction_id
+        payload_str = json.dumps(payload_dict, sort_keys=True)
+        request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+        existing = await db.scalar(
+            select(MaterialTransaction).where(
+                MaterialTransaction.idempotency_key == idempotency_key
+            )
+        )
+        if existing:
+            if existing.request_hash != request_hash:
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key already used with a different request payload.",
+                )
+            return MessageResponse(message="Material usage reversed successfully")
+
+    # Fetch original transaction
+    original_tx = await db.get(MaterialTransaction, transaction_id)
+    if not original_tx:
+        raise HTTPException(404, "Transaction not found")
+
+    if original_tx.type != DBTransactionType.USAGE:
+        raise HTTPException(400, "Only USAGE transactions can be reversed")
+
+    if original_tx.quantity >= 0:
+        raise HTTPException(400, "Cannot reverse a transaction that does not have negative quantity")
+
+    original_qty = abs(original_tx.quantity)
+
+    # Lock material
+    material = await db.scalar(
+        select(Material)
+        .where(
+            Material.id == original_tx.material_id,
+            Material.is_deleted == False,
+        )
+        .with_for_update()
+    )
+
+    if not material:
+        raise HTTPException(404, "Material not found")
+
+    from app.api.project import assert_project_access
+    try:
+        await assert_project_access(
+            db, project_id=material.project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Material not found")
+
+    # Calculate already reversed quantity
+    reversals = (
+        await db.execute(
+            select(MaterialTransaction.quantity).where(
+                MaterialTransaction.reference_id == f"REV-{original_tx.id}"
+            )
+        )
+    ).scalars().all()
+
+    already_reversed_qty = sum(reversals) if reversals else Decimal("0")
+    remaining_qty = original_qty - already_reversed_qty
+
+    requested_qty = Decimal(str(data.quantity))
+
+    if requested_qty > remaining_qty:
+        raise HTTPException(
+            400, f"Cannot reverse more than remaining quantity: {remaining_qty}"
+        )
+
+    boq = None
+    if original_tx.boq_item_id:
+        boq = await db.scalar(
+            select(BOQ).where(BOQ.id == original_tx.boq_item_id).with_for_update()
+        )
+
+    reversal_cost = -(requested_qty * original_tx.rate)
+    reference = f"REV-{original_tx.id}"
+    reason_clean = " ".join((data.reason or "").strip().split())
+    remarks = f"Reversal of {original_tx.id}: {reason_clean}"
+
+    if material.quantity_used < requested_qty:
+        raise HTTPException(
+            400,
+            "Cannot reverse more quantity than the material's current used quantity.",
+        )
+
+    try:
+        transaction = MaterialTransaction(
+            material_id=original_tx.material_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            boq_item_id=original_tx.boq_item_id,
+            type=DBTransactionType.USAGE,
+            quantity=requested_qty,
+            rate=original_tx.rate,
+            total_amount=reversal_cost,
+            amount_paid=Decimal("0"),
+            payment_pending=Decimal("0"),
+            issue_type=original_tx.issue_type,
+            project_id=original_tx.project_id,
+            task_id=original_tx.task_id,
+            remarks=remarks,
+            reference_id=reference,
+        )
+
+        ledger = MaterialLedger(
+            material_id=original_tx.material_id,
+            boq_item_id=original_tx.boq_item_id,
+            type=DBTransactionType.USAGE,
+            quantity=requested_qty,
+            rate=original_tx.rate,
+            total_amount=reversal_cost,
+            amount_paid=Decimal("0"),
+            payment_pending=Decimal("0"),
+            issue_type=original_tx.issue_type,
+            project_id=original_tx.project_id,
+            remarks=remarks,
+            reference_id=reference,
+        )
+
+        from datetime import datetime
+        usage_entry = MaterialUsage(
+            material_id=original_tx.material_id,
+            boq_item_id=original_tx.boq_item_id,
+            project_id=original_tx.project_id,
+            task_id=original_tx.task_id,
+            quantity_used=-requested_qty,
+            usage_date=datetime.utcnow(),
+        )
+
+        db.add(transaction)
+        db.add(ledger)
+        db.add(usage_entry)
+
+        material.quantity_used -= requested_qty
+
+        await db.flush()
+
+        if boq:
+            await recalculate_boq_actuals(db, boq.id)
+
+        update_material_fields(material)
+
+        await db.commit()
+
+    except IntegrityError:
+        await db.rollback()
+        if idempotency_key:
+            existing = await db.scalar(
+                select(MaterialTransaction).where(
+                    MaterialTransaction.idempotency_key == idempotency_key
+                )
+            )
+            if existing:
+                if existing.request_hash != request_hash:
+                    raise HTTPException(
+                        409,
+                        "Idempotency-Key already used with a different request payload.",
+                    )
+                return MessageResponse(message="Material usage reversed successfully")
+        raise
+    except Exception:
+        await db.rollback()
+        raise
+
+    await bump_cache_version(redis, VERSION_KEY)
+
+    return MessageResponse(message="Material usage reversed successfully")
 
 
 # ================= PURCHASE =================
