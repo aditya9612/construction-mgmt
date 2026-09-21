@@ -3312,7 +3312,10 @@ async def list_maintenance(
         stmt = stmt.where(EquipmentMaintenance.maintenance_date <= date_to)
 
     stmt = (
-        stmt.order_by(EquipmentMaintenance.maintenance_date.desc())
+        stmt.order_by(
+            EquipmentMaintenance.maintenance_date.desc(),
+            EquipmentMaintenance.id.desc()
+        )
         .limit(limit)
         .offset(offset)
     )
