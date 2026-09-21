@@ -98,7 +98,6 @@ async def test_complete_rental_and_allocate():
         resp_inspect = client.post(
             f"/api/v1/equipment/{eq_id}/return-inspection",
             json={
-                "equipment_id": eq_id,
                 "rental_id": rental_id,
                 "inspection_date": str(today),
                 "condition": "GOOD",
@@ -106,6 +105,16 @@ async def test_complete_rental_and_allocate():
             }
         )
         assert resp_inspect.status_code == 200, resp_inspect.text
+        inspection_data = resp_inspect.json()
+        assert "id" in inspection_data
+        inspection_id = inspection_data["id"]
+
+        # Verify DB relationship (Bug Fix Regression)
+        async with AsyncSessionLocal() as db_check:
+            from app.models.equipment import EquipmentInspection
+            insp_row = await db_check.get(EquipmentInspection, inspection_id)
+            assert insp_row is not None
+            assert insp_row.equipment_id == eq_id
 
         # 5. Equipment should now be AVAILABLE
         resp_eq_after = client.get(f"/api/v1/equipment/{eq_id}")

@@ -1341,7 +1341,6 @@ class DeleteUsageResponse(BaseSchema):
 
 class EquipmentInspectionCreate(BaseSchema):
 
-    equipment_id: int = Field(..., gt=0)
     rental_id: Optional[int] = Field(None, gt=0)
     inspection_date: date
     condition: EquipmentCondition
