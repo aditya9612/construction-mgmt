@@ -39,7 +39,7 @@ class Invoice(Base):
 
     # Type
     type = Column(
-        Enum(InvoiceType, values_callable=lambda obj: [e.value for e in obj]),
+        Enum(InvoiceType),
         nullable=False,
     )  # owner / labour / material / contractor
 
