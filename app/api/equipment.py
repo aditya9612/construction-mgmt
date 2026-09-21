@@ -3148,18 +3148,9 @@ async def delete_maintenance(
 
     equipment = await get_active_equipment_or_404(db, maintenance.equipment_id, current_user)
 
-    # ================= BOQ COST ROLLBACK =================
-
+    boq_item_id_to_recalc = None
     if maintenance.boq_item_id and maintenance.cost:
-
-        boq_item = await db.get(
-            BOQ,
-            maintenance.boq_item_id,
-        )
-
-        if boq_item:
-            await db.flush()
-            await recalculate_boq_actuals(db, boq_item.id)
+        boq_item_id_to_recalc = maintenance.boq_item_id
 
     # ================= AUDIT LOG =================
 
@@ -3181,6 +3172,12 @@ async def delete_maintenance(
     # ================= DELETE =================
 
     await db.delete(maintenance)
+    await db.flush()
+
+    # ================= BOQ COST ROLLBACK =================
+
+    if boq_item_id_to_recalc:
+        await recalculate_boq_actuals(db, boq_item_id_to_recalc)
 
     # ================= STATUS RECALCULATE =================
 
@@ -4146,18 +4143,7 @@ async def delete_rental(
         request=request,
     )
 
-    # ================= BOQ COST ROLLBACK =================
-
-    if rental.boq_item_id:
-
-        boq_item = await db.get(
-            BOQ,
-            rental.boq_item_id,
-        )
-
-        if boq_item:
-            await db.flush()
-            await recalculate_boq_actuals(db, boq_item.id)
+    boq_item_id_to_recalc = rental.boq_item_id
 
     # ================= DELETE RENTAL =================
 
@@ -4165,6 +4151,11 @@ async def delete_rental(
 
     # Flush delete before status recalculation
     await db.flush()
+
+    # ================= BOQ COST ROLLBACK =================
+
+    if boq_item_id_to_recalc:
+        await recalculate_boq_actuals(db, boq_item_id_to_recalc)
 
     # ================= STATUS RECALCULATE =================
 
@@ -5196,10 +5187,7 @@ async def delete_purchase(
     boq_item_id = purchase.boq_item_id
 
     try:
-        # ================= BOQ ROLLBACK (single execution) =================
-        if purchase.boq_item_id:
-            await db.flush()
-            await recalculate_boq_actuals(db, purchase.boq_item_id)
+        boq_item_id_to_recalc = purchase.boq_item_id
 
         # ================= AUDIT LOG (single execution) =================
         await create_audit_log(
@@ -5221,6 +5209,12 @@ async def delete_purchase(
         )
 
         await db.delete(purchase)
+        await db.flush()
+
+        # ================= BOQ ROLLBACK (single execution) =================
+        if boq_item_id_to_recalc:
+            await recalculate_boq_actuals(db, boq_item_id_to_recalc)
+
         await db.commit()
 
     except Exception:
