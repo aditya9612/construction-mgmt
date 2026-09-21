@@ -2665,15 +2665,6 @@ async def create_maintenance(
         )
 
 
-    # ================= SUPPLIER VALIDATION =================
-    if payload.supplier_id is not None:
-        from app.models.material import Supplier
-        supplier = await db.get(Supplier, payload.supplier_id)
-        if not supplier:
-            raise HTTPException(status_code=400, detail="Supplier not found")
-        if supplier.company_id and current_user.company_id and supplier.company_id != current_user.company_id:
-            raise HTTPException(status_code=400, detail="Supplier does not belong to your company")
-
     # ================= BOQ VALIDATION =================
 
     boq_item = None

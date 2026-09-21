@@ -1615,11 +1615,6 @@ async def create_quotation(
                 detail="Advance paid cannot exceed grand total."
             )
 
-        quotation.balance_due = round(
-            quotation.grand_total - quotation.advance_paid,
-            2,
-        )
-
         # =====================================================
         # SAVE UPDATED TOTALS
         # =====================================================

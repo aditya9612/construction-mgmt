@@ -5965,7 +5965,40 @@ async def list_activities(
             filters.append(m.WorkActivity.engineer_id == engineer_id)
 
         if status is not None:
-            filters.append(m.WorkActivity.status == status)
+            pct = func.coalesce(m.WorkActivity.completion_percentage, Decimal("0.00"))
+            if status == WorkActivityStatus.COMPLETED:
+                filters.append(pct >= Decimal("100"))
+            elif status == WorkActivityStatus.DELAY:
+                filters.append(
+                    and_(
+                        pct < Decimal("100"),
+                        m.WorkActivity.end_date != None,
+                        m.WorkActivity.end_date < date.today(),
+                    )
+                )
+            elif status == WorkActivityStatus.ON_TRACK:
+                filters.append(
+                    and_(
+                        pct > Decimal("0"),
+                        pct < Decimal("100"),
+                        or_(
+                            m.WorkActivity.end_date == None,
+                            m.WorkActivity.end_date >= date.today(),
+                        ),
+                    )
+                )
+            elif status == WorkActivityStatus.NOT_STARTED:
+                filters.append(
+                    and_(
+                        pct <= Decimal("0"),
+                        or_(
+                            m.WorkActivity.end_date == None,
+                            m.WorkActivity.end_date >= date.today(),
+                        ),
+                    )
+                )
+            else:
+                filters.append(m.WorkActivity.status == status)
 
         if search:
             search = search.strip()
@@ -7481,13 +7514,14 @@ async def project_progress_summary(
     try:
         project = await _get_scoped_project_for_wp(db, project_id, current_user)
 
+        pct = func.coalesce(m.WorkActivity.completion_percentage, Decimal("0.00"))
         summary_stmt = select(
             func.count(m.WorkActivity.id).label("total_activities"),
             func.coalesce(
                 func.sum(
                     case(
                         (
-                            m.WorkActivity.status == WorkActivityStatus.COMPLETED,
+                            pct >= Decimal("100"),
                             1,
                         ),
                         else_=0,
@@ -7499,7 +7533,14 @@ async def project_progress_summary(
                 func.sum(
                     case(
                         (
-                            m.WorkActivity.status == WorkActivityStatus.ON_TRACK,
+                            and_(
+                                pct > Decimal("0"),
+                                pct < Decimal("100"),
+                                or_(
+                                    m.WorkActivity.end_date == None,
+                                    m.WorkActivity.end_date >= date.today(),
+                                ),
+                            ),
                             1,
                         ),
                         else_=0,
@@ -7511,7 +7552,11 @@ async def project_progress_summary(
                 func.sum(
                     case(
                         (
-                            m.WorkActivity.status == WorkActivityStatus.DELAY,
+                            and_(
+                                pct < Decimal("100"),
+                                m.WorkActivity.end_date != None,
+                                m.WorkActivity.end_date < date.today(),
+                            ),
                             1,
                         ),
                         else_=0,
@@ -7523,7 +7568,13 @@ async def project_progress_summary(
                 func.sum(
                     case(
                         (
-                            m.WorkActivity.status == WorkActivityStatus.NOT_STARTED,
+                            and_(
+                                pct <= Decimal("0"),
+                                or_(
+                                    m.WorkActivity.end_date == None,
+                                    m.WorkActivity.end_date >= date.today(),
+                                ),
+                            ),
                             1,
                         ),
                         else_=0,
