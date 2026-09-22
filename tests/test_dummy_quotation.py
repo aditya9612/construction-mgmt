@@ -272,3 +272,70 @@ def test_dummy_quotation_transport_other_calculations():
         assert data3["grand_total"] == 12600.0
         assert data3["transport"] == 500.0
         assert data3["other"] == 300.0
+
+
+def test_preview_pdf_success_and_db_isolation():
+    """POST /preview/pdf returns valid PDF, inline disposition, and no DB records created."""
+    with TestClient(app) as tc:
+        list_resp_before = tc.get("/api/v1/dummy-quotations/")
+        count_before = 0
+        if list_resp_before.status_code == 200:
+            count_before = len(list_resp_before.json()) if isinstance(list_resp_before.json(), list) else len(list_resp_before.json().get("items", []))
+
+        payload = {
+            "client_name": "PDF Preview Client",
+            "items": [{"title": "Item 1", "rate": 100.0}],
+        }
+        resp = tc.post("/api/v1/dummy-quotations/preview/pdf", json=payload)
+
+        assert resp.status_code == 200
+        assert resp.headers.get("Content-Type") == "application/pdf"
+        assert "inline" in resp.headers.get("Content-Disposition", "")
+        assert "dummy_quotation_preview.pdf" in resp.headers.get("Content-Disposition", "")
+
+        content = resp.content
+        assert content.startswith(b"%PDF")
+
+        list_resp_after = tc.get("/api/v1/dummy-quotations/")
+        if list_resp_after.status_code == 200:
+            count_after = len(list_resp_after.json()) if isinstance(list_resp_after.json(), list) else len(list_resp_after.json().get("items", []))
+            assert count_after == count_before
+
+def test_preview_pdf_transport_other():
+    """Test that transport and other are accepted and do not break the PDF generation."""
+    with TestClient(app) as tc:
+        payload = {
+            "client_name": "PDF Transport Client",
+            "transport": 50.0,
+            "other": 25.0,
+            "items": [{"title": "Item 2", "rate": 100.0}],
+        }
+        json_resp = tc.post("/api/v1/dummy-quotations/preview", json=payload)
+        assert json_resp.status_code == 200
+        assert json_resp.json()["transport"] == 50.0
+        assert json_resp.json()["other"] == 25.0
+        assert json_resp.json()["grand_total"] == 175.0
+
+        pdf_resp = tc.post("/api/v1/dummy-quotations/preview/pdf", json=payload)
+        assert pdf_resp.status_code == 200
+        assert pdf_resp.headers.get("Content-Type") == "application/pdf"
+        assert pdf_resp.content.startswith(b"%PDF")
+
+def test_preview_pdf_invalid_payload():
+    """Missing required fields or invalid types should return 422."""
+    with TestClient(app) as tc:
+        payload = {
+            "items": [{"title": "Item 3", "rate": "invalid_string"}]
+        }
+        resp = tc.post("/api/v1/dummy-quotations/preview/pdf", json=payload)
+        assert resp.status_code == 422
+
+def test_preview_pdf_unauthorized():
+    """Unauthorized users should be rejected."""
+    original_override = app.dependency_overrides.pop(get_current_active_user, None)
+    with TestClient(app) as tc:
+        resp = tc.post("/api/v1/dummy-quotations/preview/pdf", json={"items": []})
+        assert resp.status_code in [401, 403]
+
+    if original_override:
+        app.dependency_overrides[get_current_active_user] = original_override
