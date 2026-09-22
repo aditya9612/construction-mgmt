@@ -1635,8 +1635,8 @@ async def create_quotation(
                     "client_id": quotation.client_user_id,
                     "client_name": quotation.client_name,
                     "status": quotation.status.value,
-                    "subtotal": quotation.subtotal,
-                    "grand_total": quotation.grand_total,
+                    "subtotal": float(quotation.subtotal),
+                    "grand_total": float(quotation.grand_total),
                 },
             )
         )
