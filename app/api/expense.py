@@ -260,10 +260,7 @@ async def update_expense(
         logger.warning(f"Expense access denied or project not found id={id}")
         raise NotFoundError("Expense not found")
 
-    if payload.project_id and payload.project_id != obj.project_id:
-        new_project = await db.get(Project, payload.project_id)
-        if not new_project or (current_user.company_id is not None and new_project.company_id != current_user.company_id):
-            raise NotFoundError("Project not found")
+
 
     if obj.source_type == "attendance_auto":
         raise HTTPException(

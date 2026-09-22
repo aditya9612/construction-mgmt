@@ -345,8 +345,8 @@ async def list_labour(
     rows = (await db.execute(query)).scalars().all()
 
     items = []
-    for r in rows:
-        dump = s.LabourOut.model_validate(r).model_dump()
+    for row in rows:
+        dump = s.LabourOut.model_validate(row).model_dump()
         if project_id is not None:
             dump["project_id"] = project_id
         items.append(dump)
