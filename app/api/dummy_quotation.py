@@ -234,6 +234,8 @@ async def preview_dummy_quotation(
         "sgst_percent": totals["sgst_percent"],
         "cgst_amount": totals["cgst_amount"],
         "sgst_amount": totals["sgst_amount"],
+        "transport": payload.transport,
+        "other": payload.other,
         "discount_amount": 0.0,
         "tds_percent": 0.0,
         "tds_amount": totals["tds_amount"],
@@ -523,7 +525,7 @@ async def preview_dummy_quotation_pdf_endpoint(
     return StreamingResponse(
         pdf_buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="dummy_quotation_preview.pdf"'}
+        headers={"Content-Disposition": 'inline; filename="dummy_quotation_preview.pdf"'}
     )
 
 @router.get("/{quotation_id}/pdf", response_class=StreamingResponse)
