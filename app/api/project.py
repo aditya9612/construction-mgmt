@@ -6670,10 +6670,12 @@ async def list_daily_entries(
 
         return s.DailyProgressListResponse(
             success=True,
-            limit=limit,
-            offset=offset,
-            page_count=len(entries),
-            total_count=total_count,
+            message="Daily progress entries fetched successfully",
+            pagination=s.PaginationMeta(
+                total=total_count,
+                limit=limit,
+                offset=offset,
+            ),
             data=entries,
         )
 
