@@ -3522,6 +3522,7 @@ async def create_rental(
         rental_cost=payload.rental_cost,
         client_name=payload.client_name,
         notes=payload.notes,
+        billing_mode=payload.billing_mode,
     )
 
     db.add(rental)
@@ -3585,6 +3586,7 @@ async def create_rental(
             "rental_cost": float(payload.rental_cost),
             "client_name": payload.client_name,
             "status": equipment.status.value,
+            "billing_mode": payload.billing_mode.value if payload.billing_mode else None,
         },
         user_id=current_user.id,
         request=request,
@@ -3614,7 +3616,14 @@ async def create_rental(
 
     duration = (end_date - start_date).days + 1
 
-    per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
+    from app.core.enums import RentalBillingMode
+
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        per_day_cost = float(rental.rental_cost)
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        per_day_cost = float(rental.rental_cost)
+    else:
+        per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
 
     return EquipmentRentalOut(
         id=rental.id,
@@ -3630,6 +3639,7 @@ async def create_rental(
         status=rental_status,
         duration=duration,
         per_day_cost=round(per_day_cost, 2),
+        billing_mode=rental.billing_mode.value if rental.billing_mode else None,
     )
 
 
@@ -3746,41 +3756,52 @@ async def list_rental(
     result = await db.execute(stmt)
     rentals = result.scalars().all()
 
-    return [
-        EquipmentRentalOut(
-            id=rental.id,
-            project_id=rental.project_id,
-            boq_item_id=rental.boq_item_id,
-            equipment_id=rental.equipment_id,
-            start_date=rental.start_date,
-            end_date=rental.end_date,
-            rental_cost=float(rental.rental_cost or 0),
-            client_name=rental.client_name,
-            notes=rental.notes,
-            created_at=rental.created_at,
-            status=(
-                "COMPLETED"
-                if rental.is_completed or ((rental.end_date or rental.start_date) < today)
-                else (
-                    "UPCOMING"
-                    if rental.start_date > today
-                    else "ACTIVE"
-                )
-            ),
-            duration=((rental.end_date or rental.start_date) - rental.start_date).days
-            + 1,
-            per_day_cost=round(
-                float(rental.rental_cost or 0)
-                / (
-                    ((rental.end_date or rental.start_date) - rental.start_date).days
-                    + 1
-                ),
-                2,
-            ),
-            is_completed=rental.is_completed,
+    from app.core.enums import RentalBillingMode
+
+    rental_items = []
+    for rental in rentals:
+        end_d = rental.end_date or rental.start_date
+        duration = (end_d - rental.start_date).days + 1
+        if rental.billing_mode == RentalBillingMode.PER_DAY:
+            per_day_cost = float(rental.rental_cost or 0)
+        elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+            per_day_cost = float(rental.rental_cost or 0)
+        else:
+            per_day_cost = (
+                float(rental.rental_cost or 0) / duration if duration > 0 else 0
+            )
+
+        status = (
+            "COMPLETED"
+            if rental.is_completed or (end_d < today)
+            else (
+                "UPCOMING"
+                if rental.start_date > today
+                else "ACTIVE"
+            )
         )
-        for rental in rentals
-    ]
+
+        rental_items.append(
+            EquipmentRentalOut(
+                id=rental.id,
+                project_id=rental.project_id,
+                boq_item_id=rental.boq_item_id,
+                equipment_id=rental.equipment_id,
+                start_date=rental.start_date,
+                end_date=rental.end_date,
+                rental_cost=float(rental.rental_cost or 0),
+                client_name=rental.client_name,
+                notes=rental.notes,
+                created_at=rental.created_at,
+                status=status,
+                duration=duration,
+                per_day_cost=round(per_day_cost, 2),
+                is_completed=rental.is_completed,
+                billing_mode=rental.billing_mode.value if rental.billing_mode else None,
+            )
+        )
+
+    return rental_items
 
 
 # =============================== RENTAL GET ========================
@@ -3845,7 +3866,14 @@ async def get_rental(
     else:
         rental_status = "ACTIVE"
 
-    per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
+    from app.core.enums import RentalBillingMode
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        per_day_cost = float(rental.rental_cost)
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        per_day_cost = float(rental.rental_cost)
+    else:
+        # Legacy NULL behavior
+        per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
 
     return EquipmentRentalOut(
         id=rental.id,
@@ -3862,6 +3890,7 @@ async def get_rental(
         duration=duration,
         per_day_cost=round(per_day_cost, 2),
         is_completed=rental.is_completed,
+        billing_mode=rental.billing_mode.value if rental.billing_mode else None,
     )
 
 
@@ -4054,6 +4083,15 @@ async def update_rental(
 
     duration = ((rental.end_date or rental.start_date) - rental.start_date).days + 1
 
+    from app.core.enums import RentalBillingMode
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        per_day_cost_val = round(float(rental.rental_cost), 2)
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        per_day_cost_val = round(float(rental.rental_cost), 2)
+    else:
+        # Legacy NULL behavior
+        per_day_cost_val = round(float(rental.rental_cost) / duration, 2)
+
     return EquipmentRentalOut(
         id=rental.id,
         project_id=rental.project_id,
@@ -4067,10 +4105,8 @@ async def update_rental(
         created_at=rental.created_at,
         status=rental_status,
         duration=duration,
-        per_day_cost=round(
-            float(rental.rental_cost) / duration,
-            2,
-        ),
+        per_day_cost=per_day_cost_val,
+        billing_mode=rental.billing_mode.value if rental.billing_mode else None,
     )
 
 
@@ -4312,14 +4348,21 @@ async def complete_rental(
 
     duration = (end_date - rental.start_date).days + 1
 
-    per_day_cost = (
-        round(
-            float(rental.rental_cost) / duration,
-            2,
+    from app.core.enums import RentalBillingMode
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        per_day_cost = round(float(rental.rental_cost), 2)
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        per_day_cost = round(float(rental.rental_cost), 2)
+    else:
+        # Legacy NULL behavior
+        per_day_cost = (
+            round(
+                float(rental.rental_cost) / duration,
+                2,
+            )
+            if duration > 0
+            else 0
         )
-        if duration > 0
-        else 0
-    )
 
     return EquipmentRentalOut(
         id=rental.id,
@@ -4336,6 +4379,7 @@ async def complete_rental(
         duration=duration,
         per_day_cost=per_day_cost,
         is_completed=rental.is_completed,
+        billing_mode=rental.billing_mode.value if rental.billing_mode else None,
     )
 
 
@@ -7233,12 +7277,19 @@ async def generate_rental_out_invoice(
         raise HTTPException(status_code=400, detail="Invoice already generated for this rental.")
 
     # We must calculate duration based on start/end dates
+    from app.core.enums import RentalBillingMode
     actual_end_date = rental.end_date or date.today()
-    days = (actual_end_date - rental.start_date).days
-    # If returned same day, count as 1 day minimum for billing usually, but let's just use max(1, days)
-    days = max(1, days)
-
-    total_amount = float(rental.rental_cost) * days
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        inclusive_days = (actual_end_date - rental.start_date).days + 1
+        total_amount = float(rental.rental_cost) * inclusive_days
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        total_amount = float(rental.rental_cost)
+    else:
+        # Legacy NULL behavior
+        days = (actual_end_date - rental.start_date).days
+        # If returned same day, count as 1 day minimum for billing usually, but let's just use max(1, days)
+        days = max(1, days)
+        total_amount = float(rental.rental_cost) * days
 
     company_id = current_user.company_id
 
