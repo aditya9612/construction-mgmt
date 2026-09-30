@@ -48,10 +48,7 @@ from app.models.project import ProjectOTPolicy
 
 
 async def get_user_project_ids(db, user):
-    if (
-        getattr(user, "is_super_admin", False)
-        or getattr(user, "role", None) == UserRole.SUPER_ADMIN.value
-    ):
+    if getattr(user, "is_super_admin", False):
         result = await db.execute(select(Project.id))
         return [r[0] for r in result.all()]
     if user.company_id is None:
@@ -2103,8 +2100,12 @@ async def export_excel(
     data = [
         {
             "Name": r.labour_name,
-            "Skill": r.skill_category,
-            "Wage": float(r.effective_daily_wage),
+            "Skill": (
+                r.skill_category.value
+                if hasattr(r.skill_category, "value")
+                else (r.skill_category or "")
+            ),
+            "Wage": float(r.effective_daily_wage or 0),
         }
         for r in rows
     ]

@@ -3588,7 +3588,7 @@ async def adjust_inventory(
         else:
             # Physical stock less than system stock
 
-            material.quantity_used += abs(diff)
+            material.quantity_used = (material.quantity_used or Decimal("0")) + abs(diff)
 
             # DO NOT reduce total_amount
             # total_amount = historical purchase cost
@@ -3611,7 +3611,9 @@ async def adjust_inventory(
             Decimal("0"),
         )
 
-        audit_remark = f"Stock adjusted: {old_stock} -> {new_stock} | {reason}"
+        audit_remark = (
+            f"Stock adjusted: {old_stock} -> {new_stock} | {reason}"
+        )[:255]
 
         adjustment_total = abs(diff) * avg_rate
 
