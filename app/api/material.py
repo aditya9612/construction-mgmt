@@ -3581,11 +3581,9 @@ async def adjust_inventory(
 
         if diff > 0:
             # Physical stock found extra
-
-            material.quantity_purchased += diff
-
-            # Increase inventory valuation
-            material.total_amount += diff * avg_rate
+            # DO NOT artificially inflate quantity_purchased or total_amount 
+            # to prevent corrupting Accounts Payable.
+            pass
 
         else:
             # Physical stock less than system stock
@@ -3678,21 +3676,21 @@ async def adjust_inventory(
                 adj_mat = await db.scalar(
                     select(Material).where(Material.id == existing.material_id)
                 )
-            return InventoryAdjustResponse(
-                material_id=adj_mat.id,
-                material_name=adj_mat.material_name,
-                old_stock=float(adj_mat.remaining_stock - existing.quantity),
-                new_stock=float(adj_mat.remaining_stock),
-                difference=float(existing.quantity),
-                avg_rate=float(existing.rate),
-                reason=(
-                    existing.remarks.split("|")[-1].strip()
-                    if existing.remarks
-                    else "Idempotent response"
-                ),
-                reference_id=existing.reference_id,
-                message="Inventory adjusted successfully",
-            )
+                return InventoryAdjustResponse(
+                    material_id=adj_mat.id,
+                    material_name=adj_mat.material_name,
+                    old_stock=float(adj_mat.remaining_stock - existing.quantity),
+                    new_stock=float(adj_mat.remaining_stock),
+                    difference=float(existing.quantity),
+                    avg_rate=float(existing.rate),
+                    reason=(
+                        existing.remarks.split("|")[-1].strip()
+                        if existing.remarks
+                        else "Idempotent response"
+                    ),
+                    reference_id=existing.reference_id,
+                    message="Inventory adjusted successfully",
+                )
         raise
     except Exception:
         await db.rollback()
