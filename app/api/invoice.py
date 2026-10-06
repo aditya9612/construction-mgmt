@@ -618,7 +618,11 @@ async def generate_invoice_pdf(
     obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
 
     # Register Unicode font (₹ support)
-    pdfmetrics.registerFont(TTFont("DejaVu", "app/fonts/DejaVuSans.ttf"))
+    if "DejaVu" not in pdfmetrics.getRegisteredFontNames():
+        from pathlib import Path
+
+        font_path = Path(__file__).resolve().parent.parent / "fonts" / "DejaVuSans.ttf"
+        pdfmetrics.registerFont(TTFont("DejaVu", str(font_path)))
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer)
@@ -641,15 +645,15 @@ async def generate_invoice_pdf(
     if obj.source_type:
         elements.append(Paragraph(f"Source: {obj.source_type.value}", styles["Normal"]))
 
-    elements.append(Paragraph(f"Amount: ₹{float(obj.amount):,.2f}", styles["Normal"]))
+    elements.append(Paragraph(f"Amount: ₹{float(obj.amount or 0):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
-    elements.append(Paragraph(f"GST: ₹{float(obj.gst_amount):,.2f}", styles["Normal"]))
+    elements.append(Paragraph(f"GST: ₹{float(obj.gst_amount or 0):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
 
-    elements.append(Paragraph(f"Tax: ₹{float(obj.tax_amount):,.2f}", styles["Normal"]))
+    elements.append(Paragraph(f"Tax: ₹{float(obj.tax_amount or 0):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
     elements.append(
-        Paragraph(f"Total: ₹{float(obj.total_amount):,.2f}", styles["Normal"])
+        Paragraph(f"Total: ₹{float(obj.total_amount or 0):,.2f}", styles["Normal"])
     )
     elements.append(Spacer(1, 4))
     # Status

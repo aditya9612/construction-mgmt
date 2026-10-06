@@ -13,6 +13,7 @@ from app.core.enums import (
     EquipmentCondition,
     EquipmentStatus,
     PurchaseType,
+    RentalBillingMode,
 )
 from app.core.validators import (
     validate_client_name,
@@ -555,6 +556,8 @@ class EquipmentRentalCreate(BaseSchema):
         max_length=1000,
     )
 
+    billing_mode: Optional[RentalBillingMode] = None
+
     start_date: Optional[date] = None
     expected_end_date: Optional[date] = None
     actual_return_date: Optional[date] = None
@@ -640,6 +643,8 @@ class EquipmentRentalUpdate(BaseSchema):
         None,
         max_length=1000,
     )
+
+    billing_mode: Optional[RentalBillingMode] = None
 
     start_date: Optional[date] = None
     expected_end_date: Optional[date] = None
@@ -736,6 +741,8 @@ class EquipmentRentalOut(BaseSchema):
     duration: Optional[int]
 
     per_day_cost: Optional[float]
+
+    billing_mode: Optional[str] = None
 
     project_id: Optional[int]
 

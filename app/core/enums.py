@@ -330,3 +330,7 @@ class WagePeriodType(str, Enum):
     DAILY = 'Daily'
     WEEKLY = 'Weekly'
     MONTHLY = 'Monthly'
+
+class RentalBillingMode(str, Enum):
+    PER_DAY = "PER_DAY"
+    LUMP_SUM = "LUMP_SUM"

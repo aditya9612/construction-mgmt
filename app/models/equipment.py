@@ -21,7 +21,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.enums import PurchaseType
-from app.core.enums import EquipmentCondition, EquipmentStatus
+from app.core.enums import EquipmentCondition, EquipmentStatus, RentalBillingMode
 from app.models.base import Base, TimestampMixin
 from app.schemas.base import BaseSchema
 
@@ -408,6 +408,11 @@ class EquipmentRental(Base, TimestampMixin):
         ForeignKey("boq_items.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
+    )
+
+    billing_mode: Mapped[Optional[RentalBillingMode]] = mapped_column(
+        SqlEnum(RentalBillingMode),
+        nullable=True,
     )
 
     is_completed: Mapped[bool] = mapped_column(
