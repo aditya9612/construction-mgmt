@@ -717,6 +717,7 @@ async def usage_report(
     "/cost-report",
     response_model=List[CostReportItem],
     operation_id="equipment_cost_report_alias",
+    deprecated=True,
 )
 async def cost_report(
     equipment_id: Optional[int] = Query(None),
@@ -1004,7 +1005,7 @@ async def maintenance_alerts(
 # ================== "Availability" =======================
 
 
-@router.get("/eq/availability", response_model=List[AvailabilityReportItem])
+@router.get("/eq/availability", response_model=List[AvailabilityReportItem], deprecated=True)
 @router.get("/availability", response_model=List[AvailabilityReportItem])
 async def availability_report(
     project_id: Optional[int] = Query(None, description="Optional: filter by project"),
