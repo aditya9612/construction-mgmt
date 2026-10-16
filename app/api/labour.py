@@ -1595,124 +1595,151 @@ async def pay_salary(
     db: AsyncSession = Depends(get_db_session),
     redis=Depends(d.get_request_redis),
 ):
-
     try:
-        await assert_project_access(
-            db,
+        try:
+            await assert_project_access(
+                db,
+                project_id=payload.project_id,
+                current_user=current_user,
+            )
+        except Exception:
+            raise NotFoundError("Project not found")
+
+        payroll = await db.scalar(
+            select(LabourPayroll)
+            .where(
+                LabourPayroll.labour_id == payload.labour_id,
+                LabourPayroll.project_id == payload.project_id,
+                LabourPayroll.month == payload.month,
+                LabourPayroll.year == payload.year,
+            )
+            .with_for_update()
+        )
+
+        if not payroll:
+            raise NotFoundError("Payroll not found")
+
+        if payload.amount <= 0:
+            raise ValidationError("Payment amount must be greater than zero")
+
+        if payroll.status == PayrollStatus.DRAFT:
+            raise HTTPException(
+                status_code=400, detail="Cannot pay DRAFT payroll. Please lock it first."
+            )
+
+        if payroll.status == PayrollStatus.PAID:
+            raise HTTPException(status_code=400, detail="Payroll is already PAID in full.")
+
+        current_paid = payroll.paid_amount or Decimal("0")
+        current_remaining = payroll.remaining_amount or Decimal("0")
+
+        if payload.amount > current_remaining:
+            raise ValidationError("Amount exceeds remaining salary")
+
+        # =========================
+        # UPDATE PAYROLL
+        # =========================
+        payroll.paid_amount = current_paid + payload.amount
+        payroll.remaining_amount = max(
+            Decimal("0"), current_remaining - payload.amount
+        )
+
+        payroll.status = (
+            PayrollStatus.PAID if payroll.remaining_amount == 0 else PayrollStatus.PARTIAL
+        )
+
+        await db.flush()
+
+        # =========================
+        #  TRANSACTION (ONLY ONCE)
+        # =========================
+        txn = Transaction(
             project_id=payload.project_id,
-            current_user=current_user,
+            invoice_id=None,
+            type="payment",
+            amount=payload.amount,
+            mode="cash",
+            reference=f"payroll:{payload.labour_id}",
+            created_by=current_user.id,
         )
+        db.add(txn)
+
+        # =========================
+        #  JOURNAL ENTRY
+        # =========================
+        entry = JournalEntry(
+            description="Salary Payment",
+            created_by=current_user.id,
+        )
+        db.add(entry)
+        await db.flush()  # get entry.id
+        txn.journal_entry_id = entry.id
+
+        project = await db.get(Project, payload.project_id)
+        project_company_id = project.company_id if project else current_user.company_id
+
+        wages_payable_query = select(Account).where(Account.code == "WAGES_PAYABLE")
+        if project_company_id is not None:
+            wages_payable_acc = await db.scalar(
+                select(Account).where(
+                    Account.code == "WAGES_PAYABLE",
+                    Account.company_id == project_company_id,
+                )
+            )
+            if not wages_payable_acc:
+                wages_payable_acc = await db.scalar(wages_payable_query)
+        else:
+            wages_payable_acc = await db.scalar(wages_payable_query)
+
+        if not wages_payable_acc:
+            raise HTTPException(
+                status_code=400, detail="WAGES_PAYABLE account is not configured."
+            )
+
+        from app.utils.accounting import get_primary_cash_account
+
+        try:
+            cash_acc = await get_primary_cash_account(db, company_id=project_company_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="Primary Cash Account not configured"
+            )
+
+        db.add(
+            JournalLine(
+                entry_id=entry.id,
+                account_id=wages_payable_acc.id,
+                debit=payload.amount,
+                credit=0,
+            )
+        )
+
+        db.add(
+            JournalLine(
+                entry_id=entry.id,
+                account_id=cash_acc.id,
+                debit=0,
+                credit=payload.amount,
+            )
+        )
+
+        # =========================
+        # CACHE
+        # =========================
+        try:
+            await r.bump_cache_version(redis, "dashboard_version")
+        except Exception as exc:
+            logger.warning("Failed to bump dashboard cache version in pay_salary: %s", exc)
+
+        return payroll
+
+    except (HTTPException, AppError):
+        await db.rollback()
+        raise
     except Exception:
-        raise NotFoundError("Project not found")
-
-    payroll = await db.scalar(
-        select(LabourPayroll)
-        .where(
-            LabourPayroll.labour_id == payload.labour_id,
-            LabourPayroll.project_id == payload.project_id,
-            LabourPayroll.month == payload.month,
-            LabourPayroll.year == payload.year,
-        )
-        .with_for_update()
-    )
-
-    if not payroll:
-        raise NotFoundError("Payroll not found")
-
-    if payload.amount <= 0:
-        raise ValidationError("Payment amount must be greater than zero")
-
-    if payroll.status == PayrollStatus.DRAFT:
-        raise HTTPException(
-            status_code=400, detail="Cannot pay DRAFT payroll. Please lock it first."
-        )
-
-    if payroll.status == PayrollStatus.PAID:
-        raise HTTPException(status_code=400, detail="Payroll is already PAID in full.")
-
-    if payload.amount > payroll.remaining_amount:
-        raise ValidationError("Amount exceeds remaining salary")
-
-    # =========================
-    # UPDATE PAYROLL
-    # =========================
-    payroll.paid_amount += payload.amount
-    payroll.remaining_amount = max(
-        Decimal("0"), payroll.remaining_amount - payload.amount
-    )
-
-    payroll.status = (
-        PayrollStatus.PAID if payroll.remaining_amount == 0 else PayrollStatus.PARTIAL
-    )
-
-    await db.flush()
-
-    # =========================
-    #  TRANSACTION (ONLY ONCE)
-    # =========================
-    txn = Transaction(
-        project_id=payload.project_id,
-        invoice_id=None,
-        type="payment",
-        amount=payload.amount,
-        mode="cash",
-        reference=f"payroll:{payload.labour_id}",
-        created_by=current_user.id,
-    )
-    db.add(txn)
-
-    # =========================
-    #  JOURNAL ENTRY
-    # =========================
-    entry = JournalEntry(description="Salary Payment")
-    db.add(entry)
-    await db.flush()  # get entry.id
-
-    wages_payable_acc = await db.scalar(
-        select(Account).where(Account.code == "WAGES_PAYABLE")
-    )
-    if not wages_payable_acc:
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=400, detail="WAGES_PAYABLE account is not configured."
-        )
-
-    from app.utils.accounting import get_primary_cash_account
-
-    try:
-        cash_acc = await get_primary_cash_account(db)
-    except ValueError:
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=400, detail="Primary Cash Account not configured"
-        )
-
-    db.add(
-        JournalLine(
-            entry_id=entry.id,
-            account_id=wages_payable_acc.id,
-            debit=payload.amount,
-            credit=0,
-        )
-    )
-
-    db.add(
-        JournalLine(
-            entry_id=entry.id,
-            account_id=cash_acc.id,
-            debit=0,
-            credit=payload.amount,
-        )
-    )
-
-    # =========================
-    # CACHE
-    # =========================
-    await r.bump_cache_version(redis, "dashboard_version")
-
-    return payroll
+        await db.rollback()
+        logger.exception("Payroll payment failed")
+        raise
 
 
 # =========================

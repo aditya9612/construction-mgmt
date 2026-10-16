@@ -18,6 +18,8 @@ from app.models.master_data import LabourType
 from app.models.labour import Labour, LabourProject, LabourAttendance, LabourPayroll, LabourWageRecord
 from app.models.user import UserAttendance
 from app.models.rbac import Role, Permission, RolePermission, UserPermissionOverride
+from app.models.invoice import Transaction
+from app.models.accountant import JournalEntry, JournalLine
 from app.core.security import get_password_hash, create_access_token
 from app.core.enums import AttendanceStatus, LabourStatus, PayrollStatus
 
@@ -337,6 +339,7 @@ async def setup_batch_h_data():
 
         # Teardown
         async with AsyncSessionLocal() as cleanup_db:
+            test_user_ids = [super_admin.id, admin_a.id, admin_b.id, user_custom_a.id, user_legacy_a.id, user_labour_a.id, user_labour_b.id]
             await cleanup_db.execute(delete(UserPermissionOverride).where(UserPermissionOverride.user_id.in_([admin_a.id, admin_b.id, user_custom_a.id, user_legacy_a.id])))
             await cleanup_db.execute(delete(RolePermission).where(RolePermission.role_id == role_custom.id))
             await cleanup_db.execute(delete(LabourWageRecord).where(LabourWageRecord.id.in_([wage_a.id, wage_b.id])))
@@ -346,10 +349,20 @@ async def setup_batch_h_data():
             await cleanup_db.execute(delete(ProjectMember).where(ProjectMember.project_id.in_([proj_a.id, proj_b.id])))
             await cleanup_db.execute(delete(Labour).where(Labour.id.in_([labour_a.id, labour_b.id])))
             await cleanup_db.execute(delete(Contractor).where(Contractor.id.in_([contractor_a.id, contractor_b.id])))
+
+            # Clean up test-created journal lines, entries, and transactions before deleting parent projects/users
+            entry_ids = (await cleanup_db.scalars(
+                select(JournalEntry.id).where(JournalEntry.created_by.in_(test_user_ids))
+            )).all()
+            if entry_ids:
+                await cleanup_db.execute(delete(JournalLine).where(JournalLine.entry_id.in_(entry_ids)))
+                await cleanup_db.execute(delete(JournalEntry).where(JournalEntry.id.in_(entry_ids)))
+            await cleanup_db.execute(delete(Transaction).where(Transaction.project_id.in_([proj_a.id, proj_b.id])))
+
             await cleanup_db.execute(delete(Project).where(Project.id.in_([proj_a.id, proj_b.id])))
             await cleanup_db.execute(delete(Owner).where(Owner.id.in_([owner_a.id, owner_b.id])))
             await cleanup_db.execute(delete(Role).where(Role.id == role_custom.id))
-            await cleanup_db.execute(delete(User).where(User.id.in_([super_admin.id, admin_a.id, admin_b.id, user_custom_a.id, user_legacy_a.id, user_labour_a.id, user_labour_b.id])))
+            await cleanup_db.execute(delete(User).where(User.id.in_(test_user_ids)))
             await cleanup_db.execute(delete(CompanySettings).where(CompanySettings.company_id.in_([comp_a.id, comp_b.id])))
             await cleanup_db.execute(delete(Company).where(Company.id.in_([comp_a.id, comp_b.id])))
             await cleanup_db.commit()
