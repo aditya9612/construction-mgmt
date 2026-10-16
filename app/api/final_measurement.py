@@ -18,6 +18,7 @@ from app.schemas.final_measurement import (
     FinalMeasurementCreate,
     FinalMeasurementUpdate,
     FinalMeasurementOut,
+    MeasurementDeleteOut,
 )
 from app.utils.helpers import NotFoundError, ValidationError
 from app.core.logger import logger
@@ -246,7 +247,7 @@ async def update_measurement(
     return FinalMeasurementOut.model_validate(obj)
 
 
-@router.delete("/{id}", status_code=204)
+@router.delete("/{id}", response_model=MeasurementDeleteOut, status_code=200)
 async def delete_measurement(
     id: int,
     current_user: User = Depends(require_permission("measurements.delete")),
@@ -293,7 +294,7 @@ async def delete_measurement(
 
     logger.info(f"Measurement deleted id={id}")
 
-    return None
+    return {"message": "Measurement deleted successfully"}
 
 
 @router.put("/{id}/status", response_model=FinalMeasurementOut)

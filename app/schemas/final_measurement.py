@@ -60,3 +60,7 @@ class FinalMeasurementOut(BaseModel):
     status: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MeasurementDeleteOut(BaseModel):
+    message: str = "Measurement deleted successfully"

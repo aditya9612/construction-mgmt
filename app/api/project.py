@@ -1157,12 +1157,179 @@ class ProjectsService:
             grace_period_minutes=obj.grace_period_minutes,
         )
 
+    async def _check_blocking_dependencies(
+        self, db: AsyncSession, project_id: int
+    ) -> list[str]:
+        """
+        Inspect all tables referencing projects.id with ON DELETE NO ACTION/RESTRICT.
+        Returns a list of human-readable category strings for any dependencies found.
+        """
+        from sqlalchemy import literal, or_
+        from app.models.invoice import Transaction, Invoice
+        from app.models.accountant import VendorBill, FixedAsset
+        from app.models.quotation import QuotationMaster
+        from app.models.labour import LabourPayroll, LabourWageRecord
+        from app.models.material import (
+            PurchaseOrder,
+            Material,
+            MaterialTransaction,
+            MaterialUsage,
+            MaterialTransfer,
+            MaterialLedger,
+        )
+        from app.models.equipment import (
+            EquipmentRental,
+            EquipmentPurchase,
+            EquipmentMaintenance,
+        )
+        from app.models.project import Checklist, SafetyIncident, QCRecord
+        from app.models.alert import Alert
+        from app.models.settings import UserSettings
+        from app.models.billing import RABill
+
+        blocked_reasons: list[str] = []
+
+        # 1. Financial Transactions & Bills
+        has_tx = await db.scalar(
+            select(literal(1)).select_from(Transaction).where(Transaction.project_id == project_id).limit(1)
+        )
+        if has_tx:
+            blocked_reasons.append("financial transactions")
+
+        has_vb = await db.scalar(
+            select(literal(1)).select_from(VendorBill).where(VendorBill.project_id == project_id).limit(1)
+        )
+        if has_vb:
+            blocked_reasons.append("vendor bills")
+
+        has_inv = await db.scalar(
+            select(literal(1)).select_from(Invoice).where(Invoice.project_id == project_id).limit(1)
+        )
+        has_rabill = await db.scalar(
+            select(literal(1)).select_from(RABill).where(RABill.project_id == project_id).limit(1)
+        ) if not has_inv else True
+        if has_inv or has_rabill:
+            blocked_reasons.append("customer invoices or RA bills")
+
+        # 2. Quotation Master (Originating Sales Proposal)
+        has_qm = await db.scalar(
+            select(literal(1)).select_from(QuotationMaster).where(QuotationMaster.project_id == project_id).limit(1)
+        )
+        if has_qm:
+            blocked_reasons.append("originating quotations")
+
+        # 3. Labour Payroll & Wages
+        has_payroll = await db.scalar(
+            select(literal(1)).select_from(LabourPayroll).where(LabourPayroll.project_id == project_id).limit(1)
+        )
+        has_wages = await db.scalar(
+            select(literal(1)).select_from(LabourWageRecord).where(LabourWageRecord.project_id == project_id).limit(1)
+        ) if not has_payroll else True
+        if has_payroll or has_wages:
+            blocked_reasons.append("labour payroll records")
+
+        # 4. Materials, Purchase Orders & Inventory
+        has_po = await db.scalar(
+            select(literal(1)).select_from(PurchaseOrder).where(PurchaseOrder.project_id == project_id).limit(1)
+        )
+        has_mat = await db.scalar(
+            select(literal(1)).select_from(Material).where(Material.project_id == project_id).limit(1)
+        ) if not has_po else True
+        has_mat_tx = await db.scalar(
+            select(literal(1)).select_from(MaterialTransaction).where(MaterialTransaction.project_id == project_id).limit(1)
+        ) if not (has_po or has_mat) else True
+        has_mat_usg = await db.scalar(
+            select(literal(1)).select_from(MaterialUsage).where(MaterialUsage.project_id == project_id).limit(1)
+        ) if not (has_po or has_mat or has_mat_tx) else True
+        has_mat_ldg = await db.scalar(
+            select(literal(1)).select_from(MaterialLedger).where(MaterialLedger.project_id == project_id).limit(1)
+        ) if not (has_po or has_mat or has_mat_tx or has_mat_usg) else True
+        has_mat_tr = await db.scalar(
+            select(literal(1)).select_from(MaterialTransfer).where(
+                or_(MaterialTransfer.from_project_id == project_id, MaterialTransfer.to_project_id == project_id)
+            ).limit(1)
+        ) if not (has_po or has_mat or has_mat_tx or has_mat_usg or has_mat_ldg) else True
+        if has_po or has_mat or has_mat_tx or has_mat_usg or has_mat_ldg or has_mat_tr:
+            blocked_reasons.append("material and procurement records")
+
+        # 5. Equipment (Rentals, Purchases, Maintenance)
+        has_eq_rent = await db.scalar(
+            select(literal(1)).select_from(EquipmentRental).where(EquipmentRental.project_id == project_id).limit(1)
+        )
+        has_eq_purch = await db.scalar(
+            select(literal(1)).select_from(EquipmentPurchase).where(EquipmentPurchase.project_id == project_id).limit(1)
+        ) if not has_eq_rent else True
+        has_eq_maint = await db.scalar(
+            select(literal(1)).select_from(EquipmentMaintenance).where(EquipmentMaintenance.project_id == project_id).limit(1)
+        ) if not (has_eq_rent or has_eq_purch) else True
+        if has_eq_rent or has_eq_purch or has_eq_maint:
+            blocked_reasons.append("equipment records")
+
+        # 6. Fixed Assets
+        has_fa = await db.scalar(
+            select(literal(1)).select_from(FixedAsset).where(FixedAsset.project_id == project_id).limit(1)
+        )
+        if has_fa:
+            blocked_reasons.append("fixed assets")
+
+        # 7. Site Compliance (Checklists, Safety Incidents, QC Records)
+        has_chk = await db.scalar(
+            select(literal(1)).select_from(Checklist).where(Checklist.project_id == project_id).limit(1)
+        )
+        has_safe = await db.scalar(
+            select(literal(1)).select_from(SafetyIncident).where(SafetyIncident.project_id == project_id).limit(1)
+        ) if not has_chk else True
+        has_qc = await db.scalar(
+            select(literal(1)).select_from(QCRecord).where(QCRecord.project_id == project_id).limit(1)
+        ) if not (has_chk or has_safe) else True
+        if has_chk or has_safe or has_qc:
+            blocked_reasons.append("quality and safety records")
+
+        # 8. Alerts
+        has_alert = await db.scalar(
+            select(literal(1)).select_from(Alert).where(Alert.project_id == project_id).limit(1)
+        )
+        if has_alert:
+            blocked_reasons.append("system alerts")
+
+        # 9. User Settings Default Project
+        has_pref = await db.scalar(
+            select(literal(1)).select_from(UserSettings).where(UserSettings.default_project_id == project_id).limit(1)
+        )
+        if has_pref:
+            blocked_reasons.append("user default project preferences")
+
+        return blocked_reasons
+
     async def delete_project(
         self, db: AsyncSession, current_user: User, *, project_id: int
     ) -> None:
         obj = await _get_scoped_project(db, project_id, current_user, for_update=True)
+        project_name = obj.project_name or f"ID {project_id}"
+        
+        # 1. Validate blocking dependencies before attempting physical deletion
+        blocked_reasons = await self._check_blocking_dependencies(db, project_id=project_id)
+        if blocked_reasons:
+            reasons_str = ", ".join(blocked_reasons)
+            raise ConflictError(
+                f"Cannot delete project '{project_name}' because it has associated {reasons_str}. "
+                "Please remove or reassign these records before deleting the project."
+            )
+
+        # 2. Attempt physical deletion; foreign keys act as final integrity safeguard
         try:
             await self.projects_repo.delete_project(db, obj)
+        except IntegrityError as exc:
+            await db.rollback()
+            err_str = str(exc.orig) if hasattr(exc, "orig") and exc.orig else str(exc)
+            if "1451" in err_str or "foreign key constraint fails" in err_str.lower():
+                logger.warning(f"Project delete blocked by foreign key constraint id={project_id}: {err_str}")
+                raise ConflictError(
+                    f"Cannot delete project '{project_name}' because it has associated records referencing it. "
+                    "Please remove or reassign all related records before deleting the project."
+                )
+            logger.exception(f"Unexpected database integrity error during project delete id={project_id}")
+            raise
         except Exception:
             await db.rollback()
             logger.exception(f"Project delete failed id={project_id}")
