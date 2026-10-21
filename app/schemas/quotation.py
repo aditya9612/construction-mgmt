@@ -579,6 +579,8 @@ class QuotationOut(BaseModel):
 
     status: QuotationStatus  # FIX #15: was plain str, now the real enum
 
+    rejected_reason: Optional[str] = None
+
     created_at: datetime
 
     items: list[QuotationItemOut]

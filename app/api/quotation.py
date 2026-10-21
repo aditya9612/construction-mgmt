@@ -2607,13 +2607,6 @@ async def reject_quotation(
 
     quotation = await get_quotation_or_404(quotation_id, db, current_user)
 
-    # Quotation must be sent first
-    if quotation.status == QuotationStatus.DRAFT:
-        raise HTTPException(
-            status_code=400,
-            detail="Please send the quotation to the client before rejecting it.",
-        )
-
     # Already approved
     if quotation.status == QuotationStatus.APPROVED:
         raise HTTPException(
