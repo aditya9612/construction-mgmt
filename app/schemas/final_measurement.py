@@ -29,6 +29,20 @@ class FinalMeasurementBase(BaseModel):
             raise ValueError("Quantities cannot be negative")
         return v
 
+    @field_validator(
+        "final_area",
+        "approved_rate",
+        "extra_area",
+        "extra_rate",
+        "retention_amount",
+        mode="before",
+    )
+    @classmethod
+    def validate_non_negative_measurement_fields(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and Decimal(str(v)) < 0:
+            raise ValueError("Measurement and certification values cannot be negative")
+        return v
+
     @field_validator("status", mode="before")
     @classmethod
     def validate_initial_status(cls, v: Optional[str]) -> str:
@@ -67,6 +81,20 @@ class FinalMeasurementUpdate(BaseModel):
     def validate_update_non_negative_qty(cls, v: Optional[float]) -> Optional[float]:
         if v is not None and Decimal(str(v)) < 0:
             raise ValueError("Quantities cannot be negative")
+        return v
+
+    @field_validator(
+        "final_area",
+        "approved_rate",
+        "extra_area",
+        "extra_rate",
+        "retention_amount",
+        mode="before",
+    )
+    @classmethod
+    def validate_update_non_negative_measurement_fields(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and Decimal(str(v)) < 0:
+            raise ValueError("Measurement and certification values cannot be negative")
         return v
 
     @field_validator("status", mode="before")
