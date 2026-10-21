@@ -71,7 +71,7 @@ ITEM_ROAD_WORK = "road_work"
 
 
 def calculate_cubic_feet(length, width, height):
-    return length * width * height
+    return (length or 0) * (width or 0) * (height or 0)
 
 
 def calculate_cubic_meter(cubic_ft):
@@ -86,7 +86,210 @@ def calculate_amount(quantity, rate):
     return quantity * rate
 
 
-def calculate_item(unit, length, width, height, rate):
+def validate_item_measurement_dimensions(
+    unit: str | None,
+    length: float | None,
+    width: float | None,
+    height: float | None,
+    title: str,
+    quantity: float | None = None,
+):
+    unit_lower = (unit or "").strip().lower()
+    l = length or 0
+    w = width or 0
+    h = height or 0
+    q = quantity or 0
+
+    if unit_lower in [
+        "brass",
+        "m3",
+        "cum",
+        "cubic meter",
+        "cubic meters",
+        "cubic_meter",
+        "cft",
+        "ft3",
+        "cubic feet",
+        "cubic_feet",
+    ]:
+        if l <= 0 or w <= 0 or h <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid measurement values for '{title}'.",
+            )
+    elif unit_lower in [
+        "sqft",
+        "sq.ft",
+        "square feet",
+        "sq ft",
+        "square_feet",
+        "sqm",
+        "sq.m",
+        "square meter",
+        "sq meter",
+        "square meters",
+        "square_meter",
+    ]:
+        if l <= 0 or w <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid measurement values for '{title}'.",
+            )
+    elif unit_lower in [
+        "rm",
+        "running meter",
+        "running meters",
+        "r.m.",
+        "running_meter",
+        "rft",
+        "running feet",
+        "running_feet",
+    ]:
+        if l <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid measurement values for '{title}'.",
+            )
+    elif unit_lower in [
+        "nos",
+        "no",
+        "no.",
+        "nos.",
+        "number",
+        "numbers",
+        "piece",
+        "pieces",
+        "pcs",
+    ]:
+        if quantity is None or q <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid measurement values for '{title}'.",
+            )
+    elif unit_lower in [
+        "kg",
+        "kgs",
+        "kilogram",
+        "kilograms",
+        "ton",
+        "tons",
+        "tonne",
+        "tonnes",
+        "mt",
+        "metric ton",
+    ]:
+        if quantity is None or q <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid measurement values for '{title}'.",
+            )
+    elif unit_lower in [
+        "ls",
+        "l.s.",
+        "lump sum",
+        "lumpsum",
+        "lump-sum",
+    ]:
+        if quantity is not None and q <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid measurement values for '{title}'.",
+            )
+    else:
+        if l <= 0 and w <= 0 and h <= 0 and q <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid measurement values for '{title}'.",
+            )
+
+
+def get_unit_family(unit: str | None) -> str:
+    u = (unit or "").strip().lower()
+    if u in [
+        "brass",
+        "m3",
+        "cum",
+        "cubic meter",
+        "cubic meters",
+        "cubic_meter",
+        "cft",
+        "ft3",
+        "cubic feet",
+        "cubic_feet",
+    ]:
+        return "volumetric"
+    if u in [
+        "sqft",
+        "sq.ft",
+        "square feet",
+        "sq ft",
+        "square_feet",
+        "sqm",
+        "sq.m",
+        "square meter",
+        "sq meter",
+        "square meters",
+        "square_meter",
+    ]:
+        return "area"
+    if u in [
+        "rm",
+        "running meter",
+        "running meters",
+        "r.m.",
+        "running_meter",
+        "rft",
+        "running feet",
+        "running_feet",
+    ]:
+        return "linear"
+    if u in [
+        "nos",
+        "no",
+        "no.",
+        "nos.",
+        "number",
+        "numbers",
+        "piece",
+        "pieces",
+        "pcs",
+    ]:
+        return "count"
+    if u in [
+        "kg",
+        "kgs",
+        "kilogram",
+        "kilograms",
+    ]:
+        return "weight_kg"
+    if u in [
+        "ton",
+        "tons",
+        "tonne",
+        "tonnes",
+        "mt",
+        "metric ton",
+    ]:
+        return "weight_ton"
+    if u in [
+        "ls",
+        "l.s.",
+        "lump sum",
+        "lumpsum",
+        "lump-sum",
+    ]:
+        return "lump_sum"
+    return "unknown"
+
+
+def calculate_item(
+    unit,
+    length,
+    width,
+    height,
+    rate,
+    quantity=None,
+):
 
     cubic_ft = calculate_cubic_feet(length, width, height)
 
@@ -94,31 +297,125 @@ def calculate_item(unit, length, width, height, rate):
 
     brass = calculate_brass(cubic_ft)
 
-    unit_lower = (unit or "").lower()
+    unit_lower = (unit or "").strip().lower()
 
     if unit_lower in ["brass"]:
-        quantity = brass
+        calc_quantity = brass
         formula = "brass"
 
-    elif unit_lower in ["m3", "cum", "cubic meter"]:
-        quantity = cubic_meter
+    elif unit_lower in [
+        "m3",
+        "cum",
+        "cubic meter",
+        "cubic meters",
+        "cubic_meter",
+    ]:
+        calc_quantity = cubic_meter
         formula = "cubic_meter"
 
-    elif unit_lower in ["cft", "ft3", "cubic feet"]:
-        quantity = cubic_ft
+    elif unit_lower in ["cft", "ft3", "cubic feet", "cubic_feet"]:
+        calc_quantity = cubic_ft
         formula = "cubic_feet"
+
+    elif unit_lower in [
+        "sqft",
+        "sq.ft",
+        "square feet",
+        "sq ft",
+        "square_feet",
+    ]:
+        calc_quantity = (length or 0) * (width or 0)
+        formula = "sqft"
+
+    elif unit_lower in [
+        "sqm",
+        "sq.m",
+        "square meter",
+        "sq meter",
+        "square meters",
+        "square_meter",
+    ]:
+        calc_quantity = (length or 0) * (width or 0) * 0.092903
+        formula = "sqm"
+
+    elif unit_lower in ["rft", "running feet", "running_feet"]:
+        calc_quantity = length or 0
+        formula = "rft"
+
+    elif unit_lower in [
+        "rm",
+        "running meter",
+        "running meters",
+        "r.m.",
+        "running_meter",
+    ]:
+        calc_quantity = (length or 0) * 0.3048
+        formula = "rm"
+
+    elif unit_lower in [
+        "nos",
+        "no",
+        "no.",
+        "nos.",
+        "number",
+        "numbers",
+        "piece",
+        "pieces",
+        "pcs",
+    ]:
+        if quantity is None or quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid measurement values for '{unit}'.")
+        calc_quantity = quantity
+        formula = "nos"
+
+    elif unit_lower in [
+        "kg",
+        "kgs",
+        "kilogram",
+        "kilograms",
+    ]:
+        if quantity is None or quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid measurement values for '{unit}'.")
+        calc_quantity = quantity
+        formula = "kg"
+
+    elif unit_lower in [
+        "ton",
+        "tons",
+        "tonne",
+        "tonnes",
+        "mt",
+        "metric ton",
+    ]:
+        if quantity is None or quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid measurement values for '{unit}'.")
+        calc_quantity = quantity
+        formula = "ton"
+
+    elif unit_lower in [
+        "ls",
+        "l.s.",
+        "lump sum",
+        "lumpsum",
+        "lump-sum",
+    ]:
+        if quantity is not None and quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid measurement values for '{unit}'.")
+        calc_quantity = quantity if (quantity is not None and quantity > 0) else 1.0
+        formula = "ls"
 
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported unit: {unit}")
 
-    amount = quantity * rate
+    calc_quantity = round(calc_quantity, 2)
+    amount = round(calc_quantity * float(rate), 2)
 
     return {
         "cubic_feet": round(cubic_ft, 2),
         "cubic_meter": round(cubic_meter, 2),
         "brass": round(brass, 2),
-        "quantity": round(quantity, 2),
-        "amount": round(amount, 2),
+        "quantity": calc_quantity,
+        "amount": amount,
         "formula": formula,
     }
 
@@ -1434,18 +1731,14 @@ async def create_quotation(
 
             for measurement_data in item_data.measurements:
 
-                if (
-                    (measurement_data.length or 0) <= 0
-                    or (measurement_data.width or 0) <= 0
-                    or (measurement_data.height or 0) <= 0
-                ):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Invalid measurement values for "
-                            f"'{item_data.title}'."
-                        ),
-                    )
+                validate_item_measurement_dimensions(
+                    unit=item_data.unit,
+                    length=measurement_data.length,
+                    width=measurement_data.width,
+                    height=measurement_data.height,
+                    title=item_data.title,
+                    quantity=measurement_data.quantity,
+                )
 
                 result = calculate_item(
                     unit=item_data.unit,
@@ -1453,6 +1746,7 @@ async def create_quotation(
                     width=measurement_data.width,
                     height=measurement_data.height,
                     rate=item_data.rate,
+                    quantity=measurement_data.quantity,
                 )
 
                 measurement = MeasurementDetail(
@@ -1915,12 +2209,22 @@ async def add_quotation_item(
 
     for m in payload.measurements:
 
+        validate_item_measurement_dimensions(
+            unit=payload.unit,
+            length=m.length,
+            width=m.width,
+            height=m.height,
+            title=payload.title,
+            quantity=m.quantity,
+        )
+
         result = calculate_item(
             unit=payload.unit,
             length=m.length or 0,
             width=m.width or 0,
             height=m.height or 0,
             rate=payload.rate,
+            quantity=m.quantity,
         )
 
         measurement = MeasurementDetail(
@@ -2014,6 +2318,7 @@ async def update_quotation_item(
 
     update_data = payload.model_dump(exclude_unset=True)
 
+    old_unit = item.unit
     unit_changed = (
         "unit" in update_data
         and update_data["unit"] != item.unit
@@ -2044,12 +2349,22 @@ async def update_quotation_item(
 
         for m in payload.measurements:
 
+            validate_item_measurement_dimensions(
+                unit=item.unit,
+                length=m.length,
+                width=m.width,
+                height=m.height,
+                title=item.title,
+                quantity=m.quantity,
+            )
+
             result = calculate_item(
                 unit=item.unit,
                 length=m.length or 0,
                 width=m.width or 0,
                 height=m.height or 0,
                 rate=item.rate,
+                quantity=m.quantity,
             )
 
             measurement = MeasurementDetail(
@@ -2085,10 +2400,30 @@ async def update_quotation_item(
                 detail="Cannot change unit without measurements.",
             )
 
+        old_family = get_unit_family(old_unit)
+        new_family = get_unit_family(item.unit)
+
+        dimensional_families = {"volumetric", "area", "linear"}
+        if old_family != new_family:
+            if not (old_family in dimensional_families and new_family in dimensional_families):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot change unit from '{old_unit}' to '{item.unit}' without providing new measurements.",
+                )
+
         total_quantity = 0
         total_amount = 0
 
         for existing in item.measurements:
+
+            validate_item_measurement_dimensions(
+                unit=item.unit,
+                length=existing.length,
+                width=existing.width,
+                height=existing.height,
+                title=item.title,
+                quantity=existing.quantity,
+            )
 
             result = calculate_item(
                 unit=item.unit,
@@ -2096,6 +2431,7 @@ async def update_quotation_item(
                 width=existing.width or 0,
                 height=existing.height or 0,
                 rate=item.rate,
+                quantity=existing.quantity,
             )
 
             existing.cubic_feet = result["cubic_feet"]

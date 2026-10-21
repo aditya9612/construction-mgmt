@@ -157,6 +157,8 @@ class QuotationLabourOut(BaseModel):
 
 class MeasurementCreate(BaseModel):
 
+    quantity: Optional[float] = Field(None, ge=0)
+
     length: Optional[float] = Field(None, ge=0)
 
     width: Optional[float] = Field(None, ge=0)
@@ -171,8 +173,14 @@ class MeasurementCreate(BaseModel):
 
         length = info.data.get("length")
         width = info.data.get("width")
+        quantity = info.data.get("quantity")
 
-        if (length or 0) == 0 and (width or 0) == 0 and (v or 0) == 0:
+        if (
+            (length or 0) == 0
+            and (width or 0) == 0
+            and (v or 0) == 0
+            and (quantity or 0) == 0
+        ):
             raise ValueError("At least one dimension must be greater than 0")
 
         return v
@@ -509,7 +517,7 @@ class QuotationOut(BaseModel):
 
     quotation_no: str
 
-    client_user_id: int
+    client_user_id: Optional[int] = None
 
     client_name: str
 
