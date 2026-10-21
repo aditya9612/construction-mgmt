@@ -50,20 +50,39 @@ async def auto_post_journal(
     
     return je
 
-async def get_primary_cash_account(db: AsyncSession) -> Account:
+async def get_primary_cash_account(
+    db: AsyncSession, company_id: Optional[int] = None
+) -> Account:
     """
     Resolves the primary cash account for the system.
-    1. Checks CompanySettings.primary_cash_account_id
-    2. Raises ValueError if missing
+    1. Checks CompanySettings.primary_cash_account_id (filtered by company_id if provided)
+    2. Falls back to Account with code 'CASH'
+    3. Raises ValueError if missing
     """
     from app.models.settings import CompanySettings
-    
-    settings = await db.scalar(select(CompanySettings))
-    
+
+    stmt = select(CompanySettings)
+    if company_id is not None:
+        stmt = stmt.where(CompanySettings.company_id == company_id)
+
+    settings = await db.scalar(stmt)
+    if not settings and company_id is not None:
+        settings = await db.scalar(select(CompanySettings))
+
     if settings and settings.primary_cash_account_id:
         cash_acc = await db.get(Account, settings.primary_cash_account_id)
         if cash_acc:
             return cash_acc
+
+    # Fallback to standard Cash account by code
+    cash_by_code_stmt = select(Account).where(Account.code == "CASH")
+    if company_id is not None:
+        cash_by_code_stmt = cash_by_code_stmt.where(Account.company_id == company_id)
+    cash_acc = await db.scalar(cash_by_code_stmt)
+    if not cash_acc and company_id is not None:
+        cash_acc = await db.scalar(select(Account).where(Account.code == "CASH"))
+    if cash_acc:
+        return cash_acc
 
     raise ValueError("Primary Cash Account is not configured.")
 

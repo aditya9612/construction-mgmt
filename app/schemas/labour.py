@@ -264,18 +264,49 @@ class PayrollOut(BaseModel):
     month: int
     year: int
 
-    total_working_hours: Decimal
-    total_overtime_hours: Decimal
-    total_wage: Decimal
+    total_working_hours: Optional[Decimal] = Decimal("0.00")
+    total_overtime_hours: Optional[Decimal] = Decimal("0.00")
+    total_wage: Optional[Decimal] = Decimal("0.00")
 
-    paid_amount: Decimal
-    remaining_amount: Decimal
+    paid_amount: Optional[Decimal] = Decimal("0.00")
+    remaining_amount: Optional[Decimal] = Decimal("0.00")
 
     status: e.PayrollStatus
+
+    @field_validator(
+        "total_working_hours",
+        "total_overtime_hours",
+        "total_wage",
+        "paid_amount",
+        "remaining_amount",
+        mode="before",
+    )
+    @classmethod
+    def default_none_to_decimal_zero(cls, v):
+        if v is None:
+            return Decimal("0.00")
+        return v
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, v):
+        if isinstance(v, str):
+            v_upper = v.upper()
+            mapping = {
+                "DRAFT": e.PayrollStatus.DRAFT,
+                "LOCKED": e.PayrollStatus.LOCKED,
+                "PENDING": e.PayrollStatus.PENDING,
+                "PAID": e.PayrollStatus.PAID,
+                "PARTIAL": e.PayrollStatus.PARTIAL,
+            }
+            if v_upper in mapping:
+                return mapping[v_upper]
+        return v
 
     class Config:
         from_attributes = True
         json_encoders = {Decimal: float}
+
 
 
 # ======================

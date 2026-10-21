@@ -60,6 +60,8 @@ async def create_ra_bill(
 ):
     from app.models.work_order import WorkOrder
     from app.models.final_measurement import FinalMeasurement
+    from app.models.invoice import Invoice
+    from app.core.enums import InvoiceSourceType
 
     project = await db.get(Project, payload.project_id)
 
@@ -92,9 +94,10 @@ async def create_ra_bill(
     # ================= Measurement Validation =================
 
     if payload.measurement_id:
-        measurement = await db.get(
-            FinalMeasurement,
-            payload.measurement_id,
+        measurement = await db.scalar(
+            select(FinalMeasurement)
+            .where(FinalMeasurement.id == payload.measurement_id)
+            .with_for_update()
         )
 
         if not measurement:
@@ -107,6 +110,23 @@ async def create_ra_bill(
             raise ValidationError(
                 "Only VERIFIED or APPROVED measurements can be billed"
             )
+
+        existing_meas_bill = await db.scalar(
+            select(RABill.id).where(
+                RABill.measurement_id == payload.measurement_id,
+            )
+        )
+        if existing_meas_bill:
+            raise ValidationError("RA Bill already exists for this measurement")
+
+        existing_meas_invoice = await db.scalar(
+            select(Invoice.id).where(
+                Invoice.reference_id == payload.measurement_id,
+                Invoice.source_type == InvoiceSourceType.MEASUREMENT,
+            )
+        )
+        if existing_meas_invoice:
+            raise ValidationError("Owner invoice already exists for this measurement")
 
     # ================= Duplicate Bill =================
 
@@ -179,6 +199,8 @@ async def create_ra_bill(
     )
 
     db.add(obj)
+    if payload.measurement_id and measurement:
+        measurement.status = "BILLED"
     await db.flush()
 
     # ================= Owner Transaction =================

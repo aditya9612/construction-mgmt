@@ -238,6 +238,15 @@ class DocumentStatus(str, Enum):
     UNDER_REVIEW = "UNDER_REVIEW"
 
 
+class MeasurementStatus(str, Enum):
+    DRAFT = "DRAFT"
+    SUBMITTED = "SUBMITTED"
+    VERIFIED = "VERIFIED"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    BILLED = "BILLED"
+
+
 class ChecklistStatus(str, Enum):
     DONE = "DONE"
     PENDING = "PENDING"
