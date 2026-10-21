@@ -83,6 +83,17 @@ async def create_measurement(
         logger.warning(f"Project not found id={payload.project_id}")
         raise NotFoundError("Project not found")
 
+    # Validate quantities
+    measured_qty = Decimal(str(payload.measured_qty if payload.measured_qty is not None else 0))
+    certified_qty = Decimal(str(payload.certified_qty if payload.certified_qty is not None else 0))
+    rejected_qty = Decimal(str(payload.rejected_qty if payload.rejected_qty is not None else 0))
+
+    if measured_qty < 0 or certified_qty < 0 or rejected_qty < 0:
+        raise ValidationError("Quantities cannot be negative")
+
+    if certified_qty + rejected_qty > measured_qty:
+        raise ValidationError("Certified Qty and Rejected Qty cannot exceed Measured Qty")
+
     # Add safeguard validation if boq_item_id is provided
     if payload.boq_item_id:
         boq_query = select(BOQ).where(
@@ -216,6 +227,30 @@ async def update_measurement(
 
     if payload.status is not None:
         raise ValidationError("Status cannot be modified via general measurement update. Use dedicated workflow endpoints.")
+
+    # Validate effective quantities before applying mutations
+    effective_measured = (
+        Decimal(str(payload.measured_qty))
+        if payload.measured_qty is not None
+        else Decimal(str(obj.measured_qty or 0))
+    )
+    effective_certified = (
+        Decimal(str(payload.certified_qty))
+        if payload.certified_qty is not None
+        else Decimal(str(obj.certified_qty or 0))
+    )
+    effective_rejected = (
+        Decimal(str(payload.rejected_qty))
+        if payload.rejected_qty is not None
+        else Decimal(str(obj.rejected_qty or 0))
+    )
+
+    if effective_measured < 0 or effective_certified < 0 or effective_rejected < 0:
+        raise ValidationError("Quantities cannot be negative")
+
+    if effective_certified + effective_rejected > effective_measured:
+        raise ValidationError("Certified Qty and Rejected Qty cannot exceed Measured Qty")
+
     data = payload.model_dump(exclude_unset=True)
     data.pop("status", None)
 
