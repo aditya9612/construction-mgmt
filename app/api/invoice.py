@@ -24,6 +24,7 @@ from app.core.enums import (
     PaymentMode,
     InvoiceType,
     InvoiceSourceType,
+    MeasurementStatus,
 )
 from app.core.logger import logger
 from app.db.session import get_db_session
@@ -919,8 +920,12 @@ async def create_invoice_from_measurement(
 ):
     logger.info(f"Creating owner invoice from measurement_id={measurement_id}")
 
-    # 1. Get measurement
-    measurement = await db.get(FinalMeasurement, measurement_id)
+    # 1. Get measurement with row locking
+    measurement = await db.scalar(
+        select(FinalMeasurement)
+        .where(FinalMeasurement.id == measurement_id)
+        .with_for_update()
+    )
     if not measurement or not getattr(measurement, "project_id", None):
         raise NotFoundError("Measurement not found")
 
@@ -934,7 +939,7 @@ async def create_invoice_from_measurement(
 
     # 3. Check existing owner invoice
     existing_invoice = await db.scalar(
-        select(Invoice).where(
+        select(Invoice.id).where(
             Invoice.reference_id == measurement.id,
             Invoice.source_type == InvoiceSourceType.MEASUREMENT,
         )
@@ -942,8 +947,22 @@ async def create_invoice_from_measurement(
     if existing_invoice:
         raise ValidationError("Owner invoice already exists")
 
+    # 3b. Check existing RA bill
+    existing_ra_bill = await db.scalar(
+        select(RABill.id).where(
+            RABill.measurement_id == measurement.id,
+        )
+    )
+    if existing_ra_bill:
+        raise ValidationError("RA Bill already exists for this measurement")
+
+    # 3c. Verify measurement status eligibility
+    if measurement.status not in [MeasurementStatus.VERIFIED.value, MeasurementStatus.APPROVED.value]:
+        raise ValidationError("Only VERIFIED or APPROVED measurements can be invoiced")
+
     try:
         total_amount = Decimal(measurement.total_amount)
+        measurement.status = MeasurementStatus.BILLED.value
 
         # 4. Create invoice
         obj = Invoice(

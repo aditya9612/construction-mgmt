@@ -1,18 +1,19 @@
 from decimal import Decimal
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.enums import InvoiceSourceType
-from app.core.dependencies import require_permission
+from app.core.enums import InvoiceSourceType, MeasurementStatus
+from app.core.dependencies import require_permission, get_effective_user_permissions, has_permission
 from app.db.session import get_db_session
 from app.models.final_measurement import FinalMeasurement
 from app.models.project import Project
 from app.models.boq import BOQ
 from app.models.invoice import Invoice
+from app.models.approval import Approval
 from app.models.user import User
 from app.schemas.final_measurement import (
     FinalMeasurementCreate,
@@ -34,6 +35,7 @@ async def _get_scoped_measurement(
     db: AsyncSession,
     measurement_id: int,
     current_user: User,
+    for_update: bool = False,
 ) -> FinalMeasurement:
     """Retrieve FinalMeasurement enforcing tenant boundary isolation through Project.company_id."""
     is_sa = getattr(current_user, "is_super_admin", False) is True
@@ -48,6 +50,9 @@ async def _get_scoped_measurement(
         if current_user.company_id is None:
             raise NotFoundError("Measurement not found")
         query = query.where(Project.company_id == current_user.company_id)
+
+    if for_update:
+        query = query.with_for_update()
 
     obj = await db.scalar(query)
     if not obj:
@@ -109,8 +114,11 @@ async def create_measurement(
         + payload.extra_area * payload.extra_rate
     )
 
+    create_data = payload.model_dump()
+    create_data.pop("status", None)
     obj = FinalMeasurement(
-        **payload.model_dump(),
+        **create_data,
+        status=MeasurementStatus.DRAFT.value,
         total_area=total_area,
         total_amount=total_amount,
     )
@@ -180,7 +188,7 @@ async def update_measurement(
 ):
     logger.info(f"Updating measurement id={id}")
 
-    obj = await _get_scoped_measurement(db, id, current_user)
+    obj = await _get_scoped_measurement(db, id, current_user, for_update=True)
 
     if obj.status not in ["DRAFT", "REJECTED"]:
         raise ValidationError(
@@ -206,7 +214,10 @@ async def update_measurement(
         logger.warning(f"Measurement locked (invoice exists) id={id}")
         raise ValidationError("Measurement is locked. Invoice already generated.")
 
+    if payload.status is not None:
+        raise ValidationError("Status cannot be modified via general measurement update. Use dedicated workflow endpoints.")
     data = payload.model_dump(exclude_unset=True)
+    data.pop("status", None)
 
     # If boq_item_id is updated, validate it belongs to the same project
     if "boq_item_id" in data and data["boq_item_id"] is not None:
@@ -255,7 +266,7 @@ async def delete_measurement(
 ):
     logger.info(f"Deleting measurement id={id}")
 
-    obj = await _get_scoped_measurement(db, id, current_user)
+    obj = await _get_scoped_measurement(db, id, current_user, for_update=True)
 
     if obj.status not in ["DRAFT", "REJECTED"]:
         raise ValidationError(
@@ -306,16 +317,9 @@ async def update_measurement_status(
 ):
     logger.info(f"Updating measurement status id={id} to {payload.status}")
 
-    obj = await _get_scoped_measurement(db, id, current_user)
+    obj = await _get_scoped_measurement(db, id, current_user, for_update=True)
 
-    valid_statuses = [
-        "DRAFT",
-        "SUBMITTED",
-        "VERIFIED",
-        "APPROVED",
-        "REJECTED",
-        "BILLED",
-    ]
+    valid_statuses = [s.value for s in MeasurementStatus]
     if payload.status not in valid_statuses:
         raise ValidationError(f"Invalid status. Must be one of: {valid_statuses}")
 
@@ -324,7 +328,69 @@ async def update_measurement_status(
             "Cannot manually set status to APPROVED or REJECTED. Must use the central Approvals API."
         )
 
-    obj.status = payload.status
+    if payload.status == "BILLED":
+        raise ValidationError(
+            "Cannot manually set status to BILLED. Must be updated through the authorized billing workflow."
+        )
+
+    if obj.status in ["APPROVED", "BILLED"]:
+        raise ValidationError(
+            f"Cannot modify or transition a measurement once it has been {obj.status.lower()}."
+        )
+
+    if payload.status == "SUBMITTED":
+        if obj.status not in ["DRAFT", "REJECTED"]:
+            raise ValidationError(
+                f"Cannot submit measurement with status '{obj.status}'. Only 'DRAFT' or 'REJECTED' measurements can be submitted."
+            )
+        obj.status = "SUBMITTED"
+        existing_approval = await db.scalar(
+            select(Approval).where(
+                func.lower(Approval.entity_type) == "measurement",
+                Approval.entity_id == obj.id,
+                Approval.status == "Pending",
+            )
+        )
+        if not existing_approval:
+            db.add(
+                Approval(
+                    entity_type="measurement",
+                    entity_id=obj.id,
+                    requested_by=current_user.id,
+                    status="Pending",
+                )
+            )
+
+    elif payload.status == "VERIFIED":
+        if obj.status != "SUBMITTED":
+            raise ValidationError(
+                f"Cannot verify measurement with status '{obj.status}'. Only 'SUBMITTED' measurements can be verified."
+            )
+        is_sa = getattr(current_user, "is_super_admin", False) is True
+        if not is_sa:
+            effective_perms = await get_effective_user_permissions(db, current_user)
+            if not (
+                has_permission(effective_perms, "measurements.approve")
+                or has_permission(effective_perms, "approvals.approve")
+                or has_permission(effective_perms, "measurements.manage")
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Insufficient permissions to verify measurement.",
+                )
+        obj.status = "VERIFIED"
+
+    elif payload.status == "DRAFT":
+        if obj.status != "REJECTED":
+            raise ValidationError(
+                f"Cannot revert measurement to DRAFT from status '{obj.status}'. Only REJECTED measurements can be reset to DRAFT."
+            )
+        obj.status = "DRAFT"
+
+    else:
+        raise ValidationError(
+            f"Transition from '{obj.status}' to '{payload.status}' is not permitted."
+        )
 
     try:
         await db.commit()
