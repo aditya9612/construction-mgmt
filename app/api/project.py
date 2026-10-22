@@ -27,7 +27,7 @@ from app.core.enums import (
 from app.models.boq import BOQ
 from app.models.work_order import WorkOrder
 from app.schemas.base import PaginatedResponse, PaginationMeta
-from app.core.validators import validate_drawing_file
+from app.core.validators import validate_drawing_file, validate_drawing_name
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
@@ -9243,6 +9243,11 @@ async def upload_drawing(
     current_user: User = Depends(require_permission("drawings.upload")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    try:
+        drawing_name = validate_drawing_name(drawing_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     os.makedirs("uploads/drawings", exist_ok=True)
 
     await validate_drawing_file(file)
@@ -9321,7 +9326,7 @@ async def upload_drawing(
             entity_type="drawing",
             entity_id=obj.id,
             requested_by=current_user.id,
-            remarks=f"Approval requested for drawing: {drawing_name}",
+            remarks=f"Approval requested for drawing: {drawing_name}"[:255],
             status="Pending",
         )
 
