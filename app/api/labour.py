@@ -1840,16 +1840,43 @@ async def attendance_dashboard(
 
     labour = None
 
-    if labour_id is not None:
+    if current_user.role == UserRole.LABOUR.value:
+        caller_labour = await db.scalar(
+            select(Labour).where(Labour.user_id == current_user.id)
+        )
+        if not caller_labour:
+            raise NotFoundError("Labour profile not found")
+        if labour_id is not None and labour_id != caller_labour.id:
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to view another labourer's attendance",
+            )
+        labour = caller_labour
+        labour_id = caller_labour.id
+        if labour.user_id:
+            attendance_filters.append(UserAttendance.user_id == labour.user_id)
+        else:
+            attendance_filters.append(UserAttendance.user_id == -1)
+    elif labour_id is not None:
         labour = await db.get(Labour, labour_id)
 
-        if not labour:
+        if not labour or (
+            current_user.company_id is not None and labour.company_id != current_user.company_id
+        ):
             raise HTTPException(
                 status_code=404,
                 detail="Labour not found",
             )
 
-        attendance_filters.append(UserAttendance.user_id == labour.user_id)
+        if labour.user_id:
+            attendance_filters.append(UserAttendance.user_id == labour.user_id)
+        else:
+            attendance_filters.append(UserAttendance.user_id == -1)
+    else:
+        labour_users_query = select(Labour.user_id).where(Labour.user_id.is_not(None))
+        if current_user.company_id is not None:
+            labour_users_query = labour_users_query.where(Labour.company_id == current_user.company_id)
+        attendance_filters.append(UserAttendance.user_id.in_(labour_users_query))
 
     # =====================================================
     # TOTAL LABOUR

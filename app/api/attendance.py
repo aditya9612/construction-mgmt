@@ -11,7 +11,7 @@ from app.core.enums import (
     AccountType,
 )
 from app.db.session import get_db_session
-from app.models.user import User, UserAttendance, ActivityLog
+from app.models.user import User, UserRole, UserAttendance, ActivityLog
 from app.models.project import (
     Project,
     ProjectOTPolicy,
@@ -561,6 +561,17 @@ async def list_attendance(
     current_user: User = Depends(require_permission("attendance.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if current_user.role == UserRole.LABOUR.value:
+        if user_id is not None and user_id != current_user.id:
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to view another user's attendance",
+            )
+        user_id = current_user.id
+
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+
     stmt = select(UserAttendance)
     count_stmt = select(func.count()).select_from(UserAttendance)
     
