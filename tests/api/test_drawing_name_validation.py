@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 import uuid
 import os
@@ -572,3 +573,383 @@ async def test_drawing_upload_approval_remarks_bounds_at_255_chars():
             history_data = history_resp.json()
             assert len(history_data) >= 1
             assert history_data[0]["remarks"] == f"{expected_prefix}{name_255}"[:255]
+
+
+# ==============================================================================
+# Duplicate Drawing Name + Version Regression Tests
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_drawing_upload_rejects_duplicate_name_and_version():
+    """Verify POST /api/v1/drawings/upload rejects exact duplicate drawing_name and version with HTTP 400."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+            file_content = b"%PDF-1.4 test duplicate content"
+
+            # 1. Initial upload succeeds
+            resp1 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "FloorPlan_DupTest",
+                    "version": "v1.0",
+                },
+                files={"file": ("plan_init.pdf", file_content, "application/pdf")},
+            )
+            assert resp1.status_code == 200
+            data1 = resp1.json()
+            if data1.get("file_url"):
+                ctx["uploaded_files"].append(data1["file_url"])
+
+            # 2. Duplicate upload within same project is rejected with 400
+            resp2 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "FloorPlan_DupTest",
+                    "version": "v1.0",
+                },
+                files={"file": ("plan_dup.pdf", file_content, "application/pdf")},
+            )
+            assert resp2.status_code == 400
+            assert resp2.json()["detail"] == "A drawing with this name and version already exists."
+
+
+@pytest.mark.asyncio
+async def test_drawing_upload_rejects_duplicate_case_insensitive():
+    """Verify duplicate detection is case-insensitive, consistent with MySQL collation."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+            file_content = b"%PDF-1.4 test case duplicate content"
+
+            # 1. Initial upload
+            resp1 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "StructurePlan",
+                    "version": "v1.0",
+                },
+                files={"file": ("plan_case1.pdf", file_content, "application/pdf")},
+            )
+            assert resp1.status_code == 200
+            data1 = resp1.json()
+            if data1.get("file_url"):
+                ctx["uploaded_files"].append(data1["file_url"])
+
+            # 2. Different case on drawing_name and version
+            resp2 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "structureplan",
+                    "version": "V1.0",
+                },
+                files={"file": ("plan_case2.pdf", file_content, "application/pdf")},
+            )
+            assert resp2.status_code == 400
+            assert resp2.json()["detail"] == "A drawing with this name and version already exists."
+
+
+@pytest.mark.asyncio
+async def test_drawing_upload_rejects_duplicate_whitespace_normalization():
+    """Verify duplicate detection normalizes leading/trailing whitespace on drawing_name and version."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+            file_content = b"%PDF-1.4 test space duplicate content"
+
+            # 1. Initial upload
+            resp1 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "ElevationPlan",
+                    "version": "v1.0",
+                },
+                files={"file": ("plan_sp1.pdf", file_content, "application/pdf")},
+            )
+            assert resp1.status_code == 200
+            data1 = resp1.json()
+            if data1.get("file_url"):
+                ctx["uploaded_files"].append(data1["file_url"])
+
+            # 2. Upload with surrounding whitespace
+            resp2 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "  ElevationPlan  ",
+                    "version": "  v1.0  ",
+                },
+                files={"file": ("plan_sp2.pdf", file_content, "application/pdf")},
+            )
+            assert resp2.status_code == 400
+            assert resp2.json()["detail"] == "A drawing with this name and version already exists."
+
+
+@pytest.mark.asyncio
+async def test_drawing_upload_allows_same_name_different_version():
+    """Verify same drawing name with a different version is allowed and increments revision."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+            file_content = b"%PDF-1.4 test diff version content"
+
+            resp1 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "HVAC_Layout",
+                    "version": "v1.0",
+                },
+                files={"file": ("hvac_v1.pdf", file_content, "application/pdf")},
+            )
+            assert resp1.status_code == 200
+            data1 = resp1.json()
+            if data1.get("file_url"):
+                ctx["uploaded_files"].append(data1["file_url"])
+
+            resp2 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "HVAC_Layout",
+                    "version": "v2.0",
+                },
+                files={"file": ("hvac_v2.pdf", file_content, "application/pdf")},
+            )
+            assert resp2.status_code == 200
+            data2 = resp2.json()
+            if data2.get("file_url"):
+                ctx["uploaded_files"].append(data2["file_url"])
+
+            # Verify both exist and v2 is latest
+            async with AsyncSessionLocal() as db:
+                doc1 = await db.get(DrawingDocument, data1["id"])
+                doc2 = await db.get(DrawingDocument, data2["id"])
+                assert doc1.is_latest_version is False
+                assert doc2.is_latest_version is True
+                assert doc2.revision_no == doc1.revision_no + 1
+
+
+@pytest.mark.asyncio
+async def test_drawing_upload_allows_different_name_same_version():
+    """Verify different drawing names sharing the same version string are allowed."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+            file_content = b"%PDF-1.4 test diff name content"
+
+            resp1 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "Plumbing_Section_A",
+                    "version": "v1.0",
+                },
+                files={"file": ("plumb_a.pdf", file_content, "application/pdf")},
+            )
+            assert resp1.status_code == 200
+            data1 = resp1.json()
+            if data1.get("file_url"):
+                ctx["uploaded_files"].append(data1["file_url"])
+
+            resp2 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "Plumbing_Section_B",
+                    "version": "v1.0",
+                },
+                files={"file": ("plumb_b.pdf", file_content, "application/pdf")},
+            )
+            assert resp2.status_code == 200
+            data2 = resp2.json()
+            if data2.get("file_url"):
+                ctx["uploaded_files"].append(data2["file_url"])
+
+
+@pytest.mark.asyncio
+async def test_drawing_update_rejects_duplicate_name_and_version():
+    """Verify PUT /api/v1/drawings/{id} rejects updating to an existing drawing's name + version with HTTP 400."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+
+            # Create doc1 (Arch_1, v1.0) and doc2 (Arch_2, v2.0)
+            async with AsyncSessionLocal() as db:
+                doc1 = DrawingDocument(
+                    project_id=proj_id,
+                    drawing_name="Arch_1",
+                    version="v1.0",
+                    is_folder=False,
+                    is_latest_version=True,
+                )
+                doc2 = DrawingDocument(
+                    project_id=proj_id,
+                    drawing_name="Arch_2",
+                    version="v2.0",
+                    is_folder=False,
+                    is_latest_version=True,
+                )
+                db.add_all([doc1, doc2])
+                await db.commit()
+                await db.refresh(doc1)
+                await db.refresh(doc2)
+                doc1_id = doc1.id
+                doc2_id = doc2.id
+
+            # Attempt updating doc2 to match doc1's (name: Arch_1, version: v1.0)
+            resp = await ac.put(
+                f"/api/v1/drawings/{doc2_id}",
+                headers=headers,
+                json={"drawing_name": "Arch_1", "version": "v1.0"},
+            )
+            assert resp.status_code == 400
+            assert resp.json()["detail"] == "A drawing with this name and version already exists."
+
+            # Verify DB was NOT mutated
+            async with AsyncSessionLocal() as db:
+                refreshed = await db.get(DrawingDocument, doc2_id)
+                assert refreshed.drawing_name == "Arch_2"
+                assert refreshed.version == "v2.0"
+
+
+@pytest.mark.asyncio
+async def test_drawing_update_allows_own_name_and_version():
+    """Verify PUT /api/v1/drawings/{id} excludes the current drawing and allows updating remarks/date."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+
+            async with AsyncSessionLocal() as db:
+                doc = DrawingDocument(
+                    project_id=proj_id,
+                    drawing_name="Arch_Own",
+                    version="v1.0",
+                    is_folder=False,
+                    is_latest_version=True,
+                )
+                db.add(doc)
+                await db.commit()
+                await db.refresh(doc)
+                doc_id = doc.id
+
+            resp = await ac.put(
+                f"/api/v1/drawings/{doc_id}",
+                headers=headers,
+                json={"drawing_name": "Arch_Own", "version": "v1.0", "remarks": "Updated remark"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["remarks"] == "Updated remark"
+
+
+@pytest.mark.asyncio
+async def test_drawing_upload_duplicate_rollback_and_no_file_leak():
+    """Verify duplicate upload leaves no orphaned file in uploads/drawings."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+            file_content = b"%PDF-1.4 test cleanup content"
+
+            resp1 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "CleanupTestPlan",
+                    "version": "v1.0",
+                },
+                files={"file": ("plan_cl1.pdf", file_content, "application/pdf")},
+            )
+            assert resp1.status_code == 200
+            data1 = resp1.json()
+            if data1.get("file_url"):
+                ctx["uploaded_files"].append(data1["file_url"])
+
+            # Snapshot upload dir files
+            upload_dir = "uploads/drawings"
+            files_before = set(os.listdir(upload_dir)) if os.path.exists(upload_dir) else set()
+
+            # Attempt duplicate
+            resp2 = await ac.post(
+                "/api/v1/drawings/upload",
+                headers=headers,
+                data={
+                    "project_id": str(proj_id),
+                    "drawing_name": "CleanupTestPlan",
+                    "version": "v1.0",
+                },
+                files={"file": ("plan_cl2.pdf", file_content, "application/pdf")},
+            )
+            assert resp2.status_code == 400
+
+            files_after = set(os.listdir(upload_dir)) if os.path.exists(upload_dir) else set()
+            assert files_before == files_after, "Duplicate rejection must not leave newly created file on disk"
+
+
+@pytest.mark.asyncio
+async def test_drawing_upload_concurrent_duplicate_returns_400():
+    """Verify concurrent duplicate submissions result in 1 success (200) and 1 rejection (400)."""
+    async with setup_drawing_test_data() as ctx:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            proj_id = ctx["proj"].id
+            headers = ctx["headers"]
+            file_content = b"%PDF-1.4 concurrent test content"
+
+            async def upload_req():
+                return await ac.post(
+                    "/api/v1/drawings/upload",
+                    headers=headers,
+                    data={
+                        "project_id": str(proj_id),
+                        "drawing_name": "ConcurrentPlan",
+                        "version": "v1.0",
+                    },
+                    files={"file": ("plan_conc.pdf", file_content, "application/pdf")},
+                )
+
+            resps = await asyncio.gather(upload_req(), upload_req(), return_exceptions=True)
+            status_codes = []
+            for r in resps:
+                assert not isinstance(r, Exception), f"Unexpected exception: {r}"
+                status_codes.append(r.status_code)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("file_url"):
+                        ctx["uploaded_files"].append(data["file_url"])
+                elif r.status_code == 400:
+                    assert r.json()["detail"] == "A drawing with this name and version already exists."
+
+            assert sorted(status_codes) == [200, 400], f"Expected [200, 400], got {status_codes}"
