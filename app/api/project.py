@@ -27,7 +27,7 @@ from app.core.enums import (
 from app.models.boq import BOQ
 from app.models.work_order import WorkOrder
 from app.schemas.base import PaginatedResponse, PaginationMeta
-from app.core.validators import validate_drawing_file
+from app.core.validators import validate_drawing_file, validate_drawing_name, validate_non_empty_string
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
@@ -77,7 +77,7 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors as pdf_colors
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from fastapi import UploadFile, File
 from app.utils.helpers import (
     AppError,
@@ -9243,6 +9243,30 @@ async def upload_drawing(
     current_user: User = Depends(require_permission("drawings.upload")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    try:
+        drawing_name = validate_drawing_name(drawing_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        version = validate_non_empty_string(version)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # ================= PRE-CHECK DUPLICATE DRAWING =================
+    existing_drawing = await db.scalar(
+        select(m.DrawingDocument.id).where(
+            m.DrawingDocument.project_id == project_id,
+            func.lower(m.DrawingDocument.drawing_name) == func.lower(drawing_name),
+            func.lower(m.DrawingDocument.version) == func.lower(version),
+        )
+    )
+    if existing_drawing:
+        raise HTTPException(
+            status_code=400,
+            detail="A drawing with this name and version already exists.",
+        )
+
     os.makedirs("uploads/drawings", exist_ok=True)
 
     await validate_drawing_file(file)
@@ -9321,7 +9345,7 @@ async def upload_drawing(
             entity_type="drawing",
             entity_id=obj.id,
             requested_by=current_user.id,
-            remarks=f"Approval requested for drawing: {drawing_name}",
+            remarks=f"Approval requested for drawing: {drawing_name}"[:255],
             status="Pending",
         )
 
@@ -9338,6 +9362,46 @@ async def upload_drawing(
         await db.refresh(obj)
 
         return obj
+
+    except IntegrityError as exc:
+
+        await db.rollback()
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        orig_msg = str(exc.orig) if hasattr(exc, "orig") else str(exc)
+        if "uq_project_drawing_version" in orig_msg or "Duplicate entry" in orig_msg:
+            raise HTTPException(
+                status_code=400,
+                detail="A drawing with this name and version already exists.",
+            )
+
+        raise
+
+    except OperationalError as exc:
+
+        await db.rollback()
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        orig_msg = str(exc.orig) if hasattr(exc, "orig") else str(exc)
+        if "1213" in orig_msg or "Deadlock" in orig_msg:
+            existing_after = await db.scalar(
+                select(m.DrawingDocument.id).where(
+                    m.DrawingDocument.project_id == project_id,
+                    func.lower(m.DrawingDocument.drawing_name) == func.lower(drawing_name),
+                    func.lower(m.DrawingDocument.version) == func.lower(version),
+                )
+            )
+            if existing_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A drawing with this name and version already exists.",
+                )
+
+        raise
 
     except Exception:
 
@@ -9371,10 +9435,56 @@ async def update_drawing(
 
     update_data = payload.model_dump(exclude_unset=True)
 
+    target_name = update_data.get("drawing_name", obj.drawing_name)
+    target_version = update_data.get("version", obj.version)
+
+    if ("drawing_name" in update_data or "version" in update_data) and target_name and target_version:
+        conflict = await db.scalar(
+            select(m.DrawingDocument.id).where(
+                m.DrawingDocument.project_id == obj.project_id,
+                m.DrawingDocument.id != obj.id,
+                func.lower(m.DrawingDocument.drawing_name) == func.lower(target_name),
+                func.lower(m.DrawingDocument.version) == func.lower(target_version),
+            )
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=400,
+                detail="A drawing with this name and version already exists.",
+            )
+
     for field, value in update_data.items():
         setattr(obj, field, value)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        orig_msg = str(exc.orig) if hasattr(exc, "orig") else str(exc)
+        if "uq_project_drawing_version" in orig_msg or "Duplicate entry" in orig_msg:
+            raise HTTPException(
+                status_code=400,
+                detail="A drawing with this name and version already exists.",
+            )
+        raise
+    except OperationalError as exc:
+        await db.rollback()
+        orig_msg = str(exc.orig) if hasattr(exc, "orig") else str(exc)
+        if "1213" in orig_msg or "Deadlock" in orig_msg:
+            conflict_after = await db.scalar(
+                select(m.DrawingDocument.id).where(
+                    m.DrawingDocument.project_id == obj.project_id,
+                    m.DrawingDocument.id != obj.id,
+                    func.lower(m.DrawingDocument.drawing_name) == func.lower(target_name),
+                    func.lower(m.DrawingDocument.version) == func.lower(target_version),
+                )
+            )
+            if conflict_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A drawing with this name and version already exists.",
+                )
+        raise
 
     await db.refresh(obj)
 

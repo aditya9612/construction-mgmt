@@ -129,6 +129,18 @@ def validate_non_empty_string(v):
     return v.strip()
 
 
+MAX_DRAWING_NAME_LENGTH = 255
+
+
+def validate_drawing_name(v):
+    if v is None:
+        return v
+    v = validate_non_empty_string(v)
+    if len(v) > MAX_DRAWING_NAME_LENGTH:
+        raise ValueError("Drawing Name must not exceed the maximum allowed character limit.")
+    return v
+
+
 def validate_gst(v):
     if v is None:
         return v

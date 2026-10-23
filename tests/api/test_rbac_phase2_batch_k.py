@@ -1248,37 +1248,82 @@ async def test_batch_k_client_user_access_and_isolation():
 
 @pytest.mark.asyncio
 async def test_batch_k_quotation_lifecycle_and_business_rules():
-    """Verify the business lifecycle: Send -> Approve / Reject, and deletion business rules."""
+    """Verify the business lifecycle: Send -> Approve / Reject, and deletion business rules.
+
+    Lifecycle requirements:
+    - DRAFT -> SENT -> REJECTED
+    - DRAFT -> SENT -> APPROVED
+    - DRAFT cannot be rejected directly (must be sent first)
+    - DRAFT cannot be approved directly (must be sent first)
+    - APPROVED quotation cannot be deleted, edited, or rejected
+    - REJECTED quotation cannot be rejected again
+    """
     async with setup_batch_k_data() as d_data:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             token_a = d_data["tokens"]["admin_a"]
             headers_a = {"Authorization": f"Bearer {token_a}"}
-            q_id = d_data["qtn_a1"].id
+            q_id = d_data["qtn_a1"].id        # DRAFT quotation
+            q_sent_id = d_data["qtn_a2"].id   # SENT quotation (for approve lifecycle)
 
             # 1. Cannot approve DRAFT quotation directly (must be sent first)
             resp_app = await ac.put(f"/api/v1/quotations/{q_id}/approve", headers=headers_a)
             assert resp_app.status_code == 400
+            assert "must be sent to the client before approval" in resp_app.text.lower()
 
             # 2. Cannot reject DRAFT quotation directly (must be sent first)
-            resp_rej = await ac.put(f"/api/v1/quotations/{q_id}/reject", json={"reason": "Too expensive"}, headers=headers_a)
-            assert resp_rej.status_code == 400
+            resp_rej_draft = await ac.put(f"/api/v1/quotations/{q_id}/reject", json={"reason": "Too expensive"}, headers=headers_a)
+            assert resp_rej_draft.status_code == 400
+            assert "please send the quotation to the client before rejecting it" in resp_rej_draft.text.lower()
 
-            # 3. Send quotation -> 200
+            # 2a. Verify status remains DRAFT after rejected attempt
+            resp_get_draft = await ac.get(f"/api/v1/quotations/{q_id}", headers=headers_a)
+            assert resp_get_draft.status_code == 200
+            assert resp_get_draft.json()["status"] == "draft"
+
+            # 3. Send quotation -> 200 (transitions DRAFT -> SENT)
             resp_send = await ac.post(f"/api/v1/quotations/{q_id}/send", headers=headers_a)
-            assert resp_send.status_code == 200
+            assert resp_send.status_code == 200, resp_send.text
+            assert resp_send.json().get("message") == "Quotation sent successfully."
 
-            # 4. Now approve the sent quotation -> 200
-            resp_app2 = await ac.put(f"/api/v1/quotations/{q_id}/approve", headers=headers_a)
-            assert resp_app2.status_code == 200
+            # 3a. Verify status is now SENT
+            resp_get_sent = await ac.get(f"/api/v1/quotations/{q_id}", headers=headers_a)
+            assert resp_get_sent.status_code == 200
+            assert resp_get_sent.json()["status"] == "sent"
 
-            # 5. Approved quotation cannot be deleted -> 400
-            resp_del = await ac.delete(f"/api/v1/quotations/{q_id}", headers=headers_a)
+            # 4. Now reject the sent quotation -> 200 (transitions SENT -> REJECTED)
+            resp_rej = await ac.put(f"/api/v1/quotations/{q_id}/reject", json={"reason": "Too expensive"}, headers=headers_a)
+            assert resp_rej.status_code == 200, resp_rej.text
+            assert resp_rej.json().get("message") == "Quotation rejected successfully"
+
+            # 4a. Verify status persisted as REJECTED and rejected_reason is populated
+            resp_get = await ac.get(f"/api/v1/quotations/{q_id}", headers=headers_a)
+            assert resp_get.status_code == 200, resp_get.text
+            q_data = resp_get.json()
+            assert q_data["status"] == "rejected", f"Expected 'rejected', got: {q_data['status']}"
+            assert q_data["rejected_reason"] == "Too expensive"
+
+            # 4b. Already-REJECTED quotation cannot be rejected again -> 400
+            resp_rej_again = await ac.put(f"/api/v1/quotations/{q_id}/reject", json={"reason": "Retry"}, headers=headers_a)
+            assert resp_rej_again.status_code == 400
+            assert "already rejected" in resp_rej_again.text.lower()
+
+            # 5. Use the pre-seeded SENT quotation for the approve lifecycle
+            resp_app2 = await ac.put(f"/api/v1/quotations/{q_sent_id}/approve", headers=headers_a)
+            assert resp_app2.status_code == 200, resp_app2.text
+
+            # 6. Approved quotation cannot be deleted -> 400
+            resp_del = await ac.delete(f"/api/v1/quotations/{q_sent_id}", headers=headers_a)
             assert resp_del.status_code == 400
 
-            # 6. Approved quotation cannot be edited -> 400
-            resp_edit = await ac.put(f"/api/v1/quotations/{q_id}", json={"project_name": "Edited Name"}, headers=headers_a)
+            # 7. Approved quotation cannot be edited -> 400
+            resp_edit = await ac.put(f"/api/v1/quotations/{q_sent_id}", json={"project_name": "Edited Name"}, headers=headers_a)
             assert resp_edit.status_code == 400
+
+            # 8. Approved quotation cannot be rejected -> 400
+            resp_rej_appr = await ac.put(f"/api/v1/quotations/{q_sent_id}/reject", json={"reason": "Changed mind"}, headers=headers_a)
+            assert resp_rej_appr.status_code == 400
+            assert "approved quotation cannot be rejected" in resp_rej_appr.text.lower()
 
 
 # ==============================================================================

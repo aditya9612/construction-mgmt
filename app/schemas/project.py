@@ -40,6 +40,7 @@ from pydantic_core.core_schema import ValidationInfo
 from datetime import date as dt_date
 from app.core.validators import (
     validate_activity_name,
+    validate_drawing_name,
     validate_non_empty_string,
     validate_progress_date,
     validate_progress_remarks,
@@ -1088,8 +1089,12 @@ class DrawingCreate(BaseSchema):
     date: Optional[dt_date] = None
     remarks: Optional[str] = None
 
-    @field_validator("drawing_name", "version")
-    def validate_fields(cls, v):
+    @field_validator("drawing_name")
+    def validate_name(cls, v):
+        return validate_drawing_name(v)
+
+    @field_validator("version")
+    def validate_version(cls, v):
         if v is None:
             return v
         return validate_non_empty_string(v)
@@ -1101,8 +1106,12 @@ class DrawingUpdate(BaseSchema):
     date: Optional[dt_date] = None
     remarks: Optional[str] = None
 
-    @field_validator("drawing_name", "version")
-    def validate_fields(cls, v):
+    @field_validator("drawing_name")
+    def validate_name(cls, v):
+        return validate_drawing_name(v)
+
+    @field_validator("version")
+    def validate_version(cls, v):
         return validate_non_empty_string(v)
 
 
@@ -1125,8 +1134,8 @@ class DrawingFolderCreate(BaseSchema):
     parent_id: Optional[int] = None
 
     @field_validator("folder_name")
-    def validate_fields(cls, v):
-        return validate_non_empty_string(v)
+    def validate_folder_name(cls, v):
+        return validate_drawing_name(v)
 
 
 class DrawingFolderOut(BaseSchema):

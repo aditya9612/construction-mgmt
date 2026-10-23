@@ -1,5 +1,7 @@
 from pydantic import BaseModel, ConfigDict, field_validator
 from app.core.enums import MeasurementStatus
+from decimal import Decimal
+
 from typing import Optional
 
 
@@ -19,6 +21,27 @@ class FinalMeasurementBase(BaseModel):
     rejected_qty: float = 0
     retention_amount: float = 0
     status: str = "DRAFT"
+
+    @field_validator("measured_qty", "certified_qty", "rejected_qty", mode="before")
+    @classmethod
+    def validate_non_negative_qty(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and Decimal(str(v)) < 0:
+            raise ValueError("Quantities cannot be negative")
+        return v
+
+    @field_validator(
+        "final_area",
+        "approved_rate",
+        "extra_area",
+        "extra_rate",
+        "retention_amount",
+        mode="before",
+    )
+    @classmethod
+    def validate_non_negative_measurement_fields(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and Decimal(str(v)) < 0:
+            raise ValueError("Measurement and certification values cannot be negative")
+        return v
 
     @field_validator("status", mode="before")
     @classmethod
@@ -52,6 +75,27 @@ class FinalMeasurementUpdate(BaseModel):
     rejected_qty: Optional[float] = None
     retention_amount: Optional[float] = None
     status: Optional[str] = None
+
+    @field_validator("measured_qty", "certified_qty", "rejected_qty", mode="before")
+    @classmethod
+    def validate_update_non_negative_qty(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and Decimal(str(v)) < 0:
+            raise ValueError("Quantities cannot be negative")
+        return v
+
+    @field_validator(
+        "final_area",
+        "approved_rate",
+        "extra_area",
+        "extra_rate",
+        "retention_amount",
+        mode="before",
+    )
+    @classmethod
+    def validate_update_non_negative_measurement_fields(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and Decimal(str(v)) < 0:
+            raise ValueError("Measurement and certification values cannot be negative")
+        return v
 
     @field_validator("status", mode="before")
     @classmethod
