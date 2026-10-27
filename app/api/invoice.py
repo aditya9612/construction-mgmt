@@ -98,12 +98,16 @@ async def _get_invoice_or_404(
     *,
     invoice_id: int,
     current_user: User,
+    for_update: bool = False,
 ) -> tuple[Invoice, Project]:
     """Resolve Invoice -> Project -> Company ownership chain and verify access.
 
     Masks foreign/nonexistent/inaccessible invoices as 404 Not Found.
     """
-    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id))
+    stmt = select(Invoice).where(Invoice.id == invoice_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    invoice = await db.scalar(stmt)
     if not invoice:
         raise NotFoundError("Invoice not found")
 
@@ -562,7 +566,7 @@ async def mark_paid(
     current_user: User = Depends(require_permission("invoices.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user, for_update=True)
 
     if invoice.pending_amount <= 0:
         raise ValidationError("Already paid")
@@ -590,11 +594,13 @@ async def mark_paid(
     if invoice.owner_id:
         await create_system_alert(
             db,
-            invoice.owner_id,
+            current_user.id,
             "Payment Received",
             f"Payment of ₹{remaining:,.2f} received for Invoice #{invoice.id}.",
             priority="Medium",
             category="Finance",
+            project_id=invoice.project_id,
+            alert_type="Payment",
         )
 
     await db.commit()
@@ -1115,7 +1121,7 @@ async def pay_invoice(
     current_user: User = Depends(require_permission("invoices.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user, for_update=True)
 
     if amount <= 0:
         raise ValidationError("Invalid payment amount")

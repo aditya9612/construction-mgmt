@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import OwnerReferenceType, OwnerTransactionType
 from app.db.session import get_db_session
 from app.models.expense import Expense
+from app.models.invoice import Invoice
+from app.core.enums import InvoiceStatus
 from app.models.project import Project
 from app.models.owner import OwnerTransaction
 from app.schemas.expense import (
@@ -237,6 +239,30 @@ async def get_expense(
     return ExpenseOut.model_validate(obj)
 
 
+async def assert_expense_editable(db: AsyncSession, expense_id: int) -> None:
+    """Ensure expense is not linked to any Invoice in PAID or PARTIAL status.
+
+    Acquires row-level locks on linked non-cancelled invoices (SELECT ... FOR UPDATE)
+    to serialize against concurrent payment state transitions.
+    """
+    stmt = (
+        select(Invoice)
+        .where(
+            Invoice.linked_expense_ids.is_not(None),
+            func.json_contains(Invoice.linked_expense_ids, func.json_array(int(expense_id))) == 1,
+            Invoice.status != InvoiceStatus.CANCELLED,
+        )
+        .with_for_update()
+    )
+    linked_invoices = (await db.scalars(stmt)).all()
+    for inv in linked_invoices:
+        if inv.status in (InvoiceStatus.PAID, InvoiceStatus.PARTIAL):
+            raise HTTPException(
+                status_code=400,
+                detail="Expense cannot be modified or deleted because its associated invoice has received payment.",
+            )
+
+
 @router.put("/{id:int}", response_model=ExpenseOut)
 async def update_expense(
     id: int,
@@ -267,6 +293,9 @@ async def update_expense(
             status_code=403,
             detail="Cannot modify attendance-generated expenses directly. Please use the Attendance/Payroll modules."
         )
+
+    # Validate associated invoice payment status
+    await assert_expense_editable(db, obj.id)
 
     # Capture original state to determine if accounting impact occurred
     old_amount = obj.amount
@@ -418,6 +447,9 @@ async def delete_expense(
                 status_code=403,
                 detail="Cannot modify attendance-generated expenses directly. Please use the Attendance/Payroll modules."
             )
+
+        # Validate associated invoice payment status
+        await assert_expense_editable(db, obj.id)
 
         # 3. Find Current Active Journal
         active_journal = await db.scalar(
