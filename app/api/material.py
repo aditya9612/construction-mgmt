@@ -2646,15 +2646,6 @@ async def usage(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
 
-    _m = await db.get(Material, material_id)
-    if not _m or _m.is_deleted:
-        raise NotFoundError("Material not found")
-    try:
-        await assert_project_access(
-            db, project_id=_m.project_id, current_user=current_user
-        )
-    except Exception:
-        raise NotFoundError("Material not found")
     import json
     import hashlib
 
@@ -2665,6 +2656,38 @@ async def usage(
         payload_str = json.dumps(payload_dict, sort_keys=True)
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
+    obj = await db.scalar(
+        select(Material)
+        .options(
+            selectinload(Material.supplier),
+            selectinload(Material.unit),
+            selectinload(Material.material_master),
+        )
+        .where(
+            Material.id == material_id,
+            Material.is_deleted == False,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+
+    if not obj:
+        raise NotFoundError("Material not found")
+
+    try:
+        await assert_project_access(
+            db, project_id=obj.project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Material not found")
+
+    if data.project_id != obj.project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Project ID does not match material project",
+        )
+
+    if idempotency_key:
         existing = await db.scalar(
             select(MaterialTransaction).where(
                 MaterialTransaction.idempotency_key == idempotency_key
@@ -2678,23 +2701,6 @@ async def usage(
                 )
             return await _build_material_out_from_id(db, existing.material_id)
 
-    obj = await db.scalar(
-        select(Material)
-        .options(
-            selectinload(Material.supplier),
-            selectinload(Material.unit),
-            selectinload(Material.material_master),
-        )
-        .where(
-            Material.id == material_id,
-            Material.is_deleted == False,
-        )
-        .with_for_update()
-    )
-
-    if not obj:
-        raise HTTPException(404, "Material not found")
-
     qty = Decimal(str(data.quantity))
 
     if qty <= 0:
@@ -2702,16 +2708,19 @@ async def usage(
 
     purchased = obj.quantity_purchased or Decimal("0")
     used = obj.quantity_used or Decimal("0")
-
-    current_stock = purchased - used
+    current_stock = (
+        obj.remaining_stock
+        if obj.remaining_stock is not None
+        else (purchased - used)
+    )
 
     if current_stock <= 0:
-        raise HTTPException(400, "Stock exhausted")
+        raise HTTPException(400, "Insufficient stock available.")
 
     if qty > current_stock:
         raise HTTPException(
             400,
-            f"Insufficient stock. Available: {current_stock}",
+            f"Insufficient stock available. Available: {current_stock}",
         )
 
     total_amount_current = obj.total_amount or Decimal("0")
@@ -2824,6 +2833,7 @@ async def usage(
         # =====================================
 
         update_material_fields(obj)
+        obj.remaining_stock = max(Decimal("0"), current_stock - qty)
 
         await db.commit()
 

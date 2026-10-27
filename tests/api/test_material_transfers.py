@@ -80,8 +80,9 @@ async def setup_test_data():
         owner_a = await db.scalar(select(Owner).where(Owner.company_id == 1))
         if not owner_a:
             owner_a = Owner(
-                name="Owner A",
-                phone="9876543210",
+                owner_code=f"OWN-A-{uuid.uuid4().hex[:6]}",
+                owner_name="Owner A",
+                mobile="9876543210",
                 email="owner_a@test.com",
                 company_id=1,
             )
@@ -91,8 +92,9 @@ async def setup_test_data():
         owner_b = await db.scalar(select(Owner).where(Owner.company_id == 2))
         if not owner_b:
             owner_b = Owner(
-                name="Owner B",
-                phone="9876543211",
+                owner_code=f"OWN-B-{uuid.uuid4().hex[:6]}",
+                owner_name="Owner B",
+                mobile="9876543211",
                 email="owner_b@test.com",
                 company_id=2,
             )
