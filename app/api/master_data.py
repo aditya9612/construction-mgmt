@@ -278,9 +278,15 @@ async def update_unit(
     update_data = payload.model_dump(exclude_unset=True)
 
     if "name" in update_data:
+        raw_name = update_data["name"]
+        if raw_name is None or not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValidationError("Unit name is required")
+        normalized_name = raw_name.strip()
+        update_data["name"] = normalized_name
+
         existing = await db.scalar(
             select(m.Unit).where(
-                func.lower(m.Unit.name) == update_data["name"].strip().lower(),
+                func.lower(m.Unit.name) == normalized_name.lower(),
                 m.Unit.id != id,
             )
         )
@@ -435,9 +441,15 @@ async def update_labour_type(
     update_data = payload.model_dump(exclude_unset=True)
 
     if "name" in update_data:
+        raw_name = update_data["name"]
+        if raw_name is None or not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValidationError("Labour type name is required")
+        normalized_name = raw_name.strip()
+        update_data["name"] = normalized_name
+
         existing = await db.scalar(
             select(m.LabourType).where(
-                func.lower(m.LabourType.name) == update_data["name"].strip().lower(),
+                func.lower(m.LabourType.name) == normalized_name.lower(),
                 m.LabourType.id != id,
             )
         )
@@ -606,9 +618,15 @@ async def update_activity_type(
             raise ValidationError("Invalid unit")
 
     if "name" in update_data:
+        raw_name = update_data["name"]
+        if raw_name is None or not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValidationError("Activity type name is required")
+        normalized_name = raw_name.strip()
+        update_data["name"] = normalized_name
+
         existing = await db.scalar(
             select(m.ActivityType).where(
-                func.lower(m.ActivityType.name) == update_data["name"].strip().lower(),
+                func.lower(m.ActivityType.name) == normalized_name.lower(),
                 m.ActivityType.id != id,
             )
         )
@@ -853,11 +871,16 @@ async def update_material_master(
 
     # ===== DUPLICATE NAME CHECK =====
     if "name" in update_data:
+        raw_name = update_data["name"]
+        if raw_name is None or not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValidationError("Material Name is required")
+        normalized_name = raw_name.strip()
+        update_data["name"] = normalized_name
 
         existing = await db.scalar(
             select(m.MaterialMaster).where(
                 func.lower(m.MaterialMaster.name)
-                == update_data["name"].strip().lower(),
+                == normalized_name.lower(),
                 m.MaterialMaster.id != id,
             )
         )
