@@ -74,7 +74,16 @@ async def create_expense(
 
     data = payload.model_dump()
 
-    if not data.get("boq_item_id"):
+    if data.get("boq_item_id"):
+        boq_item = await db.get(BOQ, data["boq_item_id"])
+        if not boq_item:
+            raise NotFoundError("BOQ item not found")
+        if boq_item.project_id != payload.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="BOQ item does not belong to this project",
+            )
+    else:
         boq = await db.scalar(
             select(BOQ).where(
                 BOQ.project_id == data["project_id"],
@@ -86,12 +95,15 @@ async def create_expense(
             data["boq_item_id"] = boq.id
 
     request_hash = None
-    if idempotency_key:
+    if idempotency_key and idempotency_key.strip():
+        idempotency_key = idempotency_key.strip()
         payload_dict = payload.model_dump(mode="json")
         payload_str = json.dumps(payload_dict, sort_keys=True)
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
         data["idempotency_key"] = idempotency_key
         data["request_hash"] = request_hash
+    else:
+        idempotency_key = None
 
     obj = Expense(**data)
     db.add(obj)
@@ -101,16 +113,17 @@ async def create_expense(
             await db.flush()
         except IntegrityError:
             await db.rollback()
-            existing_expense = await db.scalar(
-                select(Expense).where(Expense.idempotency_key == idempotency_key)
-            )
-            if existing_expense:
-                if existing_expense.request_hash != request_hash:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Idempotency-Key already used with a different request payload."
-                    )
-                return ExpenseOut.model_validate(existing_expense)
+            if idempotency_key:
+                existing_expense = await db.scalar(
+                    select(Expense).where(Expense.idempotency_key == idempotency_key)
+                )
+                if existing_expense:
+                    if existing_expense.request_hash != request_hash:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Idempotency-Key already used with a different request payload."
+                        )
+                    return ExpenseOut.model_validate(existing_expense)
             raise
 
         if obj.boq_item_id:
@@ -303,6 +316,16 @@ async def update_expense(
     old_category = obj.category
     old_mode = obj.payment_mode
     old_boq_id = obj.boq_item_id
+
+    if payload.boq_item_id is not None:
+        boq_item = await db.get(BOQ, payload.boq_item_id)
+        if not boq_item:
+            raise NotFoundError("BOQ item not found")
+        if boq_item.project_id != obj.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="BOQ item does not belong to this project",
+            )
 
     # Update metadata
     for k, v in payload.model_dump(exclude_unset=True).items():
