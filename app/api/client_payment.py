@@ -443,7 +443,12 @@ def validate_and_normalize_payment_fields(data: "s.ClientPaymentBase") -> None:
         data.bank_name, data.cheque_no, data.reference_no = None, None, None
 
 
-async def assert_invoice_payable(invoice_obj: Invoice, amount) -> None:
+async def assert_invoice_payable(
+    invoice_obj: Invoice,
+    amount,
+    db: AsyncSession | None = None,
+    exclude_payment_id: int | None = None,
+) -> None:
     """Shared invoice-eligibility check for create and update."""
     if invoice_obj.status in (InvoiceStatus.CANCELLED, InvoiceStatus.PAID):
         raise HTTPException(
@@ -455,11 +460,31 @@ async def assert_invoice_payable(invoice_obj: Invoice, amount) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invoice is already fully paid.",
         )
-    if amount > invoice_obj.pending_amount:
+    if (
+        amount > invoice_obj.pending_amount
+        or (invoice_obj.paid_amount or Decimal("0")) + Decimal(str(amount)) > invoice_obj.total_amount
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Payment amount exceeds pending invoice amount.",
         )
+    if db is not None:
+        stmt = select(func.coalesce(func.sum(ClientPayment.amount), Decimal("0"))).where(
+            ClientPayment.invoice_id == invoice_obj.id,
+            ClientPayment.payment_status.in_([
+                PaymentStatus.PENDING,
+                PaymentStatus.VERIFICATION_PENDING,
+            ]),
+        )
+        if exclude_payment_id is not None:
+            stmt = stmt.where(ClientPayment.id != exclude_payment_id)
+        unverified_sum = await db.scalar(stmt) or Decimal("0")
+        available = invoice_obj.pending_amount - unverified_sum
+        if Decimal(str(amount)) > available:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Payment amount exceeds pending invoice amount.",
+            )
 
 
 async def validate_receipt(receipt: UploadFile | None, payment_method: PaymentMethod):
@@ -1469,8 +1494,10 @@ async def create_client_payment(
 
     target_company_id = project.company_id or current_user.company_id
 
-    # Validate invoice
-    invoice_obj = await db.get(Invoice, data.invoice_id)
+    # Validate invoice with row-level lock
+    invoice_obj = await db.scalar(
+        select(Invoice).where(Invoice.id == data.invoice_id).with_for_update()
+    )
     if invoice_obj is None or invoice_obj.company_id != target_company_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found."
@@ -1480,7 +1507,7 @@ async def create_client_payment(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invoice does not belong to this project.",
         )
-    await assert_invoice_payable(invoice_obj, data.amount)
+    await assert_invoice_payable(invoice_obj, data.amount, db=db)
 
     await validate_receipt(receipt, data.payment_method)
     payment_status_value = create_payment_status(data.payment_method)
@@ -1820,7 +1847,9 @@ async def update_client_payment(
 
     # Validate invoice if changed
     if data.invoice_id and data.invoice_id != payment.invoice_id:
-        invoice_obj = await db.get(Invoice, data.invoice_id)
+        invoice_obj = await db.scalar(
+            select(Invoice).where(Invoice.id == data.invoice_id).with_for_update()
+        )
         target_comp = payment.company_id or current_user.company_id
         if not invoice_obj or invoice_obj.company_id != target_comp:
             raise HTTPException(
@@ -1831,9 +1860,13 @@ async def update_client_payment(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invoice does not belong to this project.",
             )
-        await assert_invoice_payable(invoice_obj, data.amount or payment.amount)
+        await assert_invoice_payable(invoice_obj, data.amount or payment.amount, db=db, exclude_payment_id=payment_id)
     elif data.amount and data.amount != payment.amount:
-        await assert_invoice_payable(payment.invoice, data.amount)
+        invoice_obj = await db.scalar(
+            select(Invoice).where(Invoice.id == payment.invoice_id).with_for_update()
+        )
+        if invoice_obj:
+            await assert_invoice_payable(invoice_obj, data.amount, db=db, exclude_payment_id=payment_id)
 
     await validate_receipt(receipt, data.payment_method)
 
@@ -1967,8 +2000,8 @@ async def delete_client_payment(
     receipt_url = payment.receipt_url
 
     try:
-        # If linked to invoice, restore pending amount
-        if payment.invoice:
+        # If linked to invoice and already verified, restore pending amount
+        if payment.invoice and payment.payment_status == PaymentStatus.SUCCESS:
             payment.invoice.paid_amount -= payment.amount
             payment.invoice.pending_amount += payment.amount
             if payment.invoice.paid_amount <= 0:
@@ -2069,20 +2102,42 @@ async def verify_client_payment(
 
     try:
         if action == "approve":
+            # Re-fetch invoice with row-level lock if attached
+            if payment.invoice_id:
+                invoice = await db.scalar(
+                    select(Invoice).where(Invoice.id == payment.invoice_id).with_for_update()
+                )
+                if not invoice:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Invoice not found.",
+                    )
+                if invoice.status in (InvoiceStatus.CANCELLED, InvoiceStatus.PAID) or invoice.pending_amount <= Decimal("0"):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invoice is already fully paid or cancelled.",
+                    )
+                if (
+                    payment.amount > invoice.pending_amount
+                    or (invoice.paid_amount or Decimal("0")) + payment.amount > invoice.total_amount
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Payment amount exceeds pending invoice amount.",
+                    )
+                invoice.paid_amount = (invoice.paid_amount or Decimal("0")) + payment.amount
+                invoice.pending_amount = max(Decimal("0"), invoice.total_amount - invoice.paid_amount)
+                if invoice.pending_amount <= Decimal("0") or invoice.paid_amount >= invoice.total_amount:
+                    invoice.pending_amount = Decimal("0")
+                    invoice.status = InvoiceStatus.PAID
+                else:
+                    invoice.status = InvoiceStatus.PARTIAL
+
             payment.payment_status = PaymentStatus.SUCCESS
             payment.verified_by = current_user.id
             payment.verified_at = datetime.now(timezone.utc)
 
-            # Update invoice
-            if payment.invoice:
-                payment.invoice.paid_amount += payment.amount
-                payment.invoice.pending_amount -= payment.amount
-                if payment.invoice.pending_amount <= 0:
-                    payment.invoice.pending_amount = 0
-                    payment.invoice.status = InvoiceStatus.PAID
-                else:
-                    payment.invoice.status = InvoiceStatus.PARTIAL
-
+            if payment.invoice_id:
                 # Create transaction record
                 txn = Transaction(
                     project_id=payment.project_id,

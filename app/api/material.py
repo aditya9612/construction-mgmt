@@ -1065,8 +1065,14 @@ async def material_summary(
             total_amt = m.total_amount or Decimal("0")
             remaining = m.remaining_stock or Decimal("0")
 
-            avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
-            total_stock += remaining * avg_rate
+            if m.purchase_rate is not None and m.purchase_rate > Decimal("0"):
+                rate = m.purchase_rate
+            elif purchased > 0 and total_amt > 0:
+                rate = total_amt / purchased
+            else:
+                rate = Decimal("0")
+
+            total_stock += remaining * rate
 
         total_pending = await db.scalar(
             select(func.sum(Material.payment_pending))
@@ -3824,6 +3830,7 @@ async def get_inventory_valuation(
             Material.quantity_purchased,
             Material.remaining_stock,
             Material.total_amount,
+            Material.purchase_rate,
         )
         .join(Project, Project.id == Material.project_id)
         .where(
@@ -3844,10 +3851,16 @@ async def get_inventory_valuation(
         purchased = r.quantity_purchased or Decimal("0")
         remaining = r.remaining_stock or Decimal("0")
         total_amount = r.total_amount or Decimal("0")
+        purchase_rate = r.purchase_rate
 
-        avg_rate = total_amount / purchased if purchased > 0 else Decimal("0")
+        if purchase_rate is not None and purchase_rate > Decimal("0"):
+            rate = purchase_rate
+        elif purchased > 0 and total_amount > 0:
+            rate = total_amount / purchased
+        else:
+            rate = Decimal("0")
 
-        total_value += remaining * avg_rate
+        total_value += remaining * rate
 
     return {
         "project_id": project_id,
@@ -4091,7 +4104,12 @@ async def material_report(
         remaining = m.remaining_stock or Decimal("0")
         total_amount = m.total_amount or Decimal("0")
 
-        avg_rate = total_amount / purchased if purchased > 0 else Decimal("0")
+        if m.purchase_rate is not None and m.purchase_rate > Decimal("0"):
+            avg_rate = m.purchase_rate
+        elif purchased > 0 and total_amount > 0:
+            avg_rate = total_amount / purchased
+        else:
+            avg_rate = Decimal("0")
 
         stock_value = remaining * avg_rate
 

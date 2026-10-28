@@ -466,9 +466,12 @@ async def update_invoice(
 
     obj.gst_amount = (amount * gst_percent) / 100
     obj.tax_amount = (amount * tax_percent) / 100
-    obj.total_amount = amount + obj.gst_amount + obj.tax_amount
+    new_total = amount + obj.gst_amount + obj.tax_amount
+    if obj.paid_amount and new_total < obj.paid_amount:
+        raise ValidationError("Total amount cannot be less than paid amount")
+    obj.total_amount = new_total
 
-    obj.pending_amount = obj.total_amount - (obj.paid_amount or 0)
+    obj.pending_amount = max(Decimal("0"), obj.total_amount - (obj.paid_amount or Decimal("0")))
 
     try:
         await db.commit()
@@ -568,7 +571,10 @@ async def mark_paid(
 ):
     invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user, for_update=True)
 
-    if invoice.pending_amount <= 0:
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise ValidationError("Cannot pay cancelled invoice")
+
+    if invoice.status == InvoiceStatus.PAID or invoice.pending_amount <= 0:
         raise ValidationError("Already paid")
 
     remaining = invoice.pending_amount
@@ -1126,10 +1132,13 @@ async def pay_invoice(
     if amount <= 0:
         raise ValidationError("Invalid payment amount")
 
-    if invoice.pending_amount <= 0:
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise ValidationError("Cannot pay cancelled invoice")
+
+    if invoice.status == InvoiceStatus.PAID or invoice.pending_amount <= Decimal("0"):
         raise ValidationError("Invoice already fully paid")
 
-    if amount > invoice.pending_amount:
+    if amount > invoice.pending_amount or (invoice.paid_amount or Decimal("0")) + amount > invoice.total_amount:
         raise ValidationError("Amount exceeds pending")
 
     # 1. Create transaction
@@ -1145,11 +1154,11 @@ async def pay_invoice(
     db.add(txn)
 
     # 2. Update invoice
-    invoice.paid_amount += amount
-    invoice.pending_amount = invoice.total_amount - invoice.paid_amount
+    invoice.paid_amount = (invoice.paid_amount or Decimal("0")) + amount
+    invoice.pending_amount = max(Decimal("0"), invoice.total_amount - invoice.paid_amount)
 
-    if invoice.pending_amount <= 0:
-        invoice.pending_amount = 0
+    if invoice.pending_amount <= Decimal("0") or invoice.paid_amount >= invoice.total_amount:
+        invoice.pending_amount = Decimal("0")
         invoice.status = InvoiceStatus.PAID
     else:
         invoice.status = InvoiceStatus.PARTIAL
