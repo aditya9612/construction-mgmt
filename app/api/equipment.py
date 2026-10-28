@@ -199,7 +199,7 @@ async def create_audit_log(
         old_values=old_values,
         new_values=new_values,
         user_id=user_id,
-        ip_address=request.client.host if request else None,
+        ip_address=request.client.host if (request and request.client) else None,
     )
     db.add(log)
 
@@ -3958,6 +3958,26 @@ async def update_rental(
     update_data = payload.model_dump(exclude_unset=True)
 
     # ================= VALIDATE BEFORE MUTATING =================
+
+    RENTAL_IN_FIELDS = {
+        "expected_end_date",
+        "actual_return_date",
+        "is_received",
+        "is_returned",
+    }
+    submitted_rental_in = RENTAL_IN_FIELDS.intersection(update_data.keys())
+    if submitted_rental_in:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Rental-IN fields ({', '.join(sorted(submitted_rental_in))}) cannot be updated via standard equipment rental. Use Rental-IN endpoints instead.",
+        )
+
+    for field in update_data.keys():
+        if not hasattr(rental, field):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported field '{field}' for equipment rental update",
+            )
 
     if rental.end_date and rental.end_date < date.today():
         raise HTTPException(

@@ -2826,7 +2826,11 @@ class ReportsService:
                 "Client Name",
                 owner.owner_name if owner else "N/A",
                 "Project Type",
-                str(project.type) if project.type else "N/A",
+                (
+                    project.type.value.capitalize()
+                    if getattr(project, "type", None) and hasattr(project.type, "value")
+                    else (str(project.type) if getattr(project, "type", None) else "N/A")
+                ),
             ],
             [
                 "Location",
@@ -3291,7 +3295,11 @@ class ReportsService:
                 "name": project.project_name,
                 "code": project.business_id,
                 "client": owner.owner_name if owner else "N/A",
-                "type": getattr(project, "type", "Residential"),
+                "type": (
+                    project.type.value.capitalize()
+                    if getattr(project, "type", None) and hasattr(project.type, "value")
+                    else (str(project.type) if getattr(project, "type", None) else "Residential")
+                ),
                 "location": getattr(
                     project,
                     "location",

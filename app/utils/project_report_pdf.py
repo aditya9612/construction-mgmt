@@ -113,6 +113,16 @@ def generate_project_report_pdf(data: dict) -> io.BytesIO:
     # 2. PROJECT INFO
     project_info = data.get("project", {})
 
+    raw_type = project_info.get("type", "N/A")
+    if hasattr(raw_type, "value"):
+        type_display = str(raw_type.value).capitalize()
+    elif isinstance(raw_type, str):
+        if "." in raw_type:
+            raw_type = raw_type.split(".")[-1]
+        type_display = raw_type.capitalize() if raw_type.isupper() else raw_type
+    else:
+        type_display = str(raw_type) if raw_type else "N/A"
+
     pi_data = [
         [
             Paragraph("<b>Project Name</b>", bold_style),
@@ -124,7 +134,7 @@ def generate_project_report_pdf(data: dict) -> io.BytesIO:
             Paragraph("<b>Client Name</b>", bold_style),
             project_info.get("client", "N/A"),
             Paragraph("<b>Project Type</b>", bold_style),
-            project_info.get("type", "N/A"),
+            type_display,
         ],
         [
             Paragraph("<b>Location</b>", bold_style),
