@@ -49,6 +49,18 @@ class UnitUpdate(BaseModel):
 
     is_active: Optional[bool] = None
 
+    @field_validator("name")
+    def validate_name(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, str):
+            raise ValueError("Name must be a string")
+        v_stripped = v.strip()
+        if not v_stripped:
+            raise ValueError("Name cannot be empty")
+        return v_stripped
+
+
 
 class UnitOut(BaseModel):
 
@@ -121,6 +133,18 @@ class LabourTypeUpdate(BaseModel):
 
     is_active: Optional[bool] = None
 
+    @field_validator("name")
+    def validate_name(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, str):
+            raise ValueError("Name must be a string")
+        v_stripped = v.strip()
+        if not v_stripped:
+            raise ValueError("Name cannot be empty")
+        return v_stripped
+
+
     @field_validator("default_daily_wage")
     def validate_daily_wage(cls, v):
 
@@ -179,6 +203,18 @@ class ActivityTypeUpdate(BaseModel):
 
     is_active: Optional[bool] = None
 
+    @field_validator("name")
+    def validate_name(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, str):
+            raise ValueError("Name must be a string")
+        v_stripped = v.strip()
+        if not v_stripped:
+            raise ValueError("Name cannot be empty")
+        return v_stripped
+
+
 
 class ActivityTypeOut(MasterDataBase):
 
@@ -236,6 +272,18 @@ class MaterialMasterUpdate(BaseModel):
     minimum_stock_level: Optional[int] = None
 
     is_active: Optional[bool] = None
+
+    @field_validator("name")
+    def validate_name(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, str):
+            raise ValueError("Name must be a string")
+        v_stripped = v.strip()
+        if not v_stripped:
+            raise ValueError("Name cannot be empty")
+        return v_stripped
+
 
 
 class MaterialMasterOut(MasterDataBase):

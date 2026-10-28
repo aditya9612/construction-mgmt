@@ -1065,8 +1065,14 @@ async def material_summary(
             total_amt = m.total_amount or Decimal("0")
             remaining = m.remaining_stock or Decimal("0")
 
-            avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
-            total_stock += remaining * avg_rate
+            if m.purchase_rate is not None and m.purchase_rate > Decimal("0"):
+                rate = m.purchase_rate
+            elif purchased > 0 and total_amt > 0:
+                rate = total_amt / purchased
+            else:
+                rate = Decimal("0")
+
+            total_stock += remaining * rate
 
         total_pending = await db.scalar(
             select(func.sum(Material.payment_pending))
@@ -1486,15 +1492,36 @@ async def get_supplier_materials(
     current_user: User = Depends(require_permission("suppliers.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if project_id:
-        try:
-            await assert_project_access(
-                db, project_id=project_id, current_user=current_user
+    supplier = await db.get(Supplier, supplier_id)
+    if (
+        not supplier
+        or supplier.is_deleted
+        or (current_user.company_id is not None and supplier.company_id != current_user.company_id)
+    ):
+        raise NotFoundError("Supplier not found")
+
+    allowed_project_ids: list[int] = []
+    if current_user.role != UserRole.ADMIN.value:
+        if "project_memberships" in current_user.__dict__:
+            allowed_project_ids = [pm.project_id for pm in current_user.project_memberships]
+        else:
+            res = await db.scalars(
+                select(proj_model.ProjectMember.project_id).where(
+                    proj_model.ProjectMember.user_id == current_user.id
+                )
             )
-        except Exception:
+            allowed_project_ids = list(res.all())
+
+    if project_id is not None:
+        proj = await db.get(Project, project_id)
+        if not proj or (current_user.company_id is not None and proj.company_id != current_user.company_id):
             raise NotFoundError("Project not found")
-    else:
-        raise PermissionDeniedError("Global query without project_id not permitted")
+        if current_user.role != UserRole.ADMIN.value and project_id not in allowed_project_ids:
+            raise HTTPException(403, "Access denied")
+
+    if current_user.company_id is None:
+        return []
+
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
 
@@ -1512,15 +1539,20 @@ async def get_supplier_materials(
             Supplier.id == Material.supplier_id,
             isouter=True,
         )
+        .join(Project, Project.id == Material.project_id)
         .where(
             Material.supplier_id == supplier_id,
             Material.is_deleted == False,
+            Project.company_id == current_user.company_id,
         )
     )
 
-    # Optional Project Filter
     if project_id is not None:
         query = query.where(Material.project_id == project_id)
+    elif current_user.role != UserRole.ADMIN.value:
+        if not allowed_project_ids:
+            return []
+        query = query.where(Material.project_id.in_(allowed_project_ids))
 
     query = query.order_by(Material.id.desc()).offset(skip).limit(limit)
 
@@ -2646,15 +2678,6 @@ async def usage(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
 
-    _m = await db.get(Material, material_id)
-    if not _m or _m.is_deleted:
-        raise NotFoundError("Material not found")
-    try:
-        await assert_project_access(
-            db, project_id=_m.project_id, current_user=current_user
-        )
-    except Exception:
-        raise NotFoundError("Material not found")
     import json
     import hashlib
 
@@ -2665,6 +2688,38 @@ async def usage(
         payload_str = json.dumps(payload_dict, sort_keys=True)
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
+    obj = await db.scalar(
+        select(Material)
+        .options(
+            selectinload(Material.supplier),
+            selectinload(Material.unit),
+            selectinload(Material.material_master),
+        )
+        .where(
+            Material.id == material_id,
+            Material.is_deleted == False,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+
+    if not obj:
+        raise NotFoundError("Material not found")
+
+    try:
+        await assert_project_access(
+            db, project_id=obj.project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Material not found")
+
+    if data.project_id != obj.project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Project ID does not match material project",
+        )
+
+    if idempotency_key:
         existing = await db.scalar(
             select(MaterialTransaction).where(
                 MaterialTransaction.idempotency_key == idempotency_key
@@ -2678,23 +2733,6 @@ async def usage(
                 )
             return await _build_material_out_from_id(db, existing.material_id)
 
-    obj = await db.scalar(
-        select(Material)
-        .options(
-            selectinload(Material.supplier),
-            selectinload(Material.unit),
-            selectinload(Material.material_master),
-        )
-        .where(
-            Material.id == material_id,
-            Material.is_deleted == False,
-        )
-        .with_for_update()
-    )
-
-    if not obj:
-        raise HTTPException(404, "Material not found")
-
     qty = Decimal(str(data.quantity))
 
     if qty <= 0:
@@ -2702,16 +2740,19 @@ async def usage(
 
     purchased = obj.quantity_purchased or Decimal("0")
     used = obj.quantity_used or Decimal("0")
-
-    current_stock = purchased - used
+    current_stock = (
+        obj.remaining_stock
+        if obj.remaining_stock is not None
+        else (purchased - used)
+    )
 
     if current_stock <= 0:
-        raise HTTPException(400, "Stock exhausted")
+        raise HTTPException(400, "Insufficient stock available.")
 
     if qty > current_stock:
         raise HTTPException(
             400,
-            f"Insufficient stock. Available: {current_stock}",
+            f"Insufficient stock available. Available: {current_stock}",
         )
 
     total_amount_current = obj.total_amount or Decimal("0")
@@ -2824,6 +2865,7 @@ async def usage(
         # =====================================
 
         update_material_fields(obj)
+        obj.remaining_stock = max(Decimal("0"), current_stock - qty)
 
         await db.commit()
 
@@ -3739,6 +3781,7 @@ async def get_all_inventory(
             Material.project_id,
             Material.total_amount,
             Material.quantity_purchased,
+            Material.purchase_rate,
         )
         .outerjoin(Unit, Unit.id == Material.unit_id)
         .join(Project, Project.id == Material.project_id)
@@ -3758,8 +3801,14 @@ async def get_all_inventory(
         qty_purchased = r.quantity_purchased or Decimal("0")
         remaining = r.remaining_stock or Decimal("0")
         total_amount = r.total_amount or Decimal("0")
+        purchase_rate = r.purchase_rate
 
-        avg_rate = total_amount / qty_purchased if qty_purchased > 0 else Decimal("0")
+        if purchase_rate is not None and purchase_rate > Decimal("0"):
+            avg_rate = purchase_rate
+        elif qty_purchased > 0 and total_amount > 0:
+            avg_rate = total_amount / qty_purchased
+        else:
+            avg_rate = Decimal("0")
 
         total_value = remaining * avg_rate
 
@@ -3814,6 +3863,7 @@ async def get_inventory_valuation(
             Material.quantity_purchased,
             Material.remaining_stock,
             Material.total_amount,
+            Material.purchase_rate,
         )
         .join(Project, Project.id == Material.project_id)
         .where(
@@ -3834,10 +3884,16 @@ async def get_inventory_valuation(
         purchased = r.quantity_purchased or Decimal("0")
         remaining = r.remaining_stock or Decimal("0")
         total_amount = r.total_amount or Decimal("0")
+        purchase_rate = r.purchase_rate
 
-        avg_rate = total_amount / purchased if purchased > 0 else Decimal("0")
+        if purchase_rate is not None and purchase_rate > Decimal("0"):
+            rate = purchase_rate
+        elif purchased > 0 and total_amount > 0:
+            rate = total_amount / purchased
+        else:
+            rate = Decimal("0")
 
-        total_value += remaining * avg_rate
+        total_value += remaining * rate
 
     return {
         "project_id": project_id,
@@ -3867,6 +3923,7 @@ async def get_project_inventory(
             Material.project_id,
             Material.total_amount,
             Material.quantity_purchased,
+            Material.purchase_rate,
         )
         .outerjoin(Unit, Unit.id == Material.unit_id)
         .where(Material.project_id == project_id, Material.is_deleted == False)
@@ -3882,8 +3939,14 @@ async def get_project_inventory(
         purchased = r.quantity_purchased or Decimal("0")
         remaining = r.remaining_stock or Decimal("0")
         total_amt = r.total_amount or Decimal("0")
+        purchase_rate = r.purchase_rate
 
-        avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
+        if purchase_rate is not None and purchase_rate > Decimal("0"):
+            avg_rate = purchase_rate
+        elif purchased > 0 and total_amt > 0:
+            avg_rate = total_amt / purchased
+        else:
+            avg_rate = Decimal("0")
 
         total_value = remaining * avg_rate
 
@@ -3916,23 +3979,30 @@ async def logs(
     current_user: User = Depends(require_permission("materials.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if project_id:
-        try:
-            await assert_project_access(
-                db, project_id=project_id, current_user=current_user
+    allowed_project_ids: list[int] = []
+    if current_user.role != UserRole.ADMIN.value:
+        if "project_memberships" in current_user.__dict__:
+            allowed_project_ids = [pm.project_id for pm in current_user.project_memberships]
+        else:
+            res = await db.scalars(
+                select(proj_model.ProjectMember.project_id).where(
+                    proj_model.ProjectMember.user_id == current_user.id
+                )
             )
-        except Exception:
-            raise NotFoundError("Project not found")
-    else:
-        raise PermissionDeniedError("Global query without project_id not permitted")
-    limit = min(max(limit, 1), 100)
+            allowed_project_ids = list(res.all())
 
-    if (
-        project_id is not None
-        and current_user.role != UserRole.ADMIN.value
-        and (project_id not in (current_user.allowed_projects or []))
-    ):
-        raise HTTPException(403, "Access denied")
+    if project_id is not None:
+        proj = await db.get(Project, project_id)
+        if not proj or (current_user.company_id is not None and proj.company_id != current_user.company_id):
+            raise NotFoundError("Project not found")
+        if current_user.role != UserRole.ADMIN.value and project_id not in allowed_project_ids:
+            raise HTTPException(403, "Access denied")
+
+    if current_user.company_id is None:
+        return []
+
+    limit = min(max(limit, 1), 100)
+    offset = max(offset, 0)
 
     query = (
         select(
@@ -3943,6 +4013,8 @@ async def logs(
         )
         .join(Material, Material.id == MaterialTransaction.material_id)
         .outerjoin(Supplier, Supplier.id == Material.supplier_id)
+        .join(Project, Project.id == MaterialTransaction.project_id)
+        .where(Project.company_id == current_user.company_id)
     )
 
     if material_id is not None:
@@ -3951,9 +4023,9 @@ async def logs(
     if project_id is not None:
         query = query.where(MaterialTransaction.project_id == project_id)
     elif current_user.role != UserRole.ADMIN.value:
-        query = query.where(
-            MaterialTransaction.project_id.in_(current_user.allowed_projects or [])
-        )
+        if not allowed_project_ids:
+            return []
+        query = query.where(MaterialTransaction.project_id.in_(allowed_project_ids))
 
     if type is not None:
         query = query.where(MaterialTransaction.type == type.value)
@@ -4081,7 +4153,12 @@ async def material_report(
         remaining = m.remaining_stock or Decimal("0")
         total_amount = m.total_amount or Decimal("0")
 
-        avg_rate = total_amount / purchased if purchased > 0 else Decimal("0")
+        if m.purchase_rate is not None and m.purchase_rate > Decimal("0"):
+            avg_rate = m.purchase_rate
+        elif purchased > 0 and total_amount > 0:
+            avg_rate = total_amount / purchased
+        else:
+            avg_rate = Decimal("0")
 
         stock_value = remaining * avg_rate
 

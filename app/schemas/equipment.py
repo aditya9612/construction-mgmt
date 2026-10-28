@@ -558,11 +558,10 @@ class EquipmentRentalCreate(BaseSchema):
 
     billing_mode: Optional[RentalBillingMode] = None
 
-    start_date: Optional[date] = None
     expected_end_date: Optional[date] = None
     actual_return_date: Optional[date] = None
-    is_received: bool = False
-    is_returned: bool = False
+    is_received: Optional[bool] = None
+    is_returned: Optional[bool] = None
 
     project_id: Optional[int] = Field(
         None,

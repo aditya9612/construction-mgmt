@@ -1,6 +1,7 @@
 import logging
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from sqlalchemy import select, func
+from sqlalchemy.orm import aliased
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -248,7 +249,9 @@ async def create_approval(
             detail="An unexpected error occurred while creating the approval.",
         )
 
-    return ApprovalOut.model_validate(obj)
+    out = ApprovalOut.model_validate(obj)
+    out.requested_by_name = current_user.full_name
+    return out
 
 
 @router.get("", response_model=list[ApprovalOut])
@@ -258,17 +261,107 @@ async def list_approvals(
 ):
     is_sa = _check_tenant_access(current_user)
 
-    stmt = select(Approval).join(User, Approval.requested_by == User.id)
+    Requester = aliased(User, name="requester")
+    Approver = aliased(User, name="approver")
+
+    stmt = (
+        select(
+            Approval,
+            Requester.full_name.label("requested_by_name"),
+            Approver.full_name.label("approved_by_name"),
+        )
+        .outerjoin(Requester, Approval.requested_by == Requester.id)
+        .outerjoin(Approver, Approval.approved_by == Approver.id)
+    )
     if not is_sa:
-        stmt = stmt.where(User.company_id == current_user.company_id)
+        stmt = stmt.where(Requester.company_id == current_user.company_id)
     elif current_user.company_id is not None:
-        stmt = stmt.where(User.company_id == current_user.company_id)
+        stmt = stmt.where(Requester.company_id == current_user.company_id)
 
     stmt = stmt.order_by(Approval.id.desc())
     result = await db.execute(stmt)
-    rows = result.scalars().all()
+    rows = result.all()
 
-    return [ApprovalOut.model_validate(r) for r in rows]
+    items = []
+    for approval, req_name, app_name in rows:
+        items.append(
+            ApprovalOut(
+                id=approval.id,
+                entity_type=approval.entity_type,
+                entity_id=approval.entity_id,
+                status=approval.status,
+                requested_by=approval.requested_by,
+                requested_by_name=req_name,
+                approved_by=approval.approved_by,
+                approved_by_name=app_name,
+                remarks=approval.remarks,
+            )
+        )
+    return items
+
+
+@router.get("/export")
+async def export_approvals(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("approvals.view")),
+):
+    is_sa = _check_tenant_access(current_user)
+
+    Requester = aliased(User, name="requester")
+    Approver = aliased(User, name="approver")
+
+    stmt = (
+        select(
+            Approval,
+            Requester.full_name.label("requested_by_name"),
+            Approver.full_name.label("approved_by_name"),
+        )
+        .outerjoin(Requester, Approval.requested_by == Requester.id)
+        .outerjoin(Approver, Approval.approved_by == Approver.id)
+    )
+    if not is_sa:
+        stmt = stmt.where(Requester.company_id == current_user.company_id)
+    elif current_user.company_id is not None:
+        stmt = stmt.where(Requester.company_id == current_user.company_id)
+
+    stmt = stmt.order_by(Approval.id.desc())
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    import io
+    import csv
+    from fastapi.responses import StreamingResponse
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Approval ID",
+        "Entity Type",
+        "Entity ID",
+        "Status",
+        "Requested By",
+        "Approved By",
+        "Remarks",
+        "Created At",
+    ])
+    for approval, req_name, app_name in rows:
+        writer.writerow([
+            approval.id,
+            approval.entity_type,
+            approval.entity_id,
+            approval.status,
+            req_name or f"User #{approval.requested_by}",
+            app_name or (f"User #{approval.approved_by}" if approval.approved_by else ""),
+            approval.remarks or "",
+            approval.created_at.strftime("%Y-%m-%d %H:%M:%S") if approval.created_at else "",
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=approvals_export.csv"},
+    )
 
 
 @router.put("/{id}/approve")

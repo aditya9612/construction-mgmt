@@ -98,12 +98,16 @@ async def _get_invoice_or_404(
     *,
     invoice_id: int,
     current_user: User,
+    for_update: bool = False,
 ) -> tuple[Invoice, Project]:
     """Resolve Invoice -> Project -> Company ownership chain and verify access.
 
     Masks foreign/nonexistent/inaccessible invoices as 404 Not Found.
     """
-    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id))
+    stmt = select(Invoice).where(Invoice.id == invoice_id)
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    invoice = await db.scalar(stmt)
     if not invoice:
         raise NotFoundError("Invoice not found")
 
@@ -462,9 +466,12 @@ async def update_invoice(
 
     obj.gst_amount = (amount * gst_percent) / 100
     obj.tax_amount = (amount * tax_percent) / 100
-    obj.total_amount = amount + obj.gst_amount + obj.tax_amount
+    new_total = amount + obj.gst_amount + obj.tax_amount
+    if obj.paid_amount and new_total < obj.paid_amount:
+        raise ValidationError("Total amount cannot be less than paid amount")
+    obj.total_amount = new_total
 
-    obj.pending_amount = obj.total_amount - (obj.paid_amount or 0)
+    obj.pending_amount = max(Decimal("0"), obj.total_amount - (obj.paid_amount or Decimal("0")))
 
     try:
         await db.commit()
@@ -562,9 +569,12 @@ async def mark_paid(
     current_user: User = Depends(require_permission("invoices.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user, for_update=True)
 
-    if invoice.pending_amount <= 0:
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise ValidationError("Cannot pay cancelled invoice")
+
+    if invoice.status == InvoiceStatus.PAID or invoice.pending_amount <= 0:
         raise ValidationError("Already paid")
 
     remaining = invoice.pending_amount
@@ -590,11 +600,13 @@ async def mark_paid(
     if invoice.owner_id:
         await create_system_alert(
             db,
-            invoice.owner_id,
+            current_user.id,
             "Payment Received",
             f"Payment of ₹{remaining:,.2f} received for Invoice #{invoice.id}.",
             priority="Medium",
             category="Finance",
+            project_id=invoice.project_id,
+            alert_type="Payment",
         )
 
     await db.commit()
@@ -1115,15 +1127,18 @@ async def pay_invoice(
     current_user: User = Depends(require_permission("invoices.edit")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    invoice, project = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user, for_update=True)
 
     if amount <= 0:
         raise ValidationError("Invalid payment amount")
 
-    if invoice.pending_amount <= 0:
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise ValidationError("Cannot pay cancelled invoice")
+
+    if invoice.status == InvoiceStatus.PAID or invoice.pending_amount <= Decimal("0"):
         raise ValidationError("Invoice already fully paid")
 
-    if amount > invoice.pending_amount:
+    if amount > invoice.pending_amount or (invoice.paid_amount or Decimal("0")) + amount > invoice.total_amount:
         raise ValidationError("Amount exceeds pending")
 
     # 1. Create transaction
@@ -1139,11 +1154,11 @@ async def pay_invoice(
     db.add(txn)
 
     # 2. Update invoice
-    invoice.paid_amount += amount
-    invoice.pending_amount = invoice.total_amount - invoice.paid_amount
+    invoice.paid_amount = (invoice.paid_amount or Decimal("0")) + amount
+    invoice.pending_amount = max(Decimal("0"), invoice.total_amount - invoice.paid_amount)
 
-    if invoice.pending_amount <= 0:
-        invoice.pending_amount = 0
+    if invoice.pending_amount <= Decimal("0") or invoice.paid_amount >= invoice.total_amount:
+        invoice.pending_amount = Decimal("0")
         invoice.status = InvoiceStatus.PAID
     else:
         invoice.status = InvoiceStatus.PARTIAL

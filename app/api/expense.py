@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import OwnerReferenceType, OwnerTransactionType
 from app.db.session import get_db_session
 from app.models.expense import Expense
+from app.models.invoice import Invoice
+from app.core.enums import InvoiceStatus
 from app.models.project import Project
 from app.models.owner import OwnerTransaction
 from app.schemas.expense import (
@@ -72,7 +74,16 @@ async def create_expense(
 
     data = payload.model_dump()
 
-    if not data.get("boq_item_id"):
+    if data.get("boq_item_id"):
+        boq_item = await db.get(BOQ, data["boq_item_id"])
+        if not boq_item:
+            raise NotFoundError("BOQ item not found")
+        if boq_item.project_id != payload.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="BOQ item does not belong to this project",
+            )
+    else:
         boq = await db.scalar(
             select(BOQ).where(
                 BOQ.project_id == data["project_id"],
@@ -84,12 +95,15 @@ async def create_expense(
             data["boq_item_id"] = boq.id
 
     request_hash = None
-    if idempotency_key:
+    if idempotency_key and idempotency_key.strip():
+        idempotency_key = idempotency_key.strip()
         payload_dict = payload.model_dump(mode="json")
         payload_str = json.dumps(payload_dict, sort_keys=True)
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
         data["idempotency_key"] = idempotency_key
         data["request_hash"] = request_hash
+    else:
+        idempotency_key = None
 
     obj = Expense(**data)
     db.add(obj)
@@ -99,16 +113,17 @@ async def create_expense(
             await db.flush()
         except IntegrityError:
             await db.rollback()
-            existing_expense = await db.scalar(
-                select(Expense).where(Expense.idempotency_key == idempotency_key)
-            )
-            if existing_expense:
-                if existing_expense.request_hash != request_hash:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Idempotency-Key already used with a different request payload."
-                    )
-                return ExpenseOut.model_validate(existing_expense)
+            if idempotency_key:
+                existing_expense = await db.scalar(
+                    select(Expense).where(Expense.idempotency_key == idempotency_key)
+                )
+                if existing_expense:
+                    if existing_expense.request_hash != request_hash:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Idempotency-Key already used with a different request payload."
+                        )
+                    return ExpenseOut.model_validate(existing_expense)
             raise
 
         if obj.boq_item_id:
@@ -237,6 +252,30 @@ async def get_expense(
     return ExpenseOut.model_validate(obj)
 
 
+async def assert_expense_editable(db: AsyncSession, expense_id: int) -> None:
+    """Ensure expense is not linked to any Invoice in PAID or PARTIAL status.
+
+    Acquires row-level locks on linked non-cancelled invoices (SELECT ... FOR UPDATE)
+    to serialize against concurrent payment state transitions.
+    """
+    stmt = (
+        select(Invoice)
+        .where(
+            Invoice.linked_expense_ids.is_not(None),
+            func.json_contains(Invoice.linked_expense_ids, func.json_array(int(expense_id))) == 1,
+            Invoice.status != InvoiceStatus.CANCELLED,
+        )
+        .with_for_update()
+    )
+    linked_invoices = (await db.scalars(stmt)).all()
+    for inv in linked_invoices:
+        if inv.status in (InvoiceStatus.PAID, InvoiceStatus.PARTIAL):
+            raise HTTPException(
+                status_code=400,
+                detail="Expense cannot be modified or deleted because its associated invoice has received payment.",
+            )
+
+
 @router.put("/{id:int}", response_model=ExpenseOut)
 async def update_expense(
     id: int,
@@ -268,12 +307,25 @@ async def update_expense(
             detail="Cannot modify attendance-generated expenses directly. Please use the Attendance/Payroll modules."
         )
 
+    # Validate associated invoice payment status
+    await assert_expense_editable(db, obj.id)
+
     # Capture original state to determine if accounting impact occurred
     old_amount = obj.amount
     old_date = obj.expense_date
     old_category = obj.category
     old_mode = obj.payment_mode
     old_boq_id = obj.boq_item_id
+
+    if payload.boq_item_id is not None:
+        boq_item = await db.get(BOQ, payload.boq_item_id)
+        if not boq_item:
+            raise NotFoundError("BOQ item not found")
+        if boq_item.project_id != obj.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="BOQ item does not belong to this project",
+            )
 
     # Update metadata
     for k, v in payload.model_dump(exclude_unset=True).items():
@@ -418,6 +470,9 @@ async def delete_expense(
                 status_code=403,
                 detail="Cannot modify attendance-generated expenses directly. Please use the Attendance/Payroll modules."
             )
+
+        # Validate associated invoice payment status
+        await assert_expense_editable(db, obj.id)
 
         # 3. Find Current Active Journal
         active_journal = await db.scalar(

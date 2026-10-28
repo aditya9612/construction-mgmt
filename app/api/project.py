@@ -2826,7 +2826,11 @@ class ReportsService:
                 "Client Name",
                 owner.owner_name if owner else "N/A",
                 "Project Type",
-                str(project.type) if project.type else "N/A",
+                (
+                    project.type.value.capitalize()
+                    if getattr(project, "type", None) and hasattr(project.type, "value")
+                    else (str(project.type) if getattr(project, "type", None) else "N/A")
+                ),
             ],
             [
                 "Location",
@@ -3291,7 +3295,11 @@ class ReportsService:
                 "name": project.project_name,
                 "code": project.business_id,
                 "client": owner.owner_name if owner else "N/A",
-                "type": getattr(project, "type", "Residential"),
+                "type": (
+                    project.type.value.capitalize()
+                    if getattr(project, "type", None) and hasattr(project.type, "value")
+                    else (str(project.type) if getattr(project, "type", None) else "Residential")
+                ),
                 "location": getattr(
                     project,
                     "location",
@@ -9505,8 +9513,17 @@ async def get_drawing_approval_history(
     if not drawing:
         raise NotFoundError("Drawing not found")
 
+    Requester = aliased(User, name="requester")
+    Approver = aliased(User, name="approver")
+
     result = await db.execute(
-        select(Approval)
+        select(
+            Approval,
+            Requester.full_name.label("requested_by_name"),
+            Approver.full_name.label("approved_by_name"),
+        )
+        .outerjoin(Requester, Approval.requested_by == Requester.id)
+        .outerjoin(Approver, Approval.approved_by == Approver.id)
         .where(
             Approval.entity_type == "drawing",
             Approval.entity_id == id,
@@ -9514,7 +9531,7 @@ async def get_drawing_approval_history(
         .order_by(Approval.id.desc())
     )
 
-    approvals = result.scalars().all()
+    rows = result.all()
 
     return [
         {
@@ -9522,13 +9539,15 @@ async def get_drawing_approval_history(
             "entity_type": approval.entity_type,
             "entity_id": approval.entity_id,
             "requested_by": approval.requested_by,
+            "requested_by_name": req_name,
             "approved_by": approval.approved_by,
+            "approved_by_name": app_name,
             "status": approval.status,
             "remarks": approval.remarks,
             "created_at": approval.created_at,
             "updated_at": approval.updated_at,
         }
-        for approval in approvals
+        for approval, req_name, app_name in rows
     ]
 
 

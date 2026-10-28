@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from datetime import date
 from typing import Optional
 
@@ -17,6 +17,29 @@ class ExpenseBase(BaseModel):
 class ExpenseCreate(ExpenseBase):
     boq_item_id: Optional[int] = None
 
+    @field_validator('boq_item_id', mode='before')
+    @classmethod
+    def validate_boq_item_id(cls, v: object) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v_str = v.strip()
+            if v_str == '':
+                raise ValueError('boq_item_id cannot be an empty string')
+            if v_str == '0':
+                return None
+            try:
+                v = int(v_str)
+            except ValueError:
+                raise ValueError('boq_item_id must be a valid integer')
+        if isinstance(v, int):
+            if v == 0:
+                return None
+            if v < 0:
+                raise ValueError('boq_item_id must be a positive integer')
+            return v
+        return v
+
 
 class ExpenseUpdate(BaseModel):
     category: Optional[str] = None
@@ -25,6 +48,25 @@ class ExpenseUpdate(BaseModel):
     expense_date: Optional[date] = None
     payment_mode: Optional[str] = None
     boq_item_id: Optional[int] = None
+
+    @field_validator('boq_item_id', mode='before')
+    @classmethod
+    def validate_boq_item_id(cls, v: object) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v_str = v.strip()
+            if v_str == '':
+                raise ValueError('boq_item_id cannot be an empty string')
+            try:
+                v = int(v_str)
+            except ValueError:
+                raise ValueError('boq_item_id must be a valid integer')
+        if isinstance(v, int):
+            if v <= 0:
+                raise ValueError('boq_item_id must be a positive integer')
+            return v
+        return v
 
 
 class ExpenseOut(ExpenseBase):
