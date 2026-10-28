@@ -106,7 +106,7 @@ async def _get_invoice_or_404(
     """
     stmt = select(Invoice).where(Invoice.id == invoice_id)
     if for_update:
-        stmt = stmt.with_for_update()
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     invoice = await db.scalar(stmt)
     if not invoice:
         raise NotFoundError("Invoice not found")

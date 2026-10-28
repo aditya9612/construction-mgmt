@@ -469,16 +469,21 @@ async def assert_invoice_payable(
             detail="Payment amount exceeds pending invoice amount.",
         )
     if db is not None:
-        stmt = select(func.coalesce(func.sum(ClientPayment.amount), Decimal("0"))).where(
-            ClientPayment.invoice_id == invoice_obj.id,
-            ClientPayment.payment_status.in_([
-                PaymentStatus.PENDING,
-                PaymentStatus.VERIFICATION_PENDING,
-            ]),
+        stmt = (
+            select(ClientPayment.amount)
+            .where(
+                ClientPayment.invoice_id == invoice_obj.id,
+                ClientPayment.payment_status.in_([
+                    PaymentStatus.PENDING,
+                    PaymentStatus.VERIFICATION_PENDING,
+                ]),
+            )
+            .with_for_update()
         )
         if exclude_payment_id is not None:
             stmt = stmt.where(ClientPayment.id != exclude_payment_id)
-        unverified_sum = await db.scalar(stmt) or Decimal("0")
+        amounts = (await db.execute(stmt)).scalars().all()
+        unverified_sum = sum(amounts, Decimal("0"))
         available = invoice_obj.pending_amount - unverified_sum
         if Decimal(str(amount)) > available:
             raise HTTPException(
@@ -1496,7 +1501,10 @@ async def create_client_payment(
 
     # Validate invoice with row-level lock
     invoice_obj = await db.scalar(
-        select(Invoice).where(Invoice.id == data.invoice_id).with_for_update()
+        select(Invoice)
+        .where(Invoice.id == data.invoice_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if invoice_obj is None or invoice_obj.company_id != target_company_id:
         raise HTTPException(
@@ -1848,7 +1856,10 @@ async def update_client_payment(
     # Validate invoice if changed
     if data.invoice_id and data.invoice_id != payment.invoice_id:
         invoice_obj = await db.scalar(
-            select(Invoice).where(Invoice.id == data.invoice_id).with_for_update()
+            select(Invoice)
+            .where(Invoice.id == data.invoice_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         target_comp = payment.company_id or current_user.company_id
         if not invoice_obj or invoice_obj.company_id != target_comp:
@@ -1863,7 +1874,10 @@ async def update_client_payment(
         await assert_invoice_payable(invoice_obj, data.amount or payment.amount, db=db, exclude_payment_id=payment_id)
     elif data.amount and data.amount != payment.amount:
         invoice_obj = await db.scalar(
-            select(Invoice).where(Invoice.id == payment.invoice_id).with_for_update()
+            select(Invoice)
+            .where(Invoice.id == payment.invoice_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if invoice_obj:
             await assert_invoice_payable(invoice_obj, data.amount, db=db, exclude_payment_id=payment_id)
@@ -1987,6 +2001,29 @@ async def delete_client_payment(
 
     assert_client_owns_payment(current_user, payment)
 
+    # Acquire lock on invoice first if attached, then lock payment
+    invoice = None
+    if payment.invoice_id:
+        invoice = await db.scalar(
+            select(Invoice)
+            .where(Invoice.id == payment.invoice_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+
+    payment = await db.scalar(
+        select(ClientPayment)
+        .where(ClientPayment.id == payment_id)
+        .options(selectinload(ClientPayment.invoice))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if not payment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found.",
+        )
+
     # Only allow cancellation if not yet verified
     if payment.payment_status not in (
         PaymentStatus.PENDING,
@@ -2001,15 +2038,16 @@ async def delete_client_payment(
 
     try:
         # If linked to invoice and already verified, restore pending amount
-        if payment.invoice and payment.payment_status == PaymentStatus.SUCCESS:
-            payment.invoice.paid_amount -= payment.amount
-            payment.invoice.pending_amount += payment.amount
-            if payment.invoice.paid_amount <= 0:
-                payment.invoice.paid_amount = 0
-            if payment.invoice.status == InvoiceStatus.PARTIAL:
+        target_inv = invoice or payment.invoice
+        if target_inv and payment.payment_status == PaymentStatus.SUCCESS:
+            target_inv.paid_amount -= payment.amount
+            target_inv.pending_amount += payment.amount
+            if target_inv.paid_amount <= 0:
+                target_inv.paid_amount = 0
+            if target_inv.status == InvoiceStatus.PARTIAL:
                 # Check if still partial or fully unpaid
-                if payment.invoice.pending_amount >= payment.invoice.total_amount:
-                    payment.invoice.status = InvoiceStatus.PENDING
+                if target_inv.pending_amount >= target_inv.total_amount:
+                    target_inv.status = InvoiceStatus.PENDING
 
         db.add(
             ActivityLog(
@@ -2101,17 +2139,39 @@ async def verify_client_payment(
         )
 
     try:
-        if action == "approve":
-            # Re-fetch invoice with row-level lock if attached
-            if payment.invoice_id:
-                invoice = await db.scalar(
-                    select(Invoice).where(Invoice.id == payment.invoice_id).with_for_update()
+        invoice = None
+        if payment.invoice_id:
+            invoice = await db.scalar(
+                select(Invoice)
+                .where(Invoice.id == payment.invoice_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if not invoice:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Invoice not found.",
                 )
-                if not invoice:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="Invoice not found.",
-                    )
+
+        payment = await db.scalar(
+            select(ClientPayment)
+            .where(ClientPayment.id == payment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if not payment:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Payment not found.",
+            )
+        if payment.payment_status != PaymentStatus.VERIFICATION_PENDING:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Payment is not pending verification.",
+            )
+
+        if action == "approve":
+            if invoice:
                 if invoice.status in (InvoiceStatus.CANCELLED, InvoiceStatus.PAID) or invoice.pending_amount <= Decimal("0"):
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,

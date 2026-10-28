@@ -420,3 +420,101 @@ async def test_update_invoice_total_less_than_paid_rejected(setup_invoice_contex
             assert res.status_code in (400, 422)
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_client_payment_creation_unverified_queue_limit(setup_invoice_context):
+    """
+    Two concurrent requests try to create a client payment of 600.00 each on an invoice
+    with pending 1000.00. Exactly one must succeed (201) and the second must be rejected (400)
+    because the unverified payment queue would exceed pending amount.
+    """
+    ctx = setup_invoice_context
+    app.dependency_overrides[get_current_user] = lambda: ctx["admin_a"]
+    app.dependency_overrides[get_current_active_user] = lambda: ctx["admin_a"]
+
+    barrier = asyncio.Barrier(2)
+
+    async def submit_cp(client):
+        await barrier.wait()
+        return await client.post("/api/v1/client-payments", data={
+            "project_id": ctx["proj_a_id"],
+            "invoice_id": ctx["inv1_id"],
+            "amount": "600.00",
+            "payment_method": "CASH",
+        })
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c1, \
+                   AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c2:
+            res1, res2 = await asyncio.gather(submit_cp(c1), submit_cp(c2))
+            statuses = [res1.status_code, res2.status_code]
+            assert 201 in statuses
+            assert 400 in statuses
+
+        async with AsyncSessionLocal() as db:
+            cps = (await db.execute(select(ClientPayment).where(ClientPayment.invoice_id == ctx["inv1_id"]))).scalars().all()
+            assert len(cps) == 1
+            assert cps[0].amount == Decimal("600.00")
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_payment_verification_race_prevent_overpayment(setup_invoice_context):
+    """
+    Two pending payments of 600.00 exist on an invoice with pending 1000.00.
+    Concurrently approving both must result in exactly one 200 and one 400,
+    leaving invoice paid_amount = 600.00 and pending_amount = 400.00.
+    """
+    ctx = setup_invoice_context
+    app.dependency_overrides[get_current_user] = lambda: ctx["admin_a"]
+    app.dependency_overrides[get_current_active_user] = lambda: ctx["admin_a"]
+
+    # Create two pending payments directly
+    async with AsyncSessionLocal() as db:
+        cp_a = ClientPayment(
+            company_id=ctx["comp_a_id"],
+            client_user_id=ctx["admin_a"].id,
+            invoice_id=ctx["inv1_id"],
+            project_id=ctx["proj_a_id"],
+            amount=Decimal("600.00"),
+            payment_method="CASH",
+            payment_status=PaymentStatus.VERIFICATION_PENDING,
+            payment_no="CP_RACE_VER_A",
+        )
+        cp_b = ClientPayment(
+            company_id=ctx["comp_a_id"],
+            client_user_id=ctx["admin_a"].id,
+            invoice_id=ctx["inv1_id"],
+            project_id=ctx["proj_a_id"],
+            amount=Decimal("600.00"),
+            payment_method="CASH",
+            payment_status=PaymentStatus.VERIFICATION_PENDING,
+            payment_no="CP_RACE_VER_B",
+        )
+        db.add_all([cp_a, cp_b])
+        await db.commit()
+        cp_a_id = cp_a.id
+        cp_b_id = cp_b.id
+
+    barrier = asyncio.Barrier(2)
+
+    async def verify_cp(client, cp_id):
+        await barrier.wait()
+        return await client.post(f"/api/v1/client-payments/{cp_id}/verify", json={"action": "approve"})
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c1, \
+                   AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c2:
+            res1, res2 = await asyncio.gather(verify_cp(c1, cp_a_id), verify_cp(c2, cp_b_id))
+            statuses = [res1.status_code, res2.status_code]
+            assert 200 in statuses
+            assert 400 in statuses
+
+        async with AsyncSessionLocal() as db:
+            inv = await db.get(Invoice, ctx["inv1_id"])
+            assert inv.paid_amount == Decimal("600.00")
+            assert inv.pending_amount == Decimal("400.00")
+    finally:
+        app.dependency_overrides.clear()
