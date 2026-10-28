@@ -15,6 +15,7 @@ from typing import Optional, List, Dict, Any
 from app.core.enums import (
     PRIORITY_MAP,
     AttendanceStatus,
+    DocumentStatus,
     InvoiceStatus,
     ProjectStatus,
     IssueStatus,
@@ -1097,6 +1098,9 @@ async def pm_command_center(
         bill_ids = [
             a.entity_id for a in all_pending_approvals if a.entity_type == "bill"
         ]
+        drawing_ids = list({
+            a.entity_id for a in all_pending_approvals if a.entity_type == "drawing"
+        })
 
         valid_reviews = 0
         if expense_ids:
@@ -1122,6 +1126,20 @@ async def pm_command_center(
                     select(func.count(VendorBill.id)).where(
                         VendorBill.id.in_(bill_ids),
                         VendorBill.project_id.in_(project_ids),
+                    )
+                )
+            ) or 0
+        if drawing_ids:
+            valid_reviews += (
+                await db.scalar(
+                    select(func.count(func.distinct(m.DrawingDocument.id))).where(
+                        m.DrawingDocument.id.in_(drawing_ids),
+                        m.DrawingDocument.project_id.in_(project_ids),
+                        m.DrawingDocument.is_folder.is_(False),
+                        m.DrawingDocument.approval_status.in_([
+                            DocumentStatus.PENDING,
+                            DocumentStatus.UNDER_REVIEW,
+                        ]),
                     )
                 )
             ) or 0
@@ -1448,6 +1466,9 @@ async def pm_summary(
         a.entity_id for a in all_pending_approvals if a.entity_type == "material"
     ]
     bill_ids = [a.entity_id for a in all_pending_approvals if a.entity_type == "bill"]
+    drawing_ids = list({
+        a.entity_id for a in all_pending_approvals if a.entity_type == "drawing"
+    })
 
     pending_approvals = 0
     if expense_ids:
@@ -1471,6 +1492,20 @@ async def pm_summary(
             await db.scalar(
                 select(func.count(VendorBill.id)).where(
                     VendorBill.id.in_(bill_ids), VendorBill.project_id.in_(project_ids)
+                )
+            )
+        ) or 0
+    if drawing_ids:
+        pending_approvals += (
+            await db.scalar(
+                select(func.count(func.distinct(m.DrawingDocument.id))).where(
+                    m.DrawingDocument.id.in_(drawing_ids),
+                    m.DrawingDocument.project_id.in_(project_ids),
+                    m.DrawingDocument.is_folder.is_(False),
+                    m.DrawingDocument.approval_status.in_([
+                        DocumentStatus.PENDING,
+                        DocumentStatus.UNDER_REVIEW,
+                    ]),
                 )
             )
         ) or 0

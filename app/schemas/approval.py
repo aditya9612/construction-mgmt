@@ -18,7 +18,9 @@ class ApprovalOut(BaseModel):
     entity_id: int
     status: str
     requested_by: int
-    approved_by: Optional[int]
-    remarks: Optional[str]
+    requested_by_name: Optional[str] = None
+    approved_by: Optional[int] = None
+    approved_by_name: Optional[str] = None
+    remarks: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
