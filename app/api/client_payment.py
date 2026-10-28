@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import mimetypes
 import os
@@ -336,6 +337,28 @@ async def assert_client_is_project_member(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found.",
         )
+
+
+def is_mysql_deadlock(exc: BaseException) -> bool:
+    """Return True if exc or its causes are MySQL InnoDB Deadlock (errno 1213 / ER_LOCK_DEADLOCK)."""
+    curr: BaseException | None = exc
+    while curr is not None:
+        orig = getattr(curr, "orig", None)
+        if orig is not None:
+            errno = getattr(orig, "errno", None)
+            if errno == 1213:
+                return True
+            args = getattr(orig, "args", None)
+            if isinstance(args, (tuple, list)) and len(args) > 0 and args[0] == 1213:
+                return True
+        errno = getattr(curr, "errno", None)
+        if errno == 1213:
+            return True
+        args = getattr(curr, "args", None)
+        if isinstance(args, (tuple, list)) and len(args) > 0 and args[0] == 1213:
+            return True
+        curr = getattr(curr, "__cause__", None) or getattr(curr, "__context__", None)
+    return False
 
 
 async def check_duplicate_payment(
@@ -1493,142 +1516,163 @@ async def create_client_payment(
         )
 
     validate_and_normalize_payment_fields(data)
-    project = await get_project_or_404(db, data.project_id, current_user)
-    await assert_client_is_project_member(db, data.project_id, current_user)
 
-    target_company_id = project.company_id or current_user.company_id
-
-    # Validate invoice with row-level lock
-    invoice_obj = await db.scalar(
-        select(Invoice)
-        .where(Invoice.id == data.invoice_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if invoice_obj is None or invoice_obj.company_id != target_company_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found."
-        )
-    if invoice_obj.project_id != data.project_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invoice does not belong to this project.",
-        )
-    await check_duplicate_payment(db, data, current_user)
-    await assert_invoice_payable(invoice_obj, data.amount, db=db)
-
-    await validate_receipt(receipt, data.payment_method)
-    payment_status_value = create_payment_status(data.payment_method)
-
+    max_retries = 2
     payment: ClientPayment | None = None
 
-    try:
-        payment = ClientPayment(
-            company_id=target_company_id,
-            payment_no="",
-            client_user_id=current_user.id,
-            invoice_id=data.invoice_id,
-            project_id=data.project_id,
-            amount=data.amount,
-            payment_method=data.payment_method,
-            payment_status=payment_status_value,
-            bank_name=data.bank_name,
-            cheque_no=data.cheque_no,
-            reference_no=data.reference_no,
-            remarks=data.remarks,
-            receipt_url=None,
-            transaction_id=generate_transaction_id(data.payment_method),
-            verified_by=None,
-            verified_at=None,
-        )
+    for attempt in range(max_retries + 1):
+        try:
+            project = await get_project_or_404(db, data.project_id, current_user)
+            await assert_client_is_project_member(db, data.project_id, current_user)
 
-        db.add(payment)
-        await db.flush()
-        payment.payment_no = f"CP{payment.id:06d}"
+            target_company_id = project.company_id or current_user.company_id
 
-        db.add(
-            ActivityLog(
-                action="CLIENT_PAYMENT_CREATED",
-                entity="client_payment",
-                entity_id=payment.id,
-                performed_by=current_user.id,
-                details={
-                    "payment_no": payment.payment_no,
-                    "amount": str(payment.amount),
-                    "invoice_id": payment.invoice_id,
-                    "project_id": payment.project_id,
-                },
+            # Validate invoice with row-level lock
+            invoice_obj = await db.scalar(
+                select(Invoice)
+                .where(Invoice.id == data.invoice_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
-        )
-        # =====================================================
-        # SEND NOTIFICATION TO ALL ADMINS IN SAME COMPANY
-        # =====================================================
+            if invoice_obj is None or invoice_obj.company_id != target_company_id:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found."
+                )
+            if invoice_obj.project_id != data.project_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invoice does not belong to this project.",
+                )
+            await check_duplicate_payment(db, data, current_user)
+            await assert_invoice_payable(invoice_obj, data.amount, db=db)
 
-        admins = (
-            (
-                await db.execute(
-                    select(User).where(
-                        User.role == UserRole.ADMIN,
-                        User.company_id == target_company_id,
-                        User.is_deleted == False,
+            await validate_receipt(receipt, data.payment_method)
+            payment_status_value = create_payment_status(data.payment_method)
+
+            payment = ClientPayment(
+                company_id=target_company_id,
+                payment_no="",
+                client_user_id=current_user.id,
+                invoice_id=data.invoice_id,
+                project_id=data.project_id,
+                amount=data.amount,
+                payment_method=data.payment_method,
+                payment_status=payment_status_value,
+                bank_name=data.bank_name,
+                cheque_no=data.cheque_no,
+                reference_no=data.reference_no,
+                remarks=data.remarks,
+                receipt_url=None,
+                transaction_id=generate_transaction_id(data.payment_method),
+                verified_by=None,
+                verified_at=None,
+            )
+
+            db.add(payment)
+            await db.flush()
+            payment.payment_no = f"CP{payment.id:06d}"
+
+            db.add(
+                ActivityLog(
+                    action="CLIENT_PAYMENT_CREATED",
+                    entity="client_payment",
+                    entity_id=payment.id,
+                    performed_by=current_user.id,
+                    details={
+                        "payment_no": payment.payment_no,
+                        "amount": str(payment.amount),
+                        "invoice_id": payment.invoice_id,
+                        "project_id": payment.project_id,
+                    },
+                )
+            )
+            # =====================================================
+            # SEND NOTIFICATION TO ALL ADMINS IN SAME COMPANY
+            # =====================================================
+
+            admins = (
+                (
+                    await db.execute(
+                        select(User).where(
+                            User.role == UserRole.ADMIN,
+                            User.company_id == target_company_id,
+                            User.is_deleted == False,
+                        )
                     )
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
 
-        for admin in admins:
-            db.add(
-                Notification(
-                    user_id=admin.id,
-                    title="New Client Payment Received",
-                    message=(
-                        f"Client has submitted payment "
-                        f"{payment.payment_no} of ₹{payment.amount} "
-                        f"for Invoice #{invoice_obj.id}."
-                    ),
-                    type="Client Payment",
-                    link=f"/client-payments/{payment.id}",
+            for admin in admins:
+                db.add(
+                    Notification(
+                        user_id=admin.id,
+                        title="New Client Payment Received",
+                        message=(
+                            f"Client has submitted payment "
+                            f"{payment.payment_no} of ₹{payment.amount} "
+                            f"for Invoice #{invoice_obj.id}."
+                        ),
+                        type="Client Payment",
+                        link=f"/client-payments/{payment.id}",
+                    )
+                )
+            if receipt:
+                payment.receipt_url = await save_receipt(receipt, payment.payment_no)
+
+            await db.commit()
+
+            stmt = (
+                select(ClientPayment)
+                .where(ClientPayment.id == payment.id)
+                .options(
+                    selectinload(ClientPayment.client_user),
+                    selectinload(ClientPayment.project),
+                    selectinload(ClientPayment.invoice),
                 )
             )
-        if receipt:
-            payment.receipt_url = await save_receipt(receipt, payment.payment_no)
+            payment = (await db.execute(stmt)).scalar_one()
+            break
 
-        await db.commit()
-
-        stmt = (
-            select(ClientPayment)
-            .where(ClientPayment.id == payment.id)
-            .options(
-                selectinload(ClientPayment.client_user),
-                selectinload(ClientPayment.project),
-                selectinload(ClientPayment.invoice),
+        except IntegrityError:
+            await db.rollback()
+            if payment:
+                _safe_remove(payment.receipt_url)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="Duplicate payment found."
             )
-        )
-        payment = (await db.execute(stmt)).scalar_one()
-
-    except IntegrityError:
-        await db.rollback()
-        if payment:
-            _safe_remove(payment.receipt_url)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Duplicate payment found."
-        )
-    except HTTPException:
-        await db.rollback()
-        if payment:
-            _safe_remove(payment.receipt_url)
-        raise
-    except Exception:
-        await db.rollback()
-        if payment:
-            _safe_remove(payment.receipt_url)
-        logger.exception("Unable to create client payment.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unable to create payment.",
-        )
+        except HTTPException:
+            await db.rollback()
+            if payment:
+                _safe_remove(payment.receipt_url)
+            raise
+        except Exception as e:
+            await db.rollback()
+            if payment:
+                _safe_remove(payment.receipt_url)
+                payment = None
+            if is_mysql_deadlock(e):
+                logger.warning(
+                    f"MySQL deadlock 1213 detected (attempt {attempt + 1}/{max_retries + 1}): {e}"
+                )
+                if attempt < max_retries:
+                    if receipt:
+                        try:
+                            await receipt.seek(0)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.05 * (attempt + 1))
+                    continue
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Duplicate payment found.",
+                )
+            logger.exception("Unable to create client payment.")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Unable to create payment.",
+            )
 
     try:
         await bump_cache_version(redis, VERSION_KEY)
@@ -1948,10 +1992,16 @@ async def update_client_payment(
         if payment.receipt_url != old_receipt_url:
             _safe_remove(payment.receipt_url)
         raise
-    except Exception:
+    except Exception as e:
         await db.rollback()
         if payment.receipt_url != old_receipt_url:
             _safe_remove(payment.receipt_url)
+        if is_mysql_deadlock(e):
+            logger.warning(f"MySQL deadlock 1213 detected during payment update: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Duplicate payment found.",
+            )
         logger.exception("Unable to update client payment.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

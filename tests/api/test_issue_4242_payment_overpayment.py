@@ -567,3 +567,92 @@ async def test_concurrent_duplicate_upi_reference_rejected(setup_invoice_context
             assert cps[0].amount == Decimal("40.00")
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_reference_across_different_invoices_deadlock_handled(setup_invoice_context):
+    """
+    Two simultaneous requests submit the exact same UPI reference_no for payments
+    on TWO DIFFERENT invoices (inv1 and inv2) in the same company.
+    Even though the invoice locks do not serialize the requests and MySQL InnoDB
+    triggers deadlock 1213 on the secondary index gap locks during INSERT, the
+    deadlock is handled via clean rollback & retry, ensuring exactly ONE payment
+    succeeds (201) and the duplicate returns a controlled 409 Conflict (never 500).
+    """
+    ctx = setup_invoice_context
+    app.dependency_overrides[get_current_user] = lambda: ctx["admin_a"]
+    app.dependency_overrides[get_current_active_user] = lambda: ctx["admin_a"]
+
+    barrier = asyncio.Barrier(2)
+    cross_ref = f"UPI_DIFF_INV_{uuid.uuid4().hex[:8]}"
+
+    async def submit_upi(client, inv_id, amt):
+        await barrier.wait()
+        return await client.post(
+            "/api/v1/client-payments",
+            data={
+                "project_id": ctx["proj_a_id"],
+                "invoice_id": inv_id,
+                "amount": amt,
+                "payment_method": "UPI",
+                "reference_no": cross_ref,
+            },
+            files={"receipt": ("rec.jpg", b"\xff\xd8\xff\xe0dummy_receipt", "image/jpeg")},
+        )
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c1, \
+                   AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c2:
+            res1, res2 = await asyncio.gather(
+                submit_upi(c1, ctx["inv1_id"], "50.00"),
+                submit_upi(c2, ctx["inv2_id"], "75.00"),
+            )
+            statuses = [res1.status_code, res2.status_code]
+            assert 201 in statuses, f"Expected 201, got {statuses}"
+            assert 409 in statuses, f"Expected 409 Conflict, got {statuses}"
+            assert 500 not in statuses, f"Unexpected 500 error! Got {statuses}"
+
+        async with AsyncSessionLocal() as db:
+            cps = (
+                await db.execute(
+                    select(ClientPayment).where(ClientPayment.reference_no == cross_ref)
+                )
+            ).scalars().all()
+            assert len(cps) == 1, f"Expected exactly 1 payment in DB, found {len(cps)}"
+            assert cps[0].payment_status == PaymentStatus.VERIFICATION_PENDING
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_non_deadlock_db_error_not_converted_to_409():
+    """
+    Ensure is_mysql_deadlock strictly checks MySQL errno 1213 and ordinary DB errors
+    (e.g., table missing 1146, syntax 1064, lock wait timeout 1205) are NOT treated as deadlocks.
+    """
+    from app.api.client_payment import is_mysql_deadlock
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    # Generic Exception
+    assert not is_mysql_deadlock(ValueError("regular error"))
+
+    # ProgrammingError / syntax error
+    class MockOrigSyntax:
+        errno = 1064
+        args = (1064, "Syntax error")
+    err_syntax = ProgrammingError("SELECT SYNTAX", {}, MockOrigSyntax())
+    assert not is_mysql_deadlock(err_syntax)
+
+    # Lock wait timeout (errno 1205) is NOT deadlock (1213)
+    class MockOrigTimeout:
+        errno = 1205
+        args = (1205, "Lock wait timeout exceeded")
+    err_timeout = OperationalError("SELECT TIMEOUT", {}, MockOrigTimeout())
+    assert not is_mysql_deadlock(err_timeout)
+
+    # Actual Deadlock (errno 1213)
+    class MockOrigDeadlock:
+        errno = 1213
+        args = (1213, "Deadlock found when trying to get lock")
+    err_deadlock = OperationalError("INSERT DEADLOCK", {}, MockOrigDeadlock())
+    assert is_mysql_deadlock(err_deadlock)
