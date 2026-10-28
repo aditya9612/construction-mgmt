@@ -518,3 +518,52 @@ async def test_concurrent_payment_verification_race_prevent_overpayment(setup_in
             assert inv.pending_amount == Decimal("400.00")
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_upi_reference_rejected(setup_invoice_context):
+    """
+    Two simultaneous requests submit the exact same UPI reference_no for payments
+    of ₹40.00 each on a ₹1000.00 invoice. Even though both amounts comfortably fit within
+    the invoice balance, duplicate detection under row-level locking must ensure exactly
+    ONE payment succeeds (201) and the duplicate is rejected with 409 Conflict.
+    """
+    ctx = setup_invoice_context
+    app.dependency_overrides[get_current_user] = lambda: ctx["admin_a"]
+    app.dependency_overrides[get_current_active_user] = lambda: ctx["admin_a"]
+
+    barrier = asyncio.Barrier(2)
+    same_ref = f"UPI_RACE_{uuid.uuid4().hex[:8]}"
+
+    async def submit_upi(client):
+        await barrier.wait()
+        return await client.post(
+            "/api/v1/client-payments",
+            data={
+                "project_id": ctx["proj_a_id"],
+                "invoice_id": ctx["inv1_id"],
+                "amount": "40.00",
+                "payment_method": "UPI",
+                "reference_no": same_ref,
+            },
+            files={"receipt": ("rec.jpg", b"\xff\xd8\xff\xe0dummy_receipt", "image/jpeg")},
+        )
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c1, \
+                   AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c2:
+            res1, res2 = await asyncio.gather(submit_upi(c1), submit_upi(c2))
+            statuses = [res1.status_code, res2.status_code]
+            assert 201 in statuses, f"Expected exactly one 201 Created, got {statuses}"
+            assert 409 in statuses, f"Expected exactly one 409 Conflict, got {statuses}"
+
+        async with AsyncSessionLocal() as db:
+            cps = (
+                await db.execute(
+                    select(ClientPayment).where(ClientPayment.reference_no == same_ref)
+                )
+            ).scalars().all()
+            assert len(cps) == 1, f"Expected exactly 1 payment in DB, found {len(cps)}"
+            assert cps[0].amount == Decimal("40.00")
+    finally:
+        app.dependency_overrides.clear()

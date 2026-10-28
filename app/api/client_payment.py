@@ -367,7 +367,7 @@ async def check_duplicate_payment(
         return
     if exclude_payment_id is not None:
         stmt = stmt.where(ClientPayment.id != exclude_payment_id)
-    payment = await db.scalar(stmt)
+    payment = await db.scalar(stmt.with_for_update())
     if payment:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Duplicate payment found."
@@ -1495,7 +1495,6 @@ async def create_client_payment(
     validate_and_normalize_payment_fields(data)
     project = await get_project_or_404(db, data.project_id, current_user)
     await assert_client_is_project_member(db, data.project_id, current_user)
-    await check_duplicate_payment(db, data, current_user)
 
     target_company_id = project.company_id or current_user.company_id
 
@@ -1515,6 +1514,7 @@ async def create_client_payment(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invoice does not belong to this project.",
         )
+    await check_duplicate_payment(db, data, current_user)
     await assert_invoice_payable(invoice_obj, data.amount, db=db)
 
     await validate_receipt(receipt, data.payment_method)
