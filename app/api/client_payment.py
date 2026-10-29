@@ -16,6 +16,7 @@ from fastapi import (
     File,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     status,
 )
@@ -1499,6 +1500,7 @@ async def export_client_payments_pdf(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_client_payment(
+    request: Request,
     payload: s.ClientPaymentCreateForm = Depends(),
     receipt: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db_session),
@@ -1506,8 +1508,30 @@ async def create_client_payment(
     current_user: User = Depends(require_permission("invoices.create")),
 ):
     """Create a new client payment."""
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                for k in [
+                    "invoice_id",
+                    "project_id",
+                    "amount",
+                    "payment_method",
+                    "bank_name",
+                    "cheque_no",
+                    "reference_no",
+                    "remarks",
+                ]:
+                    if k in body:
+                        setattr(payload, k, body[k])
+        except Exception:
+            pass
+
     try:
         data = payload.to_schema()
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1524,7 +1548,7 @@ async def create_client_payment(
     if data.amount is None or data.amount <= 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payment amount must be greater than zero.",
+            detail="Paid Amount must be greater than zero.",
         )
 
     validate_and_normalize_payment_fields(data)
@@ -1850,6 +1874,7 @@ async def get_client_payment(
 @router.put("/{payment_id}", response_model=s.ClientPaymentOut)
 async def update_client_payment(
     payment_id: int = ApiPath(..., gt=0),
+    request: Request = None,
     payload: s.ClientPaymentCreateForm = Depends(),
     receipt: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db_session),
@@ -1890,8 +1915,31 @@ async def update_client_payment(
             detail="Payment cannot be updated after verification.",
         )
 
+    if request is not None:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    for k in [
+                        "invoice_id",
+                        "project_id",
+                        "amount",
+                        "payment_method",
+                        "bank_name",
+                        "cheque_no",
+                        "reference_no",
+                        "remarks",
+                    ]:
+                        if k in body:
+                            setattr(payload, k, body[k])
+            except Exception:
+                pass
+
     try:
         data = payload.to_schema()
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1908,7 +1956,7 @@ async def update_client_payment(
     if data.amount is not None and data.amount <= 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payment amount must be greater than zero.",
+            detail="Paid Amount must be greater than zero.",
         )
 
     validate_and_normalize_payment_fields(data)
