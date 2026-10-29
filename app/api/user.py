@@ -4,7 +4,8 @@ from typing import Optional
 from pydantic import ValidationError
 from sqlalchemy import String, and_, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.cache.redis import cache_get_json, cache_set_json, get_cache_version
+from app.cache.redis import cache_get_json, cache_set_json, get_cache_version, bump_cache_version
+from redis.asyncio import Redis
 from app.core.dependencies import get_current_active_user, get_request_redis, require_roles
 from app.core.security import get_password_hash
 from app.db.session import get_db_session
@@ -55,6 +56,7 @@ AUDIT_ALLOWED_FIELDS = {
     "designation",
     "joining_date",
     "profile_image",
+    "is_active",
 }
 
 
@@ -594,10 +596,12 @@ async def get_user(
 @router.put("/{user_id}", response_model=UserOut)
 async def update_user(
     user_id: int,
+    request: Request,
     payload: UserUpdatePayload = Depends(),
     profile_image: UploadFile = File(None),
     current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
+    redis: Redis | None = Depends(get_request_redis),
 ):
     logger.info(f"Updating user id={user_id}")
 
@@ -614,14 +618,54 @@ async def update_user(
     try:
         data = payload.model_dump(exclude_unset=True)
 
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            try:
+                body_json = await request.json()
+                if isinstance(body_json, dict):
+                    data.update({k: v for k, v in body_json.items() if v is not None and v != ""})
+            except Exception:
+                pass
+        elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+            try:
+                form = await request.form()
+                for k, v in form.items():
+                    if k != "profile_image" and v is not None and v != "":
+                        data[k] = v
+            except Exception:
+                pass
+
         data = {k: v for k, v in data.items() if v is not None and v != ""}
+
+        # Normalize status / is_active
+        if "status" in data:
+            status_val = str(data.pop("status")).strip().lower()
+            if status_val in ["inactive", "deactivated", "disabled", "false", "0"]:
+                data["is_active"] = False
+            elif status_val in ["active", "enabled", "true", "1"]:
+                data["is_active"] = True
+            else:
+                raise AppError(422, f"Invalid status: {status_val}. Use Active or Inactive.")
+
+        if "is_active" in data:
+            val = data["is_active"]
+            if isinstance(val, str):
+                v_lower = val.strip().lower()
+                if v_lower in ["false", "0", "inactive", "deactivated", "disabled"]:
+                    data["is_active"] = False
+                elif v_lower in ["true", "1", "active", "enabled"]:
+                    data["is_active"] = True
+                else:
+                    raise AppError(422, f"Invalid is_active value: {val}")
+            else:
+                data["is_active"] = bool(val)
 
         old_image_path = user.profile_image
 
         # ------------------------
         # IMAGE
         # ------------------------
-        if profile_image:
+        if profile_image and profile_image.filename and profile_image.filename.strip():
             data["profile_image"] = await validate_and_save_image(
                 file=profile_image,
                 upload_dir="uploads/profile",
@@ -734,10 +778,17 @@ async def update_user(
         # ------------------------
         # CLEAN OLD IMAGE
         # ------------------------
-        if profile_image and old_image_path and old_image_path.startswith("uploads"):
+        if profile_image and profile_image.filename and profile_image.filename.strip() and old_image_path and old_image_path.startswith("uploads"):
             old_path = os.path.join(".", old_image_path.lstrip("/"))
             if os.path.exists(old_path) and os.path.isfile(old_path):
                 os.remove(old_path)
+
+        if redis:
+            try:
+                await redis.delete(f"cache:user:{user_id}")
+                await bump_cache_version(redis, VERSION_KEY)
+            except Exception:
+                pass
 
         return UserOut.model_validate(user)
 
@@ -749,8 +800,10 @@ async def update_user(
 @router.delete("/{user_id}", status_code=204)
 async def delete_user(
     user_id: int,
+    request: Request,
     current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
+    redis: Redis | None = Depends(get_request_redis),
 ):
     logger.info(f"Deleting user id={user_id}")
 
@@ -781,14 +834,26 @@ async def delete_user(
 
     logger.info(f"User soft deleted id={user_id}")
 
+    if redis:
+        try:
+            now_ts = time.time()
+            ttl = settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60
+            await redis.setex(f"logout_all:user:{user_id}", ttl, str(now_ts))
+            await redis.delete(f"cache:user:{user_id}")
+            await bump_cache_version(redis, VERSION_KEY)
+        except Exception:
+            pass
+
     return None
 
 
 @router.put("/{user_id}/restore", response_model=UserOut)
 async def restore_user(
     user_id: int,
+    request: Request,
     current_user: User = Depends(require_roles([UserRole.ADMIN.value])),
     db: AsyncSession = Depends(get_db_session),
+    redis: Redis | None = Depends(get_request_redis),
 ):
     logger.info(f"Restoring user id={user_id}")
 
@@ -814,6 +879,13 @@ async def restore_user(
     )
 
     logger.info(f"User restored id={user_id}")
+
+    if redis:
+        try:
+            await redis.delete(f"cache:user:{user_id}")
+            await bump_cache_version(redis, VERSION_KEY)
+        except Exception:
+            pass
 
     return UserOut.model_validate(user)
 

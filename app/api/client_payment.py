@@ -68,6 +68,7 @@ from app.models.invoice import Invoice
 from app.models.project import Project, ProjectMember
 from app.models.user import ActivityLog, User, UserRole
 from app.utils.accounting import auto_post_journal
+from app.utils.helpers import AppError
 
 logger = logging.getLogger(__name__)
 
@@ -333,10 +334,21 @@ async def assert_client_is_project_member(
         )
     )
     if member is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found.",
+        from app.models.quotation import QuotationMaster
+
+        q_match = await db.scalar(
+            select(func.count())
+            .select_from(QuotationMaster)
+            .where(
+                QuotationMaster.project_id == project_id,
+                QuotationMaster.client_user_id == current_user.id,
+            )
         )
+        if not q_match:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found.",
+            )
 
 
 def is_mysql_deadlock(exc: BaseException) -> bool:
@@ -1541,7 +1553,7 @@ async def create_client_payment(
             if invoice_obj.project_id != data.project_id:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invoice does not belong to this project.",
+                    detail="Selected invoice does not belong to this project.",
                 )
             await check_duplicate_payment(db, data, current_user)
             await assert_invoice_payable(invoice_obj, data.amount, db=db)
@@ -1642,10 +1654,15 @@ async def create_client_payment(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="Duplicate payment found."
             )
-        except HTTPException:
+        except (HTTPException, AppError) as exc:
             await db.rollback()
             if payment:
                 _safe_remove(payment.receipt_url)
+            if isinstance(exc, AppError):
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.message,
+                )
             raise
         except Exception as e:
             await db.rollback()
@@ -1913,7 +1930,7 @@ async def update_client_payment(
         if invoice_obj.project_id != payment.project_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invoice does not belong to this project.",
+                detail="Selected invoice does not belong to this project.",
             )
         await assert_invoice_payable(invoice_obj, data.amount or payment.amount, db=db, exclude_payment_id=payment_id)
     elif data.amount and data.amount != payment.amount:

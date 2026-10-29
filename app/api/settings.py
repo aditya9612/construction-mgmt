@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db_session
 from app.models.settings import CompanySettings, UserSettings
 from app.schemas.settings import CompanySettingsOut, CompanySettingsUpdate, UserSettingsUpdate, UserSettingsOut
-from app.models.user import User, ActivityLog
+from app.models.user import User, ActivityLog, UserRole
 from app.core.dependencies import get_current_active_user, require_permission
 from app.schemas.user import UserOut
 from datetime import date
@@ -47,6 +47,29 @@ async def update_settings(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if payload.default_project_id is not None and current_user.role == UserRole.CLIENT.value:
+        from app.models.project import Project, ProjectMember
+        from app.models.quotation import QuotationMaster
+
+        member_match = await db.scalar(
+            select(ProjectMember).where(
+                ProjectMember.project_id == payload.default_project_id,
+                ProjectMember.user_id == current_user.id,
+            )
+        )
+        if not member_match:
+            quotation_match = await db.scalar(
+                select(QuotationMaster).where(
+                    QuotationMaster.project_id == payload.default_project_id,
+                    QuotationMaster.client_user_id == current_user.id,
+                )
+            )
+            if not quotation_match:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Selected project is not assigned to this client.",
+                )
+
     obj = await db.scalar(
         select(UserSettings).where(UserSettings.user_id == current_user.id)
     )
