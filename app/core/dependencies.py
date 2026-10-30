@@ -121,8 +121,16 @@ async def get_current_user(
                 )
 
                 if user:
+                    if getattr(user, "is_deleted", False):
+                        logger.warning(f"Deleted user token access attempt id={user_id}")
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Your account has been deleted. Please contact Admin.",
+                        )
                     return user
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning(f"Redis cache read failed: {e}")
 
@@ -138,6 +146,13 @@ async def get_current_user(
     if user is None:
         logger.warning(f"User not found id={user_id}")
         raise credentials_exception
+
+    if getattr(user, "is_deleted", False):
+        logger.warning(f"Deleted user token access attempt id={user_id}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been deleted. Please contact Admin.",
+        )
 
     # --------------------------------------------------
     # Store in Redis for future requests
@@ -168,6 +183,11 @@ async def get_current_active_user(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ) -> User:
+    if getattr(current_user, "is_deleted", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been deleted. Please contact Admin.",
+        )
     if not current_user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive"

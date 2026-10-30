@@ -974,6 +974,23 @@ class ProjectsService:
         elif not current_user.company_id:
             base_query = base_query.where(m.Project.company_id == None)
 
+        if current_user.role == UserRole.CLIENT.value:
+            from app.models.quotation import QuotationMaster
+
+            member_subq = select(m.ProjectMember.project_id).where(
+                m.ProjectMember.user_id == current_user.id
+            )
+            quotation_subq = select(QuotationMaster.project_id).where(
+                QuotationMaster.client_user_id == current_user.id,
+                QuotationMaster.project_id.is_not(None),
+            )
+            base_query = base_query.where(
+                or_(
+                    m.Project.id.in_(member_subq),
+                    m.Project.id.in_(quotation_subq),
+                )
+            )
+
         if search:
             base_query = base_query.where(
                 m.Project.project_name.ilike(f"%{search.strip()}%")

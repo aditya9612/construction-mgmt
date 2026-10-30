@@ -16,6 +16,7 @@ from fastapi import (
     File,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     status,
 )
@@ -68,6 +69,7 @@ from app.models.invoice import Invoice
 from app.models.project import Project, ProjectMember
 from app.models.user import ActivityLog, User, UserRole
 from app.utils.accounting import auto_post_journal
+from app.utils.helpers import AppError
 
 logger = logging.getLogger(__name__)
 
@@ -333,10 +335,21 @@ async def assert_client_is_project_member(
         )
     )
     if member is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Project not found.",
+        from app.models.quotation import QuotationMaster
+
+        q_match = await db.scalar(
+            select(func.count())
+            .select_from(QuotationMaster)
+            .where(
+                QuotationMaster.project_id == project_id,
+                QuotationMaster.client_user_id == current_user.id,
+            )
         )
+        if not q_match:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found.",
+            )
 
 
 def is_mysql_deadlock(exc: BaseException) -> bool:
@@ -1487,6 +1500,7 @@ async def export_client_payments_pdf(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_client_payment(
+    request: Request,
     payload: s.ClientPaymentCreateForm = Depends(),
     receipt: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db_session),
@@ -1494,8 +1508,30 @@ async def create_client_payment(
     current_user: User = Depends(require_permission("invoices.create")),
 ):
     """Create a new client payment."""
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                for k in [
+                    "invoice_id",
+                    "project_id",
+                    "amount",
+                    "payment_method",
+                    "bank_name",
+                    "cheque_no",
+                    "reference_no",
+                    "remarks",
+                ]:
+                    if k in body:
+                        setattr(payload, k, body[k])
+        except Exception:
+            pass
+
     try:
         data = payload.to_schema()
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1512,7 +1548,7 @@ async def create_client_payment(
     if data.amount is None or data.amount <= 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payment amount must be greater than zero.",
+            detail="Paid Amount must be greater than zero.",
         )
 
     validate_and_normalize_payment_fields(data)
@@ -1541,7 +1577,7 @@ async def create_client_payment(
             if invoice_obj.project_id != data.project_id:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invoice does not belong to this project.",
+                    detail="Selected invoice does not belong to this project.",
                 )
             await check_duplicate_payment(db, data, current_user)
             await assert_invoice_payable(invoice_obj, data.amount, db=db)
@@ -1642,10 +1678,15 @@ async def create_client_payment(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="Duplicate payment found."
             )
-        except HTTPException:
+        except (HTTPException, AppError) as exc:
             await db.rollback()
             if payment:
                 _safe_remove(payment.receipt_url)
+            if isinstance(exc, AppError):
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.message,
+                )
             raise
         except Exception as e:
             await db.rollback()
@@ -1833,6 +1874,7 @@ async def get_client_payment(
 @router.put("/{payment_id}", response_model=s.ClientPaymentOut)
 async def update_client_payment(
     payment_id: int = ApiPath(..., gt=0),
+    request: Request = None,
     payload: s.ClientPaymentCreateForm = Depends(),
     receipt: UploadFile | None = File(None),
     db: AsyncSession = Depends(get_db_session),
@@ -1873,8 +1915,31 @@ async def update_client_payment(
             detail="Payment cannot be updated after verification.",
         )
 
+    if request is not None:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    for k in [
+                        "invoice_id",
+                        "project_id",
+                        "amount",
+                        "payment_method",
+                        "bank_name",
+                        "cheque_no",
+                        "reference_no",
+                        "remarks",
+                    ]:
+                        if k in body:
+                            setattr(payload, k, body[k])
+            except Exception:
+                pass
+
     try:
         data = payload.to_schema()
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1891,7 +1956,7 @@ async def update_client_payment(
     if data.amount is not None and data.amount <= 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payment amount must be greater than zero.",
+            detail="Paid Amount must be greater than zero.",
         )
 
     validate_and_normalize_payment_fields(data)
@@ -1913,7 +1978,7 @@ async def update_client_payment(
         if invoice_obj.project_id != payment.project_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invoice does not belong to this project.",
+                detail="Selected invoice does not belong to this project.",
             )
         await assert_invoice_payable(invoice_obj, data.amount or payment.amount, db=db, exclude_payment_id=payment_id)
     elif data.amount and data.amount != payment.amount:

@@ -19,7 +19,7 @@ async def assert_project_access(
     if getattr(current_user, "is_super_admin", False):
         return
 
-    if current_user.role == UserRole.ADMIN.value:
+    if current_user.role in [UserRole.ADMIN.value, UserRole.ACCOUNTANT.value]:
         # Check tenant access
         project = await db.get(m.Project, project_id)
         if not project:
@@ -43,6 +43,20 @@ async def assert_project_access(
     exists = await db.scalar(query)
 
     if not exists:
+        if current_user.role == UserRole.CLIENT.value:
+            from app.models.quotation import QuotationMaster
+
+            q_match = await db.scalar(
+                select(func.count())
+                .select_from(QuotationMaster)
+                .where(
+                    QuotationMaster.project_id == project_id,
+                    QuotationMaster.client_user_id == current_user.id,
+                )
+            )
+            if q_match:
+                return
+
         if current_user.role == UserRole.LABOUR.value:
             from app.models.labour import Labour, LabourProject
 

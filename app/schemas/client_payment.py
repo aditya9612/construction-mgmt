@@ -1,9 +1,10 @@
 from datetime import datetime
-from decimal import Decimal
-from typing import Literal, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any, Literal, Optional
 
-from fastapi import Form
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from fastapi import Form, HTTPException, status
+from fastapi.params import Form as FormParam
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.enums import InvoiceStatus, PaymentMethod, PaymentStatus
 
@@ -30,6 +31,13 @@ class ClientPaymentBase(BaseModel):
 
     remarks: Optional[str] = Field(None, max_length=500)
 
+    @field_validator("amount")
+    @classmethod
+    def validate_amount(cls, v: Decimal) -> Decimal:
+        if v is None or v <= Decimal("0"):
+            raise ValueError("Paid Amount must be greater than zero.")
+        return v
+
 
 # =====================================================
 # CREATE
@@ -49,10 +57,10 @@ class ClientPaymentCreateForm:
 
     def __init__(
         self,
-        invoice_id: int = Form(...),
-        project_id: int = Form(...),
-        amount: Decimal = Form(...),
-        payment_method: PaymentMethod = Form(...),
+        invoice_id: Optional[Any] = Form(None),
+        project_id: Optional[Any] = Form(None),
+        amount: Optional[Any] = Form(None),
+        payment_method: Optional[Any] = Form(None),
         bank_name: Optional[str] = Form(None),
         cheque_no: Optional[str] = Form(None),
         reference_no: Optional[str] = Form(None),
@@ -68,15 +76,103 @@ class ClientPaymentCreateForm:
         self.remarks = remarks
 
     def to_schema(self) -> ClientPaymentCreate:
+        def is_empty(val):
+            if val is None or isinstance(val, FormParam):
+                return True
+            if isinstance(val, str) and not val.strip():
+                return True
+            return False
+
+        if (
+            is_empty(self.invoice_id)
+            or is_empty(self.project_id)
+            or is_empty(self.amount)
+            or is_empty(self.payment_method)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Please fill out all required fields.",
+            )
+
+        try:
+            inv_id = int(self.invoice_id)
+            if inv_id <= 0:
+                raise ValueError()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid invoice ID.",
+            )
+
+        try:
+            proj_id = int(self.project_id)
+            if proj_id <= 0:
+                raise ValueError()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project ID.",
+            )
+
+        try:
+            amt = Decimal(str(self.amount).strip())
+        except (InvalidOperation, TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid payment amount.",
+            )
+
+        if amt <= Decimal("0"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Paid Amount must be greater than zero.",
+            )
+
+        if isinstance(self.payment_method, PaymentMethod):
+            pm = self.payment_method
+        else:
+            pm_raw = str(self.payment_method).strip()
+            try:
+                pm = PaymentMethod(pm_raw.upper())
+            except ValueError:
+                try:
+                    pm = PaymentMethod(pm_raw)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid payment method: {pm_raw}",
+                    )
+
+        bank = (
+            (self.bank_name or "").strip() or None
+            if not isinstance(self.bank_name, FormParam)
+            else None
+        )
+        cheque = (
+            (self.cheque_no or "").strip() or None
+            if not isinstance(self.cheque_no, FormParam)
+            else None
+        )
+        ref = (
+            (self.reference_no or "").strip() or None
+            if not isinstance(self.reference_no, FormParam)
+            else None
+        )
+        rem = (
+            (self.remarks or "").strip() or None
+            if not isinstance(self.remarks, FormParam)
+            else None
+        )
+
         return ClientPaymentCreate(
-            invoice_id=self.invoice_id,
-            project_id=self.project_id,
-            amount=self.amount,
-            payment_method=self.payment_method,
-            bank_name=(self.bank_name or "").strip() or None,
-            cheque_no=(self.cheque_no or "").strip() or None,
-            reference_no=(self.reference_no or "").strip() or None,
-            remarks=(self.remarks or "").strip() or None,
+            invoice_id=inv_id,
+            project_id=proj_id,
+            amount=amt,
+            payment_method=pm,
+            bank_name=bank,
+            cheque_no=cheque,
+            reference_no=ref,
+            remarks=rem,
         )
 
 
@@ -84,26 +180,98 @@ class ClientPaymentCreateForm:
 # UPDATE
 # =====================================================
 class ClientPaymentUpdateForm:
-    invoice_id: int
-    project_id: int
-    amount: Decimal
-    payment_method: PaymentMethod
+    invoice_id: Optional[Any] = None
+    project_id: Optional[Any] = None
+    amount: Optional[Any] = None
+    payment_method: Optional[Any] = None
 
     bank_name: str | None = None
     cheque_no: str | None = None
     reference_no: str | None = None
     remarks: str | None = None
 
-    def to_schema(self):
+    def to_schema(self) -> ClientPaymentCreate:
+        def is_empty(val):
+            if val is None or isinstance(val, FormParam):
+                return True
+            if isinstance(val, str) and not val.strip():
+                return True
+            return False
+
+        if (
+            is_empty(self.invoice_id)
+            or is_empty(self.project_id)
+            or is_empty(self.amount)
+            or is_empty(self.payment_method)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Please fill out all required fields.",
+            )
+
+        try:
+            inv_id = int(self.invoice_id)
+            if inv_id <= 0:
+                raise ValueError()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid invoice ID.",
+            )
+
+        try:
+            proj_id = int(self.project_id)
+            if proj_id <= 0:
+                raise ValueError()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project ID.",
+            )
+
+        try:
+            amt = Decimal(str(self.amount).strip())
+        except (InvalidOperation, TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid payment amount.",
+            )
+
+        if amt <= Decimal("0"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Paid Amount must be greater than zero.",
+            )
+
+        if isinstance(self.payment_method, PaymentMethod):
+            pm = self.payment_method
+        else:
+            pm_raw = str(self.payment_method).strip()
+            try:
+                pm = PaymentMethod(pm_raw.upper())
+            except ValueError:
+                try:
+                    pm = PaymentMethod(pm_raw)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid payment method: {pm_raw}",
+                    )
+
+        bank = (self.bank_name or "").strip() or None
+        cheque = (self.cheque_no or "").strip() or None
+        ref = (self.reference_no or "").strip() or None
+        rem = (self.remarks or "").strip() or None
+
         return ClientPaymentCreate(
-            invoice_id=self.invoice_id,
-            project_id=self.project_id,
-            amount=self.amount,
-            payment_method=self.payment_method,
-            bank_name=self.bank_name,
-            cheque_no=self.cheque_no,
-            reference_no=self.reference_no,
-            remarks=self.remarks,
+            invoice_id=inv_id,
+            project_id=proj_id,
+            amount=amt,
+            payment_method=pm,
+            bank_name=bank,
+            cheque_no=cheque,
+            reference_no=ref,
+            remarks=rem,
         )
 
 

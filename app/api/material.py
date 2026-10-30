@@ -2,7 +2,7 @@ from app.utils.helpers import AppError
 from app.utils.helpers import NotFoundError
 from datetime import date
 from typing import Optional, List
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import uuid
 import os
 from sqlalchemy.exc import IntegrityError
@@ -5731,8 +5731,22 @@ async def update_material(
         # APPLY UPDATES
         # =====================================================
 
+        rate_changed = False
+        if "purchase_rate" in update_data and update_data["purchase_rate"] is not None:
+            new_rate = Decimal(str(update_data["purchase_rate"]))
+            old_rate = obj.purchase_rate or Decimal("0")
+            if old_rate != new_rate:
+                rate_changed = True
+
         for key, value in update_data.items():
             setattr(obj, key, value)
+
+        if rate_changed:
+            qty = obj.quantity_purchased or Decimal("0")
+            rate = obj.purchase_rate or Decimal("0")
+            obj.total_amount = (qty * rate).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
 
         update_material_fields(obj)
 
