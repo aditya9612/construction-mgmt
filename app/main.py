@@ -199,7 +199,27 @@ def create_app() -> FastAPI:
 
     os.makedirs("uploads/payments", exist_ok=True)
 
-    application.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+    from starlette.responses import Response
+
+    class RestrictedStaticFiles(StaticFiles):
+        BLOCKED_DIRECTORIES = {
+            "task_requests",
+        }
+
+        async def get_response(self, path: str, scope):
+            normalized = os.path.normpath(path).replace(os.sep, "/").replace("\\", "/").lstrip("/")
+            if normalized.startswith(".."):
+                return Response("Forbidden", status_code=403, media_type="text/plain")
+            parts = normalized.split("/")
+            if parts and parts[0].lower() in self.BLOCKED_DIRECTORIES:
+                return Response(
+                    "Direct static access to sensitive documents is forbidden. Use authenticated API endpoints.",
+                    status_code=403,
+                    media_type="text/plain",
+                )
+            return await super().get_response(path, scope)
+
+    application.mount("/uploads", RestrictedStaticFiles(directory="uploads"), name="uploads")
 
     @application.middleware("http")
     async def log_requests(request: Request, call_next):

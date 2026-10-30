@@ -593,6 +593,21 @@ class TaskRequestBase(BaseModel):
             raise ValueError("Description cannot exceed 5000 characters")
         return v_stripped
 
+    @field_validator("attachment_url")
+    @classmethod
+    def validate_attachment_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_stripped = v.strip()
+        if not v_stripped or v_stripped.lower() in ("null", "undefined"):
+            return None
+        lower_v = v_stripped.lower()
+        if any(lower_v.startswith(s) for s in ("http:", "https:", "javascript:", "data:", "file:", "ftp:")):
+            raise ValueError("External URLs and script schemes are not allowed in attachment_url")
+        if not lower_v.startswith("/uploads/task_requests/"):
+            raise ValueError("attachment_url must be a valid server-managed task request attachment path")
+        return v_stripped
+
 
 # =========================================================
 # JSON REQUEST
@@ -657,9 +672,21 @@ class TaskRequestCreateForm:
         elif clean_desc and len(clean_desc) > 5000:
             raise HTTPException(status_code=422, detail="Description cannot exceed 5000 characters")
 
+        has_file = bool(
+            (self.attachment and getattr(self.attachment, "filename", None) and self.attachment.filename.strip())
+            or (self.file and getattr(self.file, "filename", None) and self.file.filename.strip())
+        )
         clean_att_url = self.attachment_url.strip() if self.attachment_url else None
         if clean_att_url in ("", "null", "undefined"):
             clean_att_url = None
+
+        if has_file:
+            clean_att_url = None
+        elif clean_att_url is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="attachment_url cannot be manually specified during creation; upload an attachment file instead",
+            )
 
         return TaskRequestCreate(
             project_id=self.project_id,
@@ -727,6 +754,21 @@ class TaskRequestUpdate(BaseModel):
             return None
         if len(v_stripped) > 5000:
             raise ValueError("Description cannot exceed 5000 characters")
+        return v_stripped
+
+    @field_validator("attachment_url")
+    @classmethod
+    def validate_attachment_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_stripped = v.strip()
+        if not v_stripped or v_stripped.lower() in ("null", "undefined"):
+            return None
+        lower_v = v_stripped.lower()
+        if any(lower_v.startswith(s) for s in ("http:", "https:", "javascript:", "data:", "file:", "ftp:")):
+            raise ValueError("External URLs and script schemes are not allowed in attachment_url")
+        if not lower_v.startswith("/uploads/task_requests/"):
+            raise ValueError("attachment_url must be a valid server-managed task request attachment path")
         return v_stripped
 
 
