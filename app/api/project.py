@@ -9252,6 +9252,7 @@ async def create_folder(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("drawings.create")),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     obj = m.DrawingDocument(
         project_id=project_id,
         drawing_name=data.folder_name,
@@ -9286,6 +9287,7 @@ async def upload_drawing(
     current_user: User = Depends(require_permission("drawings.upload")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     try:
         drawing_name = validate_drawing_name(drawing_name)
     except ValueError as e:
@@ -9471,6 +9473,8 @@ async def update_drawing(
     if not obj:
         raise NotFoundError("Drawing not found")
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     # ================= LOCK APPROVED DRAWINGS =================
 
     if obj.approval_status == DocumentStatus.APPROVED:
@@ -9548,6 +9552,8 @@ async def get_drawing_approval_history(
     if not drawing:
         raise NotFoundError("Drawing not found")
 
+    await assert_project_access(db, project_id=drawing.project_id, current_user=current_user)
+
     Requester = aliased(User, name="requester")
     Approver = aliased(User, name="approver")
 
@@ -9600,6 +9606,7 @@ async def list_drawings(
     current_user: User = Depends(require_permission("drawings.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     stmt = select(m.DrawingDocument).where(m.DrawingDocument.project_id == project_id)
     count_stmt = (
         select(func.count())
@@ -9659,6 +9666,8 @@ async def get_versions(
     skip: int = 0,
     limit: int = 50,
 ):
+    if project_id is not None:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
     query = select(m.DrawingDocument)
     if project_id is not None:
         query = query.where(m.DrawingDocument.project_id == project_id)
@@ -9694,6 +9703,8 @@ async def get_latest(
     project_id: Optional[int] = None,
     parent_id: Optional[int] = Query(None),
 ):
+    if project_id is not None:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
     query = select(m.DrawingDocument).where(
         m.DrawingDocument.is_latest_version == True,
     )
@@ -9734,6 +9745,8 @@ async def delete_drawing(
     if not obj:
         raise NotFoundError("Drawing not found")
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     if obj.file_url and os.path.exists(obj.file_url):
         os.remove(obj.file_url)
 
@@ -9765,6 +9778,8 @@ async def download_document(
     if not doc:
         raise NotFoundError("Document not found")
 
+    await assert_project_access(db, project_id=doc.project_id, current_user=current_user)
+
     if not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
@@ -9788,6 +9803,8 @@ async def view_document(
 
     if not doc:
         raise NotFoundError("Document not found")
+
+    await assert_project_access(db, project_id=doc.project_id, current_user=current_user)
 
     if not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
