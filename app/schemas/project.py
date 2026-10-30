@@ -553,13 +553,33 @@ class TaskStatusUpdate(BaseSchema):
 
 
 class TaskRequestBase(BaseModel):
-    title: str = Field(..., min_length=1, description="Title of the task request")
-    category: str = Field(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)")
+    title: str = Field(..., min_length=3, description="Title of the task request")
+    category: str = Field(..., min_length=3, description="Category of the task request (e.g. Construction, Electrical, General)")
     project_id: int = Field(..., description="Project ID")
-    priority: str = Field(..., description="Priority (LOW, MEDIUM, HIGH)")
+    priority: str = Field(..., min_length=3, description="Priority (LOW, MEDIUM, HIGH)")
     description: Optional[str] = Field(default=None, description="Detailed description of the task request")
     attachment_url: Optional[str] = Field(default=None, description="Attachment URL or filename")
     assigned_to: Optional[int] = Field(default=None, description="User ID of assignee")
+
+    @field_validator("title", "category")
+    @classmethod
+    def validate_title_category(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Field cannot be empty or whitespace only")
+        v_stripped = v.strip()
+        if len(v_stripped) < 3:
+            raise ValueError("Field must be at least 3 characters")
+        return v_stripped
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, v: str) -> str:
+        if not v:
+            raise ValueError("Priority cannot be empty")
+        v_upper = v.strip().upper()
+        if v_upper not in ("LOW", "MEDIUM", "HIGH"):
+            raise ValueError("Priority must be one of: LOW, MEDIUM, HIGH")
+        return v_upper
 
 
 # =========================================================
@@ -581,9 +601,9 @@ class TaskRequestCreateForm:
     def __init__(
         self,
         project_id: int = Form(..., description="Project ID"),
-        title: str = Form(..., min_length=1, description="Title of the task request"),
-        category: str = Form(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)"),
-        priority: str = Form(..., min_length=1, description="Priority (LOW, MEDIUM, HIGH)"),
+        title: str = Form(..., min_length=3, description="Title of the task request"),
+        category: str = Form(..., min_length=3, description="Category of the task request (e.g. Construction, Electrical, General)"),
+        priority: str = Form(..., min_length=3, description="Priority (LOW, MEDIUM, HIGH)"),
         description: Optional[str] = Form(None, description="Detailed description of the task request"),
         assigned_to: Optional[int] = Form(None, description="User ID to assign to"),
         attachment: Optional[UploadFile] = File(None, description="Attachment file"),
@@ -598,16 +618,18 @@ class TaskRequestCreateForm:
 
     def to_schema(self) -> TaskRequestCreate:
         clean_title = self.title.strip() if self.title else ""
-        if not clean_title:
-            raise HTTPException(status_code=422, detail="Title cannot be empty")
+        if not clean_title or len(clean_title) < 3:
+            raise HTTPException(status_code=422, detail="Title must be at least 3 characters")
 
         clean_category = self.category.strip() if self.category else ""
-        if not clean_category:
-            raise HTTPException(status_code=422, detail="Category cannot be empty")
+        if not clean_category or len(clean_category) < 3:
+            raise HTTPException(status_code=422, detail="Category must be at least 3 characters")
 
-        clean_priority = self.priority.strip() if self.priority else ""
+        clean_priority = self.priority.strip().upper() if self.priority else ""
         if not clean_priority or clean_priority.lower() == "null":
             raise HTTPException(status_code=422, detail="Priority cannot be empty")
+        if clean_priority not in ("LOW", "MEDIUM", "HIGH"):
+            raise HTTPException(status_code=422, detail="Priority must be one of: LOW, MEDIUM, HIGH")
 
         clean_desc = self.description.strip() if self.description else None
         if clean_desc in ("", "null", "undefined"):
@@ -629,9 +651,9 @@ class TaskRequestCreateForm:
 
 
 class TaskRequestUpdate(BaseModel):
-    title: str = Field(..., min_length=1, description="Title of the task request")
-    category: str = Field(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)")
-    priority: str = Field(..., min_length=1, description="Priority (LOW, MEDIUM, HIGH)")
+    title: str = Field(..., min_length=3, description="Title of the task request")
+    category: str = Field(..., min_length=3, description="Category of the task request (e.g. Construction, Electrical, General)")
+    priority: str = Field(..., min_length=3, description="Priority (LOW, MEDIUM, HIGH)")
     status: str = Field(..., min_length=1, description="Status (PENDING, APPROVED, REJECTED)")
     description: Optional[str] = Field(default=None, description="Detailed description of the task request")
     attachment_url: Optional[str] = Field(default=None, description="Attachment URL or filename")
@@ -643,7 +665,10 @@ class TaskRequestUpdate(BaseModel):
     def validate_non_empty(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("Field cannot be empty or whitespace only")
-        return v.strip()
+        v_stripped = v.strip()
+        if len(v_stripped) < 3:
+            raise ValueError("Field must be at least 3 characters")
+        return v_stripped
 
     @field_validator("status")
     @classmethod
