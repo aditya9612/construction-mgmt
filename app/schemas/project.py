@@ -553,13 +553,60 @@ class TaskStatusUpdate(BaseSchema):
 
 
 class TaskRequestBase(BaseModel):
-    title: str = Field(..., min_length=1, description="Title of the task request")
-    category: str = Field(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)")
+    title: str = Field(..., min_length=3, max_length=255, description="Title of the task request")
+    category: str = Field(..., min_length=3, max_length=100, description="Category of the task request (e.g. Construction, Electrical, General)")
     project_id: int = Field(..., description="Project ID")
-    priority: str = Field(..., description="Priority (LOW, MEDIUM, HIGH)")
-    description: Optional[str] = Field(default=None, description="Detailed description of the task request")
+    priority: str = Field(..., min_length=3, max_length=20, description="Priority (LOW, MEDIUM, HIGH)")
+    description: Optional[str] = Field(default=None, max_length=5000, description="Detailed description of the task request")
     attachment_url: Optional[str] = Field(default=None, description="Attachment URL or filename")
     assigned_to: Optional[int] = Field(default=None, description="User ID of assignee")
+
+    @field_validator("title", "category")
+    @classmethod
+    def validate_title_category(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Field cannot be empty or whitespace only")
+        v_stripped = v.strip()
+        if len(v_stripped) < 3:
+            raise ValueError("Field must be at least 3 characters")
+        return v_stripped
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, v: str) -> str:
+        if not v:
+            raise ValueError("Priority cannot be empty")
+        v_upper = v.strip().upper()
+        if v_upper not in ("LOW", "MEDIUM", "HIGH"):
+            raise ValueError("Priority must be one of: LOW, MEDIUM, HIGH")
+        return v_upper
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_stripped = v.strip()
+        if not v_stripped or v_stripped.lower() in ("null", "undefined"):
+            return None
+        if len(v_stripped) > 5000:
+            raise ValueError("Description cannot exceed 5000 characters")
+        return v_stripped
+
+    @field_validator("attachment_url")
+    @classmethod
+    def validate_attachment_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_stripped = v.strip()
+        if not v_stripped or v_stripped.lower() in ("null", "undefined"):
+            return None
+        lower_v = v_stripped.lower()
+        if any(lower_v.startswith(s) for s in ("http:", "https:", "javascript:", "data:", "file:", "ftp:")):
+            raise ValueError("External URLs and script schemes are not allowed in attachment_url")
+        if not lower_v.startswith("/uploads/task_requests/"):
+            raise ValueError("attachment_url must be a valid server-managed task request attachment path")
+        return v_stripped
 
 
 # =========================================================
@@ -581,12 +628,14 @@ class TaskRequestCreateForm:
     def __init__(
         self,
         project_id: int = Form(..., description="Project ID"),
-        title: str = Form(..., min_length=1, description="Title of the task request"),
-        category: str = Form(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)"),
-        priority: str = Form(..., min_length=1, description="Priority (LOW, MEDIUM, HIGH)"),
-        description: Optional[str] = Form(None, description="Detailed description of the task request"),
+        title: str = Form(..., min_length=3, max_length=255, description="Title of the task request"),
+        category: str = Form(..., min_length=3, max_length=100, description="Category of the task request (e.g. Construction, Electrical, General)"),
+        priority: str = Form(..., min_length=3, max_length=20, description="Priority (LOW, MEDIUM, HIGH)"),
+        description: Optional[str] = Form(None, max_length=5000, description="Detailed description of the task request"),
         assigned_to: Optional[int] = Form(None, description="User ID to assign to"),
         attachment: Optional[UploadFile] = File(None, description="Attachment file"),
+        file: Optional[UploadFile] = File(None, description="Attachment file (alias)"),
+        attachment_url: Optional[str] = Form(None, description="Attachment URL or filename"),
     ):
         self.project_id = project_id
         self.title = title
@@ -594,24 +643,50 @@ class TaskRequestCreateForm:
         self.priority = priority
         self.description = description
         self.assigned_to = assigned_to
-        self.attachment = attachment
+        self.attachment = attachment or file
+        self.file = file
+        self.attachment_url = attachment_url
 
     def to_schema(self) -> TaskRequestCreate:
         clean_title = self.title.strip() if self.title else ""
-        if not clean_title:
-            raise HTTPException(status_code=422, detail="Title cannot be empty")
+        if not clean_title or len(clean_title) < 3:
+            raise HTTPException(status_code=422, detail="Title must be at least 3 characters")
+        if len(clean_title) > 255:
+            raise HTTPException(status_code=422, detail="Title cannot exceed 255 characters")
 
         clean_category = self.category.strip() if self.category else ""
-        if not clean_category:
-            raise HTTPException(status_code=422, detail="Category cannot be empty")
+        if not clean_category or len(clean_category) < 3:
+            raise HTTPException(status_code=422, detail="Category must be at least 3 characters")
+        if len(clean_category) > 100:
+            raise HTTPException(status_code=422, detail="Category cannot exceed 100 characters")
 
-        clean_priority = self.priority.strip() if self.priority else ""
+        clean_priority = self.priority.strip().upper() if self.priority else ""
         if not clean_priority or clean_priority.lower() == "null":
             raise HTTPException(status_code=422, detail="Priority cannot be empty")
+        if clean_priority not in ("LOW", "MEDIUM", "HIGH"):
+            raise HTTPException(status_code=422, detail="Priority must be one of: LOW, MEDIUM, HIGH")
 
         clean_desc = self.description.strip() if self.description else None
         if clean_desc in ("", "null", "undefined"):
             clean_desc = None
+        elif clean_desc and len(clean_desc) > 5000:
+            raise HTTPException(status_code=422, detail="Description cannot exceed 5000 characters")
+
+        has_file = bool(
+            (self.attachment and getattr(self.attachment, "filename", None) and self.attachment.filename.strip())
+            or (self.file and getattr(self.file, "filename", None) and self.file.filename.strip())
+        )
+        clean_att_url = self.attachment_url.strip() if self.attachment_url else None
+        if clean_att_url in ("", "null", "undefined"):
+            clean_att_url = None
+
+        if has_file:
+            clean_att_url = None
+        elif clean_att_url is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="attachment_url cannot be manually specified during creation; upload an attachment file instead",
+            )
 
         return TaskRequestCreate(
             project_id=self.project_id,
@@ -619,6 +694,7 @@ class TaskRequestCreateForm:
             category=clean_category,
             priority=clean_priority,
             description=clean_desc,
+            attachment_url=clean_att_url,
             assigned_to=self.assigned_to,
         )
 
@@ -629,11 +705,11 @@ class TaskRequestCreateForm:
 
 
 class TaskRequestUpdate(BaseModel):
-    title: str = Field(..., min_length=1, description="Title of the task request")
-    category: str = Field(..., min_length=1, description="Category of the task request (e.g. Construction, Electrical, General)")
-    priority: str = Field(..., min_length=1, description="Priority (LOW, MEDIUM, HIGH)")
+    title: str = Field(..., min_length=3, max_length=255, description="Title of the task request")
+    category: str = Field(..., min_length=3, max_length=100, description="Category of the task request (e.g. Construction, Electrical, General)")
+    priority: str = Field(..., min_length=3, max_length=20, description="Priority (LOW, MEDIUM, HIGH)")
     status: str = Field(..., min_length=1, description="Status (PENDING, APPROVED, REJECTED)")
-    description: Optional[str] = Field(default=None, description="Detailed description of the task request")
+    description: Optional[str] = Field(default=None, max_length=5000, description="Detailed description of the task request")
     attachment_url: Optional[str] = Field(default=None, description="Attachment URL or filename")
     assigned_to: Optional[int] = Field(default=None, description="User ID of assignee")
     is_deleted: Optional[bool] = Field(default=False, description="Soft delete flag")
@@ -643,7 +719,10 @@ class TaskRequestUpdate(BaseModel):
     def validate_non_empty(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("Field cannot be empty or whitespace only")
-        return v.strip()
+        v_stripped = v.strip()
+        if len(v_stripped) < 3:
+            raise ValueError("Field must be at least 3 characters")
+        return v_stripped
 
     @field_validator("status")
     @classmethod
@@ -664,6 +743,33 @@ class TaskRequestUpdate(BaseModel):
         if v_upper not in ("LOW", "MEDIUM", "HIGH"):
             raise ValueError("Priority must be one of: LOW, MEDIUM, HIGH")
         return v_upper
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_stripped = v.strip()
+        if not v_stripped or v_stripped.lower() in ("null", "undefined"):
+            return None
+        if len(v_stripped) > 5000:
+            raise ValueError("Description cannot exceed 5000 characters")
+        return v_stripped
+
+    @field_validator("attachment_url")
+    @classmethod
+    def validate_attachment_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_stripped = v.strip()
+        if not v_stripped or v_stripped.lower() in ("null", "undefined"):
+            return None
+        lower_v = v_stripped.lower()
+        if any(lower_v.startswith(s) for s in ("http:", "https:", "javascript:", "data:", "file:", "ftp:")):
+            raise ValueError("External URLs and script schemes are not allowed in attachment_url")
+        if not lower_v.startswith("/uploads/task_requests/"):
+            raise ValueError("attachment_url must be a valid server-managed task request attachment path")
+        return v_stripped
 
 
 # =========================================================

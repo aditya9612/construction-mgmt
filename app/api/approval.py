@@ -8,8 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db_session
 from app.models.approval import Approval
 from app.schemas.approval import ApprovalCreate, ApprovalOut, ApprovalAction
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.core.dependencies import require_permission
+from app.utils.common import assert_project_access
 from app.services.notification_service import create_notification
 from app.core.enums import DocumentStatus
 
@@ -169,6 +170,8 @@ async def verify_approval_entity_access(
             detail=f"{entity_type} not found",
         )
 
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+
     return entity
 
 
@@ -254,6 +257,72 @@ async def create_approval(
     return out
 
 
+async def _filter_approvals_for_user(db: AsyncSession, current_user: User, rows: list, is_sa: bool):
+    if is_sa or current_user.role in (UserRole.ADMIN.value, UserRole.ACCOUNTANT.value):
+        return rows
+
+    from app.models.project import ProjectMember, DrawingDocument
+    from app.models.boq import BOQ
+    from app.models.final_measurement import FinalMeasurement
+    from app.models.material import PurchaseOrder
+    from app.models.document import Document
+    from app.models.billing import RABill
+
+    user_project_ids = set(
+        (
+            await db.scalars(
+                select(ProjectMember.project_id).where(
+                    ProjectMember.user_id == current_user.id
+                )
+            )
+        ).all()
+    )
+
+    drawing_ids = [a.entity_id for a, _, _ in rows if a.entity_type == "drawing"]
+    boq_ids = [a.entity_id for a, _, _ in rows if a.entity_type == "boq"]
+    meas_ids = [a.entity_id for a, _, _ in rows if a.entity_type == "measurement"]
+    po_ids = [a.entity_id for a, _, _ in rows if a.entity_type == "purchase_order"]
+    doc_ids = [a.entity_id for a, _, _ in rows if a.entity_type == "document"]
+    bill_ids = [a.entity_id for a, _, _ in rows if a.entity_type == "bill"]
+
+    entity_project_map = {}
+    if drawing_ids:
+        res = await db.execute(select(DrawingDocument.id, DrawingDocument.project_id).where(DrawingDocument.id.in_(drawing_ids)))
+        for eid, pid in res.all():
+            entity_project_map[("drawing", eid)] = pid
+    if boq_ids:
+        res = await db.execute(select(BOQ.id, BOQ.project_id).where(BOQ.id.in_(boq_ids)))
+        for eid, pid in res.all():
+            entity_project_map[("boq", eid)] = pid
+    if meas_ids:
+        res = await db.execute(select(FinalMeasurement.id, FinalMeasurement.project_id).where(FinalMeasurement.id.in_(meas_ids)))
+        for eid, pid in res.all():
+            entity_project_map[("measurement", eid)] = pid
+    if po_ids:
+        res = await db.execute(select(PurchaseOrder.id, PurchaseOrder.project_id).where(PurchaseOrder.id.in_(po_ids)))
+        for eid, pid in res.all():
+            entity_project_map[("purchase_order", eid)] = pid
+    if doc_ids:
+        res = await db.execute(select(Document.id, Document.project_id).where(Document.id.in_(doc_ids)))
+        for eid, pid in res.all():
+            entity_project_map[("document", eid)] = pid
+    if bill_ids:
+        res = await db.execute(select(RABill.id, RABill.project_id).where(RABill.id.in_(bill_ids)))
+        for eid, pid in res.all():
+            entity_project_map[("bill", eid)] = pid
+
+    filtered_rows = []
+    for row in rows:
+        approval = row[0]
+        if approval.requested_by == current_user.id:
+            filtered_rows.append(row)
+        else:
+            proj_id = entity_project_map.get((approval.entity_type, approval.entity_id))
+            if proj_id is not None and proj_id in user_project_ids:
+                filtered_rows.append(row)
+    return filtered_rows
+
+
 @router.get("", response_model=list[ApprovalOut])
 async def list_approvals(
     db: AsyncSession = Depends(get_db_session),
@@ -281,6 +350,7 @@ async def list_approvals(
     stmt = stmt.order_by(Approval.id.desc())
     result = await db.execute(stmt)
     rows = result.all()
+    rows = await _filter_approvals_for_user(db, current_user, rows, is_sa)
 
     items = []
     for approval, req_name, app_name in rows:
@@ -327,6 +397,7 @@ async def export_approvals(
     stmt = stmt.order_by(Approval.id.desc())
     result = await db.execute(stmt)
     rows = result.all()
+    rows = await _filter_approvals_for_user(db, current_user, rows, is_sa)
 
     import io
     import csv

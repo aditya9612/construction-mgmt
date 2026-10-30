@@ -3593,14 +3593,16 @@ async def export_labour_payments(
     current_user: User = Depends(d.get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    from sqlalchemy.orm import selectinload
+
     labour_res = await db.execute(
-        select(Labour).where(Labour.user_id == current_user.id)
+        select(Labour)
+        .options(selectinload(Labour.labour_type))
+        .where(Labour.user_id == current_user.id)
     )
     labour = labour_res.scalars().first()
     if not labour:
         raise HTTPException(status_code=404, detail="Labour profile not found for user")
-
-    from sqlalchemy.orm import selectinload
 
     records_stmt = (
         select(LabourPayroll, Labour)
@@ -3687,79 +3689,271 @@ async def export_labour_payments(
             TableStyle,
             Spacer,
         )
-        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
-        from reportlab.lib.units import inch
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
         from fastapi.responses import StreamingResponse
+        from datetime import datetime
+
+        class NumberedCanvas(canvas.Canvas):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._saved_page_states = []
+
+            def showPage(self):
+                self._saved_page_states.append(dict(self.__dict__))
+                self._startPage()
+
+            def save(self):
+                num_pages = len(self._saved_page_states)
+                for state in self._saved_page_states:
+                    self.__dict__.update(state)
+                    self.draw_page_decorations(num_pages)
+                    super().showPage()
+                super().save()
+
+            def draw_page_decorations(self, page_count):
+                self.saveState()
+                self.setFont("Helvetica", 8)
+                self.setFillColor(colors.HexColor("#718096"))
+                self.drawString(36, 22, "Confidential - Labour Payment Statement | Construction Management ERP")
+                page_str = f"Page {self._pageNumber} of {page_count}"
+                self.drawRightString(letter[0] - 36, 22, page_str)
+                self.setStrokeColor(colors.HexColor("#CBD5E1"))
+                self.setLineWidth(0.5)
+                self.line(36, 32, letter[0] - 36, 32)
+                self.restoreState()
 
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(
             buffer,
             pagesize=letter,
-            rightMargin=30,
-            leftMargin=30,
-            topMargin=30,
-            bottomMargin=18,
+            rightMargin=36,
+            leftMargin=36,
+            topMargin=36,
+            bottomMargin=45,
         )
-        elements = []
+
         styles = getSampleStyleSheet()
-
-        elements.append(
-            Paragraph(
-                f"Labour Payments Report: {current_user.full_name}", styles["Heading1"]
-            )
+        title_style = ParagraphStyle(
+            "TitleStyle",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=16,
+            leading=20,
+            textColor=colors.HexColor("#0B2B5C"),
         )
-        elements.append(Spacer(1, 0.2 * inch))
-
-        data = [["ID", "Date", "Skill", "Wage", "OT", "Total", "Status"]]
-        for pr, lab in records:
-            date_str = (
-                pr.created_at.strftime("%d %b %Y")
-                if pr.created_at
-                else f"{pr.month}/{pr.year}"
-            )
-            skill_type = (
-                lab.skill_category.value
-                if hasattr(lab.skill_category, "value")
-                else str(lab.skill_category)
-            )
-            data.append(
-                [
-                    f"{pr.id:03d}",
-                    date_str,
-                    skill_type.capitalize()[:10],
-                    (
-                        f"₹{lab.daily_wage_rate}"
-                        if hasattr(lab, "daily_wage_rate") and lab.daily_wage_rate
-                        else "₹800"
-                    ),
-                    (
-                        f"{int(pr.total_overtime_hours)}h"
-                        if pr.total_overtime_hours
-                        else "0h"
-                    ),
-                    f"₹{pr.total_wage:,.0f}" if pr.total_wage else "₹0",
-                    pr.status.value if hasattr(pr.status, "value") else str(pr.status),
-                ]
-            )
-
-        t = Table(data)
-        t.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-                    ("BACKGROUND", (0, 1), (-1, -1), colors.beige),
-                    ("GRID", (0, 0), (-1, -1), 1, colors.black),
-                ]
-            )
+        meta_label_style = ParagraphStyle(
+            "MetaLabel",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#64748B"),
         )
-        elements.append(t)
-        doc.build(elements)
+        meta_value_style = ParagraphStyle(
+            "MetaValue",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=11,
+            textColor=colors.HexColor("#0F172A"),
+        )
+        cell_style = ParagraphStyle(
+            "Cell",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#1E293B"),
+        )
+        cell_bold = ParagraphStyle(
+            "CellBold",
+            parent=cell_style,
+            fontName="Helvetica-Bold",
+        )
+        cell_right = ParagraphStyle(
+            "CellRight",
+            parent=cell_style,
+            alignment=TA_RIGHT,
+        )
+        cell_center = ParagraphStyle(
+            "CellCenter",
+            parent=cell_style,
+            alignment=TA_CENTER,
+        )
+
+        elements = []
+
+        # Header Title
+        elements.append(Paragraph("LABOUR PAYMENT REPORT", title_style))
+        elements.append(Paragraph(f"<font size=8 color='#64748B'>Disbursement and payroll statement &bull; Generated: {datetime.now().strftime('%d-%b-%Y %I:%M %p')}</font>", styles["Normal"]))
+        elements.append(Spacer(1, 10))
+
+        # Metadata computation
+        skill_val = (
+            labour.skill_category.value
+            if hasattr(labour.skill_category, "value")
+            else str(labour.skill_category or "General")
+        )
+        skill_display = skill_val.capitalize()
+        daily_wage = (
+            labour.daily_wage_rate
+            if hasattr(labour, "daily_wage_rate") and labour.daily_wage_rate
+            else (labour.custom_daily_wage_rate or (labour.labour_type.default_daily_wage if labour.labour_type else 0) or 0)
+        )
+        if month and year:
+            period_display = f"{month:02d}/{year}"
+        elif year:
+            period_display = f"Year {year}"
+        elif time_filter:
+            period_display = time_filter.replace("_", " ").title()
+        else:
+            period_display = "All Time"
+
+        worker_info = [
+            [
+                Paragraph("Worker Name:", meta_label_style),
+                Paragraph(labour.labour_name or current_user.full_name or "N/A", meta_value_style),
+                Paragraph("Worker Code:", meta_label_style),
+                Paragraph(labour.worker_code or "N/A", meta_value_style),
+            ],
+            [
+                Paragraph("Skill Category:", meta_label_style),
+                Paragraph(skill_display, meta_value_style),
+                Paragraph("Daily Wage:", meta_label_style),
+                Paragraph(f"Rs. {daily_wage:,.2f}", meta_value_style),
+            ],
+            [
+                Paragraph("Contact:", meta_label_style),
+                Paragraph(labour.mobile_number or current_user.mobile_number or "N/A", meta_value_style),
+                Paragraph("Period:", meta_label_style),
+                Paragraph(period_display, meta_value_style),
+            ]
+        ]
+        t_worker = Table(worker_info, colWidths=[85, 185, 85, 185])
+        t_worker.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E2E8F0")),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(t_worker)
+        elements.append(Spacer(1, 10))
+
+        # KPI Summary Cards
+        total_ot_hours = sum(float(pr.total_overtime_hours or 0) for pr, _ in records)
+        total_wage_sum = sum(float(pr.total_wage or 0) for pr, _ in records)
+
+        kpi_data = [
+            [
+                Paragraph(f"<font size=7 color='#64748B'>TOTAL RECORDS</font><br/><b><font size=12 color='#0B2B5C'>{len(records)}</font></b>", cell_center),
+                Paragraph(f"<font size=7 color='#64748B'>TOTAL OT HOURS</font><br/><b><font size=12 color='#0B2B5C'>{total_ot_hours:.1f} hrs</font></b>", cell_center),
+                Paragraph(f"<font size=7 color='#64748B'>TOTAL WAGE EARNED</font><br/><b><font size=12 color='#0B2B5C'>Rs. {total_wage_sum:,.2f}</font></b>", cell_center),
+            ]
+        ]
+        t_kpi = Table(kpi_data, colWidths=[180, 180, 180])
+        t_kpi.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F1F5F9")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        elements.append(t_kpi)
+        elements.append(Spacer(1, 12))
+
+        # Table or Empty Message
+        if not records:
+            elements.append(
+                Paragraph("<font color='#64748B'><i>No payment records found for the selected period.</i></font>", styles["Normal"])
+            )
+        else:
+            table_data = [
+                [
+                    Paragraph("<font color='white'><b>ID</b></font>", cell_center),
+                    Paragraph("<font color='white'><b>Date / Period</b></font>", cell_center),
+                    Paragraph("<font color='white'><b>Skill Type</b></font>", cell_style),
+                    Paragraph("<font color='white'><b>Daily Wage</b></font>", cell_right),
+                    Paragraph("<font color='white'><b>OT Hours</b></font>", cell_center),
+                    Paragraph("<font color='white'><b>Total Wage</b></font>", cell_right),
+                    Paragraph("<font color='white'><b>Status</b></font>", cell_center),
+                    Paragraph("<font color='white'><b>Remarks</b></font>", cell_style),
+                ]
+            ]
+            for pr, lab in records:
+                date_str = (
+                    pr.created_at.strftime("%d %b %Y")
+                    if pr.created_at
+                    else f"{pr.month:02d}/{pr.year}"
+                )
+                row_skill = (
+                    lab.skill_category.value
+                    if hasattr(lab.skill_category, "value")
+                    else str(lab.skill_category or "")
+                )
+                row_wage = (
+                    lab.daily_wage_rate
+                    if hasattr(lab, "daily_wage_rate") and lab.daily_wage_rate
+                    else daily_wage
+                )
+                ot_hrs = float(pr.total_overtime_hours or 0)
+                tot_wage = float(pr.total_wage or 0)
+                status_str = pr.status.value if hasattr(pr.status, "value") else str(pr.status or "")
+                rem_str = pr.remarks or ("STANDARD PAYOUT" if status_str == "PAID" else "PENDING")
+
+                table_data.append([
+                    Paragraph(f"{pr.id:03d}", cell_center),
+                    Paragraph(date_str, cell_center),
+                    Paragraph(row_skill.capitalize()[:15], cell_style),
+                    Paragraph(f"Rs. {row_wage:,.2f}", cell_right),
+                    Paragraph(f"{ot_hrs:.1f}h", cell_center),
+                    Paragraph(f"Rs. {tot_wage:,.2f}", cell_right),
+                    Paragraph(status_str, cell_center),
+                    Paragraph(rem_str[:30], cell_style),
+                ])
+
+            # Grand total summary row
+            table_data.append([
+                Paragraph("<b>GRAND TOTAL</b>", cell_bold),
+                Paragraph("", cell_style),
+                Paragraph("", cell_style),
+                Paragraph("", cell_style),
+                Paragraph(f"<b>{total_ot_hours:.1f}h</b>", cell_center),
+                Paragraph(f"<b>Rs. {total_wage_sum:,.2f}</b>", cell_right),
+                Paragraph("", cell_style),
+                Paragraph("", cell_style),
+            ])
+
+            col_widths = [30, 70, 70, 65, 45, 80, 60, 120]
+            t = Table(table_data, colWidths=col_widths, repeatRows=1)
+            t_styles = [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B2B5C")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("GRID", (0, 0), (-1, -2), 0.5, colors.HexColor("#E2E8F0")),
+                ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#E2E8F0")),
+                ("LINEABOVE", (0, -1), (-1, -1), 1.5, colors.HexColor("#0B2B5C")),
+                ("SPAN", (0, -1), (3, -1)),
+            ]
+            for idx in range(1, len(table_data) - 1):
+                bg_color = colors.HexColor("#FFFFFF") if idx % 2 == 1 else colors.HexColor("#F8FAFC")
+                t_styles.append(("BACKGROUND", (0, idx), (-1, idx), bg_color))
+
+            t.setStyle(TableStyle(t_styles))
+            elements.append(t)
+
+        doc.build(elements, canvasmaker=NumberedCanvas)
         buffer.seek(0)
         return StreamingResponse(
             buffer,

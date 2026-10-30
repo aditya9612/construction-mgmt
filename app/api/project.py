@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 import json
 import mimetypes
-import pathlib, re, io, os, uuid
+import pathlib, re, io, os, uuid, zipfile
 from ezdxf import colors
 from openpyxl import Workbook
 from typing import Annotated, List, Optional, Union
@@ -4465,6 +4465,42 @@ async def list_task_progress_history(
     )
 
 
+def _validate_file_signature(content: bytes, ext: str) -> None:
+    ext_lower = ext.lower()
+    if ext_lower == ".pdf":
+        if not content.startswith(b"%PDF-"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid PDF file signature")
+    elif ext_lower == ".png":
+        if not content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid PNG file signature")
+    elif ext_lower in (".jpg", ".jpeg"):
+        if not content.startswith(b"\xff\xd8\xff"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JPEG file signature")
+    elif ext_lower == ".webp":
+        if not (content.startswith(b"RIFF") and len(content) >= 12 and content[8:12] == b"WEBP"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid WebP file signature")
+    elif ext_lower in (".docx", ".xlsx"):
+        if not content.startswith(b"PK\x03\x04"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Office document signature")
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                if "[Content_Types].xml" not in zf.namelist():
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Office OpenXML document")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed Office document archive")
+    elif ext_lower in (".doc", ".xls"):
+        if not content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Microsoft Office file signature")
+    elif ext_lower == ".txt":
+        if b"\x00" in content[:1024]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid text file: binary characters detected")
+        stripped_prefix = content[:100].lstrip().lower()
+        if stripped_prefix.startswith((b"<html", b"<!doctype", b"<?xml", b"<svg", b"<script")):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid text file: HTML/XML script content not allowed")
+
+
 @tasks_router.post(
     "/task-requests",
     response_model=s.TaskRequestResponse,
@@ -4479,28 +4515,63 @@ async def create_task_request(
     await _get_scoped_project(db, project_id=request.project_id, current_user=current_user, load_relations=False)
 
     attachment_url = None
+    newly_saved_path = None
 
-    if form.attachment and form.attachment.filename and form.attachment.filename.strip():
+    uploaded_file = form.attachment or getattr(form, "file", None)
+    if uploaded_file and uploaded_file.filename and uploaded_file.filename.strip():
+        raw_name = os.path.basename(uploaded_file.filename.strip())
+        _, ext = os.path.splitext(raw_name)
+        allowed_exts = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".doc", ".docx", ".xls", ".xlsx", ".txt"}
+        if ext.lower() not in allowed_exts:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file extension. Allowed extensions are: {', '.join(sorted(allowed_exts))}",
+            )
+        content = await uploaded_file.read()
+        if len(content) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file cannot be empty",
+            )
+        if len(content) > 15 * 1024 * 1024:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File size exceeds maximum allowed limit (15MB)",
+            )
+        _validate_file_signature(content, ext)
+
         try:
             os.makedirs("uploads/task_requests", exist_ok=True)
-            safe_filename = form.attachment.filename.replace(" ", "_")
-            unique_name = f"{uuid4().hex[:8]}_{safe_filename}"
+            safe_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw_name)
+            unique_name = f"{uuid.uuid4().hex}_{safe_filename}"
             file_path = os.path.join("uploads/task_requests", unique_name)
-            content = await form.attachment.read()
             with open(file_path, "wb") as f:
                 f.write(content)
+            newly_saved_path = file_path
             attachment_url = f"/uploads/task_requests/{unique_name}"
-        except Exception:
-            attachment_url = form.attachment.filename
+        except Exception as exc:
+            logger.exception(f"Failed to save task request attachment: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to save attachment file",
+            )
 
     data = request.model_dump(exclude={"attachment_url"})
     data["attachment_url"] = attachment_url
 
     db_obj = m.TaskRequest(**data)
 
-    db.add(db_obj)
-    await db.commit()
-    await db.refresh(db_obj)
+    try:
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+    except Exception:
+        if newly_saved_path and os.path.exists(newly_saved_path):
+            try:
+                os.remove(newly_saved_path)
+            except Exception as rm_err:
+                logger.warning(f"Failed to clean up newly saved attachment {newly_saved_path}: {rm_err}")
+        raise
 
     return db_obj
 
@@ -4564,6 +4635,41 @@ async def list_task_requests(
     )
 
 
+@tasks_router.get("/task-requests/{task_request_id}/attachment")
+async def download_task_request_attachment(
+    task_request_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("tasks.view")),
+):
+    req = await _get_scoped_task_request(db, task_request_id, current_user, for_update=False)
+    await assert_project_access(db, project_id=req.project_id, current_user=current_user)
+
+    if not req.attachment_url:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task request has no attachment")
+
+    base_dir = pathlib.Path("uploads/task_requests").resolve()
+    clean_rel = req.attachment_url.lstrip("/")
+    target_path = pathlib.Path(clean_rel).resolve()
+
+    try:
+        if not target_path.is_relative_to(base_dir) or not target_path.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment file not found on disk")
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment file not found on disk")
+
+    safe_filename = target_path.name
+
+    return FileResponse(
+        path=str(target_path),
+        filename=safe_filename,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @tasks_router.put("/task-requests/{request_id}", response_model=s.TaskRequestResponse)
 async def update_task_request(
     request_id: int,
@@ -4572,6 +4678,7 @@ async def update_task_request(
     current_user: User = Depends(require_permission("tasks.edit")),
 ):
     db_obj = await _get_scoped_task_request(db, request_id, current_user, for_update=True)
+    await assert_project_access(db, project_id=db_obj.project_id, current_user=current_user)
 
     update_data = request.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -4589,6 +4696,7 @@ async def delete_task_request(
     current_user: User = Depends(require_permission("tasks.delete")),
 ):
     db_obj = await _get_scoped_task_request(db, request_id, current_user, for_update=True)
+    await assert_project_access(db, project_id=db_obj.project_id, current_user=current_user)
 
     # Soft delete
     db_obj.is_deleted = True
@@ -9234,6 +9342,7 @@ async def create_folder(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("drawings.create")),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     obj = m.DrawingDocument(
         project_id=project_id,
         drawing_name=data.folder_name,
@@ -9268,6 +9377,7 @@ async def upload_drawing(
     current_user: User = Depends(require_permission("drawings.upload")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     try:
         drawing_name = validate_drawing_name(drawing_name)
     except ValueError as e:
@@ -9453,6 +9563,8 @@ async def update_drawing(
     if not obj:
         raise NotFoundError("Drawing not found")
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     # ================= LOCK APPROVED DRAWINGS =================
 
     if obj.approval_status == DocumentStatus.APPROVED:
@@ -9530,6 +9642,8 @@ async def get_drawing_approval_history(
     if not drawing:
         raise NotFoundError("Drawing not found")
 
+    await assert_project_access(db, project_id=drawing.project_id, current_user=current_user)
+
     Requester = aliased(User, name="requester")
     Approver = aliased(User, name="approver")
 
@@ -9582,6 +9696,7 @@ async def list_drawings(
     current_user: User = Depends(require_permission("drawings.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     stmt = select(m.DrawingDocument).where(m.DrawingDocument.project_id == project_id)
     count_stmt = (
         select(func.count())
@@ -9641,6 +9756,8 @@ async def get_versions(
     skip: int = 0,
     limit: int = 50,
 ):
+    if project_id is not None:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
     query = select(m.DrawingDocument)
     if project_id is not None:
         query = query.where(m.DrawingDocument.project_id == project_id)
@@ -9676,6 +9793,8 @@ async def get_latest(
     project_id: Optional[int] = None,
     parent_id: Optional[int] = Query(None),
 ):
+    if project_id is not None:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
     query = select(m.DrawingDocument).where(
         m.DrawingDocument.is_latest_version == True,
     )
@@ -9716,6 +9835,8 @@ async def delete_drawing(
     if not obj:
         raise NotFoundError("Drawing not found")
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     if obj.file_url and os.path.exists(obj.file_url):
         os.remove(obj.file_url)
 
@@ -9747,6 +9868,8 @@ async def download_document(
     if not doc:
         raise NotFoundError("Document not found")
 
+    await assert_project_access(db, project_id=doc.project_id, current_user=current_user)
+
     if not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
@@ -9770,6 +9893,8 @@ async def view_document(
 
     if not doc:
         raise NotFoundError("Document not found")
+
+    await assert_project_access(db, project_id=doc.project_id, current_user=current_user)
 
     if not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
