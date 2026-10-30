@@ -607,6 +607,8 @@ class TaskRequestCreateForm:
         description: Optional[str] = Form(None, description="Detailed description of the task request"),
         assigned_to: Optional[int] = Form(None, description="User ID to assign to"),
         attachment: Optional[UploadFile] = File(None, description="Attachment file"),
+        file: Optional[UploadFile] = File(None, description="Attachment file (alias)"),
+        attachment_url: Optional[str] = Form(None, description="Attachment URL or filename"),
     ):
         self.project_id = project_id
         self.title = title
@@ -614,7 +616,9 @@ class TaskRequestCreateForm:
         self.priority = priority
         self.description = description
         self.assigned_to = assigned_to
-        self.attachment = attachment
+        self.attachment = attachment or file
+        self.file = file
+        self.attachment_url = attachment_url
 
     def to_schema(self) -> TaskRequestCreate:
         clean_title = self.title.strip() if self.title else ""
@@ -635,12 +639,17 @@ class TaskRequestCreateForm:
         if clean_desc in ("", "null", "undefined"):
             clean_desc = None
 
+        clean_att_url = self.attachment_url.strip() if self.attachment_url else None
+        if clean_att_url in ("", "null", "undefined"):
+            clean_att_url = None
+
         return TaskRequestCreate(
             project_id=self.project_id,
             title=clean_title,
             category=clean_category,
             priority=clean_priority,
             description=clean_desc,
+            attachment_url=clean_att_url,
             assigned_to=self.assigned_to,
         )
 

@@ -4478,20 +4478,38 @@ async def create_task_request(
     request = form.to_schema()
     await _get_scoped_project(db, project_id=request.project_id, current_user=current_user, load_relations=False)
 
-    attachment_url = None
+    attachment_url = request.attachment_url
 
-    if form.attachment and form.attachment.filename and form.attachment.filename.strip():
+    uploaded_file = form.attachment or getattr(form, "file", None)
+    if uploaded_file and uploaded_file.filename and uploaded_file.filename.strip():
+        raw_name = os.path.basename(uploaded_file.filename.strip())
+        _, ext = os.path.splitext(raw_name)
+        allowed_exts = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".doc", ".docx", ".xls", ".xlsx", ".txt"}
+        if ext.lower() not in allowed_exts:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file extension. Allowed extensions are: {', '.join(sorted(allowed_exts))}",
+            )
+        content = await uploaded_file.read()
+        if len(content) > 15 * 1024 * 1024:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File size exceeds maximum allowed limit (15MB)",
+            )
         try:
             os.makedirs("uploads/task_requests", exist_ok=True)
-            safe_filename = form.attachment.filename.replace(" ", "_")
-            unique_name = f"{uuid4().hex[:8]}_{safe_filename}"
+            safe_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw_name)
+            unique_name = f"{uuid.uuid4().hex[:8]}_{safe_filename}"
             file_path = os.path.join("uploads/task_requests", unique_name)
-            content = await form.attachment.read()
             with open(file_path, "wb") as f:
                 f.write(content)
             attachment_url = f"/uploads/task_requests/{unique_name}"
-        except Exception:
-            attachment_url = form.attachment.filename
+        except Exception as exc:
+            logger.exception(f"Failed to save task request attachment: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to save attachment file",
+            )
 
     data = request.model_dump(exclude={"attachment_url"})
     data["attachment_url"] = attachment_url
