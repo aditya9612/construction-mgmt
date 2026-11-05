@@ -5881,6 +5881,7 @@ async def equipment_full_pdf_report(
             Paragraph,
             Spacer,
             Image,
+            KeepTogether,
         )
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
@@ -5902,7 +5903,7 @@ async def equipment_full_pdf_report(
             rightMargin=cm,
             leftMargin=cm,
             topMargin=cm,
-            bottomMargin=cm,
+            bottomMargin=2.2 * cm,
         )
 
         styles = getSampleStyleSheet()
@@ -6393,7 +6394,7 @@ async def equipment_full_pdf_report(
         )
 
         # ── 8. COST SUMMARY ────────────────────────────────────────────────
-        elements.append(Paragraph("8. COST SUMMARY", heading2_style))
+        cost_heading = Paragraph("8. COST SUMMARY", heading2_style)
         cost_data = [
             [
                 Paragraph("<b>Total Maintenance Cost</b>", bold_style),
@@ -6421,7 +6422,7 @@ async def equipment_full_pdf_report(
                 ]
             )
         )
-        elements.append(cost_table)
+        elements.append(KeepTogether([cost_heading, Spacer(1, 4), cost_table]))
 
         # ── FOOTER (signature lines — identical to sample) ───────────────
         def add_footer(canvas, doc_):

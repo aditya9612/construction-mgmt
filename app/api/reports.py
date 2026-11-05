@@ -1443,11 +1443,17 @@ async def export_issues_excel(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+
     query = (
         select(m.Issue, m.Project, User)
         .join(m.Project, m.Issue.project_id == m.Project.id)
         .outerjoin(User, m.Issue.assigned_to == User.id)
     )
+
+    if current_user.company_id is not None and not getattr(current_user, "is_super_admin", False):
+        query = query.where(m.Project.company_id == current_user.company_id)
 
     if project_id:
         query = query.where(m.Issue.project_id == project_id)
@@ -1477,6 +1483,9 @@ async def export_issues_excel(
         "Resolution Notes",
     ]
     rows = []
+    open_count = 0
+    resolved_count = 0
+    high_priority_count = 0
     for issue, project, user in issues:
         assigned_name = user.full_name if user else "Unassigned"
         rows.append(
@@ -1506,8 +1515,21 @@ async def export_issues_excel(
             ]
         )
 
+        status_val = str(getattr(issue.status, "value", issue.status)).upper()
+        if status_val in ("OPEN", "IN_PROGRESS"):
+            open_count += 1
+        elif status_val in ("RESOLVED", "CLOSED"):
+            resolved_count += 1
+
+        priority_val = str(getattr(issue.priority, "value", issue.priority)).upper()
+        if priority_val in ("HIGH", "CRITICAL"):
+            high_priority_count += 1
+
     eb = ExcelReportBuilder("Site Issue Log")
     eb.add_summary_row("Total Issues", len(rows))
+    eb.add_summary_row("Open Issues", open_count)
+    eb.add_summary_row("Resolved Issues", resolved_count)
+    eb.add_summary_row("High Priority Issues", high_priority_count)
     eb.build_summary_sheet()
     eb.add_data_sheet("Site Issue Log", headers, rows)
 
@@ -2035,6 +2057,14 @@ async def export_profit_loss_pdf(
     current_user: User = Depends(require_roles(REPORT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session),
 ):
+    project_name = "All Projects"
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        project = await db.get(m.Project, project_id)
+        if not project or (current_user.company_id is not None and project.company_id != current_user.company_id):
+            raise NotFoundError("Project not found")
+        project_name = project.project_name
+
     inv_query = select(Invoice)
     exp_query = select(Expense)
 
@@ -2096,7 +2126,7 @@ async def export_profit_loss_pdf(
             "Generated",
             str(date.today()),
             "Project",
-            str(project_id) if project_id else "All Projects",
+            project_name,
         )
     ]
     b.add_info_table(info_bits)
