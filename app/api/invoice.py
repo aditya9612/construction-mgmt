@@ -622,14 +622,7 @@ async def mark_paid(
 # ------------------ 11. GENERATE INVOICE PDF ------------------
 
 
-@router.get("/{id}/pdf")
-async def generate_invoice_pdf(
-    id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_permission("invoices.export")),
-):
-    obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
-
+def render_invoice_pdf_response(obj: Invoice) -> StreamingResponse:
     # Register Unicode font (₹ support)
     if "DejaVu" not in pdfmetrics.getRegisteredFontNames():
         from pathlib import Path
@@ -653,10 +646,12 @@ async def generate_invoice_pdf(
     elements.append(Spacer(1, 12))
 
     # Details
-    elements.append(Paragraph(f"Type: {obj.type.value}", styles["Normal"]))
+    type_val = obj.type.value if hasattr(obj.type, "value") else str(obj.type)
+    elements.append(Paragraph(f"Type: {type_val}", styles["Normal"]))
 
     if obj.source_type:
-        elements.append(Paragraph(f"Source: {obj.source_type.value}", styles["Normal"]))
+        source_val = obj.source_type.value if hasattr(obj.source_type, "value") else str(obj.source_type)
+        elements.append(Paragraph(f"Source: {source_val}", styles["Normal"]))
 
     elements.append(Paragraph(f"Amount: ₹{float(obj.amount or 0):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
@@ -670,8 +665,9 @@ async def generate_invoice_pdf(
     )
     elements.append(Spacer(1, 4))
     # Status
+    status_val = obj.status.value if hasattr(obj.status, "value") else str(obj.status)
     elements.append(
-        Paragraph(f"Status: {obj.status.value.capitalize()}", styles["Normal"])
+        Paragraph(f"Status: {status_val.capitalize()}", styles["Normal"])
     )
 
     doc.build(elements)
@@ -682,6 +678,16 @@ async def generate_invoice_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=invoice_{obj.id}.pdf"},
     )
+
+
+@router.get("/{id}/pdf")
+async def generate_invoice_pdf(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("invoices.export")),
+):
+    obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    return render_invoice_pdf_response(obj)
 
 
 async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
