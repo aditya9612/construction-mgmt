@@ -236,12 +236,17 @@ async def create_labour(
                     "user",
                     "contractor",
                     "labour_type",
+                    "projects",
                 ],
             )
 
+            await r.bump_cache_version(redis, VERSION_KEY)
             await r.bump_cache_version(redis, "dashboard_version")
 
-            return s.LabourOut.model_validate(obj)
+            out = s.LabourOut.model_validate(obj)
+            if project_id and out.project_id is None:
+                out.project_id = project_id
+            return out
 
         except IntegrityError as e:
             await db.rollback()
@@ -296,6 +301,7 @@ async def list_labour(
                 selectinload(Labour.user),
                 selectinload(Labour.contractor),
                 selectinload(Labour.labour_type),
+                selectinload(Labour.projects),
             )
         )
         .where(Labour.company_id == current_user.company_id)
@@ -2153,6 +2159,7 @@ async def export_excel(
 
     data = [
         {
+            "Sr. No.": idx,
             "Name": r.labour_name,
             "Skill": (
                 r.skill_category.value
@@ -2161,7 +2168,7 @@ async def export_excel(
             ),
             "Wage": float(r.effective_daily_wage or 0),
         }
-        for r in rows
+        for idx, r in enumerate(rows, 1)
     ]
 
     df = pd.DataFrame(data)
@@ -2819,6 +2826,7 @@ async def get_labour(
             selectinload(Labour.user),
             selectinload(Labour.contractor),
             selectinload(Labour.labour_type),
+            selectinload(Labour.projects),
         )
         .where(Labour.id == labour_id)
     )
@@ -2858,6 +2866,8 @@ async def get_labour(
             raise PermissionDeniedError("No access to this labour")
 
     out = s.LabourOut.model_validate(obj, from_attributes=True)
+    if project_ids and out.project_id is None:
+        out.project_id = project_ids[0]
 
     await r.cache_set_json(redis, cache_key, out.model_dump())
 
