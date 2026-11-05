@@ -5881,6 +5881,7 @@ async def equipment_full_pdf_report(
             Paragraph,
             Spacer,
             Image,
+            KeepTogether,
         )
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
@@ -5902,7 +5903,7 @@ async def equipment_full_pdf_report(
             rightMargin=cm,
             leftMargin=cm,
             topMargin=cm,
-            bottomMargin=cm,
+            bottomMargin=2.2 * cm,
         )
 
         styles = getSampleStyleSheet()
@@ -6393,7 +6394,7 @@ async def equipment_full_pdf_report(
         )
 
         # ── 8. COST SUMMARY ────────────────────────────────────────────────
-        elements.append(Paragraph("8. COST SUMMARY", heading2_style))
+        cost_heading = Paragraph("8. COST SUMMARY", heading2_style)
         cost_data = [
             [
                 Paragraph("<b>Total Maintenance Cost</b>", bold_style),
@@ -6421,7 +6422,7 @@ async def equipment_full_pdf_report(
                 ]
             )
         )
-        elements.append(cost_table)
+        elements.append(KeepTogether([cost_heading, Spacer(1, 4), cost_table]))
 
         # ── FOOTER (signature lines — identical to sample) ───────────────
         def add_footer(canvas, doc_):
@@ -7287,9 +7288,18 @@ async def generate_rental_out_invoice(
     from app.models.invoice import Invoice, InvoiceType, InvoiceStatus
     from datetime import date
 
+    # Verify equipment tenant isolation and project authorization
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
+
     rental = await db.get(EquipmentRental, rental_id)
-    if not rental or rental.equipment_id != equipment_id:
+    if not rental or rental.equipment_id != equipment.id:
         raise HTTPException(status_code=404, detail="Rental not found")
+
+    if rental.project_id is not None:
+        try:
+            await assert_project_access(db, project_id=rental.project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Rental not found")
 
     if not rental.is_completed:
         raise HTTPException(status_code=400, detail="Cannot invoice an active rental. Complete it first.")
@@ -7338,3 +7348,42 @@ async def generate_rental_out_invoice(
     await db.commit()
 
     return {"status": "success", "invoice_id": invoice.id}
+
+
+@router.get("/{equipment_id}/rental-out/{rental_id}/invoice")
+async def get_rental_out_invoice(
+    equipment_id: int,
+    rental_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("equipment.view")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from app.models.invoice import Invoice
+    from app.api.invoice import render_invoice_pdf_response
+
+    # Verify equipment tenant isolation and project authorization
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
+
+    rental = await db.get(EquipmentRental, rental_id)
+    if not rental or rental.equipment_id != equipment.id:
+        raise HTTPException(status_code=404, detail="Rental not found")
+
+    if rental.project_id is not None:
+        try:
+            await assert_project_access(db, project_id=rental.project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Rental not found")
+
+    if rental.invoice_id is None:
+        raise HTTPException(status_code=404, detail="Invoice not generated for this rental")
+
+    invoice = await db.get(Invoice, rental.invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None:
+        if invoice.company_id is not None and invoice.company_id != current_user.company_id:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+    return render_invoice_pdf_response(invoice)
