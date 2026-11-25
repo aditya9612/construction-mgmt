@@ -6,6 +6,7 @@ from sqlalchemy.orm import selectinload
 from typing import List, Optional
 import io
 import csv
+import json
 import uuid
 import logging
 from datetime import date, timedelta
@@ -781,10 +782,14 @@ async def export_recurring_journals(
         writer = csv.writer(buffer)
         writer.writerow(["Template Name", "Frequency", "Next Run Date", "Amount", "Status"])
         for j in journals:
+            t_data = j.template_data
+            if isinstance(t_data, str):
+                t_data = json.loads(t_data)
+
             amount = sum(
                 line.get("debit", 0)
-                for line in j.template_data.get("lines", [])
-            ) if j.template_data else 0
+                for line in t_data.get("lines", [])
+            ) if t_data else 0
             writer.writerow([
                 j.template_name,
                 j.frequency,
@@ -843,6 +848,9 @@ async def run_due_recurring_journals(
                 continue
 
             data = r.template_data or {}
+            if isinstance(data, str):
+                data = json.loads(data)
+
             template_lines = data.get("lines", [])
 
             # Validate template account ownership before creating any JournalEntry

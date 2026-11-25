@@ -115,10 +115,21 @@ class Labour(Base, TimestampMixin):
     notes: Mapped[Optional[str]] = mapped_column(String(500))
 
     #  NEW RELATION
-    projects = relationship("LabourProject", backref="labour", cascade="all, delete")
+    projects = relationship(
+        "LabourProject",
+        backref="labour",
+        cascade="all, delete",
+        lazy="selectin",
+    )
     contractor = relationship("Contractor")
     labour_type = relationship("LabourType")
     user = relationship("User")
+
+    @property
+    def project_id(self) -> Optional[int]:
+        if self.projects:
+            return max(self.projects, key=lambda p: p.id or 0).project_id
+        return None
 
     @property
     def contractor_name(self) -> Optional[str]:

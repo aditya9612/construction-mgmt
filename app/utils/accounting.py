@@ -70,27 +70,38 @@ async def get_primary_cash_account(
 ) -> Account:
     """
     Resolves the primary cash account for the system/tenant.
-    Requires company_id; zero cross-tenant fallback.
+    1. Checks CompanySettings.primary_cash_account_id (filtered by company_id if provided)
+    2. Falls back to Account with code 'CASH'
+    3. Raises ValueError if missing
     """
     from app.models.settings import CompanySettings
 
-    if company_id is None:
-        raise ValueError("Company context is required to resolve primary cash account.")
+    stmt = select(CompanySettings)
+    if company_id is not None:
+        stmt = stmt.where(CompanySettings.company_id == company_id)
 
-    settings = await db.scalar(
-        select(CompanySettings).where(CompanySettings.company_id == company_id)
-    )
-    if not settings:
-        raise ValueError(f"CompanySettings not configured for company {company_id}.")
+    settings = await db.scalar(stmt)
+    if not settings and company_id is not None:
+        settings = await db.scalar(select(CompanySettings))
 
-    if settings.primary_cash_account_id:
+    if settings and settings.primary_cash_account_id:
         cash_acc = await db.get(Account, settings.primary_cash_account_id)
         if cash_acc:
-            if cash_acc.company_id is not None and cash_acc.company_id != company_id:
+            if company_id is not None and cash_acc.company_id is not None and cash_acc.company_id != company_id:
                 raise ValueError("Configured primary cash account belongs to a different tenant.")
             return cash_acc
 
-    raise ValueError(f"Primary Cash Account is not configured for company {company_id}.")
+    # Fallback to standard Cash account by code
+    cash_by_code_stmt = select(Account).where(Account.code == "CASH")
+    if company_id is not None:
+        cash_by_code_stmt = cash_by_code_stmt.where(Account.company_id == company_id)
+    cash_acc = await db.scalar(cash_by_code_stmt)
+    if not cash_acc and company_id is not None:
+        cash_acc = await db.scalar(select(Account).where(Account.code == "CASH"))
+    if cash_acc:
+        return cash_acc
+
+    raise ValueError(f"Primary Cash Account is not configured{' for company ' + str(company_id) if company_id else ''}.")
 
 
 async def get_petty_cash_account(

@@ -1,0 +1,505 @@
+from io import BytesIO
+import os
+from datetime import datetime
+
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image,
+    KeepTogether,
+)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib import colors
+
+from app.models.settings import CompanySettings
+
+
+def create_styled_table(data, col_widths, highlight_last_row=False):
+    table = Table(data, colWidths=col_widths, hAlign='LEFT')
+
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING", (0, 0), (-1, 0), 6),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
+        ("TOPPADDING", (0, 1), (-1, -1), 4),
+    ]
+
+    for row in range(1, len(data)):
+        if row % 2 == 0:
+            style.append(("BACKGROUND", (0, row), (-1, row), colors.HexColor("#F2F6FA")))
+
+    if highlight_last_row and len(data) > 1:
+        last = len(data) - 1
+        style.extend(
+            [
+                ("BACKGROUND", (0, last), (-1, last), colors.HexColor("#D9EAD3")),
+                ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
+            ]
+        )
+
+    table.setStyle(TableStyle(style))
+    return table
+
+
+
+from reportlab.platypus.flowables import Flowable
+
+class AbsoluteFooter(Flowable):
+    def __init__(self, table, x, y, width):
+        Flowable.__init__(self)
+        self.table = table
+        self.x = x
+        self.y = y
+        self.doc_width = width
+        
+    def wrap(self, availWidth, availHeight):
+        return (0, 0)
+        
+    def draw(self):
+        self.canv.saveState()
+        abs_x, abs_y = self.canv.absolutePosition(0, 0)
+        self.table.wrapOn(self.canv, self.doc_width, 80)
+        self.table.drawOn(self.canv, self.x - abs_x, self.y - abs_y)
+        self.canv.restoreState()
+
+def generate_dummy_quotation_pdf(
+    data: dict, company_settings: CompanySettings | None = None
+) -> BytesIO:
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=20,
+        rightMargin=20,
+        topMargin=100,
+        bottomMargin=20,
+    )
+
+    styles = getSampleStyleSheet()
+    elements = []
+
+    title_style = ParagraphStyle(
+        "QuotationTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=22,
+        leading=26,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#1F4E79"),
+        spaceAfter=10,
+    )
+
+    logo_path = None
+    if company_settings and company_settings.company_logo:
+        if os.path.exists(company_settings.company_logo):
+            logo_path = company_settings.company_logo
+
+    title_para = Paragraph("<b>QUOTATION</b>", title_style)
+
+    # Quotation Info for Header Right Side
+    quotation_no = data.get("dummy_quotation_no", "PREVIEW")
+    created_at = data.get("created_at")
+    if created_at:
+        if isinstance(created_at, str):
+            try:
+                date_str = datetime.fromisoformat(created_at).strftime("%d-%m-%Y")
+            except ValueError:
+                date_str = created_at
+        else:
+            date_str = created_at.strftime("%d-%m-%Y")
+    else:
+        date_str = datetime.now().strftime("%d-%m-%Y")
+
+    right_style = ParagraphStyle("RightInfo", parent=styles["Normal"], fontSize=10, leading=14)
+    right_info_table = Table([
+        [Paragraph("<b>Quotation No</b>", right_style), Paragraph(f": {quotation_no}", right_style)],
+        [Paragraph("<b>Date</b>", right_style), Paragraph(f": {date_str}", right_style)]
+    ], colWidths=[75, 100])
+    right_info_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, 0), 12),
+        ("TOPPADDING", (0, 1), (-1, 1), 2),
+    ]))
+
+    if logo_path:
+        logo = Image(logo_path, width=80, height=80)
+        header_table = Table([[logo, title_para, right_info_table]], colWidths=[100, 280, 175])
+    else:
+        header_table = Table([["", title_para, right_info_table]], colWidths=[100, 280, 175])
+
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (0, 0), "LEFT"),
+                ("ALIGN", (1, 0), (1, 0), "CENTER"),
+                ("ALIGN", (2, 0), (2, 0), "RIGHT"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+
+    # Company & Client Details Side-by-Side
+    company_name = company_settings.company_name if company_settings else ""
+    gst = company_settings.gst_number if company_settings else "-"
+    mobile = company_settings.mobile_number if company_settings else "-"
+    email = company_settings.email if company_settings else "-"
+
+    client_name = data.get("client_name") or "-"
+    billing_address = data.get("billing_address") or "-"
+    client_mobile = data.get("mobile_number") or "-"
+    client_gst = data.get("gst_number") or "-"
+    client_email = data.get("email") or "-"
+
+    company_cell = f"""
+    <b>{company_name}</b><br/>
+    GST: {gst}<br/>
+    Mobile: {mobile}<br/>
+    Email: {email}
+    """
+
+    client_cell = f"""
+    <b>{client_name}</b><br/>
+    Billing Address: {billing_address}<br/>
+    Mobile: {client_mobile}<br/>
+    GST Number: {client_gst}<br/>
+    Email: {client_email}
+    """
+
+    details_data = [
+        ["Company Details", "Client Details"],
+        [Paragraph(company_cell, styles["BodyText"]), Paragraph(client_cell, styles["BodyText"])]
+    ]
+    
+    # 275 + 280 = 555 max width
+    elements.append(
+        KeepTogether(
+            [
+                create_styled_table(details_data, [275, 280]),
+                Spacer(1, 15),
+            ]
+        )
+    )
+
+    # Items
+    items = data.get("items", [])
+    if items:
+        item_data = [["Item", "Qty", "Unit", "Rate", "Amount"]]
+        for item in items:
+            title = item.get("title", "")
+            qty = item.get("quantity", 0)
+            unit = item.get("unit") or "-"
+            rate = item.get("rate", 0)
+            amount = item.get("amount", 0)
+            item_data.append(
+                [
+                    title,
+                    f"{qty:.2f}",
+                    unit,
+                    f"{rate:.2f}",
+                    f"{amount:.2f}",
+                ]
+            )
+
+        elements.append(
+            KeepTogether(
+                [
+                    Paragraph("<b>Item Details</b>", styles["Heading2"]),
+                    Spacer(1, 6),
+                    create_styled_table(item_data, [220, 60, 60, 80, 100]),
+                    Spacer(1, 15),
+                ]
+            )
+        )
+
+        # Measurements
+        has_measurements = any(item.get("measurements") for item in items)
+        if has_measurements:
+            meas_data = [["Item", "L", "W", "H", "Unit", "Qty", "Formula"]]
+            for item in items:
+                for m in item.get("measurements", []):
+                    meas_data.append(
+                        [
+                            item.get("title", ""),
+                            str(m.get("length") or "-"),
+                            str(m.get("width") or "-"),
+                            str(m.get("height") or "-"),
+                            m.get("unit") or "-",
+                            f"{m.get('quantity', 0):.2f}",
+                            m.get("formula_used") or "-",
+                        ]
+                    )
+
+            elements.append(
+                KeepTogether(
+                    [
+                        Paragraph("<b>Measurement Details</b>", styles["Heading2"]),
+                        Spacer(1, 6),
+                        create_styled_table(meas_data, [150, 50, 50, 50, 50, 70, 100]),
+                        Spacer(1, 15),
+                    ]
+                )
+            )
+
+    # Tax & Totals
+    subtotal = data.get("subtotal", 0)
+    cgst_percent = data.get("cgst_percent", 0)
+    cgst_amount = data.get("cgst_amount", 0)
+    sgst_percent = data.get("sgst_percent", 0)
+    sgst_amount = data.get("sgst_amount", 0)
+    discount_amount = data.get("discount_amount", 0)
+    tds_percent = data.get("tds_percent", 0)
+    tds_amount = data.get("tds_amount", 0)
+    transport = data.get("transport") or 0
+    other = data.get("other") or 0
+    grand_total = data.get("grand_total", 0)
+    advance_paid = data.get("advance_paid", 0)
+    balance_due = data.get("balance_due", 0)
+
+    total_data = [
+        ["Description", "Amount"],
+        ["Subtotal", f"{subtotal:.2f}"],
+    ]
+    if cgst_amount > 0 or sgst_amount > 0:
+        total_data.append([f"CGST ({cgst_percent:.1f}%)", f"{cgst_amount:.2f}"])
+        total_data.append([f"SGST ({sgst_percent:.1f}%)", f"{sgst_amount:.2f}"])
+        
+    if transport and transport > 0:
+        total_data.append(["Transport", f"{transport:.2f}"])
+        
+    if other and other > 0:
+        total_data.append(["Other Charges", f"{other:.2f}"])
+        
+    if discount_amount > 0:
+        total_data.append(["Discount", f"-{discount_amount:.2f}"])
+    
+    if tds_amount > 0:
+        total_data.append([f"TDS ({tds_percent:.1f}%)", f"-{tds_amount:.2f}"])
+    
+    total_data.append(["Grand Total", f"{grand_total:.2f}"])
+    
+    if advance_paid > 0:
+        total_data.append(["Advance Paid", f"-{advance_paid:.2f}"])
+        total_data.append(["Balance Due", f"{balance_due:.2f}"])
+
+    elements.append(
+        KeepTogether(
+            [
+                Paragraph("<b>Quotation Summary</b>", styles["Heading2"]),
+                Spacer(1, 6),
+                create_styled_table(total_data, [270, 250], highlight_last_row=True),
+                Spacer(1, 15),
+            ]
+        )
+    )
+
+    # Notes
+    notes = data.get("notes")
+    if notes:
+        elements.append(
+            KeepTogether(
+                [
+                    Paragraph("<b>Notes / Terms</b>", styles["Heading2"]),
+                    Spacer(1, 6),
+                    Paragraph(notes.replace("\n", "<br/>"), styles["BodyText"]),
+                ]
+            )
+        )
+
+
+    # =====================================================
+    # FOOTER TABLE (built before signature for KeepTogether)
+    # =====================================================
+    footer_style = ParagraphStyle(
+        "FooterStyle",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=10,
+        leading=13,
+        textColor=colors.black,
+    )
+
+    mobile_footer = company_settings.mobile_number if company_settings and company_settings.mobile_number else "-"
+    email_footer = company_settings.email if company_settings and company_settings.email else "-"
+    instagram_handle = company_settings.instagram_handle if company_settings and getattr(company_settings, "instagram_handle", None) else "-"
+    whatsapp_number = company_settings.whatsapp_number if company_settings and getattr(company_settings, "whatsapp_number", None) else "-"
+    website = company_settings.website if company_settings and getattr(company_settings, "website", None) else "-"
+    address = company_settings.address if company_settings and getattr(company_settings, "address", None) else "-"
+
+    icon_dir_final = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "static"))
+
+    def get_icon(filename):
+        path = os.path.join(icon_dir_final, filename)
+        if not os.path.exists(path):
+            path = os.path.join(icon_dir_final, "icons", filename)
+            if not os.path.exists(path):
+                return Spacer(1, 18)
+        try:
+            img = Image(path, width=18, height=18)
+            img.hAlign = "CENTER"
+            return img
+        except Exception:
+            return Spacer(1, 18)
+
+    def create_icon_text_table(icon_filename, text, col_width=150):
+        table = Table(
+            [[get_icon(icon_filename), Paragraph(text, footer_style)]],
+            colWidths=[24, col_width],
+        )
+        table.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ]
+            )
+        )
+        return table
+
+    left_column = [
+        create_icon_text_table("phone.png", mobile_footer, 126),
+        Spacer(1, 8),
+        create_icon_text_table("email.png", email_footer, 126),
+    ]
+    center_column = [
+        create_icon_text_table("instagram.png", instagram_handle, 126),
+        Spacer(1, 8),
+        create_icon_text_table("whatsapp.png", whatsapp_number, 126),
+    ]
+    right_column = [
+        create_icon_text_table("location.png", address, 140),
+        Spacer(1, 8),
+        create_icon_text_table("website.png", website, 140),
+    ]
+
+    footer_data = [[left_column, center_column, right_column]]
+    footer_table = Table(footer_data, colWidths=[180, 180, 195])
+    footer_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#D9DDE3")),
+                ("LINEABOVE", (0, 0), (-1, 0), 4, colors.HexColor("#4CAF50")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 15),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 15),
+                ("TOPPADDING", (0, 0), (-1, -1), 12),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+            ]
+        )
+    )
+
+    # Render callbacks
+    def draw_watermark(canvas, doc):
+        if not logo_path:
+            return
+        try:
+            from PIL import Image as PILImage
+            from reportlab.lib.utils import ImageReader
+            
+            img = PILImage.open(logo_path).convert("RGBA")
+            alpha = img.split()[3]
+            alpha = alpha.point(lambda p: p * 0.1)
+            img.putalpha(alpha)
+            watermark = ImageReader(img)
+            
+            img_w, img_h = img.size
+            aspect = img_h / float(img_w)
+            new_w = 400
+            new_h = new_w * aspect
+            if new_h > 400:
+                new_h = 400
+                new_w = new_h / aspect
+                
+            x = (A4[0] - new_w) / 2
+            y = (A4[1] - new_h) / 2
+            
+            canvas.saveState()
+            canvas.drawImage(watermark, x, y, width=new_w, height=new_h, mask='auto')
+            canvas.restoreState()
+        except Exception:
+            pass
+
+    def draw_first_page(canvas, doc):
+        draw_watermark(canvas, doc)
+        canvas.saveState()
+        header_table.wrapOn(canvas, doc.width, doc.topMargin)
+        header_table.drawOn(canvas, doc.leftMargin, A4[1] - 90)
+        canvas.restoreState()
+
+    def draw_later_pages(canvas, doc):
+        draw_watermark(canvas, doc)
+
+    # =====================================================
+    # SIGNATURE + FOOTER (content-aware, normal flow)
+    # =====================================================
+    company_name_text = company_settings.company_name if company_settings and company_settings.company_name else "Company"
+    signature_para = Paragraph(
+        f"<b>Authorized Signature</b><br/>{company_name_text}",
+        styles["BodyText"],
+    )
+
+    # Combine signature and footer into a single Table to get exact height
+    gap_height = 15
+    bottom_table = Table([
+        [signature_para],
+        [Spacer(1, gap_height)],
+        [footer_table]
+    ], colWidths=[doc.width])
+    bottom_table.setStyle(TableStyle([
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+    ]))
+
+    tw, th = bottom_table.wrap(doc.width, doc.height)
+
+    from reportlab.platypus.flowables import Flowable
+    class BottomSpacer(Flowable):
+        def __init__(self, required_height, min_gap=20):
+            self.required_height = required_height
+            self.min_gap = min_gap
+            self.width = 0
+            self.height = 0
+
+        def wrap(self, availWidth, availHeight):
+            self.height = availHeight - self.required_height
+            if self.height < self.min_gap:
+                self.height = availHeight + 1
+            return (self.width, max(0, self.height))
+
+        def split(self, availWidth, availHeight):
+            return [Spacer(1, max(0, availHeight)), self]
+
+        def draw(self):
+            pass
+
+    elements.append(BottomSpacer(th))
+    elements.append(bottom_table)
+
+    doc.build(elements, onFirstPage=draw_first_page, onLaterPages=draw_later_pages)
+    
+    buffer.seek(0)
+    return buffer

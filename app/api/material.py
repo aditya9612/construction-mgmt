@@ -2,7 +2,7 @@ from app.utils.helpers import AppError
 from app.utils.helpers import NotFoundError
 from datetime import date
 from typing import Optional, List
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import uuid
 import os
 from sqlalchemy.exc import IntegrityError
@@ -20,6 +20,7 @@ from app.schemas.material import (
     MaterialReportSummary,
     TransferMaterial,
     TransferProject,
+    MaterialUsageReverse,
 )
 from app.cache.redis import (
     bump_cache_version,
@@ -1037,8 +1038,14 @@ async def material_summary(
             total_amt = m.total_amount or Decimal("0")
             remaining = m.remaining_stock or Decimal("0")
 
-            avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
-            total_stock += remaining * avg_rate
+            if m.purchase_rate is not None and m.purchase_rate > Decimal("0"):
+                rate = m.purchase_rate
+            elif purchased > 0 and total_amt > 0:
+                rate = total_amt / purchased
+            else:
+                rate = Decimal("0")
+
+            total_stock += remaining * rate
 
         total_pending = await db.scalar(
             select(func.sum(Material.payment_pending))
@@ -1461,15 +1468,36 @@ async def get_supplier_materials(
     current_user: User = Depends(require_permission("suppliers.view")),
     db: AsyncSession = Depends(get_db_session),
 ):
-    if project_id:
-        try:
-            await assert_project_access(
-                db, project_id=project_id, current_user=current_user
+    supplier = await db.get(Supplier, supplier_id)
+    if (
+        not supplier
+        or supplier.is_deleted
+        or (current_user.company_id is not None and supplier.company_id != current_user.company_id)
+    ):
+        raise NotFoundError("Supplier not found")
+
+    allowed_project_ids: list[int] = []
+    if current_user.role != UserRole.ADMIN.value:
+        if "project_memberships" in current_user.__dict__:
+            allowed_project_ids = [pm.project_id for pm in current_user.project_memberships]
+        else:
+            res = await db.scalars(
+                select(proj_model.ProjectMember.project_id).where(
+                    proj_model.ProjectMember.user_id == current_user.id
+                )
             )
-        except Exception:
+            allowed_project_ids = list(res.all())
+
+    if project_id is not None:
+        proj = await db.get(Project, project_id)
+        if not proj or (current_user.company_id is not None and proj.company_id != current_user.company_id):
             raise NotFoundError("Project not found")
-    else:
-        raise PermissionDeniedError("Global query without project_id not permitted")
+        if current_user.role != UserRole.ADMIN.value and project_id not in allowed_project_ids:
+            raise HTTPException(403, "Access denied")
+
+    if current_user.company_id is None:
+        return []
+
     limit = min(max(limit, 1), 100)
     skip = max(skip, 0)
 
@@ -1487,15 +1515,20 @@ async def get_supplier_materials(
             Supplier.id == Material.supplier_id,
             isouter=True,
         )
+        .join(Project, Project.id == Material.project_id)
         .where(
             Material.supplier_id == supplier_id,
             Material.is_deleted == False,
+            Project.company_id == current_user.company_id,
         )
     )
 
-    # Optional Project Filter
     if project_id is not None:
         query = query.where(Material.project_id == project_id)
+    elif current_user.role != UserRole.ADMIN.value:
+        if not allowed_project_ids:
+            return []
+        query = query.where(Material.project_id.in_(allowed_project_ids))
 
     query = query.order_by(Material.id.desc()).offset(skip).limit(limit)
 
@@ -2556,15 +2589,6 @@ async def usage(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
 
-    _m = await db.get(Material, material_id)
-    if not _m or _m.is_deleted:
-        raise NotFoundError("Material not found")
-    try:
-        await assert_project_access(
-            db, project_id=_m.project_id, current_user=current_user
-        )
-    except Exception:
-        raise NotFoundError("Material not found")
     import json
     import hashlib
 
@@ -2575,6 +2599,38 @@ async def usage(
         payload_str = json.dumps(payload_dict, sort_keys=True)
         request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
+    obj = await db.scalar(
+        select(Material)
+        .options(
+            selectinload(Material.supplier),
+            selectinload(Material.unit),
+            selectinload(Material.material_master),
+        )
+        .where(
+            Material.id == material_id,
+            Material.is_deleted == False,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+
+    if not obj:
+        raise NotFoundError("Material not found")
+
+    try:
+        await assert_project_access(
+            db, project_id=obj.project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Material not found")
+
+    if data.project_id != obj.project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Project ID does not match material project",
+        )
+
+    if idempotency_key:
         existing = await db.scalar(
             select(MaterialTransaction).where(
                 MaterialTransaction.idempotency_key == idempotency_key
@@ -2588,23 +2644,6 @@ async def usage(
                 )
             return await _build_material_out_from_id(db, existing.material_id)
 
-    obj = await db.scalar(
-        select(Material)
-        .options(
-            selectinload(Material.supplier),
-            selectinload(Material.unit),
-            selectinload(Material.material_master),
-        )
-        .where(
-            Material.id == material_id,
-            Material.is_deleted == False,
-        )
-        .with_for_update()
-    )
-
-    if not obj:
-        raise HTTPException(404, "Material not found")
-
     qty = Decimal(str(data.quantity))
 
     if qty <= 0:
@@ -2612,16 +2651,19 @@ async def usage(
 
     purchased = obj.quantity_purchased or Decimal("0")
     used = obj.quantity_used or Decimal("0")
-
-    current_stock = purchased - used
+    current_stock = (
+        obj.remaining_stock
+        if obj.remaining_stock is not None
+        else (purchased - used)
+    )
 
     if current_stock <= 0:
-        raise HTTPException(400, "Stock exhausted")
+        raise HTTPException(400, "Insufficient stock available.")
 
     if qty > current_stock:
         raise HTTPException(
             400,
-            f"Insufficient stock. Available: {current_stock}",
+            f"Insufficient stock available. Available: {current_stock}",
         )
 
     total_amount_current = obj.total_amount or Decimal("0")
@@ -2734,6 +2776,7 @@ async def usage(
         # =====================================
 
         update_material_fields(obj)
+        obj.remaining_stock = max(Decimal("0"), current_stock - qty)
 
         await db.commit()
 
@@ -2852,6 +2895,194 @@ async def usage(
         minimum_stock_level=float(obj.minimum_stock_level),
         alert_type=alert_type,
     )
+
+
+# ================= USAGE REVERSAL =================
+
+@router.post("/usage/{transaction_id}/reverse", response_model=MessageResponse)
+async def reverse_usage(
+    transaction_id: int,
+    data: MaterialUsageReverse,
+    current_user: User = Depends(require_permission("inventory.create")),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    import json
+    import hashlib
+
+    request_hash = None
+    if idempotency_key:
+        payload_dict = data.model_dump(mode="json")
+        payload_dict["transaction_id"] = transaction_id
+        payload_str = json.dumps(payload_dict, sort_keys=True)
+        request_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+        existing = await db.scalar(
+            select(MaterialTransaction).where(
+                MaterialTransaction.idempotency_key == idempotency_key
+            )
+        )
+        if existing:
+            if existing.request_hash != request_hash:
+                raise HTTPException(
+                    409,
+                    "Idempotency-Key already used with a different request payload.",
+                )
+            return MessageResponse(message="Material usage reversed successfully")
+
+    # Fetch original transaction
+    original_tx = await db.get(MaterialTransaction, transaction_id)
+    if not original_tx:
+        raise HTTPException(404, "Transaction not found")
+
+    if original_tx.type != DBTransactionType.USAGE:
+        raise HTTPException(400, "Only USAGE transactions can be reversed")
+
+    if original_tx.quantity >= 0:
+        raise HTTPException(400, "Cannot reverse a transaction that does not have negative quantity")
+
+    original_qty = abs(original_tx.quantity)
+
+    # Lock material
+    material = await db.scalar(
+        select(Material)
+        .where(
+            Material.id == original_tx.material_id,
+            Material.is_deleted == False,
+        )
+        .with_for_update()
+    )
+
+    if not material:
+        raise HTTPException(404, "Material not found")
+
+    from app.api.project import assert_project_access
+    try:
+        await assert_project_access(
+            db, project_id=material.project_id, current_user=current_user
+        )
+    except Exception:
+        raise NotFoundError("Material not found")
+
+    # Calculate already reversed quantity
+    reversals = (
+        await db.execute(
+            select(MaterialTransaction.quantity).where(
+                MaterialTransaction.reference_id == f"REV-{original_tx.id}"
+            )
+        )
+    ).scalars().all()
+
+    already_reversed_qty = sum(reversals) if reversals else Decimal("0")
+    remaining_qty = original_qty - already_reversed_qty
+
+    requested_qty = Decimal(str(data.quantity))
+
+    if requested_qty > remaining_qty:
+        raise HTTPException(
+            400, f"Cannot reverse more than remaining quantity: {remaining_qty}"
+        )
+
+    boq = None
+    if original_tx.boq_item_id:
+        boq = await db.scalar(
+            select(BOQ).where(BOQ.id == original_tx.boq_item_id).with_for_update()
+        )
+
+    reversal_cost = -(requested_qty * original_tx.rate)
+    reference = f"REV-{original_tx.id}"
+    reason_clean = " ".join((data.reason or "").strip().split())
+    remarks = f"Reversal of {original_tx.id}: {reason_clean}"
+
+    if material.quantity_used < requested_qty:
+        raise HTTPException(
+            400,
+            "Cannot reverse more quantity than the material's current used quantity.",
+        )
+
+    try:
+        transaction = MaterialTransaction(
+            material_id=original_tx.material_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            boq_item_id=original_tx.boq_item_id,
+            type=DBTransactionType.USAGE,
+            quantity=requested_qty,
+            rate=original_tx.rate,
+            total_amount=reversal_cost,
+            amount_paid=Decimal("0"),
+            payment_pending=Decimal("0"),
+            issue_type=original_tx.issue_type,
+            project_id=original_tx.project_id,
+            task_id=original_tx.task_id,
+            remarks=remarks,
+            reference_id=reference,
+        )
+
+        ledger = MaterialLedger(
+            material_id=original_tx.material_id,
+            boq_item_id=original_tx.boq_item_id,
+            type=DBTransactionType.USAGE,
+            quantity=requested_qty,
+            rate=original_tx.rate,
+            total_amount=reversal_cost,
+            amount_paid=Decimal("0"),
+            payment_pending=Decimal("0"),
+            issue_type=original_tx.issue_type,
+            project_id=original_tx.project_id,
+            remarks=remarks,
+            reference_id=reference,
+        )
+
+        from datetime import datetime
+        usage_entry = MaterialUsage(
+            material_id=original_tx.material_id,
+            boq_item_id=original_tx.boq_item_id,
+            project_id=original_tx.project_id,
+            task_id=original_tx.task_id,
+            quantity_used=-requested_qty,
+            usage_date=datetime.utcnow(),
+        )
+
+        db.add(transaction)
+        db.add(ledger)
+        db.add(usage_entry)
+
+        material.quantity_used -= requested_qty
+
+        await db.flush()
+
+        if boq:
+            await recalculate_boq_actuals(db, boq.id)
+
+        update_material_fields(material)
+
+        await db.commit()
+
+    except IntegrityError:
+        await db.rollback()
+        if idempotency_key:
+            existing = await db.scalar(
+                select(MaterialTransaction).where(
+                    MaterialTransaction.idempotency_key == idempotency_key
+                )
+            )
+            if existing:
+                if existing.request_hash != request_hash:
+                    raise HTTPException(
+                        409,
+                        "Idempotency-Key already used with a different request payload.",
+                    )
+                return MessageResponse(message="Material usage reversed successfully")
+        raise
+    except Exception:
+        await db.rollback()
+        raise
+
+    await bump_cache_version(redis, VERSION_KEY)
+
+    return MessageResponse(message="Material usage reversed successfully")
 
 
 # ================= PURCHASE =================
@@ -3303,16 +3534,14 @@ async def adjust_inventory(
 
         if diff > 0:
             # Physical stock found extra
-
-            material.quantity_purchased += diff
-
-            # Increase inventory valuation
-            material.total_amount += diff * avg_rate
+            # DO NOT artificially inflate quantity_purchased or total_amount 
+            # to prevent corrupting Accounts Payable.
+            pass
 
         else:
             # Physical stock less than system stock
 
-            material.quantity_used += abs(diff)
+            material.quantity_used = (material.quantity_used or Decimal("0")) + abs(diff)
 
             # DO NOT reduce total_amount
             # total_amount = historical purchase cost
@@ -3335,7 +3564,9 @@ async def adjust_inventory(
             Decimal("0"),
         )
 
-        audit_remark = f"Stock adjusted: {old_stock} -> {new_stock} | {reason}"
+        audit_remark = (
+            f"Stock adjusted: {old_stock} -> {new_stock} | {reason}"
+        )[:255]
 
         adjustment_total = abs(diff) * avg_rate
 
@@ -3400,21 +3631,21 @@ async def adjust_inventory(
                 adj_mat = await db.scalar(
                     select(Material).where(Material.id == existing.material_id)
                 )
-            return InventoryAdjustResponse(
-                material_id=adj_mat.id,
-                material_name=adj_mat.material_name,
-                old_stock=float(adj_mat.remaining_stock - existing.quantity),
-                new_stock=float(adj_mat.remaining_stock),
-                difference=float(existing.quantity),
-                avg_rate=float(existing.rate),
-                reason=(
-                    existing.remarks.split("|")[-1].strip()
-                    if existing.remarks
-                    else "Idempotent response"
-                ),
-                reference_id=existing.reference_id,
-                message="Inventory adjusted successfully",
-            )
+                return InventoryAdjustResponse(
+                    material_id=adj_mat.id,
+                    material_name=adj_mat.material_name,
+                    old_stock=float(adj_mat.remaining_stock - existing.quantity),
+                    new_stock=float(adj_mat.remaining_stock),
+                    difference=float(existing.quantity),
+                    avg_rate=float(existing.rate),
+                    reason=(
+                        existing.remarks.split("|")[-1].strip()
+                        if existing.remarks
+                        else "Idempotent response"
+                    ),
+                    reference_id=existing.reference_id,
+                    message="Inventory adjusted successfully",
+                )
         raise
     except Exception:
         await db.rollback()
@@ -3462,6 +3693,7 @@ async def get_all_inventory(
             Material.project_id,
             Material.total_amount,
             Material.quantity_purchased,
+            Material.purchase_rate,
         )
         .outerjoin(Unit, Unit.id == Material.unit_id)
         .join(Project, Project.id == Material.project_id)
@@ -3482,8 +3714,14 @@ async def get_all_inventory(
         qty_purchased = r.quantity_purchased or Decimal("0")
         remaining = r.remaining_stock or Decimal("0")
         total_amount = r.total_amount or Decimal("0")
+        purchase_rate = r.purchase_rate
 
-        avg_rate = total_amount / qty_purchased if qty_purchased > 0 else Decimal("0")
+        if purchase_rate is not None and purchase_rate > Decimal("0"):
+            avg_rate = purchase_rate
+        elif qty_purchased > 0 and total_amount > 0:
+            avg_rate = total_amount / qty_purchased
+        else:
+            avg_rate = Decimal("0")
 
         total_value = remaining * avg_rate
 
@@ -3536,6 +3774,7 @@ async def get_inventory_valuation(
             Material.quantity_purchased,
             Material.remaining_stock,
             Material.total_amount,
+            Material.purchase_rate,
         )
         .join(Project, Project.id == Material.project_id)
         .where(
@@ -3558,10 +3797,16 @@ async def get_inventory_valuation(
         purchased = r.quantity_purchased or Decimal("0")
         remaining = r.remaining_stock or Decimal("0")
         total_amount = r.total_amount or Decimal("0")
+        purchase_rate = r.purchase_rate
 
-        avg_rate = total_amount / purchased if purchased > 0 else Decimal("0")
+        if purchase_rate is not None and purchase_rate > Decimal("0"):
+            rate = purchase_rate
+        elif purchased > 0 and total_amount > 0:
+            rate = total_amount / purchased
+        else:
+            rate = Decimal("0")
 
-        total_value += remaining * avg_rate
+        total_value += remaining * rate
 
     return {
         "project_id": project_id,
@@ -3591,6 +3836,7 @@ async def get_project_inventory(
             Material.project_id,
             Material.total_amount,
             Material.quantity_purchased,
+            Material.purchase_rate,
         )
         .outerjoin(Unit, Unit.id == Material.unit_id)
         .where(Material.project_id == project_id, Material.is_deleted == False)
@@ -3606,8 +3852,14 @@ async def get_project_inventory(
         purchased = r.quantity_purchased or Decimal("0")
         remaining = r.remaining_stock or Decimal("0")
         total_amt = r.total_amount or Decimal("0")
+        purchase_rate = r.purchase_rate
 
-        avg_rate = total_amt / purchased if purchased > 0 else Decimal("0")
+        if purchase_rate is not None and purchase_rate > Decimal("0"):
+            avg_rate = purchase_rate
+        elif purchased > 0 and total_amt > 0:
+            avg_rate = total_amt / purchased
+        else:
+            avg_rate = Decimal("0")
 
         total_value = remaining * avg_rate
 
@@ -3641,17 +3893,30 @@ async def logs(
     db: AsyncSession = Depends(get_db_session),
 ):
     is_sa = getattr(current_user, "is_super_admin", False) is True
-    if project_id:
-        try:
-            await assert_project_access(
-                db, project_id=project_id, current_user=current_user
+    allowed_project_ids: list[int] = []
+    if not is_sa and current_user.role != UserRole.ADMIN.value:
+        if "project_memberships" in current_user.__dict__:
+            allowed_project_ids = [pm.project_id for pm in current_user.project_memberships]
+        else:
+            res = await db.scalars(
+                select(proj_model.ProjectMember.project_id).where(
+                    proj_model.ProjectMember.user_id == current_user.id
+                )
             )
-        except Exception:
-            raise NotFoundError("Project not found")
-    elif not is_sa:
-        raise PermissionDeniedError("Global query without project_id not permitted")
-    limit = min(max(limit, 1), 100)
+            allowed_project_ids = list(res.all())
 
+    if project_id is not None:
+        proj = await db.get(Project, project_id)
+        if not proj or (not is_sa and current_user.company_id is not None and proj.company_id != current_user.company_id):
+            raise NotFoundError("Project not found")
+        if not is_sa and current_user.role != UserRole.ADMIN.value and project_id not in allowed_project_ids:
+            raise HTTPException(403, "Access denied")
+
+    if not is_sa and current_user.company_id is None:
+        return []
+
+    limit = min(max(limit, 1), 100)
+    offset = max(offset, 0)
     query = (
         select(
             MaterialTransaction,
@@ -3661,6 +3926,8 @@ async def logs(
         )
         .join(Material, Material.id == MaterialTransaction.material_id)
         .outerjoin(Supplier, Supplier.id == Material.supplier_id)
+        .join(Project, Project.id == MaterialTransaction.project_id)
+        .where(Project.company_id == current_user.company_id)
     )
 
     if material_id is not None:
@@ -3668,6 +3935,10 @@ async def logs(
 
     if project_id is not None:
         query = query.where(MaterialTransaction.project_id == project_id)
+    elif not is_sa and current_user.role != UserRole.ADMIN.value:
+        if not allowed_project_ids:
+            return []
+        query = query.where(MaterialTransaction.project_id.in_(allowed_project_ids))
 
     if type is not None:
         query = query.where(MaterialTransaction.type == type.value)
@@ -3790,7 +4061,12 @@ async def material_report(
         remaining = m.remaining_stock or Decimal("0")
         total_amount = m.total_amount or Decimal("0")
 
-        avg_rate = total_amount / purchased if purchased > 0 else Decimal("0")
+        if m.purchase_rate is not None and m.purchase_rate > Decimal("0"):
+            avg_rate = m.purchase_rate
+        elif purchased > 0 and total_amount > 0:
+            avg_rate = total_amount / purchased
+        else:
+            avg_rate = Decimal("0")
 
         stock_value = remaining * avg_rate
 
@@ -5322,8 +5598,22 @@ async def update_material(
         # APPLY UPDATES
         # =====================================================
 
+        rate_changed = False
+        if "purchase_rate" in update_data and update_data["purchase_rate"] is not None:
+            new_rate = Decimal(str(update_data["purchase_rate"]))
+            old_rate = obj.purchase_rate or Decimal("0")
+            if old_rate != new_rate:
+                rate_changed = True
+
         for key, value in update_data.items():
             setattr(obj, key, value)
+
+        if rate_changed:
+            qty = obj.quantity_purchased or Decimal("0")
+            rate = obj.purchase_rate or Decimal("0")
+            obj.total_amount = (qty * rate).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
 
         update_material_fields(obj)
 

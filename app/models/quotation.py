@@ -1,5 +1,7 @@
 from typing import Optional
 
+from decimal import Decimal
+from sqlalchemy import DECIMAL
 from sqlalchemy import (
     String,
     Float,
@@ -103,11 +105,11 @@ class QuotationMaster(Base):
 
     # ================= TOTALS =================
 
-    subtotal: Mapped[float] = mapped_column(Float, default=0)
+    subtotal: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     gst_percent: Mapped[float] = mapped_column(Float, default=0)
 
-    gst_amount: Mapped[float] = mapped_column(Float, default=0)
+    gst_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     cgst_percent: Mapped[float] = mapped_column(Float, default=0)
 
@@ -115,19 +117,19 @@ class QuotationMaster(Base):
 
     tds_percent: Mapped[float] = mapped_column(Float, default=0)
 
-    cgst_amount: Mapped[float] = mapped_column(Float, default=0)
+    cgst_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    sgst_amount: Mapped[float] = mapped_column(Float, default=0)
+    sgst_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    tds_amount: Mapped[float] = mapped_column(Float, default=0)
+    tds_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    discount_amount: Mapped[float] = mapped_column(Float, default=0)
+    discount_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    grand_total: Mapped[float] = mapped_column(Float, default=0)
+    grand_total: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    advance_paid: Mapped[float] = mapped_column(Float, default=0)
+    advance_paid: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    balance_due: Mapped[float] = mapped_column(Float, default=0)
+    balance_due: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     payment_mode: Mapped[str | None] = mapped_column(String(50))
 
@@ -223,9 +225,9 @@ class QuotationItem(Base):
 
     quantity: Mapped[float] = mapped_column(Float, default=0)
 
-    rate: Mapped[float] = mapped_column(Float, default=0)
+    rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    amount: Mapped[float] = mapped_column(Float, default=0)
+    amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     sort_order: Mapped[int] = mapped_column(Integer, default=1)
 
@@ -300,15 +302,15 @@ class QuotationLabour(Base):
 
     labour_count: Mapped[int] = mapped_column(Integer, default=1)
 
-    daily_wage: Mapped[float] = mapped_column(Float, default=0)
+    daily_wage: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     labour_days: Mapped[float] = mapped_column(Float, default=1)
 
     overtime_hours: Mapped[float] = mapped_column(Float, default=0)
 
-    overtime_rate: Mapped[float] = mapped_column(Float, default=0)
+    overtime_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    amount: Mapped[float] = mapped_column(Float, default=0)
+    amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     notes: Mapped[str | None] = mapped_column(Text)
 
@@ -352,9 +354,9 @@ class QuotationMaterial(Base):
 
     estimated_quantity: Mapped[float] = mapped_column(Float, default=0)
 
-    estimated_rate: Mapped[float] = mapped_column(Float, default=0)
+    estimated_rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    estimated_amount: Mapped[float] = mapped_column(Float, default=0)
+    estimated_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     notes: Mapped[Optional[str]] = mapped_column(Text)
 
@@ -386,8 +388,8 @@ class QuotationExtraCharge(Base):
 
     quantity: Mapped[float] = mapped_column(Float, default=1)
 
-    rate: Mapped[float] = mapped_column(Float, default=0)
+    rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
-    amount: Mapped[float] = mapped_column(Float, default=0)
+    amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), default=Decimal('0.00'))
 
     notes: Mapped[Optional[str]] = mapped_column(Text)

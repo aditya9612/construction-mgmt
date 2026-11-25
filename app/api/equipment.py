@@ -103,6 +103,7 @@ from app.schemas.equipment import (
     AvailabilityReportItem,
     UtilizationReportItem,
     MaintenanceAlertItem,
+    RentalInReceivePayload,
 )
 
 # Internal - Middleware
@@ -326,7 +327,7 @@ async def create_audit_log(
         old_values=old_values,
         new_values=new_values,
         user_id=user_id,
-        ip_address=request.client.host if request else None,
+        ip_address=request.client.host if (request and request.client) else None,
     )
     db.add(log)
 
@@ -439,6 +440,26 @@ async def calculate_equipment_status(
 
     if active_rental:
         return EquipmentStatus.RENTED
+
+    # Check if inspection is pending for the latest completed rental
+    latest_completed_rental = await db.scalar(
+        select(EquipmentRental)
+        .where(
+            EquipmentRental.equipment_id == equipment.id,
+            EquipmentRental.is_completed == True
+        )
+        .order_by(EquipmentRental.end_date.desc())
+        .limit(1)
+    )
+    if latest_completed_rental:
+        from app.models.equipment import EquipmentInspection
+        inspection_exists = await db.scalar(
+            select(
+                exists().where(EquipmentInspection.rental_id == latest_completed_rental.id)
+            )
+        )
+        if not inspection_exists:
+            return EquipmentStatus.INSPECTION_PENDING
 
     if equipment.project_id:
         return EquipmentStatus.IN_PROJECT
@@ -824,6 +845,7 @@ async def usage_report(
     "/cost-report",
     response_model=List[CostReportItem],
     operation_id="equipment_cost_report_alias",
+    deprecated=True,
 )
 async def cost_report(
     equipment_id: Optional[int] = Query(None),
@@ -1111,7 +1133,7 @@ async def maintenance_alerts(
 # ================== "Availability" =======================
 
 
-@router.get("/eq/availability", response_model=List[AvailabilityReportItem])
+@router.get("/eq/availability", response_model=List[AvailabilityReportItem], deprecated=True)
 @router.get("/availability", response_model=List[AvailabilityReportItem])
 async def availability_report(
     project_id: Optional[int] = Query(None, description="Optional: filter by project"),
@@ -1322,6 +1344,18 @@ async def allocate_equipment(
                 {
                     "equipment_id": equipment_id,
                     "reason": "Equipment rented or reserved",
+                }
+            )
+            continue
+
+        # ================= INSPECTION CHECK =================
+
+        current_status = await calculate_equipment_status(db, obj)
+        if current_status == EquipmentStatus.INSPECTION_PENDING:
+            failed.append(
+                {
+                    "equipment_id": equipment_id,
+                    "reason": "Inspection pending after rental",
                 }
             )
             continue
@@ -2072,6 +2106,7 @@ async def create_usage(
             detail="Equipment is damaged and cannot be used",
         )
 
+
     # ================= BOQ VALIDATION =================
 
     boq_item = None
@@ -2686,6 +2721,7 @@ async def create_maintenance(
             detail="Maintenance already exists for this date",
         )
 
+
     # ================= BOQ VALIDATION =================
 
     boq_item = None
@@ -3153,7 +3189,9 @@ async def delete_maintenance(
             detail="Maintenance record not found",
         )
 
-    boq_item_id_to_recalc = maintenance.boq_item_id
+    boq_item_id_to_recalc = None
+    if maintenance.boq_item_id and maintenance.cost:
+        boq_item_id_to_recalc = maintenance.boq_item_id
 
     # ================= AUDIT LOG =================
 
@@ -3316,7 +3354,10 @@ async def list_maintenance(
         stmt = stmt.where(EquipmentMaintenance.maintenance_date <= date_to)
 
     stmt = (
-        stmt.order_by(EquipmentMaintenance.maintenance_date.desc())
+        stmt.order_by(
+            EquipmentMaintenance.maintenance_date.desc(),
+            EquipmentMaintenance.id.desc()
+        )
         .limit(limit)
         .offset(offset)
     )
@@ -3389,6 +3430,16 @@ async def create_rental(
             status_code=400,
             detail="End date cannot be before start date",
         )
+
+
+    # ================= CLIENT VALIDATION =================
+    if payload.client_id is not None:
+        from app.models.user import User as ClientUser
+        client = await db.get(ClientUser, payload.client_id)
+        if not client:
+            raise HTTPException(status_code=400, detail="Client not found")
+        if client.company_id and current_user.company_id and client.company_id != current_user.company_id:
+            raise HTTPException(status_code=400, detail="Client does not belong to your company")
 
     # ================= RENTAL COST =================
 
@@ -3509,6 +3560,7 @@ async def create_rental(
         rental_cost=payload.rental_cost,
         client_name=payload.client_name,
         notes=payload.notes,
+        billing_mode=payload.billing_mode,
     )
 
     db.add(rental)
@@ -3561,6 +3613,7 @@ async def create_rental(
             "rental_cost": float(payload.rental_cost),
             "client_name": payload.client_name,
             "status": equipment.status.value,
+            "billing_mode": payload.billing_mode.value if payload.billing_mode else None,
         },
         user_id=current_user.id,
         request=request,
@@ -3590,7 +3643,14 @@ async def create_rental(
 
     duration = (end_date - start_date).days + 1
 
-    per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
+    from app.core.enums import RentalBillingMode
+
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        per_day_cost = float(rental.rental_cost)
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        per_day_cost = float(rental.rental_cost)
+    else:
+        per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
 
     return EquipmentRentalOut(
         id=rental.id,
@@ -3606,6 +3666,7 @@ async def create_rental(
         status=rental_status,
         duration=duration,
         per_day_cost=round(per_day_cost, 2),
+        billing_mode=rental.billing_mode.value if rental.billing_mode else None,
     )
 
 
@@ -3722,41 +3783,52 @@ async def list_rental(
     result = await db.execute(stmt)
     rentals = result.scalars().all()
 
-    return [
-        EquipmentRentalOut(
-            id=rental.id,
-            project_id=rental.project_id,
-            boq_item_id=rental.boq_item_id,
-            equipment_id=rental.equipment_id,
-            start_date=rental.start_date,
-            end_date=rental.end_date,
-            rental_cost=float(rental.rental_cost or 0),
-            client_name=rental.client_name,
-            notes=rental.notes,
-            created_at=rental.created_at,
-            status=(
-                "COMPLETED"
-                if rental.is_completed or ((rental.end_date or rental.start_date) < today)
-                else (
-                    "UPCOMING"
-                    if rental.start_date > today
-                    else "ACTIVE"
-                )
-            ),
-            duration=((rental.end_date or rental.start_date) - rental.start_date).days
-            + 1,
-            per_day_cost=round(
-                float(rental.rental_cost or 0)
-                / (
-                    ((rental.end_date or rental.start_date) - rental.start_date).days
-                    + 1
-                ),
-                2,
-            ),
-            is_completed=rental.is_completed,
+    from app.core.enums import RentalBillingMode
+
+    rental_items = []
+    for rental in rentals:
+        end_d = rental.end_date or rental.start_date
+        duration = (end_d - rental.start_date).days + 1
+        if rental.billing_mode == RentalBillingMode.PER_DAY:
+            per_day_cost = float(rental.rental_cost or 0)
+        elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+            per_day_cost = float(rental.rental_cost or 0)
+        else:
+            per_day_cost = (
+                float(rental.rental_cost or 0) / duration if duration > 0 else 0
+            )
+
+        status = (
+            "COMPLETED"
+            if rental.is_completed or (end_d < today)
+            else (
+                "UPCOMING"
+                if rental.start_date > today
+                else "ACTIVE"
+            )
         )
-        for rental in rentals
-    ]
+
+        rental_items.append(
+            EquipmentRentalOut(
+                id=rental.id,
+                project_id=rental.project_id,
+                boq_item_id=rental.boq_item_id,
+                equipment_id=rental.equipment_id,
+                start_date=rental.start_date,
+                end_date=rental.end_date,
+                rental_cost=float(rental.rental_cost or 0),
+                client_name=rental.client_name,
+                notes=rental.notes,
+                created_at=rental.created_at,
+                status=status,
+                duration=duration,
+                per_day_cost=round(per_day_cost, 2),
+                is_completed=rental.is_completed,
+                billing_mode=rental.billing_mode.value if rental.billing_mode else None,
+            )
+        )
+
+    return rental_items
 
 
 # =============================== RENTAL GET ========================
@@ -3812,7 +3884,14 @@ async def get_rental(
     else:
         rental_status = "ACTIVE"
 
-    per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
+    from app.core.enums import RentalBillingMode
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        per_day_cost = float(rental.rental_cost)
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        per_day_cost = float(rental.rental_cost)
+    else:
+        # Legacy NULL behavior
+        per_day_cost = float(rental.rental_cost) / duration if duration > 0 else 0
 
     return EquipmentRentalOut(
         id=rental.id,
@@ -3829,6 +3908,7 @@ async def get_rental(
         duration=duration,
         per_day_cost=round(per_day_cost, 2),
         is_completed=rental.is_completed,
+        billing_mode=rental.billing_mode.value if rental.billing_mode else None,
     )
 
 
@@ -3886,6 +3966,26 @@ async def update_rental(
     update_data = payload.model_dump(exclude_unset=True)
 
     # ================= VALIDATE BEFORE MUTATING =================
+
+    RENTAL_IN_FIELDS = {
+        "expected_end_date",
+        "actual_return_date",
+        "is_received",
+        "is_returned",
+    }
+    submitted_rental_in = RENTAL_IN_FIELDS.intersection(update_data.keys())
+    if submitted_rental_in:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Rental-IN fields ({', '.join(sorted(submitted_rental_in))}) cannot be updated via standard equipment rental. Use Rental-IN endpoints instead.",
+        )
+
+    for field in update_data.keys():
+        if not hasattr(rental, field):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported field '{field}' for equipment rental update",
+            )
 
     if rental.end_date and rental.end_date < date.today():
         raise HTTPException(
@@ -4003,6 +4103,15 @@ async def update_rental(
 
     duration = ((rental.end_date or rental.start_date) - rental.start_date).days + 1
 
+    from app.core.enums import RentalBillingMode
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        per_day_cost_val = round(float(rental.rental_cost), 2)
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        per_day_cost_val = round(float(rental.rental_cost), 2)
+    else:
+        # Legacy NULL behavior
+        per_day_cost_val = round(float(rental.rental_cost) / duration, 2)
+
     return EquipmentRentalOut(
         id=rental.id,
         project_id=rental.project_id,
@@ -4016,10 +4125,8 @@ async def update_rental(
         created_at=rental.created_at,
         status=rental_status,
         duration=duration,
-        per_day_cost=round(
-            float(rental.rental_cost) / duration,
-            2,
-        ),
+        per_day_cost=per_day_cost_val,
+        billing_mode=rental.billing_mode.value if rental.billing_mode else None,
     )
 
 
@@ -4241,14 +4348,21 @@ async def complete_rental(
 
     duration = (end_date - rental.start_date).days + 1
 
-    per_day_cost = (
-        round(
-            float(rental.rental_cost) / duration,
-            2,
+    from app.core.enums import RentalBillingMode
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        per_day_cost = round(float(rental.rental_cost), 2)
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        per_day_cost = round(float(rental.rental_cost), 2)
+    else:
+        # Legacy NULL behavior
+        per_day_cost = (
+            round(
+                float(rental.rental_cost) / duration,
+                2,
+            )
+            if duration > 0
+            else 0
         )
-        if duration > 0
-        else 0
-    )
 
     return EquipmentRentalOut(
         id=rental.id,
@@ -4265,6 +4379,7 @@ async def complete_rental(
         duration=duration,
         per_day_cost=per_day_cost,
         is_completed=rental.is_completed,
+        billing_mode=rental.billing_mode.value if rental.billing_mode else None,
     )
 
 
@@ -4561,6 +4676,16 @@ async def create_purchase(
             status_code=400,
             detail="Warranty end date must be after purchase date",
         )
+
+
+    # ================= SUPPLIER VALIDATION =================
+    if payload.supplier_id is not None:
+        from app.models.material import Supplier
+        supplier = await db.get(Supplier, payload.supplier_id)
+        if not supplier:
+            raise HTTPException(status_code=400, detail="Supplier not found")
+        if supplier.company_id and current_user.company_id and supplier.company_id != current_user.company_id:
+            raise HTTPException(status_code=400, detail="Supplier does not belong to your company")
 
     # ================= BOQ VALIDATION =================
 
@@ -5077,6 +5202,7 @@ async def delete_purchase(
     boq_item_id = purchase.boq_item_id
 
     try:
+        boq_item_id_to_recalc = purchase.boq_item_id
         # ================= AUDIT LOG (single execution) =================
         await create_audit_log(
             db=db,
@@ -5100,8 +5226,8 @@ async def delete_purchase(
         await db.flush()
 
         # ================= BOQ ROLLBACK (single execution) =================
-        if boq_item_id:
-            await recalculate_boq_actuals(db, boq_item_id)
+        if boq_item_id_to_recalc:
+            await recalculate_boq_actuals(db, boq_item_id_to_recalc)
 
         await db.commit()
 
@@ -5712,6 +5838,7 @@ async def equipment_full_pdf_report(
             Paragraph,
             Spacer,
             Image,
+            KeepTogether,
         )
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
@@ -5733,7 +5860,7 @@ async def equipment_full_pdf_report(
             rightMargin=cm,
             leftMargin=cm,
             topMargin=cm,
-            bottomMargin=cm,
+            bottomMargin=2.2 * cm,
         )
 
         styles = getSampleStyleSheet()
@@ -6224,7 +6351,7 @@ async def equipment_full_pdf_report(
         )
 
         # ── 8. COST SUMMARY ────────────────────────────────────────────────
-        elements.append(Paragraph("8. COST SUMMARY", heading2_style))
+        cost_heading = Paragraph("8. COST SUMMARY", heading2_style)
         cost_data = [
             [
                 Paragraph("<b>Total Maintenance Cost</b>", bold_style),
@@ -6252,7 +6379,7 @@ async def equipment_full_pdf_report(
                 ]
             )
         )
-        elements.append(cost_table)
+        elements.append(KeepTogether([cost_heading, Spacer(1, 4), cost_table]))
 
         # ── FOOTER (signature lines — identical to sample) ───────────────
         def add_footer(canvas, doc_):
@@ -6729,3 +6856,491 @@ async def equipment_excel_report(
         raise HTTPException(
             status_code=500, detail=f"Excel generation failed: {str(e)}"
         )
+
+from app.schemas.equipment import EquipmentInspectionCreate, EquipmentInspectionOut
+from app.models.equipment import EquipmentInspection
+
+@router.post("/{equipment_id}/return-inspection", response_model=EquipmentInspectionOut)
+async def create_inspection(
+    equipment_id: int,
+    payload: EquipmentInspectionCreate,
+    current_user: User = Depends(require_permission("equipment.edit")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super Admin cannot access standard equipment APIs",
+        )
+
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
+
+    if payload.rental_id:
+        rental = await db.get(EquipmentRental, payload.rental_id)
+        if not rental or rental.equipment_id != equipment_id:
+            raise HTTPException(status_code=400, detail="Invalid rental_id")
+
+    inspection = EquipmentInspection(
+        equipment_id=equipment_id,
+        rental_id=payload.rental_id,
+        inspection_date=payload.inspection_date,
+        inspector_id=current_user.id,
+        condition=payload.condition,
+        damage_description=payload.damage_description,
+        repair_cost=payload.repair_cost,
+        remarks=payload.remarks,
+    )
+    db.add(inspection)
+
+    equipment.condition = payload.condition
+    await db.flush()
+    await recalculate_equipment_status(db, equipment)
+    await db.commit()
+    await db.refresh(inspection)
+
+    return inspection
+# =================================================================
+# RENTAL-IN LIFECYCLE
+# =================================================================
+
+# ---------- helpers ----------
+
+async def _do_rental_in_receive(
+    *,
+    purchase: EquipmentPurchase,
+    payload: RentalInReceivePayload,
+    current_user: User,
+    db: AsyncSession,
+    request: Request,
+) -> dict:
+    """
+    Core Rental-IN receive logic shared by both routes.
+
+    Option C behaviour:
+      • If purchase.asset_id is None → auto-create the physical Equipment record.
+      • If purchase.asset_id is already set → use the existing Equipment.
+
+    All mutations (Equipment creation, asset_id linkage, is_received flag) are
+    performed inside a single DB transaction and committed together.
+    """
+    if current_user.company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super Admin cannot access standard equipment APIs",
+        )
+
+    if purchase.purchase_type != PurchaseType.RENT:
+        raise HTTPException(status_code=400, detail="Purchase is not a rental (RENT type required)")
+
+    # Tenant isolation – the purchase must belong to the current user's company
+    project = await db.get(Project, purchase.project_id)
+    if not project or project.company_id != current_user.company_id:
+        raise HTTPException(status_code=404, detail="Rental purchase not found")
+
+    if purchase.is_received:
+        # Idempotency: already received – return existing equipment_id safely.
+        return {
+            "status": "received",
+            "equipment_id": purchase.asset_id,
+            "detail": "Equipment already received (no change made)",
+        }
+
+    try:
+        # -------- CASE A: asset_id already set (existing Equipment) --------
+        if purchase.asset_id is not None:
+            equipment = await get_active_equipment_or_404(db, purchase.asset_id, current_user)
+
+            old_status = equipment.status
+            if equipment.status == EquipmentStatus.IDLE:
+                equipment.status = EquipmentStatus.AVAILABLE
+
+            purchase.is_received = True
+
+            await create_audit_log(
+                db=db,
+                equipment_id=equipment.id,
+                action="RENTAL_IN_RECEIVE",
+                old_values={"status": old_status.value if old_status else None, "asset_id_was_preset": True},
+                new_values={"is_received": True, "status": equipment.status.value},
+                user_id=current_user.id,
+                request=request,
+            )
+
+            await db.commit()
+            return {"status": "received", "equipment_id": equipment.id}
+
+        # -------- CASE B: no asset_id – create Equipment during receive --------
+
+        # Validate equipment code uniqueness before any writes
+        existing_code = await db.scalar(
+            select(Equipment).where(
+                Equipment.equipment_code == payload.equipment_code,
+                Equipment.is_deleted == False,
+            )
+        )
+        if existing_code:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Equipment code '{payload.equipment_code}' is already in use by another active equipment",
+            )
+
+        # Create the physical Equipment record.
+        # project_id is intentionally left NULL – assignment is a separate step.
+        new_equipment = Equipment(
+            company_id=current_user.company_id,
+            project_id=None,                      # unallocated until explicit assign
+            equipment_name=payload.equipment_name,
+            equipment_code=payload.equipment_code,
+            condition=payload.condition,
+            status=EquipmentStatus.AVAILABLE,      # ready to be assigned after receipt
+            rental_cost=purchase.unit_price,       # carry the daily/periodic rental rate
+            working_hours=Decimal("0"),
+            fuel_used=Decimal("0"),
+        )
+        db.add(new_equipment)
+        await db.flush()  # get new_equipment.id without committing
+
+        # Link the purchase to the newly-created physical asset
+        purchase.asset_id = new_equipment.id
+        purchase.is_received = True
+
+        await create_audit_log(
+            db=db,
+            equipment_id=new_equipment.id,
+            action="RENTAL_IN_RECEIVE",
+            old_values={"asset_id": None, "is_received": False},
+            new_values={
+                "asset_id": new_equipment.id,
+                "is_received": True,
+                "equipment_code": payload.equipment_code,
+                "equipment_name": payload.equipment_name,
+                "status": EquipmentStatus.AVAILABLE.value,
+            },
+            user_id=current_user.id,
+            request=request,
+        )
+
+        await db.commit()
+        await db.refresh(new_equipment)
+
+        return {"status": "received", "equipment_id": new_equipment.id}
+
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception:
+        await db.rollback()
+        raise
+
+
+# ---------- PRIMARY route: no equipment_id in URL (Option C) ----------
+
+@router.post(
+    "/rental-in/{purchase_id}/receive",
+    response_model=dict,
+    summary="Receive Rental-IN equipment (creates Equipment record if not yet linked)",
+)
+async def receive_rental_in_v2(
+    purchase_id: int,
+    payload: RentalInReceivePayload,
+    request: Request,
+    current_user: User = Depends(require_permission("equipment.edit")),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+    """
+    Primary Rental-IN receive endpoint (Option C).
+
+    If the rental agreement (EquipmentPurchase) has no physical Equipment linked yet
+    (asset_id is NULL), a new Equipment record is automatically created using the
+    supplied name, code, and condition.  The new equipment's ID is returned in the
+    response so the caller can proceed with allocation, usage, vendor bill, and return.
+
+    If the purchase already has an asset_id set, the existing Equipment is used and
+    no duplicate is created (backward-compatible with pre-linked agreements).
+    """
+    purchase = await db.get(EquipmentPurchase, purchase_id)
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Rental purchase not found")
+
+    result = await _do_rental_in_receive(
+        purchase=purchase,
+        payload=payload,
+        current_user=current_user,
+        db=db,
+        request=request,
+    )
+    await bump_cache_version(redis, VERSION_KEY)
+    return result
+
+
+# ---------- BACKWARD-COMPAT route: equipment_id still in URL ----------
+
+@router.post(
+    "/{equipment_id}/rental-in/{purchase_id}/receive",
+    response_model=dict,
+    summary="Receive Rental-IN (legacy route – equipment_id in URL)",
+)
+async def receive_rental_in(
+    equipment_id: int,
+    purchase_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("equipment.edit")),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+    """
+    Legacy Rental-IN receive route.  Kept for backward compatibility.
+
+    Callers who already created an Equipment record manually and linked it via
+    asset_id can still use this route.  The equipment_id in the URL must match
+    purchase.asset_id (or the purchase will not be found).
+
+    For new Rental-IN flows where no Equipment exists yet, use the primary route:
+      POST /api/v1/equipment/rental-in/{purchase_id}/receive
+    """
+    purchase = await db.get(EquipmentPurchase, purchase_id)
+    if not purchase or purchase.asset_id != equipment_id:
+        raise HTTPException(status_code=404, detail="Rental purchase not found")
+
+    if purchase.purchase_type != PurchaseType.RENT:
+        raise HTTPException(status_code=400, detail="Not a rental")
+
+    if purchase.is_received:
+        raise HTTPException(status_code=400, detail="Equipment already received")
+
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
+
+    purchase.is_received = True
+
+    old_status = equipment.status
+    if equipment.status == EquipmentStatus.IDLE:
+        equipment.status = EquipmentStatus.AVAILABLE
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="RENTAL_IN_RECEIVE",
+        old_values={"status": old_status.value if old_status else None},
+        new_values={"is_received": True, "status": equipment.status.value},
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+    await bump_cache_version(redis, VERSION_KEY)
+    return {"status": "received", "equipment_id": equipment.id}
+
+
+@router.post("/{equipment_id}/rental-in/{purchase_id}/return", response_model=dict)
+async def return_rental_in(
+    equipment_id: int,
+    purchase_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("equipment.edit")),
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
+):
+    purchase = await db.get(EquipmentPurchase, purchase_id)
+    if not purchase or purchase.asset_id != equipment_id:
+        raise HTTPException(status_code=404, detail="Rental purchase not found")
+
+    if not purchase.is_received:
+        raise HTTPException(status_code=400, detail="Cannot return equipment that hasn't been received")
+
+    if purchase.is_returned:
+        raise HTTPException(status_code=400, detail="Equipment already returned")
+
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
+
+    if equipment.project_id:
+        raise HTTPException(status_code=400, detail="Cannot return equipment currently assigned to a project")
+
+    purchase.is_returned = True
+    from datetime import date
+    purchase.actual_return_date = date.today()
+
+    old_status = equipment.status
+    equipment.status = EquipmentStatus.IDLE
+
+    await create_audit_log(
+        db=db,
+        equipment_id=equipment.id,
+        action="RENTAL_IN_RETURN",
+        old_values={"status": old_status.value if old_status else None},
+        new_values={"is_returned": True, "actual_return_date": str(purchase.actual_return_date), "status": equipment.status.value},
+        user_id=current_user.id,
+        request=request,
+    )
+
+    await db.commit()
+    await bump_cache_version(redis, VERSION_KEY)
+    return {"status": "returned"}
+# =================================================================
+# VENDOR BILL (RENTAL-IN)
+# =================================================================
+
+@router.post("/{equipment_id}/rental-in/{purchase_id}/vendor-bill", response_model=dict)
+async def generate_rental_in_vendor_bill(
+    equipment_id: int,
+    purchase_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("equipment.edit")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from app.api.vendor_bills import create_vendor_bill
+    from app.schemas.accountant import VendorBillCreate
+    from fastapi import BackgroundTasks
+
+    purchase = await db.get(EquipmentPurchase, purchase_id)
+    if not purchase or purchase.asset_id != equipment_id:
+        raise HTTPException(status_code=404, detail="Rental purchase not found")
+
+    if not purchase.is_received:
+        raise HTTPException(status_code=400, detail="Cannot bill equipment that hasn't been received")
+
+    # The existing vendor bill creation prevents duplicate bill_number natively,
+    # so we will use purchase.invoice_number as the bill_number to rely on that safeguard.
+
+    payload = VendorBillCreate(
+        supplier_id=purchase.supplier_id,
+        project_id=purchase.project_id,
+        equipment_purchase_id=purchase.id,
+        bill_number=purchase.invoice_number,
+        bill_date=purchase.purchase_date,
+        due_date=purchase.purchase_date,
+        gross_amount=float(purchase.total_amount),
+        gst_percent=0.0,
+        gst_amount=0.0,
+        tds_percent=0.0,
+        tds_amount=0.0,
+        advance_paid=0.0,
+        total_amount=float(purchase.total_amount),
+    )
+
+    bg_tasks = BackgroundTasks()
+
+    # We call the existing vendor bill API internally
+    # This automatically tracks payment linkage and accounting records.
+    bill = await create_vendor_bill(
+        payload=payload,
+        background_tasks=bg_tasks,
+        db=db,
+        current_user=current_user
+    )
+
+    return {"status": "success", "vendor_bill_id": bill.id}
+# =================================================================
+# CUSTOMER INVOICE (RENTAL-OUT)
+# =================================================================
+
+@router.post("/{equipment_id}/rental-out/{rental_id}/invoice", response_model=dict)
+async def generate_rental_out_invoice(
+    equipment_id: int,
+    rental_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("equipment.edit")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from app.models.invoice import Invoice, InvoiceType, InvoiceStatus
+    from datetime import date
+
+    # Verify equipment tenant isolation and project authorization
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
+
+    rental = await db.get(EquipmentRental, rental_id)
+    if not rental or rental.equipment_id != equipment.id:
+        raise HTTPException(status_code=404, detail="Rental not found")
+
+    if rental.project_id is not None:
+        try:
+            await assert_project_access(db, project_id=rental.project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Rental not found")
+
+    if not rental.is_completed:
+        raise HTTPException(status_code=400, detail="Cannot invoice an active rental. Complete it first.")
+
+    if rental.invoice_id is not None:
+        raise HTTPException(status_code=400, detail="Invoice already generated for this rental.")
+
+    # We must calculate duration based on start/end dates
+    from app.core.enums import RentalBillingMode
+    actual_end_date = rental.end_date or date.today()
+    if rental.billing_mode == RentalBillingMode.PER_DAY:
+        inclusive_days = (actual_end_date - rental.start_date).days + 1
+        total_amount = float(rental.rental_cost) * inclusive_days
+    elif rental.billing_mode == RentalBillingMode.LUMP_SUM:
+        total_amount = float(rental.rental_cost)
+    else:
+        # Legacy NULL behavior
+        days = (actual_end_date - rental.start_date).days
+        # If returned same day, count as 1 day minimum for billing usually, but let's just use max(1, days)
+        days = max(1, days)
+        total_amount = float(rental.rental_cost) * days
+
+    company_id = current_user.company_id
+
+    # We fetch project to get owner if any
+    project = await db.get(Project, rental.project_id) if rental.project_id else None
+    owner_id = project.owner_id if project else None
+
+    invoice = Invoice(
+        company_id=company_id,
+        project_id=rental.project_id,
+        owner_id=owner_id,
+        type=InvoiceType.RENTAL,
+        amount=total_amount,
+        total_amount=total_amount,
+        pending_amount=total_amount,
+        paid_amount=0,
+        status=InvoiceStatus.PENDING,
+        description=f"Equipment Rental Invoice (Eq ID: {equipment_id}, Rental ID: {rental_id})",
+        invoice_date=date.today(),
+    )
+    db.add(invoice)
+    await db.flush()
+
+    rental.invoice_id = invoice.id
+    await db.commit()
+
+    return {"status": "success", "invoice_id": invoice.id}
+
+
+@router.get("/{equipment_id}/rental-out/{rental_id}/invoice")
+async def get_rental_out_invoice(
+    equipment_id: int,
+    rental_id: int,
+    request: Request,
+    current_user: User = Depends(require_permission("equipment.view")),
+    db: AsyncSession = Depends(get_db_session),
+):
+    from app.models.invoice import Invoice
+    from app.api.invoice import render_invoice_pdf_response
+
+    # Verify equipment tenant isolation and project authorization
+    equipment = await get_active_equipment_or_404(db, equipment_id, current_user)
+
+    rental = await db.get(EquipmentRental, rental_id)
+    if not rental or rental.equipment_id != equipment.id:
+        raise HTTPException(status_code=404, detail="Rental not found")
+
+    if rental.project_id is not None:
+        try:
+            await assert_project_access(db, project_id=rental.project_id, current_user=current_user)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Rental not found")
+
+    if rental.invoice_id is None:
+        raise HTTPException(status_code=404, detail="Invoice not generated for this rental")
+
+    invoice = await db.get(Invoice, rental.invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    is_super = _is_super_admin(current_user)
+    if not is_super and current_user.company_id is not None:
+        if invoice.company_id is not None and invoice.company_id != current_user.company_id:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+    return render_invoice_pdf_response(invoice)

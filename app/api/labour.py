@@ -106,6 +106,7 @@ async def _get_scoped_labour(
         selectinload(Labour.labour_type),
         selectinload(Labour.user),
         selectinload(Labour.contractor),
+        selectinload(Labour.projects),
     )
 
     if with_for_update:
@@ -319,12 +320,17 @@ async def create_labour(
                     "user",
                     "contractor",
                     "labour_type",
+                    "projects",
                 ],
             )
 
+            await r.bump_cache_version(redis, VERSION_KEY)
             await r.bump_cache_version(redis, "dashboard_version")
 
-            return s.LabourOut.model_validate(obj)
+            out = s.LabourOut.model_validate(obj)
+            if project_id and out.project_id is None:
+                out.project_id = project_id
+            return out
 
         except IntegrityError as e:
             await db.rollback()
@@ -382,6 +388,7 @@ async def list_labour(
                 selectinload(Labour.user),
                 selectinload(Labour.contractor),
                 selectinload(Labour.labour_type),
+                selectinload(Labour.projects),
             )
         )
         .where(Labour.company_id == current_user.company_id)
@@ -427,7 +434,12 @@ async def list_labour(
     total = await db.scalar(count_query)
     rows = (await db.execute(query)).scalars().all()
 
-    items = [s.LabourOut.model_validate(r).model_dump() for r in rows]
+    items = []
+    for row in rows:
+        dump = s.LabourOut.model_validate(row).model_dump()
+        if project_id is not None:
+            dump["project_id"] = project_id
+        items.append(dump)
 
     result = {
         "items": items,
@@ -1413,7 +1425,7 @@ async def unlock_payroll(
 # =========================
 # PAYROLL PAYMENT
 # =========================
-@router.post("/payroll/pay")
+@router.post("/payroll/pay", response_model=s.PayrollOut)
 async def pay_salary(
     payload: s.PayrollPayment,
     current_user: User = Depends(d.require_permission("labour.approve")),
@@ -1422,130 +1434,150 @@ async def pay_salary(
 ):
     assert_company_context(current_user)
     try:
-        await assert_project_access(
-            db,
+        try:
+            await assert_project_access(
+                db,
+                project_id=payload.project_id,
+                current_user=current_user,
+            )
+        except Exception:
+            raise NotFoundError("Project not found")
+
+        payroll = await db.scalar(
+            select(LabourPayroll)
+            .where(
+                LabourPayroll.labour_id == payload.labour_id,
+                LabourPayroll.project_id == payload.project_id,
+                LabourPayroll.month == payload.month,
+                LabourPayroll.year == payload.year,
+            )
+            .with_for_update()
+        )
+
+        if not payroll:
+            raise NotFoundError("Payroll not found")
+
+        if payload.amount <= 0:
+            raise ValidationError("Payment amount must be greater than zero")
+
+        if payroll.status == PayrollStatus.DRAFT:
+            raise HTTPException(
+                status_code=400, detail="Cannot pay DRAFT payroll. Please lock it first."
+            )
+
+        if payroll.status == PayrollStatus.PAID:
+            raise HTTPException(status_code=400, detail="Payroll is already PAID in full.")
+
+        current_paid = payroll.paid_amount or Decimal("0")
+        current_remaining = payroll.remaining_amount or Decimal("0")
+
+        if payload.amount > current_remaining:
+            raise ValidationError("Amount exceeds remaining salary")
+
+        # =========================
+        # UPDATE PAYROLL
+        # =========================
+        payroll.paid_amount = current_paid + payload.amount
+        payroll.remaining_amount = max(
+            Decimal("0"), current_remaining - payload.amount
+        )
+
+        payroll.status = (
+            PayrollStatus.PAID if payroll.remaining_amount == 0 else PayrollStatus.PARTIAL
+        )
+
+        await db.flush()
+
+        # =========================
+        #  TRANSACTION (ONLY ONCE)
+        # =========================
+        txn = Transaction(
             project_id=payload.project_id,
-            current_user=current_user,
+            invoice_id=None,
+            type="payment",
+            amount=payload.amount,
+            mode="cash",
+            reference=f"payroll:{payload.labour_id}",
+            created_by=current_user.id,
         )
+        db.add(txn)
+
+        # =========================
+        #  JOURNAL ENTRY
+        # =========================
+        entry = JournalEntry(
+            description="Salary Payment",
+            created_by=current_user.id,
+        )
+        db.add(entry)
+        await db.flush()  # get entry.id
+        txn.journal_entry_id = entry.id
+
+        project = await db.get(Project, payload.project_id)
+        project_company_id = project.company_id if project else current_user.company_id
+
+        wages_payable_query = select(Account).where(Account.code == "WAGES_PAYABLE")
+        if project_company_id is not None:
+            wages_payable_acc = await db.scalar(
+                select(Account).where(
+                    Account.code == "WAGES_PAYABLE",
+                    Account.company_id == project_company_id,
+                )
+            )
+            if not wages_payable_acc:
+                wages_payable_acc = await db.scalar(wages_payable_query)
+        else:
+            wages_payable_acc = await db.scalar(wages_payable_query)
+
+        if not wages_payable_acc:
+            raise HTTPException(
+                status_code=400, detail="WAGES_PAYABLE account is not configured."
+            )
+
+        from app.utils.accounting import get_primary_cash_account
+
+        try:
+            cash_acc = await get_primary_cash_account(db, company_id=project_company_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="Primary Cash Account not configured"
+            )
+
+        db.add(
+            JournalLine(
+                entry_id=entry.id,
+                account_id=wages_payable_acc.id,
+                debit=payload.amount,
+                credit=0,
+            )
+        )
+
+        db.add(
+            JournalLine(
+                entry_id=entry.id,
+                account_id=cash_acc.id,
+                debit=0,
+                credit=payload.amount,
+            )
+        )
+
+        # =========================
+        # CACHE
+        # =========================
+        try:
+            await r.bump_cache_version(redis, "dashboard_version")
+        except Exception as exc:
+            logger.warning("Failed to bump dashboard cache version in pay_salary: %s", exc)
+
+        return payroll
+
+    except (HTTPException, AppError):
+        await db.rollback()
+        raise
     except Exception:
-        raise NotFoundError("Project not found")
-
-    payroll = await db.scalar(
-        select(LabourPayroll)
-        .where(
-            LabourPayroll.labour_id == payload.labour_id,
-            LabourPayroll.project_id == payload.project_id,
-            LabourPayroll.month == payload.month,
-            LabourPayroll.year == payload.year,
-        )
-        .with_for_update()
-    )
-
-    if not payroll:
-        raise NotFoundError("Payroll not found")
-
-    if payload.amount <= 0:
-        raise ValidationError("Payment amount must be greater than zero")
-
-    if payroll.status == PayrollStatus.DRAFT:
-        raise HTTPException(
-            status_code=400, detail="Cannot pay DRAFT payroll. Please lock it first."
-        )
-
-    if payroll.status == PayrollStatus.PAID:
-        raise HTTPException(status_code=400, detail="Payroll is already PAID in full.")
-
-    if payload.amount > payroll.remaining_amount:
-        raise ValidationError("Amount exceeds remaining salary")
-
-    # =========================
-    # UPDATE PAYROLL
-    # =========================
-    payroll.paid_amount += payload.amount
-    payroll.remaining_amount = max(
-        Decimal("0"), payroll.remaining_amount - payload.amount
-    )
-
-    payroll.status = (
-        PayrollStatus.PAID if payroll.remaining_amount == 0 else PayrollStatus.PARTIAL
-    )
-
-    await db.flush()
-
-    # =========================
-    #  TRANSACTION (ONLY ONCE)
-    # =========================
-    txn = Transaction(
-        project_id=payload.project_id,
-        invoice_id=None,
-        type="payment",
-        amount=payload.amount,
-        mode="cash",
-        reference=f"payroll:{payload.labour_id}",
-        created_by=current_user.id,
-    )
-    db.add(txn)
-
-    # =========================
-    #  JOURNAL ENTRY
-    # =========================
-    entry = JournalEntry(description="Salary Payment")
-    db.add(entry)
-    await db.flush()  # get entry.id
-
-    labour_obj = await _get_scoped_labour(db, payload.labour_id, current_user)
-    if not labour_obj:
-        raise NotFoundError("Labour not found")
-    target_company_id = labour_obj.company_id if labour_obj else current_user.company_id
-    if target_company_id is None:
-        raise HTTPException(
-            status_code=400, detail="Primary Cash Account not configured"
-        )
-
-    wages_payable_acc = await db.scalar(
-        select(Account).where(
-            Account.code == "WAGES_PAYABLE",
-            Account.company_id == target_company_id,
-        )
-    )
-    if not wages_payable_acc:
-        raise HTTPException(
-            status_code=400, detail="WAGES_PAYABLE account is not configured."
-        )
-
-    from app.utils.accounting import get_primary_cash_account
-
-    try:
-        cash_acc = await get_primary_cash_account(db, company_id=target_company_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=400, detail="Primary Cash Account not configured"
-        )
-
-    db.add(
-        JournalLine(
-            entry_id=entry.id,
-            account_id=wages_payable_acc.id,
-            debit=payload.amount,
-            credit=0,
-        )
-    )
-
-    db.add(
-        JournalLine(
-            entry_id=entry.id,
-            account_id=cash_acc.id,
-            debit=0,
-            credit=payload.amount,
-        )
-    )
-
-    # =========================
-    # CACHE
-    # =========================
-    await r.bump_cache_version(redis, "dashboard_version")
-
-    return payroll
+        await db.rollback()
+        logger.exception("Payroll payment failed")
+        raise
 
 
 # =========================
@@ -1629,7 +1661,7 @@ async def attendance_dashboard(
     to_date: date,
     labour_id: int | None = None,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(d.require_permission("labour.view")),
+    current_user: User = Depends(d.require_permission("attendance.view")),
 ):
     assert_company_context(current_user)
     try:
@@ -1652,16 +1684,42 @@ async def attendance_dashboard(
 
     labour = None
 
-    if labour_id is not None:
+    if current_user.role == UserRole.LABOUR.value:
+        caller_labour = await db.scalar(
+            select(Labour).where(Labour.user_id == current_user.id)
+        )
+        if not caller_labour:
+            raise NotFoundError("Labour profile not found")
+        if labour_id is not None and labour_id != caller_labour.id:
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to view another labourer's attendance",
+            )
+        labour = caller_labour
+        labour_id = caller_labour.id
+        if labour.user_id:
+            attendance_filters.append(UserAttendance.user_id == labour.user_id)
+        else:
+            attendance_filters.append(UserAttendance.user_id == -1)
+    elif labour_id is not None:
         labour = await _get_scoped_labour(db, labour_id, current_user)
-
-        if not labour:
+        if not labour or (
+            current_user.company_id is not None and labour.company_id != current_user.company_id
+        ):
             raise HTTPException(
                 status_code=404,
                 detail="Labour not found",
             )
 
-        attendance_filters.append(UserAttendance.user_id == labour.user_id)
+        if labour.user_id:
+            attendance_filters.append(UserAttendance.user_id == labour.user_id)
+        else:
+            attendance_filters.append(UserAttendance.user_id == -1)
+    else:
+        labour_users_query = select(Labour.user_id).where(Labour.user_id.is_not(None))
+        if current_user.company_id is not None:
+            labour_users_query = labour_users_query.where(Labour.company_id == current_user.company_id)
+        attendance_filters.append(UserAttendance.user_id.in_(labour_users_query))
 
     # =====================================================
     # TOTAL LABOUR
@@ -1938,11 +1996,16 @@ async def export_excel(
 
     data = [
         {
+            "Sr. No.": idx,
             "Name": r.labour_name,
-            "Skill": r.skill_category,
-            "Wage": float(r.effective_daily_wage),
+            "Skill": (
+                r.skill_category.value
+                if hasattr(r.skill_category, "value")
+                else (r.skill_category or "")
+            ),
+            "Wage": float(r.effective_daily_wage or 0),
         }
-        for r in rows
+        for idx, r in enumerate(rows, 1)
     ]
 
     df = pd.DataFrame(data)
@@ -2627,6 +2690,8 @@ async def get_labour(
             raise PermissionDeniedError("No access to this labour")
 
     out = s.LabourOut.model_validate(obj, from_attributes=True)
+    if project_ids and out.project_id is None:
+        out.project_id = project_ids[0]
 
     await r.cache_set_json(redis, cache_key, out.model_dump())
 

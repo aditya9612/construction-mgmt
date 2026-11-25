@@ -24,6 +24,7 @@ from app.core.enums import (
     PaymentMode,
     InvoiceType,
     InvoiceSourceType,
+    MeasurementStatus,
 )
 from app.core.logger import logger
 from app.db.session import get_db_session
@@ -115,8 +116,7 @@ async def _get_invoice_or_404(
 
     stmt = select(Invoice).where(Invoice.id == invoice_id)
     if for_update:
-        stmt = stmt.with_for_update()
-
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     invoice = await db.scalar(stmt)
     if not invoice:
         raise NotFoundError("Invoice not found")
@@ -542,9 +542,12 @@ async def update_invoice(
 
     obj.gst_amount = (amount * gst_percent) / Decimal("100")
     obj.tax_amount = (amount * tax_percent) / Decimal("100")
-    obj.total_amount = amount + obj.gst_amount - obj.tax_amount
+    new_total = amount + obj.gst_amount + obj.tax_amount
+    if obj.paid_amount and new_total < obj.paid_amount:
+        raise ValidationError("Total amount cannot be less than paid amount")
+    obj.total_amount = new_total
 
-    obj.pending_amount = obj.total_amount - Decimal(str(obj.paid_amount or 0))
+    obj.pending_amount = max(Decimal("0"), obj.total_amount - Decimal(str(obj.paid_amount or 0)))
 
     try:
         await db.commit()
@@ -651,7 +654,10 @@ async def mark_paid(
         db, invoice_id=id, current_user=current_user, for_update=True
     )
 
-    if invoice.pending_amount <= 0:
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise ValidationError("Cannot pay cancelled invoice")
+
+    if invoice.status == InvoiceStatus.PAID or invoice.pending_amount <= 0:
         raise ValidationError("Already paid")
 
     remaining = invoice.pending_amount
@@ -677,11 +683,13 @@ async def mark_paid(
     if invoice.owner_id:
         await create_system_alert(
             db,
-            invoice.owner_id,
+            current_user.id,
             "Payment Received",
             f"Payment of ₹{remaining:,.2f} received for Invoice #{invoice.id}.",
             priority="Medium",
             category="Finance",
+            project_id=invoice.project_id,
+            alert_type="Payment",
         )
 
     await db.commit()
@@ -697,16 +705,13 @@ async def mark_paid(
 # ------------------ 11. GENERATE INVOICE PDF ------------------
 
 
-@router.get("/{id}/pdf")
-async def generate_invoice_pdf(
-    id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_permission("invoices.export")),
-):
-    obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
-
+def render_invoice_pdf_response(obj: Invoice) -> StreamingResponse:
     # Register Unicode font (₹ support)
-    pdfmetrics.registerFont(TTFont("DejaVu", "app/fonts/DejaVuSans.ttf"))
+    if "DejaVu" not in pdfmetrics.getRegisteredFontNames():
+        from pathlib import Path
+
+        font_path = Path(__file__).resolve().parent.parent / "fonts" / "DejaVuSans.ttf"
+        pdfmetrics.registerFont(TTFont("DejaVu", str(font_path)))
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer)
@@ -724,25 +729,28 @@ async def generate_invoice_pdf(
     elements.append(Spacer(1, 12))
 
     # Details
-    elements.append(Paragraph(f"Type: {obj.type.value}", styles["Normal"]))
+    type_val = obj.type.value if hasattr(obj.type, "value") else str(obj.type)
+    elements.append(Paragraph(f"Type: {type_val}", styles["Normal"]))
 
     if obj.source_type:
-        elements.append(Paragraph(f"Source: {obj.source_type.value}", styles["Normal"]))
+        source_val = obj.source_type.value if hasattr(obj.source_type, "value") else str(obj.source_type)
+        elements.append(Paragraph(f"Source: {source_val}", styles["Normal"]))
 
-    elements.append(Paragraph(f"Amount: ₹{float(obj.amount):,.2f}", styles["Normal"]))
+    elements.append(Paragraph(f"Amount: ₹{float(obj.amount or 0):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
-    elements.append(Paragraph(f"GST: ₹{float(obj.gst_amount):,.2f}", styles["Normal"]))
+    elements.append(Paragraph(f"GST: ₹{float(obj.gst_amount or 0):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
 
-    elements.append(Paragraph(f"Tax: ₹{float(obj.tax_amount):,.2f}", styles["Normal"]))
+    elements.append(Paragraph(f"Tax: ₹{float(obj.tax_amount or 0):,.2f}", styles["Normal"]))
     elements.append(Spacer(1, 4))
     elements.append(
-        Paragraph(f"Total: ₹{float(obj.total_amount):,.2f}", styles["Normal"])
+        Paragraph(f"Total: ₹{float(obj.total_amount or 0):,.2f}", styles["Normal"])
     )
     elements.append(Spacer(1, 4))
     # Status
+    status_val = obj.status.value if hasattr(obj.status, "value") else str(obj.status)
     elements.append(
-        Paragraph(f"Status: {obj.status.value.capitalize()}", styles["Normal"])
+        Paragraph(f"Status: {status_val.capitalize()}", styles["Normal"])
     )
 
     doc.build(elements)
@@ -755,6 +763,71 @@ async def generate_invoice_pdf(
     )
 
 
+@router.get("/{id}/pdf")
+async def generate_invoice_pdf(
+    id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("invoices.export")),
+):
+    obj, _ = await _get_invoice_or_404(db, invoice_id=id, current_user=current_user)
+    return render_invoice_pdf_response(obj)
+
+
+async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
+    je = JournalEntry(
+        entry_type="Invoice",
+        journal_number=f"J-INV-{invoice.id}",
+        entry_date=date.today(),
+        description=invoice.description or f"Invoice {invoice.id} posted",
+        status="Posted",
+    )
+    db.add(je)
+    await db.flush()
+
+    try:
+        ar_acc = await get_accounts_receivable(db)
+        rev_acc = await get_revenue_account(db)
+    except (ValueError, Exception):
+        # AR or Revenue account not configured — skip journal lines
+        return
+
+    # DR AR
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=ar_acc.id,
+            debit=invoice.total_amount,
+            credit=Decimal(0),
+        )
+    )
+
+    # CR Revenue
+    revenue_amount = invoice.amount
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=rev_acc.id,
+            debit=Decimal(0),
+            credit=revenue_amount,
+        )
+    )
+
+    # CR GST Payable if any
+    if invoice.gst_amount > 0:
+        from app.utils.accounting import resolve_tax_accounts
+
+        try:
+            gst_acc = await resolve_tax_accounts(db, "output_gst")
+            db.add(
+                JournalLine(
+                    entry_id=je.id,
+                    account_id=gst_acc.id,
+                    debit=Decimal(0),
+                    credit=invoice.gst_amount,
+                )
+            )
+        except (ValueError, Exception):
+            pass
 # ------------------ 12. CREATE LABOUR INVOICE ------------------
 
 
@@ -974,8 +1047,12 @@ async def create_invoice_from_measurement(
     _check_tenant_access(current_user)
     logger.info(f"Creating owner invoice from measurement_id={measurement_id}")
 
-    # 1. Get measurement
-    measurement = await db.get(FinalMeasurement, measurement_id)
+    # 1. Get measurement with row locking
+    measurement = await db.scalar(
+        select(FinalMeasurement)
+        .where(FinalMeasurement.id == measurement_id)
+        .with_for_update()
+    )
     if not measurement or not getattr(measurement, "project_id", None):
         raise NotFoundError("Measurement not found")
 
@@ -989,7 +1066,7 @@ async def create_invoice_from_measurement(
 
     # 3. Check existing owner invoice
     existing_invoice = await db.scalar(
-        select(Invoice).where(
+        select(Invoice.id).where(
             Invoice.reference_id == measurement.id,
             Invoice.source_type == InvoiceSourceType.MEASUREMENT,
         )
@@ -997,8 +1074,22 @@ async def create_invoice_from_measurement(
     if existing_invoice:
         raise ValidationError("Owner invoice already exists")
 
+    # 3b. Check existing RA bill
+    existing_ra_bill = await db.scalar(
+        select(RABill.id).where(
+            RABill.measurement_id == measurement.id,
+        )
+    )
+    if existing_ra_bill:
+        raise ValidationError("RA Bill already exists for this measurement")
+
+    # 3c. Verify measurement status eligibility
+    if measurement.status not in [MeasurementStatus.VERIFIED.value, MeasurementStatus.APPROVED.value]:
+        raise ValidationError("Only VERIFIED or APPROVED measurements can be invoiced")
+
     try:
         total_amount = Decimal(str(measurement.total_amount or 0))
+        measurement.status = MeasurementStatus.BILLED.value
 
         # 4. Create invoice
         obj = Invoice(
@@ -1160,10 +1251,13 @@ async def pay_invoice(
     if amount <= 0:
         raise ValidationError("Invalid payment amount")
 
-    if invoice.pending_amount <= 0:
+    if invoice.status == InvoiceStatus.CANCELLED:
+        raise ValidationError("Cannot pay cancelled invoice")
+
+    if invoice.status == InvoiceStatus.PAID or invoice.pending_amount <= Decimal("0"):
         raise ValidationError("Invoice already fully paid")
 
-    if amount > invoice.pending_amount:
+    if amount > invoice.pending_amount or (invoice.paid_amount or Decimal("0")) + amount > invoice.total_amount:
         raise ValidationError("Amount exceeds pending")
 
     # 1. Create transaction
@@ -1179,11 +1273,11 @@ async def pay_invoice(
     db.add(txn)
 
     # 2. Update invoice
-    invoice.paid_amount += amount
-    invoice.pending_amount = invoice.total_amount - invoice.paid_amount
+    invoice.paid_amount = (invoice.paid_amount or Decimal("0")) + amount
+    invoice.pending_amount = max(Decimal("0"), invoice.total_amount - invoice.paid_amount)
 
-    if invoice.pending_amount <= 0:
-        invoice.pending_amount = 0
+    if invoice.pending_amount <= Decimal("0") or invoice.paid_amount >= invoice.total_amount:
+        invoice.pending_amount = Decimal("0")
         invoice.status = InvoiceStatus.PAID
     else:
         invoice.status = InvoiceStatus.PARTIAL

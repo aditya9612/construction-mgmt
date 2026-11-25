@@ -41,8 +41,8 @@ class InvoiceUpdate(BaseModel):
 
 class InvoiceOut(BaseModel):
     id: int
-    project_id: int
-    owner_id: int
+    project_id: Optional[int] = None
+    owner_id: Optional[int] = None
 
     type: InvoiceType
     source_type: Optional[InvoiceSourceType] = None

@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db_session
 from app.models.settings import CompanySettings, UserSettings
 from app.schemas.settings import CompanySettingsOut, CompanySettingsUpdate, UserSettingsUpdate, UserSettingsOut
-from app.models.user import User
+from app.models.user import User, ActivityLog, UserRole
 from app.core.dependencies import get_current_active_user, require_permission
 from app.schemas.user import UserOut
 from datetime import date
@@ -47,6 +47,29 @@ async def update_settings(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db_session),
 ):
+    if payload.default_project_id is not None and current_user.role == UserRole.CLIENT.value:
+        from app.models.project import Project, ProjectMember
+        from app.models.quotation import QuotationMaster
+
+        member_match = await db.scalar(
+            select(ProjectMember).where(
+                ProjectMember.project_id == payload.default_project_id,
+                ProjectMember.user_id == current_user.id,
+            )
+        )
+        if not member_match:
+            quotation_match = await db.scalar(
+                select(QuotationMaster).where(
+                    QuotationMaster.project_id == payload.default_project_id,
+                    QuotationMaster.client_user_id == current_user.id,
+                )
+            )
+            if not quotation_match:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Selected project is not assigned to this client.",
+                )
+
     obj = await db.scalar(
         select(UserSettings).where(UserSettings.user_id == current_user.id)
     )
@@ -71,6 +94,9 @@ os.makedirs(
     exist_ok=True
 )
 
+from uuid import uuid4
+from app.api.user import log_user_changes, log_activity
+
 @router.put(
     "/profile",
     response_model=UserOut
@@ -90,8 +116,6 @@ async def update_profile(
     aadhaar_number: Optional[str] = Form(None),
 
     designation: Optional[str] = Form(None),
-
-    joining_date: Optional[date] = Form(None),
 
     # =========================================
     # FILE
@@ -120,36 +144,35 @@ async def update_profile(
     aadhaar_number = aadhaar_number or None
     designation = designation or None
 
+    data_for_audit = {}
+    updated_fields = []
+
     # =========================================
-    # VALIDATE + UPDATE TEXT FIELDS
+    # VALIDATE + PREPARE TEXT FIELDS
     # =========================================
 
     try:
         if full_name is not None:
-            current_user.full_name = validate_full_name(
+            data_for_audit["full_name"] = validate_full_name(
                 full_name
             )
 
         if address is not None:
-            current_user.address = address.strip()
+            data_for_audit["address"] = address.strip()
 
         if pan_number is not None:
-            current_user.pan_number = validate_pan(
+            data_for_audit["pan_number"] = validate_pan(
                 pan_number
             )
 
         if aadhaar_number is not None:
-            current_user.aadhaar_number = validate_aadhaar(
+            data_for_audit["aadhaar_number"] = validate_aadhaar(
                 aadhaar_number
             )
 
         if designation is not None:
-            current_user.designation = designation.strip()
+            data_for_audit["designation"] = designation.strip()
 
-        if joining_date is not None:
-            current_user.joining_date = validate_joining_date(
-                joining_date
-            )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -167,24 +190,12 @@ async def update_profile(
     # PROFILE IMAGE
     # =========================================
 
+    old_image_path = current_user.profile_image
+
     if remove_profile_image:
-
-        if (
-            current_user.profile_image
-            and os.path.exists(current_user.profile_image)
-        ):
-            os.remove(current_user.profile_image)
-
-        current_user.profile_image = None
+        data_for_audit["profile_image"] = None
 
     elif profile_image is not None:
-
-        # Remove old image if it exists
-        if (
-            current_user.profile_image
-            and os.path.exists(current_user.profile_image)
-        ):
-            os.remove(current_user.profile_image)
 
         file_path = await validate_and_save_image(
             file=profile_image,
@@ -192,7 +203,37 @@ async def update_profile(
             prefix="profile"
         )
 
-        current_user.profile_image = file_path
+        data_for_audit["profile_image"] = file_path
+
+    # =========================================
+    # AUDIT LOGGING
+    # =========================================
+    
+    change_group_id = str(uuid4())
+    await log_user_changes(db, current_user, data_for_audit, current_user.id, change_group_id)
+
+    for k, v in data_for_audit.items():
+        if hasattr(current_user, k) and getattr(current_user, k) != v:
+            setattr(current_user, k, v)
+            updated_fields.append(k)
+            
+    if (remove_profile_image or profile_image is not None) and old_image_path:
+        # Remove old image if it exists
+        if os.path.exists(old_image_path):
+            try:
+                os.remove(old_image_path)
+            except OSError:
+                pass
+
+    if updated_fields:
+        await log_activity(
+            db,
+            action="UPDATE_PROFILE",
+            entity="USER",
+            entity_id=current_user.id,
+            performed_by=current_user.id,
+            details={"fields_updated": updated_fields},
+        )
 
     # =========================================
     # SAVE
@@ -374,14 +415,34 @@ async def update_company_settings(
     if not settings:
         settings = CompanySettings(company_id=current_user.company_id)
         db.add(settings)
+        await db.flush()
 
     update_data = payload.model_dump(
         exclude_unset=True
     )
 
+    changed_fields = []
+
     for key, value in update_data.items():
         if key != "company_id":
+            old_value = getattr(settings, key, None)
+            if old_value != value:
+                changed_fields.append(key)
             setattr(settings, key, value)
+
+    if changed_fields:
+        db.add(
+            ActivityLog(
+                action="COMPANY_SETTINGS_UPDATED",
+                entity="company_settings",
+                entity_id=settings.id,
+                performed_by=current_user.id,
+                details={
+                    "changed_fields": changed_fields,
+                    "message": "Company settings updated"
+                }
+            )
+        )
 
     await db.commit()
     await db.refresh(settings)

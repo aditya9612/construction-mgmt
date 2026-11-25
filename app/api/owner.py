@@ -590,11 +590,12 @@ async def export_owner_ledger_pdf(
         )
         elements.append(Spacer(1, 15))
 
-        data = [["Date", "Type", "Amount", "Reference", "Description"]]
+        data = [["Sr. No.", "Date", "Type", "Amount", "Reference", "Description"]]
 
-        for t in transactions:
+        for idx, t in enumerate(transactions, start=1):
             data.append(
                 [
+                    str(idx),
                     str(t.created_at),
                     t.type,
                     f"{(t.amount or Decimal('0')):.2f}",
@@ -666,12 +667,13 @@ async def export_owner_ledger_excel(
         writer = csv.writer(string_buffer)
 
         writer.writerow(
-            ["Date", "Type", "Amount", "Reference Type", "Reference ID", "Description"]
+            ["Sr. No.", "Date", "Type", "Amount", "Reference Type", "Reference ID", "Description"]
         )
 
-        for t in transactions:
+        for idx, t in enumerate(transactions, start=1):
             writer.writerow(
                 [
+                    idx,
                     str(t.created_at),
                     t.type,
                     f"{(t.amount or Decimal('0')):.2f}",

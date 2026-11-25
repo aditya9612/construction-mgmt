@@ -89,12 +89,39 @@ async def test_complete_rental_and_allocate():
         assert resp_comp_again.status_code == 400
         assert "already completed" in resp_comp_again.json()["detail"].lower()
 
-        # 3. Equipment should now be AVAILABLE
+        # 3. Equipment should now be INSPECTION_PENDING
         resp_eq = client.get(f"/api/v1/equipment/{eq_id}")
         assert resp_eq.status_code == 200
-        assert resp_eq.json()["status"] == "AVAILABLE"
+        assert resp_eq.json()["status"] == "INSPECTION_PENDING"
 
-        # 4. Equipment can now be allocated to project immediately!
+        # 4. Perform the required Return Inspection
+        resp_inspect = client.post(
+            f"/api/v1/equipment/{eq_id}/return-inspection",
+            json={
+                "rental_id": rental_id,
+                "inspection_date": str(today),
+                "condition": "GOOD",
+                "repair_cost": 0.00
+            }
+        )
+        assert resp_inspect.status_code == 200, resp_inspect.text
+        inspection_data = resp_inspect.json()
+        assert "id" in inspection_data
+        inspection_id = inspection_data["id"]
+
+        # Verify DB relationship (Bug Fix Regression)
+        async with AsyncSessionLocal() as db_check:
+            from app.models.equipment import EquipmentInspection
+            insp_row = await db_check.get(EquipmentInspection, inspection_id)
+            assert insp_row is not None
+            assert insp_row.equipment_id == eq_id
+
+        # 5. Equipment should now be AVAILABLE
+        resp_eq_after = client.get(f"/api/v1/equipment/{eq_id}")
+        assert resp_eq_after.status_code == 200
+        assert resp_eq_after.json()["status"] == "AVAILABLE"
+
+        # 6. Equipment can now be allocated to project immediately!
         resp_alloc = client.post(
             "/api/v1/equipment/allocate",
             json={"equipment_ids": [eq_id], "project_id": proj_id},

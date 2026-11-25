@@ -100,6 +100,13 @@ async def login(
     if user is None:
         raise AppError(status_code=404, message="User not registered")
 
+    if user.is_deleted:
+        logger.warning(f"Deleted user login attempt mobile={mobile} user_id={user.id}")
+        raise AppError(
+            status_code=403,
+            message="Your account has been deleted. Please contact Admin.",
+        )
+
     # existing logic continues
     if not await check_otp_rate_limit(redis, mobile):
         logger.warning(f"OTP rate limit hit for mobile={mobile}") 
@@ -143,7 +150,17 @@ async def verify_otp(
 
     if len(mobile) < 10:
         raise AppError(status_code=422, message="Invalid mobile number")
-        
+
+    user_check = await db.scalar(select(User).where(User.mobile == mobile))
+    if user_check is not None and user_check.is_deleted:
+        logger.warning(
+            f"Deleted user OTP verification attempt mobile={mobile} user_id={user_check.id}"
+        )
+        raise AppError(
+            status_code=403,
+            message="Your account has been deleted. Please contact Admin.",
+        )
+
     if await is_otp_locked(redis, mobile):
         logger.warning(f"OTP verification attempted while locked mobile={mobile}")
         raise AppError(status_code=401, message="Account temporarily locked due to too many failed attempts. Please try again after 5 minutes.")
@@ -173,6 +190,15 @@ async def verify_otp(
             )
             db.add(user)
             await db.flush()
+
+        if user.is_deleted:
+            logger.warning(
+                f"Deleted user OTP verification attempt mobile={mobile} user_id={user.id}"
+            )
+            raise AppError(
+                status_code=403,
+                message="Your account has been deleted. Please contact Admin.",
+            )
 
         if not user.is_active:
             logger.warning(f"Inactive user login attempt user_id={user.id}")

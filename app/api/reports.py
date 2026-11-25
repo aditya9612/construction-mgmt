@@ -1285,6 +1285,9 @@ async def export_issues_excel(
     db: AsyncSession = Depends(get_db_session),
 ):
     is_sa = _check_tenant_access(current_user)
+    if project_id:
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+
     query = (
         select(m.Issue, m.Project, User)
         .join(m.Project, m.Issue.project_id == m.Project.id)
@@ -1295,7 +1298,6 @@ async def export_issues_excel(
         query = query.where(m.Project.company_id == current_user.company_id)
 
     if project_id:
-        await _validate_project_access_404(db, project_id, current_user)
         query = query.where(m.Issue.project_id == project_id)
     if status:
         query = query.where(m.Issue.status == status)
@@ -1312,38 +1314,66 @@ async def export_issues_excel(
 
     headers = [
         "Issue ID",
+        "Project Name",
         "Title",
-        "Project",
         "Category",
+        "Reported Date",
         "Priority",
         "Status",
         "Assigned To",
-        "Reported Date",
         "Description",
+        "Resolution Notes",
     ]
-    rows = [
-        [
-            issue.business_id or str(issue.id),
-            issue.title,
-            proj.project_name if proj else "N/A",
-            str(getattr(issue.category, "value", issue.category)),
-            str(getattr(issue.priority, "value", issue.priority)),
-            str(getattr(issue.status, "value", issue.status)),
-            usr.full_name or usr.username if usr else "Unassigned",
-            str(issue.reported_date) if issue.reported_date else "N/A",
-            issue.description or "",
-        ]
-        for issue, proj, usr in issues
-    ]
+    rows = []
+    open_count = 0
+    resolved_count = 0
+    high_priority_count = 0
+    for issue, project, user in issues:
+        assigned_name = user.full_name if user else "Unassigned"
+        rows.append(
+            [
+                issue.business_id or str(issue.id),
+                project.project_name,
+                issue.title,
+                str(
+                    issue.category.value
+                    if hasattr(issue.category, "value")
+                    else issue.category
+                ),
+                str(issue.reported_date) if issue.reported_date else "N/A",
+                str(
+                    issue.priority.value
+                    if hasattr(issue.priority, "value")
+                    else issue.priority
+                ),
+                str(
+                    issue.status.value
+                    if hasattr(issue.status, "value")
+                    else issue.status
+                ),
+                assigned_name,
+                issue.description or "",
+                issue.resolution or "",
+            ]
+        )
 
-    eb = ExcelReportBuilder("Project Issues & Risk Report")
+        status_val = str(getattr(issue.status, "value", issue.status)).upper()
+        if status_val in ("OPEN", "IN_PROGRESS"):
+            open_count += 1
+        elif status_val in ("RESOLVED", "CLOSED"):
+            resolved_count += 1
+
+        priority_val = str(getattr(issue.priority, "value", issue.priority)).upper()
+        if priority_val in ("HIGH", "CRITICAL"):
+            high_priority_count += 1
+
+    eb = ExcelReportBuilder("Site Issue Log")
     eb.add_summary_row("Total Issues", len(rows))
-    open_count = sum(1 for i, _, _ in issues if str(getattr(i.status, "value", i.status)) == "OPEN")
-    resolved_count = sum(1 for i, _, _ in issues if str(getattr(i.status, "value", i.status)) == "RESOLVED")
     eb.add_summary_row("Open Issues", open_count)
     eb.add_summary_row("Resolved Issues", resolved_count)
+    eb.add_summary_row("High Priority Issues", high_priority_count)
     eb.build_summary_sheet()
-    eb.add_data_sheet("Issues", headers, rows)
+    eb.add_data_sheet("Site Issue Log", headers, rows)
 
     stream = eb.build()
 
@@ -1827,20 +1857,24 @@ async def export_profit_loss_pdf(
     db: AsyncSession = Depends(get_db_session),
 ):
     is_sa = _check_tenant_access(current_user)
+    project_name = "All Projects"
     if project_id:
-        await _validate_project_access_404(db, project_id, current_user)
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
+        project = await db.get(m.Project, project_id)
+        if not project or (not is_sa and project.company_id != current_user.company_id):
+            raise NotFoundError("Project not found")
+        project_name = project.project_name
         inv_query = select(Invoice).where(Invoice.project_id == project_id)
         exp_query = select(Expense).where(Expense.project_id == project_id)
     else:
+        inv_query = select(Invoice)
+        exp_query = select(Expense)
         if not is_sa:
-            inv_query = select(Invoice).join(m.Project, Invoice.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
-            exp_query = select(Expense).join(m.Project, Expense.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
-        else:
-            inv_query = select(Invoice)
-            exp_query = select(Expense)
-            if current_user.company_id is not None:
-                inv_query = inv_query.join(m.Project, Invoice.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
-                exp_query = exp_query.join(m.Project, Expense.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+            inv_query = inv_query.join(m.Project, Invoice.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+            exp_query = exp_query.join(m.Project, Expense.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+        elif current_user.company_id is not None:
+            inv_query = inv_query.join(m.Project, Invoice.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
+            exp_query = exp_query.join(m.Project, Expense.project_id == m.Project.id).where(m.Project.company_id == current_user.company_id)
 
     if year:
         inv_query = inv_query.where(extract("year", Invoice.created_at) == year)
@@ -1865,55 +1899,65 @@ async def export_profit_loss_pdf(
     invoices = (await db.execute(inv_query)).scalars().all()
     expenses = (await db.execute(exp_query)).scalars().all()
 
-    total_income = sum(float(i.total_amount or 0) for i in invoices)
-    total_expense = sum(float(e.amount or 0) for e in expenses)
-    net_profit = total_income - total_expense
-    margin = (net_profit / total_income * 100) if total_income > 0 else 0.0
+    revenue = 0.0
+    cogs_labour = 0.0
+    cogs_material = 0.0
+    overhead = defaultdict(float)
 
-    b = PdfReportBuilder("PROFIT & LOSS STATEMENT")
-    period_str = (
-        f"FY {year} Q{quarter}"
-        if (year and quarter)
-        else (f"FY {year}" if year else "Custom Date Range")
-    )
-
-    b.add_info_table(
-        [
-            ("Report Date", str(date.today()), "Reporting Period", period_str),
-            ("Scope", f"Project ID: {project_id}" if project_id else "All Active Projects", "Status", "Audited Financials"),
-        ]
-    )
-
-    b.add_summary_box(
-        "EXECUTIVE SUMMARY",
-        [
-            f"<b>Total Revenue:</b> Rs. {total_income:,.2f}",
-            f"<b>Total Expenses:</b> Rs. {total_expense:,.2f}",
-            f"<b>Net Profit:</b> Rs. {net_profit:,.2f} ({margin:.1f}% Margin)",
-        ],
-    )
-
-    headers = ["Category", "Type", "Amount"]
-    rows = []
-
-    income_by_type = defaultdict(float)
     for inv in invoices:
-        income_by_type[inv.type or "General"] += float(inv.total_amount or 0)
-    for itype, amt in sorted(income_by_type.items()):
-        rows.append([f"Revenue: {itype}", "Income", f"Rs. {amt:,.2f}"])
+        amt = float(inv.total_amount or 0)
+        if inv.type == "owner":
+            revenue += amt
+        elif inv.type == "labour":
+            cogs_labour += amt
+        elif inv.type == "material":
+            cogs_material += amt
 
-    exp_by_cat = defaultdict(float)
+    total_overhead = 0.0
     for exp in expenses:
-        exp_by_cat[exp.category or "General"] += float(exp.amount or 0)
-    for ecat, amt in sorted(exp_by_cat.items()):
-        rows.append([f"Expense: {ecat}", "Cost", f"Rs. {amt:,.2f}"])
+        amt = float(exp.amount or 0)
+        overhead[exp.category] += amt
+        total_overhead += amt
 
-    b.add_section_table(
-        "INCOME & EXPENDITURE BREAKDOWN",
-        headers,
-        rows,
-        col_widths=[3.5 * inch, 1.5 * inch, 2.0 * inch],
-    )
+    cogs = cogs_labour + cogs_material
+    gross_profit = revenue - cogs
+    net_income = gross_profit - total_overhead
+    margin = (net_income / revenue * 100) if revenue > 0 else 0.0
+
+    b = PdfReportBuilder("Profit & Loss Statement")
+    info_bits = [
+        (
+            "Generated",
+            str(date.today()),
+            "Project",
+            project_name,
+        )
+    ]
+    b.add_info_table(info_bits)
+
+    filter_bits = []
+    if year:
+        filter_bits.append(f"Year: {year}")
+    if quarter:
+        filter_bits.append(f"Quarter: {quarter}")
+    if filter_bits:
+        b.add_summary_box("FILTERS APPLIED", [" | ".join(filter_bits)])
+
+    headers = ["Particulars", "Amount (Rs.)"]
+    rows = [
+        ["Revenue", f"Rs. {revenue:,.2f}"],
+        ["Labour Costs", f"Rs. {cogs_labour:,.2f}"],
+        ["Material Costs", f"Rs. {cogs_material:,.2f}"],
+        ["Total COGS", f"Rs. {cogs:,.2f}"],
+        ["Gross Profit", f"Rs. {gross_profit:,.2f}"],
+    ]
+    for cat, amt in overhead.items():
+        rows.append([cat, f"Rs. {amt:,.2f}"])
+    rows.append(["Total Operating Expenses", f"Rs. {total_overhead:,.2f}"])
+    rows.append(["Net Income", f"Rs. {net_income:,.2f}"])
+    rows.append(["Net Profit Margin", f"{margin:,.2f}%"])
+
+    b.add_section_table("PROFIT & LOSS STATEMENT", headers, rows, col_widths=[300, 150])
 
     stream = b.build()
 

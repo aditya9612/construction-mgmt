@@ -25,7 +25,7 @@ class Plan(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    price: Mapped[Decimal] = mapped_column(DECIMAL(18, 2), nullable=False, default=Decimal('0.00'))
     billing_interval: Mapped[str] = mapped_column(String(20), nullable=False, default="monthly")  # monthly, yearly
     currency: Mapped[str] = mapped_column(String(10), nullable=False, default="INR")
     features: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)

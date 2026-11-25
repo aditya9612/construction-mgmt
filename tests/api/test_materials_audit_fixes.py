@@ -13,6 +13,7 @@ from app.models.company import Company
 from app.models.owner import Owner
 from app.models.project import Project, ProjectStatus
 from app.models.master_data import MaterialMaster, Unit
+import asyncio
 from app.models.material import (
     Material,
     Supplier,
@@ -20,6 +21,7 @@ from app.models.material import (
     MaterialTransfer,
     MaterialTransaction,
     MaterialLedger,
+    MaterialUsage,
 )
 from app.core.enums import TransactionType, RateType
 
@@ -458,3 +460,435 @@ async def test_idempotency_purchase_usage():
         # Idempotent response is returned
         assert res2.status_code in (200, 201)
 
+
+
+# ==============================================================================
+# ISSUE #4197: MATERIAL CONSUMPTION / INSUFFICIENT STOCK / CONCURRENCY TESTS
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_usage_basic_stock_behavior():
+    override_user(admin_user)
+    data = await setup_audit_data()
+
+    # Create Material with 100 units
+    payload = {
+        "project_id": data["project_id"],
+        "supplier_id": data["supplier_id"],
+        "material_master_id": data["mm_id"],
+        "material_name": "Cement 53 Grade",
+        "category": "Cement",
+        "unit_id": data["unit_id"],
+        "quantity_purchased": 100,
+        "purchase_rate": 420.0,
+        "payment_given": 42000.0,
+        "rate_type": "FIXED",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        m_res = await ac.post("/api/v1/materials", json=payload)
+        assert m_res.status_code == 201
+        mat_id = m_res.json()["id"]
+
+        # 1. Stock 100, request 20: success, remaining stock 80
+        res1 = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 20,
+            "project_id": data["project_id"],
+        })
+        assert res1.status_code == 200
+        assert float(res1.json()["remaining_stock"]) == 80.0
+        assert float(res1.json()["quantity_used"]) == 20.0
+
+        # 2. Stock 80, request 80: success, remaining stock 0
+        res2 = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 80,
+            "project_id": data["project_id"],
+        })
+        assert res2.status_code == 200
+        assert float(res2.json()["remaining_stock"]) == 0.0
+        assert float(res2.json()["quantity_used"]) == 100.0
+
+        # 3. Stock 0, request 1: reject, stock remains 0
+        res3 = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 1,
+            "project_id": data["project_id"],
+        })
+        assert res3.status_code == 400
+        assert res3.json()["detail"] == "Insufficient stock available."
+
+        # Verify stock remains 0
+        get_res = await ac.get(f"/api/v1/materials/{mat_id}")
+        assert float(get_res.json()["remaining_stock"]) == 0.0
+
+        # Create new Material with 100 units for exceed check
+        data2 = await setup_audit_data()
+        payload2 = dict(payload)
+        payload2["project_id"] = data2["project_id"]
+        payload2["supplier_id"] = data2["supplier_id"]
+        m_res2 = await ac.post("/api/v1/materials", json=payload2)
+        assert m_res2.status_code == 201
+        mat_id2 = m_res2.json()["id"]
+
+        # 4. Stock 100, request 101: reject, stock remains 100
+        res4 = await ac.post(f"/api/v1/materials/{mat_id2}/usage", json={
+            "quantity": 101,
+            "project_id": data2["project_id"],
+        })
+        assert res4.status_code == 400
+        assert "Insufficient stock available. Available: 100.000" in res4.json()["detail"]
+
+        get_res2 = await ac.get(f"/api/v1/materials/{mat_id2}")
+        assert float(get_res2.json()["remaining_stock"]) == 100.0
+        assert float(get_res2.json()["quantity_used"]) == 0.0
+
+        # 5. Quantity 0 or negative: reject 422
+        res_zero = await ac.post(f"/api/v1/materials/{mat_id2}/usage", json={
+            "quantity": 0,
+            "project_id": data["project_id"],
+        })
+        assert res_zero.status_code == 422
+
+        res_neg = await ac.post(f"/api/v1/materials/{mat_id2}/usage", json={
+            "quantity": -5,
+            "project_id": data["project_id"],
+        })
+        assert res_neg.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_usage_concurrency_60_plus_60_against_100():
+    """Critical concurrency regression: two concurrent requests of 60 against 100 stock.
+    Exactly one succeeds (200), one fails (400), remaining stock is 40."""
+    override_user(admin_user)
+    data = await setup_audit_data()
+
+    payload = {
+        "project_id": data["project_id"],
+        "supplier_id": data["supplier_id"],
+        "material_master_id": data["mm_id"],
+        "material_name": "Cement 53 Grade",
+        "category": "Cement",
+        "unit_id": data["unit_id"],
+        "quantity_purchased": 100,
+        "purchase_rate": 420.0,
+        "payment_given": 42000.0,
+        "rate_type": "FIXED",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        m_res = await ac.post("/api/v1/materials", json=payload)
+        assert m_res.status_code == 201
+        mat_id = m_res.json()["id"]
+
+        req1 = ac.post(f"/api/v1/materials/{mat_id}/usage", json={"quantity": 60, "project_id": data["project_id"]})
+        req2 = ac.post(f"/api/v1/materials/{mat_id}/usage", json={"quantity": 60, "project_id": data["project_id"]})
+        res1, res2 = await asyncio.gather(req1, req2)
+
+        statuses = [res1.status_code, res2.status_code]
+        assert 200 in statuses, f"Expected one 200, got {statuses}"
+        assert 400 in statuses, f"Expected one 400, got {statuses}"
+
+        # Identify rejected response
+        rejected_res = res1 if res1.status_code == 400 else res2
+        assert "Insufficient stock available. Available: 40.000" in rejected_res.json()["detail"]
+
+        # Check final material stock
+        get_res = await ac.get(f"/api/v1/materials/{mat_id}")
+        assert float(get_res.json()["remaining_stock"]) == 40.0
+        assert float(get_res.json()["quantity_used"]) == 60.0
+
+        # Check DB records: exactly 1 usage entry and 1 usage transaction persisted
+        async with AsyncSessionLocal() as db:
+            usages = (await db.scalars(select(MaterialUsage).where(MaterialUsage.material_id == mat_id))).all()
+            assert len(usages) == 1
+            assert float(usages[0].quantity_used) == 60.0
+
+            txs = (await db.scalars(
+                select(MaterialTransaction).where(
+                    MaterialTransaction.material_id == mat_id,
+                    MaterialTransaction.type == TransactionType.USAGE
+                )
+            )).all()
+            assert len(txs) == 1
+            assert float(txs[0].quantity) == -60.0
+
+
+@pytest.mark.asyncio
+async def test_usage_concurrency_exact_sum_100():
+    """Concurrently request quantities whose sum equals available stock (60 + 40 = 100).
+    Both may succeed sequentially under locking, final stock is 0."""
+    override_user(admin_user)
+    data = await setup_audit_data()
+
+    payload = {
+        "project_id": data["project_id"],
+        "supplier_id": data["supplier_id"],
+        "material_master_id": data["mm_id"],
+        "material_name": "Cement 53 Grade",
+        "category": "Cement",
+        "unit_id": data["unit_id"],
+        "quantity_purchased": 100,
+        "purchase_rate": 420.0,
+        "payment_given": 42000.0,
+        "rate_type": "FIXED",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        m_res = await ac.post("/api/v1/materials", json=payload)
+        assert m_res.status_code == 201
+        mat_id = m_res.json()["id"]
+
+        req1 = ac.post(f"/api/v1/materials/{mat_id}/usage", json={"quantity": 60, "project_id": data["project_id"]})
+        req2 = ac.post(f"/api/v1/materials/{mat_id}/usage", json={"quantity": 40, "project_id": data["project_id"]})
+        res1, res2 = await asyncio.gather(req1, req2)
+
+        assert res1.status_code == 200
+        assert res2.status_code == 200
+
+        get_res = await ac.get(f"/api/v1/materials/{mat_id}")
+        assert float(get_res.json()["remaining_stock"]) == 0.0
+        assert float(get_res.json()["quantity_used"]) == 100.0
+
+
+@pytest.mark.asyncio
+async def test_usage_multiple_concurrent_requests_exceeding_stock():
+    """Three concurrent requests of 40 against 100 stock (total 120).
+    Exactly two succeed (80 total consumed), one fails, remaining stock is 20."""
+    override_user(admin_user)
+    data = await setup_audit_data()
+
+    payload = {
+        "project_id": data["project_id"],
+        "supplier_id": data["supplier_id"],
+        "material_master_id": data["mm_id"],
+        "material_name": "Cement 53 Grade",
+        "category": "Cement",
+        "unit_id": data["unit_id"],
+        "quantity_purchased": 100,
+        "purchase_rate": 420.0,
+        "payment_given": 42000.0,
+        "rate_type": "FIXED",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        m_res = await ac.post("/api/v1/materials", json=payload)
+        assert m_res.status_code == 201
+        mat_id = m_res.json()["id"]
+
+        req1 = ac.post(f"/api/v1/materials/{mat_id}/usage", json={"quantity": 40, "project_id": data["project_id"]})
+        req2 = ac.post(f"/api/v1/materials/{mat_id}/usage", json={"quantity": 40, "project_id": data["project_id"]})
+        req3 = ac.post(f"/api/v1/materials/{mat_id}/usage", json={"quantity": 40, "project_id": data["project_id"]})
+        results = await asyncio.gather(req1, req2, req3)
+
+        success_count = sum(1 for r in results if r.status_code == 200)
+        failure_count = sum(1 for r in results if r.status_code == 400)
+        assert success_count == 2
+        assert failure_count == 1
+
+        get_res = await ac.get(f"/api/v1/materials/{mat_id}")
+        assert float(get_res.json()["remaining_stock"]) == 20.0
+        assert float(get_res.json()["quantity_used"]) == 80.0
+
+
+@pytest.mark.asyncio
+async def test_usage_idempotency_simultaneous_retries():
+    """Simultaneous retries with the same idempotency key return identical responses
+    and do not duplicate usage or transactions."""
+    override_user(admin_user)
+    data = await setup_audit_data()
+
+    payload = {
+        "project_id": data["project_id"],
+        "supplier_id": data["supplier_id"],
+        "material_master_id": data["mm_id"],
+        "material_name": "Cement 53 Grade",
+        "category": "Cement",
+        "unit_id": data["unit_id"],
+        "quantity_purchased": 100,
+        "purchase_rate": 420.0,
+        "payment_given": 42000.0,
+        "rate_type": "FIXED",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        m_res = await ac.post("/api/v1/materials", json=payload)
+        assert m_res.status_code == 201
+        mat_id = m_res.json()["id"]
+
+        idempotency_key = f"usage-key-{uuid.uuid4().hex}"
+        headers = {"Idempotency-Key": idempotency_key}
+        usage_payload = {"quantity": 35, "project_id": data["project_id"]}
+
+        req1 = ac.post(f"/api/v1/materials/{mat_id}/usage", json=usage_payload, headers=headers)
+        req2 = ac.post(f"/api/v1/materials/{mat_id}/usage", json=usage_payload, headers=headers)
+        res1, res2 = await asyncio.gather(req1, req2)
+
+        assert res1.status_code == 200
+        assert res2.status_code == 200
+        assert res1.json()["id"] == res2.json()["id"]
+
+        get_res = await ac.get(f"/api/v1/materials/{mat_id}")
+        assert float(get_res.json()["remaining_stock"]) == 65.0
+        assert float(get_res.json()["quantity_used"]) == 35.0
+
+        async with AsyncSessionLocal() as db:
+            usages = (await db.scalars(select(MaterialUsage).where(MaterialUsage.material_id == mat_id))).all()
+            assert len(usages) == 1
+            assert float(usages[0].quantity_used) == 35.0
+
+
+@pytest.mark.asyncio
+async def test_usage_project_scoping_and_isolation():
+    """Enforce project scoping: mismatched project_id in body is rejected with 400.
+    Cross-company access is denied with 403/404."""
+    override_user(admin_user)
+    data = await setup_audit_data()
+
+    payload = {
+        "project_id": data["project_id"],
+        "supplier_id": data["supplier_id"],
+        "material_master_id": data["mm_id"],
+        "material_name": "Cement 53 Grade",
+        "category": "Cement",
+        "unit_id": data["unit_id"],
+        "quantity_purchased": 100,
+        "purchase_rate": 420.0,
+        "payment_given": 42000.0,
+        "rate_type": "FIXED",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        m_res = await ac.post("/api/v1/materials", json=payload)
+        assert m_res.status_code == 201
+        mat_id = m_res.json()["id"]
+
+        # Valid project matches -> 200
+        res_valid = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 10,
+            "project_id": data["project_id"],
+        })
+        assert res_valid.status_code == 200
+
+        # Mismatched project (project_dest_id != project_id) -> 400
+        res_mismatch = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 10,
+            "project_id": data["project_dest_id"],
+        })
+        assert res_mismatch.status_code == 400
+        assert res_mismatch.json()["detail"] == "Project ID does not match material project"
+
+        # Stock unchanged by failed request
+        get_res = await ac.get(f"/api/v1/materials/{mat_id}")
+        assert float(get_res.json()["remaining_stock"]) == 90.0
+
+    # Cross-company user -> 403 or 404
+    diff_user = User(
+        id=9003,
+        email="diff_company@test.com",
+        role=UserRole.SITE_ENGINEER.value,
+        is_active=True,
+        is_super_admin=False,
+        company_id=999,
+    )
+    override_user(diff_user)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        res_unauth = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 10,
+            "project_id": data["project_id"],
+        })
+        assert res_unauth.status_code in (403, 404)
+
+
+@pytest.mark.asyncio
+async def test_usage_transaction_rollback_and_retry():
+    """Forced failure (e.g. invalid boq_item_id) rolls back all mutations atomically.
+    Subsequent valid retry succeeds."""
+    override_user(admin_user)
+    data = await setup_audit_data()
+
+    payload = {
+        "project_id": data["project_id"],
+        "supplier_id": data["supplier_id"],
+        "material_master_id": data["mm_id"],
+        "material_name": "Cement 53 Grade",
+        "category": "Cement",
+        "unit_id": data["unit_id"],
+        "quantity_purchased": 100,
+        "purchase_rate": 420.0,
+        "payment_given": 42000.0,
+        "rate_type": "FIXED",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        m_res = await ac.post("/api/v1/materials", json=payload)
+        assert m_res.status_code == 201
+        mat_id = m_res.json()["id"]
+
+        # Invalid boq_item_id -> 404
+        res_fail = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 25,
+            "project_id": data["project_id"],
+            "boq_item_id": 999999,
+        })
+        assert res_fail.status_code == 404
+
+        # Verify no usage or ledger records were persisted
+        async with AsyncSessionLocal() as db:
+            usages = (await db.scalars(select(MaterialUsage).where(MaterialUsage.material_id == mat_id))).all()
+            assert len(usages) == 0
+
+        # Valid retry succeeds -> 200
+        res_retry = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 25,
+            "project_id": data["project_id"],
+        })
+        assert res_retry.status_code == 200
+        assert float(res_retry.json()["remaining_stock"]) == 75.0
+
+
+@pytest.mark.asyncio
+async def test_usage_reconciliation_compatibility():
+    """Material with reconciled physical stock (e.g. diff > 0, physical stock 110 > purchased 100).
+    Usage respects authoritative remaining_stock and does not overwrite it with purchased - used."""
+    override_user(admin_user)
+    data = await setup_audit_data()
+
+    payload = {
+        "project_id": data["project_id"],
+        "supplier_id": data["supplier_id"],
+        "material_master_id": data["mm_id"],
+        "material_name": "Cement 53 Grade",
+        "category": "Cement",
+        "unit_id": data["unit_id"],
+        "quantity_purchased": 100,
+        "purchase_rate": 420.0,
+        "payment_given": 42000.0,
+        "rate_type": "FIXED",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        m_res = await ac.post("/api/v1/materials", json=payload)
+        assert m_res.status_code == 201
+        mat_id = m_res.json()["id"]
+
+        # Directly set reconciled physical stock to 110 (diff = +10 extra physical stock found)
+        async with AsyncSessionLocal() as db:
+            mat_obj = await db.get(Material, mat_id)
+            mat_obj.remaining_stock = Decimal("110.000")
+            await db.commit()
+
+        # Can consume 105 units because authoritative remaining_stock is 110
+        # (If it used purchased - used = 100, 105 would have failed!)
+        res1 = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 105,
+            "project_id": data["project_id"],
+        })
+        assert res1.status_code == 200
+        body1 = res1.json()
+        assert float(body1["remaining_stock"]) == 5.0
+        assert float(body1["quantity_used"]) == 105.0
+
+        # Now attempting to use 10 units when only 5 remain -> rejected
+        res2 = await ac.post(f"/api/v1/materials/{mat_id}/usage", json={
+            "quantity": 10,
+            "project_id": data["project_id"],
+        })
+        assert res2.status_code == 400
+        assert "Insufficient stock available. Available: 5.000" in res2.json()["detail"]
+
+        # Final stock remains 5.0
+        get_res = await ac.get(f"/api/v1/materials/{mat_id}")
+        assert float(get_res.json()["remaining_stock"]) == 5.0

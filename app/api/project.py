@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 import json
 import mimetypes
-import pathlib, re, io, os, uuid
+import pathlib, re, io, os, uuid, zipfile
 from ezdxf import colors
 from openpyxl import Workbook
 from typing import Annotated, List, Optional, Union
@@ -27,7 +27,7 @@ from app.core.enums import (
 from app.models.boq import BOQ
 from app.models.work_order import WorkOrder
 from app.schemas.base import PaginatedResponse, PaginationMeta
-from app.core.validators import validate_drawing_file
+from app.core.validators import validate_drawing_file, validate_drawing_name, validate_non_empty_string
 from app.db.session import get_db_session
 from sqlalchemy.orm import selectinload
 import traceback
@@ -78,7 +78,7 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors as pdf_colors
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from fastapi import UploadFile, File
 from app.utils.helpers import (
     AppError,
@@ -1090,6 +1090,23 @@ class ProjectsService:
         elif not current_user.company_id:
             base_query = base_query.where(m.Project.company_id == None)
 
+        if current_user.role == UserRole.CLIENT.value:
+            from app.models.quotation import QuotationMaster
+
+            member_subq = select(m.ProjectMember.project_id).where(
+                m.ProjectMember.user_id == current_user.id
+            )
+            quotation_subq = select(QuotationMaster.project_id).where(
+                QuotationMaster.client_user_id == current_user.id,
+                QuotationMaster.project_id.is_not(None),
+            )
+            base_query = base_query.where(
+                or_(
+                    m.Project.id.in_(member_subq),
+                    m.Project.id.in_(quotation_subq),
+                )
+            )
+
         if search:
             base_query = base_query.where(
                 m.Project.project_name.ilike(f"%{search.strip()}%")
@@ -1288,12 +1305,179 @@ class ProjectsService:
             grace_period_minutes=obj.grace_period_minutes,
         )
 
+    async def _check_blocking_dependencies(
+        self, db: AsyncSession, project_id: int
+    ) -> list[str]:
+        """
+        Inspect all tables referencing projects.id with ON DELETE NO ACTION/RESTRICT.
+        Returns a list of human-readable category strings for any dependencies found.
+        """
+        from sqlalchemy import literal, or_
+        from app.models.invoice import Transaction, Invoice
+        from app.models.accountant import VendorBill, FixedAsset
+        from app.models.quotation import QuotationMaster
+        from app.models.labour import LabourPayroll, LabourWageRecord
+        from app.models.material import (
+            PurchaseOrder,
+            Material,
+            MaterialTransaction,
+            MaterialUsage,
+            MaterialTransfer,
+            MaterialLedger,
+        )
+        from app.models.equipment import (
+            EquipmentRental,
+            EquipmentPurchase,
+            EquipmentMaintenance,
+        )
+        from app.models.project import Checklist, SafetyIncident, QCRecord
+        from app.models.alert import Alert
+        from app.models.settings import UserSettings
+        from app.models.billing import RABill
+
+        blocked_reasons: list[str] = []
+
+        # 1. Financial Transactions & Bills
+        has_tx = await db.scalar(
+            select(literal(1)).select_from(Transaction).where(Transaction.project_id == project_id).limit(1)
+        )
+        if has_tx:
+            blocked_reasons.append("financial transactions")
+
+        has_vb = await db.scalar(
+            select(literal(1)).select_from(VendorBill).where(VendorBill.project_id == project_id).limit(1)
+        )
+        if has_vb:
+            blocked_reasons.append("vendor bills")
+
+        has_inv = await db.scalar(
+            select(literal(1)).select_from(Invoice).where(Invoice.project_id == project_id).limit(1)
+        )
+        has_rabill = await db.scalar(
+            select(literal(1)).select_from(RABill).where(RABill.project_id == project_id).limit(1)
+        ) if not has_inv else True
+        if has_inv or has_rabill:
+            blocked_reasons.append("customer invoices or RA bills")
+
+        # 2. Quotation Master (Originating Sales Proposal)
+        has_qm = await db.scalar(
+            select(literal(1)).select_from(QuotationMaster).where(QuotationMaster.project_id == project_id).limit(1)
+        )
+        if has_qm:
+            blocked_reasons.append("originating quotations")
+
+        # 3. Labour Payroll & Wages
+        has_payroll = await db.scalar(
+            select(literal(1)).select_from(LabourPayroll).where(LabourPayroll.project_id == project_id).limit(1)
+        )
+        has_wages = await db.scalar(
+            select(literal(1)).select_from(LabourWageRecord).where(LabourWageRecord.project_id == project_id).limit(1)
+        ) if not has_payroll else True
+        if has_payroll or has_wages:
+            blocked_reasons.append("labour payroll records")
+
+        # 4. Materials, Purchase Orders & Inventory
+        has_po = await db.scalar(
+            select(literal(1)).select_from(PurchaseOrder).where(PurchaseOrder.project_id == project_id).limit(1)
+        )
+        has_mat = await db.scalar(
+            select(literal(1)).select_from(Material).where(Material.project_id == project_id).limit(1)
+        ) if not has_po else True
+        has_mat_tx = await db.scalar(
+            select(literal(1)).select_from(MaterialTransaction).where(MaterialTransaction.project_id == project_id).limit(1)
+        ) if not (has_po or has_mat) else True
+        has_mat_usg = await db.scalar(
+            select(literal(1)).select_from(MaterialUsage).where(MaterialUsage.project_id == project_id).limit(1)
+        ) if not (has_po or has_mat or has_mat_tx) else True
+        has_mat_ldg = await db.scalar(
+            select(literal(1)).select_from(MaterialLedger).where(MaterialLedger.project_id == project_id).limit(1)
+        ) if not (has_po or has_mat or has_mat_tx or has_mat_usg) else True
+        has_mat_tr = await db.scalar(
+            select(literal(1)).select_from(MaterialTransfer).where(
+                or_(MaterialTransfer.from_project_id == project_id, MaterialTransfer.to_project_id == project_id)
+            ).limit(1)
+        ) if not (has_po or has_mat or has_mat_tx or has_mat_usg or has_mat_ldg) else True
+        if has_po or has_mat or has_mat_tx or has_mat_usg or has_mat_ldg or has_mat_tr:
+            blocked_reasons.append("material and procurement records")
+
+        # 5. Equipment (Rentals, Purchases, Maintenance)
+        has_eq_rent = await db.scalar(
+            select(literal(1)).select_from(EquipmentRental).where(EquipmentRental.project_id == project_id).limit(1)
+        )
+        has_eq_purch = await db.scalar(
+            select(literal(1)).select_from(EquipmentPurchase).where(EquipmentPurchase.project_id == project_id).limit(1)
+        ) if not has_eq_rent else True
+        has_eq_maint = await db.scalar(
+            select(literal(1)).select_from(EquipmentMaintenance).where(EquipmentMaintenance.project_id == project_id).limit(1)
+        ) if not (has_eq_rent or has_eq_purch) else True
+        if has_eq_rent or has_eq_purch or has_eq_maint:
+            blocked_reasons.append("equipment records")
+
+        # 6. Fixed Assets
+        has_fa = await db.scalar(
+            select(literal(1)).select_from(FixedAsset).where(FixedAsset.project_id == project_id).limit(1)
+        )
+        if has_fa:
+            blocked_reasons.append("fixed assets")
+
+        # 7. Site Compliance (Checklists, Safety Incidents, QC Records)
+        has_chk = await db.scalar(
+            select(literal(1)).select_from(Checklist).where(Checklist.project_id == project_id).limit(1)
+        )
+        has_safe = await db.scalar(
+            select(literal(1)).select_from(SafetyIncident).where(SafetyIncident.project_id == project_id).limit(1)
+        ) if not has_chk else True
+        has_qc = await db.scalar(
+            select(literal(1)).select_from(QCRecord).where(QCRecord.project_id == project_id).limit(1)
+        ) if not (has_chk or has_safe) else True
+        if has_chk or has_safe or has_qc:
+            blocked_reasons.append("quality and safety records")
+
+        # 8. Alerts
+        has_alert = await db.scalar(
+            select(literal(1)).select_from(Alert).where(Alert.project_id == project_id).limit(1)
+        )
+        if has_alert:
+            blocked_reasons.append("system alerts")
+
+        # 9. User Settings Default Project
+        has_pref = await db.scalar(
+            select(literal(1)).select_from(UserSettings).where(UserSettings.default_project_id == project_id).limit(1)
+        )
+        if has_pref:
+            blocked_reasons.append("user default project preferences")
+
+        return blocked_reasons
+
     async def delete_project(
         self, db: AsyncSession, current_user: User, *, project_id: int
     ) -> None:
         obj = await _get_scoped_project(db, project_id, current_user, for_update=True)
+        project_name = obj.project_name or f"ID {project_id}"
+        
+        # 1. Validate blocking dependencies before attempting physical deletion
+        blocked_reasons = await self._check_blocking_dependencies(db, project_id=project_id)
+        if blocked_reasons:
+            reasons_str = ", ".join(blocked_reasons)
+            raise ConflictError(
+                f"Cannot delete project '{project_name}' because it has associated {reasons_str}. "
+                "Please remove or reassign these records before deleting the project."
+            )
+
+        # 2. Attempt physical deletion; foreign keys act as final integrity safeguard
         try:
             await self.projects_repo.delete_project(db, obj)
+        except IntegrityError as exc:
+            await db.rollback()
+            err_str = str(exc.orig) if hasattr(exc, "orig") and exc.orig else str(exc)
+            if "1451" in err_str or "foreign key constraint fails" in err_str.lower():
+                logger.warning(f"Project delete blocked by foreign key constraint id={project_id}: {err_str}")
+                raise ConflictError(
+                    f"Cannot delete project '{project_name}' because it has associated records referencing it. "
+                    "Please remove or reassign all related records before deleting the project."
+                )
+            logger.exception(f"Unexpected database integrity error during project delete id={project_id}")
+            raise
         except Exception:
             await db.rollback()
             logger.exception(f"Project delete failed id={project_id}")
@@ -2803,7 +2987,11 @@ class ReportsService:
                 "Client Name",
                 owner.owner_name if owner else "N/A",
                 "Project Type",
-                str(project.type) if project.type else "N/A",
+                (
+                    project.type.value.capitalize()
+                    if getattr(project, "type", None) and hasattr(project.type, "value")
+                    else (str(project.type) if getattr(project, "type", None) else "N/A")
+                ),
             ],
             [
                 "Location",
@@ -3268,7 +3456,11 @@ class ReportsService:
                 "name": project.project_name,
                 "code": project.business_id,
                 "client": owner.owner_name if owner else "N/A",
-                "type": getattr(project, "type", "Residential"),
+                "type": (
+                    project.type.value.capitalize()
+                    if getattr(project, "type", None) and hasattr(project.type, "value")
+                    else (str(project.type) if getattr(project, "type", None) else "Residential")
+                ),
                 "location": getattr(
                     project,
                     "location",
@@ -4417,6 +4609,42 @@ async def list_task_progress_history(
     )
 
 
+def _validate_file_signature(content: bytes, ext: str) -> None:
+    ext_lower = ext.lower()
+    if ext_lower == ".pdf":
+        if not content.startswith(b"%PDF-"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid PDF file signature")
+    elif ext_lower == ".png":
+        if not content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid PNG file signature")
+    elif ext_lower in (".jpg", ".jpeg"):
+        if not content.startswith(b"\xff\xd8\xff"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JPEG file signature")
+    elif ext_lower == ".webp":
+        if not (content.startswith(b"RIFF") and len(content) >= 12 and content[8:12] == b"WEBP"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid WebP file signature")
+    elif ext_lower in (".docx", ".xlsx"):
+        if not content.startswith(b"PK\x03\x04"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Office document signature")
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                if "[Content_Types].xml" not in zf.namelist():
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Office OpenXML document")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malformed Office document archive")
+    elif ext_lower in (".doc", ".xls"):
+        if not content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Microsoft Office file signature")
+    elif ext_lower == ".txt":
+        if b"\x00" in content[:1024]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid text file: binary characters detected")
+        stripped_prefix = content[:100].lstrip().lower()
+        if stripped_prefix.startswith((b"<html", b"<!doctype", b"<?xml", b"<svg", b"<script")):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid text file: HTML/XML script content not allowed")
+
+
 @tasks_router.post(
     "/task-requests",
     response_model=s.TaskRequestResponse,
@@ -4431,28 +4659,63 @@ async def create_task_request(
     await _get_scoped_project(db, project_id=request.project_id, current_user=current_user, load_relations=False)
 
     attachment_url = None
+    newly_saved_path = None
 
-    if form.attachment and form.attachment.filename and form.attachment.filename.strip():
+    uploaded_file = form.attachment or getattr(form, "file", None)
+    if uploaded_file and uploaded_file.filename and uploaded_file.filename.strip():
+        raw_name = os.path.basename(uploaded_file.filename.strip())
+        _, ext = os.path.splitext(raw_name)
+        allowed_exts = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".doc", ".docx", ".xls", ".xlsx", ".txt"}
+        if ext.lower() not in allowed_exts:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file extension. Allowed extensions are: {', '.join(sorted(allowed_exts))}",
+            )
+        content = await uploaded_file.read()
+        if len(content) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file cannot be empty",
+            )
+        if len(content) > 15 * 1024 * 1024:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File size exceeds maximum allowed limit (15MB)",
+            )
+        _validate_file_signature(content, ext)
+
         try:
             os.makedirs("uploads/task_requests", exist_ok=True)
-            safe_filename = form.attachment.filename.replace(" ", "_")
-            unique_name = f"{uuid4().hex[:8]}_{safe_filename}"
+            safe_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw_name)
+            unique_name = f"{uuid.uuid4().hex}_{safe_filename}"
             file_path = os.path.join("uploads/task_requests", unique_name)
-            content = await form.attachment.read()
             with open(file_path, "wb") as f:
                 f.write(content)
+            newly_saved_path = file_path
             attachment_url = f"/uploads/task_requests/{unique_name}"
-        except Exception:
-            attachment_url = form.attachment.filename
+        except Exception as exc:
+            logger.exception(f"Failed to save task request attachment: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to save attachment file",
+            )
 
     data = request.model_dump(exclude={"attachment_url"})
     data["attachment_url"] = attachment_url
 
     db_obj = m.TaskRequest(**data)
 
-    db.add(db_obj)
-    await db.commit()
-    await db.refresh(db_obj)
+    try:
+        db.add(db_obj)
+        await db.commit()
+        await db.refresh(db_obj)
+    except Exception:
+        if newly_saved_path and os.path.exists(newly_saved_path):
+            try:
+                os.remove(newly_saved_path)
+            except Exception as rm_err:
+                logger.warning(f"Failed to clean up newly saved attachment {newly_saved_path}: {rm_err}")
+        raise
 
     return db_obj
 
@@ -4516,6 +4779,41 @@ async def list_task_requests(
     )
 
 
+@tasks_router.get("/task-requests/{task_request_id}/attachment")
+async def download_task_request_attachment(
+    task_request_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("tasks.view")),
+):
+    req = await _get_scoped_task_request(db, task_request_id, current_user, for_update=False)
+    await assert_project_access(db, project_id=req.project_id, current_user=current_user)
+
+    if not req.attachment_url:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task request has no attachment")
+
+    base_dir = pathlib.Path("uploads/task_requests").resolve()
+    clean_rel = req.attachment_url.lstrip("/")
+    target_path = pathlib.Path(clean_rel).resolve()
+
+    try:
+        if not target_path.is_relative_to(base_dir) or not target_path.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment file not found on disk")
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attachment file not found on disk")
+
+    safe_filename = target_path.name
+
+    return FileResponse(
+        path=str(target_path),
+        filename=safe_filename,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @tasks_router.put("/task-requests/{request_id}", response_model=s.TaskRequestResponse)
 async def update_task_request(
     request_id: int,
@@ -4524,6 +4822,7 @@ async def update_task_request(
     current_user: User = Depends(require_permission("tasks.edit")),
 ):
     db_obj = await _get_scoped_task_request(db, request_id, current_user, for_update=True)
+    await assert_project_access(db, project_id=db_obj.project_id, current_user=current_user)
 
     update_data = request.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -4541,6 +4840,7 @@ async def delete_task_request(
     current_user: User = Depends(require_permission("tasks.delete")),
 ):
     db_obj = await _get_scoped_task_request(db, request_id, current_user, for_update=True)
+    await assert_project_access(db, project_id=db_obj.project_id, current_user=current_user)
 
     # Soft delete
     db_obj.is_deleted = True
@@ -6117,6 +6417,41 @@ async def list_activities(
             await _validate_scoped_engineer(db, engineer_id, project_id, current_user)
             filters.append(m.WorkActivity.engineer_id == engineer_id)
 
+        if status is not None:
+            pct = func.coalesce(m.WorkActivity.completion_percentage, Decimal("0.00"))
+            if status == WorkActivityStatus.COMPLETED:
+                filters.append(pct >= Decimal("100"))
+            elif status == WorkActivityStatus.DELAY:
+                filters.append(
+                    and_(
+                        pct < Decimal("100"),
+                        m.WorkActivity.end_date != None,
+                        m.WorkActivity.end_date < date.today(),
+                    )
+                )
+            elif status == WorkActivityStatus.ON_TRACK:
+                filters.append(
+                    and_(
+                        pct > Decimal("0"),
+                        pct < Decimal("100"),
+                        or_(
+                            m.WorkActivity.end_date == None,
+                            m.WorkActivity.end_date >= date.today(),
+                        ),
+                    )
+                )
+            elif status == WorkActivityStatus.NOT_STARTED:
+                filters.append(
+                    and_(
+                        pct <= Decimal("0"),
+                        or_(
+                            m.WorkActivity.end_date == None,
+                            m.WorkActivity.end_date >= date.today(),
+                        ),
+                    )
+                )
+            else:
+                filters.append(m.WorkActivity.status == status)
         if search:
             search = search.strip()
             filters.append(
@@ -6825,7 +7160,7 @@ async def list_daily_entries(
 
         return s.DailyProgressListResponse(
             success=True,
-            message="Daily progress fetched successfully",
+            message="Daily progress entries fetched successfully",
             limit=limit,
             offset=offset,
             page_count=len(entries),
@@ -9109,11 +9444,11 @@ async def create_folder(
     current_user: User = Depends(require_permission("drawings.create")),
 ):
     await _get_scoped_project(db, project_id, current_user, load_relations=False)
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     if data.parent_id:
         parent = await _get_scoped_drawing(db, data.parent_id, current_user)
         if parent.project_id != project_id or not parent.is_folder:
             raise HTTPException(status_code=400, detail="Invalid parent folder")
-
     obj = m.DrawingDocument(
         project_id=project_id,
         drawing_name=data.folder_name,
@@ -9149,6 +9484,31 @@ async def upload_drawing(
     db: AsyncSession = Depends(get_db_session),
 ):
     await _get_scoped_project(db, project_id, current_user, load_relations=False)
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
+    try:
+        drawing_name = validate_drawing_name(drawing_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        version = validate_non_empty_string(version)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # ================= PRE-CHECK DUPLICATE DRAWING =================
+    existing_drawing = await db.scalar(
+        select(m.DrawingDocument.id).where(
+            m.DrawingDocument.project_id == project_id,
+            func.lower(m.DrawingDocument.drawing_name) == func.lower(drawing_name),
+            func.lower(m.DrawingDocument.version) == func.lower(version),
+        )
+    )
+    if existing_drawing:
+        raise HTTPException(
+            status_code=400,
+            detail="A drawing with this name and version already exists.",
+        )
+
     if parent_id:
         parent = await _get_scoped_drawing(db, parent_id, current_user)
         if parent.project_id != project_id or not parent.is_folder:
@@ -9232,7 +9592,7 @@ async def upload_drawing(
             entity_type="drawing",
             entity_id=obj.id,
             requested_by=current_user.id,
-            remarks=f"Approval requested for drawing: {drawing_name}",
+            remarks=f"Approval requested for drawing: {drawing_name}"[:255],
             status="Pending",
         )
 
@@ -9249,6 +9609,46 @@ async def upload_drawing(
         await db.refresh(obj)
 
         return obj
+
+    except IntegrityError as exc:
+
+        await db.rollback()
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        orig_msg = str(exc.orig) if hasattr(exc, "orig") else str(exc)
+        if "uq_project_drawing_version" in orig_msg or "Duplicate entry" in orig_msg:
+            raise HTTPException(
+                status_code=400,
+                detail="A drawing with this name and version already exists.",
+            )
+
+        raise
+
+    except OperationalError as exc:
+
+        await db.rollback()
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        orig_msg = str(exc.orig) if hasattr(exc, "orig") else str(exc)
+        if "1213" in orig_msg or "Deadlock" in orig_msg:
+            existing_after = await db.scalar(
+                select(m.DrawingDocument.id).where(
+                    m.DrawingDocument.project_id == project_id,
+                    func.lower(m.DrawingDocument.drawing_name) == func.lower(drawing_name),
+                    func.lower(m.DrawingDocument.version) == func.lower(version),
+                )
+            )
+            if existing_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A drawing with this name and version already exists.",
+                )
+
+        raise
 
     except Exception:
 
@@ -9272,6 +9672,8 @@ async def update_drawing(
 ):
     obj = await _get_scoped_drawing(db, id, current_user, for_update=True)
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     # ================= LOCK APPROVED DRAWINGS =================
 
     if obj.approval_status == DocumentStatus.APPROVED:
@@ -9279,10 +9681,56 @@ async def update_drawing(
 
     update_data = payload.model_dump(exclude_unset=True)
 
+    target_name = update_data.get("drawing_name", obj.drawing_name)
+    target_version = update_data.get("version", obj.version)
+
+    if ("drawing_name" in update_data or "version" in update_data) and target_name and target_version:
+        conflict = await db.scalar(
+            select(m.DrawingDocument.id).where(
+                m.DrawingDocument.project_id == obj.project_id,
+                m.DrawingDocument.id != obj.id,
+                func.lower(m.DrawingDocument.drawing_name) == func.lower(target_name),
+                func.lower(m.DrawingDocument.version) == func.lower(target_version),
+            )
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=400,
+                detail="A drawing with this name and version already exists.",
+            )
+
     for field, value in update_data.items():
         setattr(obj, field, value)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        orig_msg = str(exc.orig) if hasattr(exc, "orig") else str(exc)
+        if "uq_project_drawing_version" in orig_msg or "Duplicate entry" in orig_msg:
+            raise HTTPException(
+                status_code=400,
+                detail="A drawing with this name and version already exists.",
+            )
+        raise
+    except OperationalError as exc:
+        await db.rollback()
+        orig_msg = str(exc.orig) if hasattr(exc, "orig") else str(exc)
+        if "1213" in orig_msg or "Deadlock" in orig_msg:
+            conflict_after = await db.scalar(
+                select(m.DrawingDocument.id).where(
+                    m.DrawingDocument.project_id == obj.project_id,
+                    m.DrawingDocument.id != obj.id,
+                    func.lower(m.DrawingDocument.drawing_name) == func.lower(target_name),
+                    func.lower(m.DrawingDocument.version) == func.lower(target_version),
+                )
+            )
+            if conflict_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A drawing with this name and version already exists.",
+                )
+        raise
 
     await db.refresh(obj)
 
@@ -9300,8 +9748,19 @@ async def get_drawing_approval_history(
 ):
     drawing = await _get_scoped_drawing(db, id, current_user)
 
+    await assert_project_access(db, project_id=drawing.project_id, current_user=current_user)
+
+    Requester = aliased(User, name="requester")
+    Approver = aliased(User, name="approver")
+
     result = await db.execute(
-        select(Approval)
+        select(
+            Approval,
+            Requester.full_name.label("requested_by_name"),
+            Approver.full_name.label("approved_by_name"),
+        )
+        .outerjoin(Requester, Approval.requested_by == Requester.id)
+        .outerjoin(Approver, Approval.approved_by == Approver.id)
         .where(
             Approval.entity_type == "drawing",
             Approval.entity_id == id,
@@ -9309,7 +9768,7 @@ async def get_drawing_approval_history(
         .order_by(Approval.id.desc())
     )
 
-    approvals = result.scalars().all()
+    rows = result.all()
 
     return [
         {
@@ -9317,13 +9776,15 @@ async def get_drawing_approval_history(
             "entity_type": approval.entity_type,
             "entity_id": approval.entity_id,
             "requested_by": approval.requested_by,
+            "requested_by_name": req_name,
             "approved_by": approval.approved_by,
+            "approved_by_name": app_name,
             "status": approval.status,
             "remarks": approval.remarks,
             "created_at": approval.created_at,
             "updated_at": approval.updated_at,
         }
-        for approval in approvals
+        for approval, req_name, app_name in rows
     ]
 
 
@@ -9342,6 +9803,7 @@ async def list_drawings(
     db: AsyncSession = Depends(get_db_session),
 ):
     await _get_scoped_project(db, project_id, current_user, load_relations=False)
+    await assert_project_access(db, project_id=project_id, current_user=current_user)
     stmt = select(m.DrawingDocument).where(m.DrawingDocument.project_id == project_id)
     count_stmt = (
         select(func.count())
@@ -9402,6 +9864,7 @@ async def get_versions(
 ):
     if project_id is not None:
         await _get_scoped_project(db, project_id, current_user, load_relations=False)
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
         query = select(m.DrawingDocument).where(m.DrawingDocument.project_id == project_id)
     else:
         assert_company_context(current_user)
@@ -9448,6 +9911,7 @@ async def get_latest(
 ):
     if project_id is not None:
         await _get_scoped_project(db, project_id, current_user, load_relations=False)
+        await assert_project_access(db, project_id=project_id, current_user=current_user)
         query = select(m.DrawingDocument).where(
             m.DrawingDocument.is_latest_version == True,
             m.DrawingDocument.project_id == project_id,
@@ -9502,6 +9966,8 @@ async def delete_drawing(
     if obj.approval_status == DocumentStatus.APPROVED:
         raise ValidationError("Approved drawing cannot be deleted")
 
+    await assert_project_access(db, project_id=obj.project_id, current_user=current_user)
+
     if obj.file_url and os.path.exists(obj.file_url):
         try:
             os.remove(obj.file_url)
@@ -9533,6 +9999,9 @@ async def download_document(
 ):
     doc = await _get_scoped_drawing(db, id, current_user)
 
+    if not doc:
+        raise NotFoundError("Document not found")
+    await assert_project_access(db, project_id=doc.project_id, current_user=current_user)
     if not doc.file_url or not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 
@@ -9554,6 +10023,9 @@ async def view_document(
 ):
     doc = await _get_scoped_drawing(db, id, current_user)
 
+    if not doc:
+        raise NotFoundError("Document not found")
+    await assert_project_access(db, project_id=doc.project_id, current_user=current_user)
     if not doc.file_url or not os.path.exists(doc.file_url):
         raise NotFoundError("File not found on server")
 

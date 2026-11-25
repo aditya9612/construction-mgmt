@@ -101,6 +101,24 @@ class UserUpdatePayload(BaseSchema):
     department: Optional[str] = Field(None, max_length=100)
     joining_date: Optional[date] = None
     is_active: Optional[bool] = None
+    status: Optional[str] = None
+
+    @field_validator("is_active", mode="before")
+    @classmethod
+    def validate_is_active(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            v_clean = v.strip().lower()
+            if v_clean in ["false", "0", "inactive", "deactivated", "disabled"]:
+                return False
+            if v_clean in ["true", "1", "active", "enabled"]:
+                return True
+        if isinstance(v, (int, float)):
+            return bool(v)
+        return v
 
     @field_validator("pan_number")
     @classmethod

@@ -217,6 +217,7 @@ class EquipmentStatus(str, Enum):
     RENTED = "RENTED"
     MAINTENANCE = "MAINTENANCE"
     DAMAGED = "DAMAGED"
+    INSPECTION_PENDING = "INSPECTION_PENDING"
 
 
 class AlertType(str, Enum):
@@ -237,6 +238,15 @@ class DocumentStatus(str, Enum):
     UNDER_REVIEW = "UNDER_REVIEW"
 
 
+class MeasurementStatus(str, Enum):
+    DRAFT = "DRAFT"
+    SUBMITTED = "SUBMITTED"
+    VERIFIED = "VERIFIED"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    BILLED = "BILLED"
+
+
 class ChecklistStatus(str, Enum):
     DONE = "DONE"
     PENDING = "PENDING"
@@ -253,6 +263,8 @@ class InvoiceType(str, Enum):
     LABOUR = "labour"
     MATERIAL = "material"
     CONTRACTOR = "contractor"
+    EQUIPMENT = "equipment"
+    RENTAL = "rental"
 
 
 class ProjectType(str, Enum):
@@ -327,3 +339,7 @@ class WagePeriodType(str, Enum):
     DAILY = 'Daily'
     WEEKLY = 'Weekly'
     MONTHLY = 'Monthly'
+
+class RentalBillingMode(str, Enum):
+    PER_DAY = "PER_DAY"
+    LUMP_SUM = "LUMP_SUM"

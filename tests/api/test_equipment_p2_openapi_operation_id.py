@@ -118,3 +118,31 @@ def test_both_cost_report_endpoints_callable_and_consistent(seed_cost_report_use
     assert res_slash_f.status_code == 200
     assert res_dash_f.status_code == 200
     assert res_slash_f.json() == res_dash_f.json()
+
+
+def test_equipment_aliases_openapi_deprecated_status():
+    """
+    Verifies that the duplicate equipment route aliases are marked deprecated in OpenAPI,
+    canonical routes remain not deprecated, and unrelated endpoints (such as measurement deletion)
+    are unaffected.
+    """
+    openapi_schema = app.openapi()
+    paths = openapi_schema.get("paths", {})
+
+    # 1. Cost report alias deprecated, canonical not deprecated
+    cost_slash = paths.get("/api/v1/equipment/cost/report", {}).get("get", {})
+    cost_dash = paths.get("/api/v1/equipment/cost-report", {}).get("get", {})
+    assert cost_slash.get("deprecated") is not True, "Canonical /cost/report must not be marked deprecated"
+    assert cost_dash.get("deprecated") is True, "Alias /cost-report must be marked deprecated"
+
+    # 2. Availability alias deprecated, canonical not deprecated
+    avail_canon = paths.get("/api/v1/equipment/availability", {}).get("get", {})
+    avail_alias = paths.get("/api/v1/equipment/eq/availability", {}).get("get", {})
+    assert avail_canon.get("deprecated") is not True, "Canonical /availability must not be marked deprecated"
+    assert avail_alias.get("deprecated") is True, "Alias /eq/availability must be marked deprecated"
+
+    # 3. Measurement delete unaffected and not deprecated
+    meas_del = paths.get("/api/v1/measurements/{id}", {}).get("delete", {})
+    assert meas_del, "Measurement delete endpoint must remain registered in OpenAPI"
+    assert meas_del.get("deprecated") is not True, "DELETE /measurements/{id} must not be marked deprecated"
+

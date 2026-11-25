@@ -65,6 +65,13 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = "INFO"  # DEBUG | INFO
 
+    # ================= WHATSAPP (META CLOUD API) =================
+    WHATSAPP_ENABLED: bool = False
+    WHATSAPP_ACCESS_TOKEN: str = ""
+    WHATSAPP_PHONE_NUMBER_ID: str = ""
+    WHATSAPP_VENDOR_BILL_TEMPLATE: str = "vendor_bill_notification"
+    WHATSAPP_MATERIAL_APPROVAL_TEMPLATE: str = "material_approval_notification"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",

@@ -1,7 +1,7 @@
 """Consolidate site requests mandatory columns and accountant tenant isolation (gst_returns, ai_predictions)
 
 Revision ID: c4d5e6f7a8b9
-Revises: e2f3a4b5c6d7
+Revises: d2e3f4a5b6c7
 Create Date: 2026-09-10 17:00:00.000000
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = 'c4d5e6f7a8b9'
-down_revision = 'e2f3a4b5c6d7'
+down_revision = 'd2e3f4a5b6c7'
 branch_labels = None
 depends_on = None
 

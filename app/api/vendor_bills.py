@@ -1,3 +1,4 @@
+from fastapi import BackgroundTasks
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -47,6 +48,7 @@ def _check_tenant_access(current_user: User) -> bool:
 @router.post("", response_model=VendorBillOut, status_code=201)
 async def create_vendor_bill(
     payload: VendorBillCreate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_permission("vendor_bills.create")),
 ):
@@ -55,7 +57,9 @@ async def create_vendor_bill(
     # 1. Validate Supplier
     supplier_stmt = select(Supplier).where(Supplier.id == payload.supplier_id)
     if not is_sa:
-        supplier_stmt = supplier_stmt.where(Supplier.company_id == current_user.company_id)
+        supplier_stmt = supplier_stmt.where(
+            Supplier.company_id == current_user.company_id
+        )
     supplier = await db.scalar(supplier_stmt)
     if not supplier:
         raise HTTPException(status_code=404, detail="Supplier not found")
@@ -65,44 +69,93 @@ async def create_vendor_bill(
     if payload.project_id is not None:
         project_stmt = select(Project).where(Project.id == payload.project_id)
         if not is_sa:
-            project_stmt = project_stmt.where(Project.company_id == current_user.company_id)
+            project_stmt = project_stmt.where(
+                Project.company_id == current_user.company_id
+            )
         project = await db.scalar(project_stmt)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
     # 3. Validate Purchase Order if provided
     if payload.purchase_order_id is not None:
-        po_stmt = select(PurchaseOrder).where(PurchaseOrder.id == payload.purchase_order_id)
+        po_stmt = select(PurchaseOrder).where(
+            PurchaseOrder.id == payload.purchase_order_id
+        )
         po = await db.scalar(po_stmt)
         if not po:
             raise HTTPException(status_code=404, detail="Purchase order not found")
         if not project or po.project_id != project.id:
-            raise HTTPException(status_code=404, detail="Purchase order project mismatch")
+            raise HTTPException(
+                status_code=404, detail="Purchase order project mismatch"
+            )
         if po.supplier_id != supplier.id:
-            raise HTTPException(status_code=404, detail="Purchase order supplier mismatch")
+            raise HTTPException(
+                status_code=404, detail="Purchase order supplier mismatch"
+            )
 
     # Determine company_id for the bill
     if not is_sa:
         bill_company_id = current_user.company_id
     else:
-        bill_company_id = (
-            current_user.company_id
-            or (project.company_id if project else getattr(supplier, "company_id", None))
+        bill_company_id = current_user.company_id or (
+            project.company_id if project else getattr(supplier, "company_id", None)
         )
 
     # 4. Check if bill number already exists for this company
-    existing_stmt = select(VendorBill).where(VendorBill.bill_number == payload.bill_number)
+    existing_stmt = select(VendorBill).where(
+        VendorBill.bill_number == payload.bill_number
+    )
     if bill_company_id is not None:
         existing_stmt = existing_stmt.where(VendorBill.company_id == bill_company_id)
     existing = await db.scalar(existing_stmt)
     if existing:
         raise HTTPException(status_code=400, detail="Bill number already exists")
 
+    # Backend Validation for Financial Integrity
+    from decimal import Decimal, ROUND_HALF_UP
+
+    provided_gross = Decimal(str(payload.gross_amount or 0))
+    provided_gst_percent = Decimal(str(payload.gst_percent or 0))
+    provided_tds_percent = Decimal(str(payload.tds_percent or 0))
+
+    provided_gst_amount = Decimal(str(payload.gst_amount or 0))
+    provided_tds_amount = Decimal(str(payload.tds_amount or 0))
+    provided_advance = Decimal(str(payload.advance_paid or 0))
+    provided_total = Decimal(str(payload.total_amount or 0))
+
+    # Legacy payload check: existing tests/clients sometimes send only total_amount
+    is_legacy_payload = (
+        provided_gross == 0 and
+        provided_total != 0 and
+        provided_gst_percent == 0 and
+        provided_tds_percent == 0 and
+        provided_gst_amount == 0 and
+        provided_tds_amount == 0
+    )
+
+    if not is_legacy_payload:
+        expected_gst = (provided_gross * (provided_gst_percent / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        expected_tds = (provided_gross * (provided_tds_percent / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        expected_total = provided_gross + provided_gst_amount - provided_tds_amount - provided_advance
+
+        TAX_TOLERANCE = Decimal("1.00")
+        TOTAL_TOLERANCE = Decimal("0.00")
+
+        if abs(expected_gst - provided_gst_amount) > TAX_TOLERANCE:
+            raise HTTPException(status_code=400, detail="GST amount does not reconcile with gross amount and percentage")
+
+        if abs(expected_tds - provided_tds_amount) > TAX_TOLERANCE:
+            raise HTTPException(status_code=400, detail="TDS amount does not reconcile with gross amount and percentage")
+
+        if abs(expected_total - provided_total) > TOTAL_TOLERANCE:
+            raise HTTPException(status_code=400, detail="Total amount does not reconcile with components")
+
     bill = VendorBill(
         company_id=bill_company_id,
         supplier_id=payload.supplier_id,
         project_id=payload.project_id,
         purchase_order_id=payload.purchase_order_id,
+        equipment_purchase_id=payload.equipment_purchase_id,
         bill_number=payload.bill_number,
         bill_date=payload.bill_date,
         due_date=payload.due_date,
@@ -168,7 +221,9 @@ async def create_vendor_bill(
                     )
                 await notif_db.commit()
         except Exception as e:
-            logger.error("Failed to create notification for vendor bill creation: %s", e)
+            logger.error(
+                "Failed to create notification for vendor bill creation: %s", e
+            )
 
     return await _get_bill_with_details(db, bill.id, current_user)
 
@@ -280,9 +335,14 @@ async def approve_vendor_bill(
         if (not vendor_acc or not expense_acc) and bill.company_id:
             try:
                 from app.utils.accounting import seed_company_chart_of_accounts
+
                 acc_map = await seed_company_chart_of_accounts(db, bill.company_id)
                 vendor_acc = vendor_acc or acc_map.get("VENDOR_PAYABLE")
-                expense_acc = expense_acc or acc_map.get("EXPENSE") or acc_map.get("GENERAL_EXPENSE")
+                expense_acc = (
+                    expense_acc
+                    or acc_map.get("EXPENSE")
+                    or acc_map.get("GENERAL_EXPENSE")
+                )
                 gst_acc = gst_acc or acc_map.get("INPUT_GST")
             except Exception as e:
                 logger.warning("Failed to auto-seed company chart of accounts: %s", e)
@@ -383,7 +443,9 @@ async def approve_vendor_bill(
                     )
                 await notif_db.commit()
         except Exception as e:
-            logger.error("Failed to create notification for vendor bill approval: %s", e)
+            logger.error(
+                "Failed to create notification for vendor bill approval: %s", e
+            )
 
     return {
         "message": f"Bill {status_val.lower()} successfully",
@@ -477,6 +539,7 @@ async def pay_vendor_bill(
 
     txn = Transaction(
         project_id=bill.project_id,
+        vendor_bill_id=bill.id,
         type="payment",
         amount=payload.amount,
         mode=payload.mode.value if hasattr(payload.mode, "value") else payload.mode,
@@ -518,9 +581,7 @@ async def pay_vendor_bill(
     except Exception as exc:
         await db.rollback()
         logger.exception("Vendor payment failed bill_id=%s: %s", id, exc)
-        raise HTTPException(
-            status_code=500, detail="Failed to process vendor payment"
-        )
+        raise HTTPException(status_code=500, detail="Failed to process vendor payment")
 
     if bill.project_id:
         try:
@@ -702,9 +763,7 @@ async def reverse_vendor_payment(
             transaction_id,
             exc,
         )
-        raise HTTPException(
-            status_code=500, detail="Failed to reverse vendor payment"
-        )
+        raise HTTPException(status_code=500, detail="Failed to reverse vendor payment")
 
     # 7. Notification
     if bill.project_id:
@@ -743,8 +802,7 @@ async def reverse_vendor_payment(
         "message": "Payment reversed successfully",
         "paid": float(bill.amount_paid or 0),
         "pending": float(
-            Decimal(str(bill.total_amount))
-            - Decimal(str(bill.amount_paid or 0))
+            Decimal(str(bill.total_amount)) - Decimal(str(bill.amount_paid or 0))
         ),
         "status": bill.status,
     }

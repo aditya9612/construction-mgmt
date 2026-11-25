@@ -13,6 +13,7 @@ from app.core.enums import (
     EquipmentCondition,
     EquipmentStatus,
     PurchaseType,
+    RentalBillingMode,
 )
 from app.core.validators import (
     validate_client_name,
@@ -203,6 +204,7 @@ class EquipmentUsageCreate(BaseSchema):
         decimal_places=2,
     )
 
+    fuel_cost: Optional[Decimal] = Field(None, description="Explicit fuel cost from real transaction")
     fuel_used: Decimal = Field(
         ...,
         ge=0,
@@ -249,6 +251,7 @@ class EquipmentUsageUpdate(BaseSchema):
         decimal_places=2,
     )
 
+    fuel_cost: Optional[Decimal] = Field(None)
     fuel_used: Optional[Decimal] = Field(
         None,
         ge=0,
@@ -302,6 +305,7 @@ class EquipmentUsageOut(BaseSchema):
     working_hours: float
 
     fuel_used: float
+    fuel_cost: Optional[float] = None
 
     usage_date: date
 
@@ -536,6 +540,11 @@ class EquipmentRentalCreate(BaseSchema):
         decimal_places=2,
     )
 
+    client_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
     client_name: str = Field(
         ...,
         min_length=2,
@@ -546,6 +555,13 @@ class EquipmentRentalCreate(BaseSchema):
         None,
         max_length=1000,
     )
+
+    billing_mode: Optional[RentalBillingMode] = None
+
+    expected_end_date: Optional[date] = None
+    actual_return_date: Optional[date] = None
+    is_received: Optional[bool] = None
+    is_returned: Optional[bool] = None
 
     project_id: Optional[int] = Field(
         None,
@@ -612,6 +628,11 @@ class EquipmentRentalUpdate(BaseSchema):
         decimal_places=2,
     )
 
+    client_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
     client_name: Optional[str] = Field(
         None,
         max_length=255,
@@ -621,6 +642,14 @@ class EquipmentRentalUpdate(BaseSchema):
         None,
         max_length=1000,
     )
+
+    billing_mode: Optional[RentalBillingMode] = None
+
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
+    actual_return_date: Optional[date] = None
+    is_received: bool = False
+    is_returned: bool = False
 
     project_id: Optional[int] = Field(
         None,
@@ -697,6 +726,9 @@ class EquipmentRentalOut(BaseSchema):
 
     rental_cost: float
 
+    client_id: Optional[int] = None
+    invoice_id: Optional[int] = None
+
     client_name: str
 
     notes: Optional[str]
@@ -708,6 +740,8 @@ class EquipmentRentalOut(BaseSchema):
     duration: Optional[int]
 
     per_day_cost: Optional[float]
+
+    billing_mode: Optional[str] = None
 
     project_id: Optional[int]
 
@@ -753,6 +787,11 @@ class EquipmentPurchaseCreate(BaseSchema):
 
     purchase_date: date
 
+    supplier_id: Optional[int] = Field(
+        None,
+        gt=0,
+    )
+
     vendor_name: str = Field(
         ...,
         min_length=2,
@@ -791,6 +830,12 @@ class EquipmentPurchaseCreate(BaseSchema):
         None,
         max_length=1000,
     )
+
+    start_date: Optional[date] = None
+    expected_end_date: Optional[date] = None
+    actual_return_date: Optional[date] = None
+    is_received: bool = False
+    is_returned: bool = False
 
     project_id: int = Field(
         ...,
@@ -922,6 +967,9 @@ class EquipmentPurchaseOut(BaseSchema):
 
     asset_id: Optional[int]
 
+    # equipment_id is an alias exposed for Rental-IN callers after receive
+    equipment_id: Optional[int] = None
+
     asset_name: Optional[str]
 
     purchase_date: date
@@ -941,6 +989,50 @@ class EquipmentPurchaseOut(BaseSchema):
     notes: Optional[str]
 
     created_at: datetime
+
+
+# =====================================================
+# RENTAL-IN RECEIVE
+# =====================================================
+
+
+class RentalInReceivePayload(BaseSchema):
+    """
+    Payload for POST /api/v1/equipment/rental-in/{purchase_id}/receive.
+    Supplies the minimum information required to materialise a new physical
+    Equipment record when none has been linked to the rental agreement yet.
+    Both fields are required when purchase.asset_id is NULL so the new
+    Equipment record can be fully constructed.
+    """
+
+    equipment_name: str = Field(
+        ...,
+        min_length=2,
+        max_length=255,
+        description="Name / description of the physical equipment received from the vendor",
+    )
+
+    equipment_code: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Unique code for the physical equipment (must be unique across active equipment)",
+    )
+
+    condition: EquipmentCondition = Field(
+        default=EquipmentCondition.GOOD,
+        description="Physical condition of the equipment on arrival",
+    )
+
+    @field_validator("equipment_name")
+    @classmethod
+    def validate_name(cls, v):
+        return validate_equipment_name(v)
+
+    @field_validator("equipment_code")
+    @classmethod
+    def validate_code(cls, v):
+        return validate_equipment_code(v)
 
 
 # =====================================================
@@ -1246,3 +1338,41 @@ class DeleteUsageResponse(BaseSchema):
     message: str
     usage_id: int
     equipment_id: int
+
+
+# =====================================================
+# INSPECTION
+# =====================================================
+
+
+class EquipmentInspectionCreate(BaseSchema):
+
+    rental_id: Optional[int] = Field(None, gt=0)
+    inspection_date: date
+    condition: EquipmentCondition
+    damage_description: Optional[str] = None
+    repair_cost: Optional[Decimal] = Field(default=Decimal("0.00"), ge=0, max_digits=10, decimal_places=2)
+    remarks: Optional[str] = None
+
+
+class EquipmentInspectionUpdate(BaseSchema):
+
+    condition: Optional[EquipmentCondition] = None
+    damage_description: Optional[str] = None
+    repair_cost: Optional[Decimal] = Field(None, ge=0, max_digits=10, decimal_places=2)
+    remarks: Optional[str] = None
+
+
+class EquipmentInspectionOut(BaseSchema):
+
+    id: int
+    equipment_id: int
+    rental_id: Optional[int]
+    inspection_date: date
+    inspector_id: Optional[int]
+    condition: EquipmentCondition
+    damage_description: Optional[str]
+    repair_cost: float
+    remarks: Optional[str]
+    created_at: datetime
+    updated_at: datetime

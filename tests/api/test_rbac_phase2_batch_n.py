@@ -606,7 +606,8 @@ async def test_batch_n_wildcard_permission():
 
             # 6. Delete
             res_del = await ac.delete(f"/api/v1/measurements/{new_id}", headers=headers)
-            assert res_del.status_code == 204
+            assert res_del.status_code == 200
+            assert res_del.json() == {"message": "Measurement deleted successfully"}
 
 
 @pytest.mark.asyncio
@@ -753,7 +754,8 @@ async def test_batch_n_super_admin_cross_company_access():
 
             # SA can delete created measurement
             res_del = await ac.delete(f"/api/v1/measurements/{new_sa_meas_id}", headers=headers_sa)
-            assert res_del.status_code == 204
+            assert res_del.status_code == 200
+            assert res_del.json() == {"message": "Measurement deleted successfully"}
 
 
 @pytest.mark.asyncio
