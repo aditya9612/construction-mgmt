@@ -20,6 +20,21 @@ from app.models.material import MaterialLedger  # noqa: F401
 from app.models.material import Supplier  # noqa: F401
 from app.models.material import PurchaseOrder  # noqa: F401
 from app.models.material import MaterialTransfer  # noqa: F401
+from app.models.purchase_order import PurchaseOrderItem  # noqa: F401
+from app.models.inventory import (  # noqa: F401
+    StockBatch,
+    ProjectMaterialValuation,
+    GoodsReceiptNote,
+    GoodsReceiptNoteItem,
+    MaterialIssue,
+    MaterialIssueAllocation,
+)
+from app.models.daily_stock import (  # noqa: F401
+    DailyStockReconciliation,
+    DailyStockRecountHistory,
+    DailyStockIdempotencyLog,
+)
+from app.models.cancellation import OTPCancellationRequest  # noqa: F401
 
 from app.models.project import Project  # noqa: F401
 from app.models.company import Company  # noqa: F401
@@ -50,9 +65,15 @@ from app.models.master_data import MaterialMaster
 from app.models.settings import UserSettings, CompanySettings
 from app.models.chat import ChatSession, ChatMember, ChatMessage, MessageRead, MessageReaction
 from app.models.quotation import QuotationItem, QuotationMaster, QuotationStatus
+from app.models.dummy_quotation import (
+    DummyQuotation,
+    DummyQuotationItem,
+    DummyMeasurementDetail,
+)  # noqa: F401
 from app.models.project_visualization import ProjectVisualization
 from app.models.agreement import Agreement
 from app.models.notification import Notification
 from app.models.rbac import Permission, RolePermission, Role, UserPermissionOverride, RBACAuditLog  # noqa: F401
 from app.models.client_payment import ClientPayment  # noqa: F401
 from app.models.work_update import WorkUpdate, WorkUpdateImage  # noqa: F401
+from app.models.sequence import BusinessSequence  # noqa: F401

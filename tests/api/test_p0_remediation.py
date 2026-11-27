@@ -50,8 +50,9 @@ async def test_p0_4_tenant_admin_permission_lifecycle():
             db.add(perm)
             await db.commit()
 
-        # Clean any preexisting role permission
-        await db.execute(delete(RolePermission).where(RolePermission.role == "Admin", RolePermission.permission_id == perm.id))
+        # Clean any preexisting role permission including module/global wildcards
+        clean_perm_ids = (await db.scalars(select(Permission.id).where(Permission.code.in_(["*", "reports.*", "reports.view"])))).all()
+        await db.execute(delete(RolePermission).where(RolePermission.role == "Admin", RolePermission.permission_id.in_(clean_perm_ids)))
         await db.commit()
 
         # Tenant Admin user
@@ -117,8 +118,11 @@ async def test_p0_2_update_role_status_tenant_isolation():
             f"user_sa_{uid_suffix}@test.com",
         ])))).all()
         if existing_user_ids:
+            ids_str = ','.join(str(i) for i in existing_user_ids)
+            await db.execute(text(f"DELETE FROM notifications WHERE user_id IN ({ids_str})"))
             await db.execute(delete(ActivityLog).where(ActivityLog.performed_by.in_(existing_user_ids)))
-            await db.execute(text(f"UPDATE users SET updated_by = NULL WHERE id IN ({','.join(str(i) for i in existing_user_ids)})"))
+            await db.execute(text(f"UPDATE users SET updated_by = NULL WHERE updated_by IN ({ids_str}) OR id IN ({ids_str})"))
+            await db.execute(text(f"UPDATE users SET created_by = NULL WHERE created_by IN ({ids_str})"))
             await db.execute(delete(User).where(User.id.in_(existing_user_ids)))
             await db.commit()
 
@@ -215,8 +219,11 @@ async def test_p0_2_update_role_status_tenant_isolation():
 
         # Cleanup
         all_ids = [admin_a.id, user_a.id, user_b.id, user_sa.id]
+        ids_str = ','.join(str(i) for i in all_ids)
+        await db.execute(text(f"DELETE FROM notifications WHERE user_id IN ({ids_str})"))
         await db.execute(delete(ActivityLog).where(ActivityLog.performed_by.in_(all_ids)))
-        await db.execute(text(f"UPDATE users SET updated_by = NULL WHERE id IN ({','.join(str(i) for i in all_ids)})"))
+        await db.execute(text(f"UPDATE users SET updated_by = NULL WHERE updated_by IN ({ids_str}) OR id IN ({ids_str})"))
+        await db.execute(text(f"UPDATE users SET created_by = NULL WHERE created_by IN ({ids_str})"))
         await db.execute(delete(User).where(User.id.in_(all_ids)))
         await db.commit()
         app.dependency_overrides.clear()

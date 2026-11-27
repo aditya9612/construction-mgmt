@@ -303,22 +303,23 @@ async def get_effective_user_permissions(
        - Built-in non-admin roles NEVER inherit global/system fallback permissions.
        - Applies user-level overrides (is_granted=True adds, is_granted=False removes).
     """
+    is_super = getattr(user, "is_super_admin", False) is True
     is_admin = (
-        getattr(user, "is_super_admin", False) is True
+        is_super
         or user.role == UserRole.ADMIN.value
         or user.role == "Admin"
     )
 
     # =========================================================================
-    # A. ADMIN ROLE: Dynamic Full Permission Access from Permissions Catalog
+    # A. SUPER ADMIN: Dynamic Full Access to Entire Catalog
     # =========================================================================
-    if is_admin:
+    if is_super:
         catalog_res = await db.execute(
             select(Permission.code).where(Permission.code != "*")
         )
         effective_permissions: set[str] = set(catalog_res.scalars().all())
 
-        # Check for user-level explicit revocations on this admin user
+        # Check for user-level explicit revocations on this superadmin user
         override_res = await db.execute(
             select(Permission.code)
             .join(UserPermissionOverride, UserPermissionOverride.permission_id == Permission.id)
@@ -336,6 +337,68 @@ async def get_effective_user_permissions(
         return effective_permissions
 
     # =========================================================================
+    # B. TENANT ADMIN: Explicit Role Permissions + Dynamic Unassigned Catalog Injections
+    # =========================================================================
+    if is_admin:
+        # 1. Permissions explicitly assigned to Admin role in DB (excluding global wildcard reserved for Super Admin)
+        admin_perms_res = await db.execute(
+            select(Permission.code)
+            .join(RolePermission, RolePermission.permission_id == Permission.id)
+            .where(
+                RolePermission.role.in_([UserRole.ADMIN.value, "Admin"]),
+                Permission.code != "*",
+            )
+        )
+        effective_permissions = set(admin_perms_res.scalars().all())
+        effective_permissions.discard("*")
+
+        # 2. Dynamic runtime injection: catalog permissions that have not been assigned to any role yet
+        assigned_perm_ids_subq = select(RolePermission.permission_id).distinct()
+        unassigned_res = await db.execute(
+            select(Permission.code).where(
+                Permission.code != "*",
+                ~Permission.module.in_(["reports", "confidential"]),
+                ~Permission.id.in_(assigned_perm_ids_subq)
+            )
+        )
+        effective_permissions.update(unassigned_res.scalars().all())
+
+        # 3. Check for user-level explicit revocations on this admin user
+        override_res = await db.execute(
+            select(Permission.code)
+            .join(UserPermissionOverride, UserPermissionOverride.permission_id == Permission.id)
+            .where(
+                UserPermissionOverride.user_id == user.id,
+                UserPermissionOverride.is_granted == False,
+            )
+        )
+        revoked = set(override_res.scalars().all())
+        if revoked:
+            if "*" in effective_permissions:
+                all_perms_res = await db.execute(
+                    select(Permission.code).where(~Permission.code.contains("*"))
+                )
+                effective_permissions.update(all_perms_res.scalars().all())
+                effective_permissions.discard("*")
+
+            for rev in revoked:
+                if "." in rev:
+                    mod = rev.split(".")[0]
+                    mod_wc = f"{mod}.*"
+                    if mod_wc in effective_permissions:
+                        mod_perms_res = await db.execute(
+                            select(Permission.code).where(
+                                Permission.module == mod,
+                                ~Permission.code.contains("*"),
+                            )
+                        )
+                        effective_permissions.update(mod_perms_res.scalars().all())
+                        effective_permissions.discard(mod_wc)
+
+            effective_permissions -= revoked
+        return effective_permissions
+
+    # =========================================================================
     # B. NON-ADMIN ROLES: Zero Implicit Access -> Explicit Company Assignments
     # =========================================================================
     company_id = user.company_id
@@ -350,27 +413,20 @@ async def get_effective_user_permissions(
             )
         )
         if company_role is not None:
-            if user.role not in ROLES:
-                res = await db.execute(
-                    select(Permission.code)
-                    .join(RolePermission, RolePermission.permission_id == Permission.id)
-                    .where(
-                        (RolePermission.role_id == company_role.id)
-                        | (
-                            (RolePermission.role == user.role)
-                            & RolePermission.role_id.is_(None)
-                        )
+            res = await db.execute(
+                select(Permission.code)
+                .join(RolePermission, RolePermission.permission_id == Permission.id)
+                .where(
+                    (RolePermission.role_id == company_role.id)
+                    | (
+                        (RolePermission.role == user.role)
+                        & RolePermission.role_id.is_(None)
                     )
                 )
-            else:
-                res = await db.execute(
-                    select(Permission.code)
-                    .join(RolePermission, RolePermission.permission_id == Permission.id)
-                    .where(RolePermission.role_id == company_role.id)
-                )
+            )
             effective_permissions = set(res.scalars().all())
-        elif user.role not in ROLES:
-            # Fallback only for ad-hoc custom/test roles created directly with role_id is None
+        else:
+            # Fallback for roles (custom or built-in test fixtures) created with role_id is None
             res = await db.execute(
                 select(Permission.code)
                 .join(RolePermission, RolePermission.permission_id == Permission.id)
@@ -380,7 +436,7 @@ async def get_effective_user_permissions(
                 )
             )
             effective_permissions = set(res.scalars().all())
-    elif user.role not in ROLES:
+    else:
         # Fallback for un-scoped standalone test/custom roles created with role_id is None
         res = await db.execute(
             select(Permission.code)
@@ -448,10 +504,49 @@ async def get_effective_user_permissions(
     return effective_permissions
 
 
+PERMISSION_ALIASES: dict[str, list[str]] = {
+    # Purchase Order aliases
+    "po.create": ["purchase_orders.create"],
+    "purchase_orders.create": ["po.create"],
+    "po.approve": ["purchase_orders.approve"],
+    "purchase_orders.approve": ["po.approve"],
+    "po.view": ["purchase_orders.view"],
+    "purchase_orders.view": ["po.view"],
+    "po.update": ["purchase_orders.edit"],
+    "purchase_orders.edit": ["po.update"],
+    "po.edit": ["purchase_orders.edit"],
+    # Inward / GRN aliases
+    "inward.create": ["inventory.create", "materials.create"],
+    "inward.post": ["inventory.approve"],
+    "inward.view": ["inventory.view", "materials.view"],
+    # Outward / MIN aliases
+    "outward.create": ["inventory.create"],
+    "outward.view": ["inventory.view", "materials.view"],
+    # Daily Stock aliases
+    "daily_stock.create": ["stock.daily.create", "inventory.create"],
+    "stock.daily.create": ["daily_stock.create", "inventory.create"],
+    "daily_stock.reconcile": ["stock.daily.review", "inventory.approve"],
+    "stock.daily.review": ["daily_stock.reconcile", "inventory.approve"],
+    "daily_stock.view": ["stock.daily.view", "inventory.view"],
+    "stock.daily.view": ["daily_stock.view", "inventory.view"],
+    # Cancellation aliases
+    "transaction.cancel.request": ["inventory.edit", "purchase_orders.edit"],
+    "transaction.cancel.approve": ["approvals.approve", "inventory.approve"],
+    # Reports aliases
+    "report.view": ["reports.view"],
+    "reports.view": ["report.view"],
+    "report.view_price": ["reports.view_price"],
+    "reports.view_price": ["report.view_price"],
+    "report.export": ["reports.export"],
+    "reports.export": ["report.export"],
+}
+
+
 def has_permission(effective_permissions: set[str], required: str) -> bool:
     """
     Checks if the required permission is satisfied by the effective permissions set.
-    Supports exact match, global wildcard '*', and module-level wildcard 'module.*'.
+    Supports exact match, global wildcard '*', module-level wildcard 'module.*',
+    and configured domain aliases.
     """
     if "*" in effective_permissions:
         return True
@@ -460,7 +555,30 @@ def has_permission(effective_permissions: set[str], required: str) -> bool:
     module = required.split(".")[0] if "." in required else required
     if f"{module}.*" in effective_permissions:
         return True
+    # Check configured domain aliases
+    aliases = PERMISSION_ALIASES.get(required, [])
+    for alias in aliases:
+        if alias in effective_permissions:
+            return True
+        alias_mod = alias.split(".")[0] if "." in alias else alias
+        if f"{alias_mod}.*" in effective_permissions:
+            return True
     return False
+
+
+async def check_user_has_permission(
+    db: AsyncSession,
+    user: User,
+    permission: str,
+) -> bool:
+    """
+    Evaluates whether a user has a specific permission without raising HTTPException.
+    Useful for field masking, dynamic capability gating, and service-layer assertions.
+    """
+    if getattr(user, "is_super_admin", False) is True:
+        return True
+    effective_perms = await get_effective_user_permissions(db, user)
+    return has_permission(effective_perms, permission)
 
 
 def require_permission(permission: str):

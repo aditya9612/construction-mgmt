@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
-from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError, ConnectionError as RedisConnectionError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 import asyncio
@@ -142,7 +142,23 @@ async def lifespan(app: FastAPI):
 
         redis = getattr(app.state, "redis", None)
         if redis is not None:
-            await redis.close()
+            app.state.redis = None  # Idempotently clear reference before closing
+            try:
+                if hasattr(redis, "aclose"):
+                    await redis.aclose()
+                elif hasattr(redis, "close"):
+                    await redis.close()
+            except (RedisError, OSError) as exc:
+                logger.warning(
+                    "Error during Redis shutdown disconnect: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            except RuntimeError as exc:
+                if "Event loop is closed" in str(exc):
+                    logger.debug("Redis close skipped: event loop already closed.")
+                else:
+                    logger.warning("RuntimeError during Redis shutdown: %s", exc)
 
         logger.info("Disposing SQLAlchemy async engine...")
         await async_engine.dispose()
@@ -372,8 +388,20 @@ def create_app() -> FastAPI:
     api_router.include_router(superadmin_router)
 
     from app.api.saas_billing import router as saas_billing_router
+    from app.api.po_workflow import router as po_workflow_router
+    from app.api.inward import router as inward_router
+    from app.api.outward import router as outward_router
+    from app.api.daily_stock import router as daily_stock_router
+    from app.api.cancellation import router as cancellation_router
+    from app.api.inventory_reports import router as inventory_reports_router
 
     api_router.include_router(saas_billing_router)
+    api_router.include_router(po_workflow_router)
+    api_router.include_router(inward_router)
+    api_router.include_router(outward_router)
+    api_router.include_router(daily_stock_router)
+    api_router.include_router(cancellation_router)
+    api_router.include_router(inventory_reports_router)
     application.include_router(api_router, prefix="/api/v1")
 
     return application

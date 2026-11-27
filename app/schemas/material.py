@@ -965,3 +965,69 @@ class ReorderAlertsResponse(BaseSchema):
     project_id: int
     alerts: List[ReorderAlertOut]
     total_alerts: int
+
+
+# ==============================================================================
+# BULK MATERIAL UPLOAD SCHEMAS
+# ==============================================================================
+
+
+class BulkMaterialError(BaseSchema):
+    row: int
+    column: Optional[str] = None
+    message: str
+    value: Optional[str] = None
+
+
+class BulkMaterialRowPreview(BaseSchema):
+    row_number: int
+    project_id: int
+    project_name: Optional[str] = None
+    material_master_id: int
+    material_name: Optional[str] = None
+    unit_name: Optional[str] = None
+    category: Optional[str] = None
+    supplier_id: int
+    supplier_name: Optional[str] = None
+    purchase_rate: Decimal
+    rate_type: RateType
+    quantity_purchased: Decimal = Decimal("0")
+    payment_given: Decimal = Decimal("0")
+    minimum_stock_level: Decimal = Decimal("0")
+    total_amount: Decimal = Decimal("0")
+    status: str = "VALID"
+    errors: List[str] = []
+
+
+class BulkMaterialPreviewResponse(BaseSchema):
+    total_rows: int
+    valid_rows: int
+    error_rows: int
+    can_commit: bool
+    import_token: Optional[str] = None
+    errors: List[BulkMaterialError] = []
+    preview_data: List[BulkMaterialRowPreview] = []
+
+
+class BulkMaterialCommitRequest(BaseSchema):
+    import_token: str
+
+
+class BulkMaterialImportedItem(BaseSchema):
+    id: int
+    material_code: str
+    material_name: str
+    project_id: int
+    supplier_id: int
+    material_master_id: int
+    purchase_rate: Decimal
+    quantity_purchased: Decimal
+    total_amount: Decimal
+    payment_given: Decimal
+    remaining_stock: Decimal
+
+
+class BulkMaterialCommitResponse(BaseSchema):
+    imported_count: int
+    materials: List[BulkMaterialImportedItem]
+    message: str

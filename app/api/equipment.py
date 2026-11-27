@@ -1666,7 +1666,7 @@ async def list_equipment(
     is_super = _is_super_admin(current_user)
     target_company_id = company_id if is_super else current_user.company_id
 
-    if current_user.company_id is None and target_company_id is None:
+    if not is_super and current_user.company_id is None:
         return PaginatedResponse[EquipmentOut](
             items=[],
             meta=PaginationMeta(total=0, limit=limit, offset=offset),

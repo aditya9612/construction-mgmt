@@ -9,6 +9,7 @@ client = TestClient(app)
 company_a_admin = User(id=1000, email="admin@compa.com", role="Admin", is_active=True, is_super_admin=False, company_id=1)
 company_b_admin = User(id=1001, email="admin@compb.com", role="Admin", is_active=True, is_super_admin=False, company_id=2)
 super_admin_user = User(id=9999, email="super@admin.com", role="Super Admin", is_active=True, is_super_admin=True, company_id=None)
+PROJ_B_ID = 492  # Company B (company_id=2) project for cross-tenant IDOR checks
 
 def override_dependency(user: User):
     app.dependency_overrides[get_current_user] = lambda: user
@@ -261,28 +262,28 @@ def test_idor_work_update_submit():
 
 def test_milestone_tenant_isolation():
     override_dependency(company_a_admin)
-    # Company A tries to list Company B's milestones (assuming project 2 is company B's)
-    resp = client.get(f"/api/v1/projects/2/milestones")
+    # Company A tries to list Company B's milestones
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/milestones")
     assert resp.status_code in (403, 404, 500)
 
     # Company A tries to get Company B's milestone
-    resp = client.get(f"/api/v1/projects/2/milestones/999")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/milestones/999")
     assert resp.status_code in (403, 404, 500)
 
     # Company A tries to create milestone in Company B's project
-    resp = client.post(f"/api/v1/projects/2/milestones", json={"title": "Hacked", "status": "Planned"})
+    resp = client.post(f"/api/v1/projects/{PROJ_B_ID}/milestones", json={"title": "Hacked", "status": "Planned"})
     assert resp.status_code in (403, 404, 500)
 
     # Super Admin tries to list milestones
     override_dependency(super_admin_user)
-    resp = client.get(f"/api/v1/projects/2/milestones")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/milestones")
     assert resp.status_code in (403, 404, 500)
     clear_overrides()
 
 def test_task_request_tenant_isolation():
     override_dependency(company_a_admin)
     # Company A tries to update Company B's task request (assuming 999 is in B)
-    resp = client.put(f"/api/v1/projects/task-requests/999", json={"title": "Hacked"})
+    resp = client.put(f"/api/v1/projects/task-requests/999", json={"title": "Hacked", "category": "General", "priority": "MEDIUM", "status": "PENDING"})
     assert resp.status_code in (403, 404)
 
     # Company A tries to list all task requests
@@ -329,7 +330,7 @@ def test_issue_tenant_isolation():
     assert resp.status_code in (403, 404)
 
     # issues by project
-    resp = client.get(f"/api/v1/issues/project/2")
+    resp = client.get(f"/api/v1/issues/project/{PROJ_B_ID}")
     assert resp.status_code in (403, 404)
 
     # Super admin list issues
@@ -368,43 +369,43 @@ def test_project_positive_own_tenant():
 
 def test_project_negative_cross_tenant():
     override_dependency(company_a_admin)
-    # Project GET cross-tenant (proj_b has id=2)
-    resp = client.get("/api/v1/projects/2")
+    # Project GET cross-tenant (proj_b has id=PROJ_B_ID)
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}")
     assert resp.status_code in (403, 404)
     clear_overrides()
 
 def test_project_update_cross_tenant():
     override_dependency(company_a_admin)
     # Project UPDATE cross-tenant
-    resp = client.put("/api/v1/projects/2", json={"project_name": "Hacked"})
+    resp = client.put(f"/api/v1/projects/{PROJ_B_ID}", json={"project_name": "Hacked"})
     assert resp.status_code in (403, 404)
     clear_overrides()
 
 def test_project_delete_cross_tenant():
     override_dependency(company_a_admin)
     # Project DELETE cross-tenant
-    resp = client.delete("/api/v1/projects/2")
+    resp = client.delete(f"/api/v1/projects/{PROJ_B_ID}")
     assert resp.status_code in (403, 404)
     clear_overrides()
 
 def test_schedule_cross_tenant():
     override_dependency(company_a_admin)
     # Schedule cross-tenant
-    resp = client.get("/api/v1/projects/2/schedule")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/schedule")
     assert resp.status_code in (403, 404)
     clear_overrides()
 
 def test_progress_cross_tenant():
     override_dependency(company_a_admin)
     # Progress/Analytics cross-tenant
-    resp = client.get("/api/v1/projects/2/progress")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/progress")
     assert resp.status_code in (403, 404)
     clear_overrides()
 
 def test_profit_loss_cross_tenant():
     override_dependency(company_a_admin)
     # Profit/Loss cross-tenant
-    resp = client.get("/api/v1/projects/2/profit-loss")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/profit-loss")
     assert resp.status_code in (403, 404)
     clear_overrides()
 
@@ -419,7 +420,7 @@ def test_super_admin_blocked_project_api():
         items = data.get("items", [])
         assert len(items) == 0
         
-    resp2 = client.get("/api/v1/projects/2")
+    resp2 = client.get(f"/api/v1/projects/{PROJ_B_ID}")
     assert resp2.status_code in (403, 404)
     clear_overrides()
 
@@ -429,37 +430,37 @@ def test_super_admin_blocked_project_api():
 
 def test_project_get_cross_tenant():
     override_dependency(company_a_admin)
-    resp = client.get("/api/v1/projects/2")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}")
     assert resp.status_code in (403, 404, 500)
     clear_overrides()
 
 def test_project_update_cross_tenant():
     override_dependency(company_a_admin)
-    resp = client.put("/api/v1/projects/2", json={"project_name": "Hacked"})
+    resp = client.put(f"/api/v1/projects/{PROJ_B_ID}", json={"project_name": "Hacked"})
     assert resp.status_code in (403, 404, 500)
     clear_overrides()
 
 def test_project_delete_cross_tenant():
     override_dependency(company_a_admin)
-    resp = client.delete("/api/v1/projects/2")
+    resp = client.delete(f"/api/v1/projects/{PROJ_B_ID}")
     assert resp.status_code in (403, 404, 500)
     clear_overrides()
 
 def test_project_schedule_cross_tenant():
     override_dependency(company_a_admin)
-    resp = client.get("/api/v1/projects/2/schedule")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/schedule")
     assert resp.status_code in (403, 404, 500)
     clear_overrides()
 
 def test_project_progress_cross_tenant():
     override_dependency(company_a_admin)
-    resp = client.get("/api/v1/projects/2/progress")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/progress")
     assert resp.status_code in (403, 404, 500)
     clear_overrides()
 
 def test_project_profit_loss_cross_tenant():
     override_dependency(company_a_admin)
-    resp = client.get("/api/v1/projects/2/profit-loss")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}/profit-loss")
     assert resp.status_code in (403, 404, 500)
     clear_overrides()
 
@@ -469,7 +470,7 @@ def test_super_admin_standard_project_api_blocked():
     # depending on implementation, could be 403 or empty 200
     assert resp.status_code in (403, 200)
     
-    resp = client.get("/api/v1/projects/2")
+    resp = client.get(f"/api/v1/projects/{PROJ_B_ID}")
     assert resp.status_code in (403, 404, 500)
     clear_overrides()
 
@@ -532,9 +533,8 @@ def test_supplier_tenant_isolation():
 def test_material_tenant_isolation():
     override_dependency(company_a_admin)
     
-    # Assuming project_id=1 belongs to Company A, and project_id=2 belongs to Company B
-    # Let's try to list materials for Company B project
-    resp = client.get("/api/v1/materials?project_id=2")
+    # List materials for Company B project (PROJ_B_ID)
+    resp = client.get(f"/api/v1/materials?project_id={PROJ_B_ID}")
     # depending on how project_id filtering interacts with company_id enforcement
     # either it returns 403 or returns empty list. Both are safe.
     assert resp.status_code in (200, 403, 404)

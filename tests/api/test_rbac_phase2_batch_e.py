@@ -758,7 +758,24 @@ async def test_batch_e_super_admin_behavior():
             r = await client.post("/api/v1/equipment", json=payload, headers=headers_super)
             assert r.status_code == 403
 
-            # 2. Super Admin reports listing -> returns empty items
+            # 2. Super Admin listing -> returns items with cross-tenant visibility
             r = await client.get("/api/v1/equipment", headers=headers_super)
             assert r.status_code == 200
-            assert r.json()["items"] == []
+            items = r.json()["items"]
+            assert isinstance(items, list)
+            assert len(items) > 0, "SuperAdmin must have cross-tenant equipment visibility in Phase B1"
+            assert all("id" in item and "equipment_name" in item for item in items)
+
+            # 3. Super Admin listing filtered by company A -> returns Company A's equipment, excludes Company B
+            r_comp = await client.get(f"/api/v1/equipment?company_id={data['comp_a_id']}", headers=headers_super)
+            assert r_comp.status_code == 200
+            comp_items = r_comp.json()["items"]
+            comp_item_ids = [item["id"] for item in comp_items]
+            assert data["eq_a_id"] in comp_item_ids
+            assert data["eq_b_id"] not in comp_item_ids
+            assert data["eq_b_unalloc_id"] not in comp_item_ids
+
+            # 4. Super Admin listing for non-existent company -> strictly empty list
+            r_none = await client.get("/api/v1/equipment?company_id=999999", headers=headers_super)
+            assert r_none.status_code == 200
+            assert r_none.json()["items"] == []

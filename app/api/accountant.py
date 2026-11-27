@@ -35,7 +35,7 @@ from app.db.session import get_db_session
 from app.models.billing import RABill
 from app.models.invoice import Invoice, Transaction
 from app.models.user import User
-from app.core.dependencies import require_roles
+from app.core.dependencies import require_roles, get_request_redis
 from app.schemas.payment_voucher import PaymentVoucherOut
 
 from app.utils.helpers import NotFoundError, ValidationError
@@ -1870,15 +1870,23 @@ async def gst_summary(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
 ):
-    from app.utils.accounting import resolve_tax_accounts
-    from sqlalchemy import case, extract
-    import calendar
-    
-    try:
-        input_gst_acc = await resolve_tax_accounts(db, 'input_gst')
-        output_gst_acc = await resolve_tax_accounts(db, 'output_gst')
-        
-        # Calculate Input GST
+    company_id = _require_company_id(current_user)
+
+    input_gst_acc = await db.scalar(
+        select(Account).where(
+            Account.code == "INPUT_GST",
+            Account.company_id == company_id,
+        )
+    )
+    output_gst_acc = await db.scalar(
+        select(Account).where(
+            Account.code == "OUTPUT_GST",
+            Account.company_id == company_id,
+        )
+    )
+
+    # Calculate Input GST strictly within caller's company accounts (never fallback globally)
+    if input_gst_acc:
         input_gst = await db.scalar(
             select(func.sum(JournalLine.debit - JournalLine.credit))
             .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
@@ -1886,8 +1894,11 @@ async def gst_summary(
             .where(JournalEntry.status == "Posted")
         )
         input_gst = float(input_gst or 0.0)
-        
-        # Calculate Output GST
+    else:
+        input_gst = 0.0
+
+    # Calculate Output GST strictly within caller's company accounts
+    if output_gst_acc:
         output_gst = await db.scalar(
             select(func.sum(JournalLine.credit - JournalLine.debit))
             .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
@@ -1895,13 +1906,14 @@ async def gst_summary(
             .where(JournalEntry.status == "Posted")
         )
         output_gst = float(output_gst or 0.0)
-    except ValueError:
-        input_gst = 0.0
+    else:
         output_gst = 0.0
 
     tds_collected = await db.scalar(
-        select(func.sum(TDSDeduction.tds_amount))
-        .where(TDSDeduction.status == "Posted")
+        _tds_company_joins(select(func.sum(TDSDeduction.tds_amount))).where(
+            TDSDeduction.status == "Posted",
+            _tds_strict_company_filter(company_id),
+        )
     )
     tds_collected = float(tds_collected or 0.0)
 
@@ -1910,8 +1922,12 @@ async def gst_summary(
     # Monthly Trend (Mocking 6 months for example, could be done via group by)
     monthly_trend = []
     
-    # Return Status
-    returns = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
+    # Return Status (strictly company-owned; legacy NULL rows excluded)
+    returns = await db.scalars(
+        select(GSTReturn)
+        .where(GSTReturn.company_id == company_id)
+        .order_by(GSTReturn.created_at.desc())
+    )
     returns = returns.all()
     
     return_status = []
@@ -2784,25 +2800,183 @@ async def get_fund_transfer(
 
 # ===================== GST & TAXATION =====================
 
+async def _invalidate_gst_dashboard_cache(redis) -> None:
+    if redis is None:
+        return
+    try:
+        from app.cache.redis import bump_cache_version
+
+        await bump_cache_version(redis, "dashboard_version")
+    except Exception:
+        pass
+
+
+async def _get_owned_gst_return(
+    db: AsyncSession,
+    gst_id: int,
+    company_id: int,
+) -> GSTReturn:
+    gstr = await db.scalar(
+        select(GSTReturn).where(
+            GSTReturn.id == gst_id,
+            GSTReturn.company_id == company_id,
+        )
+    )
+    if not gstr:
+        raise HTTPException(status_code=404, detail="GST Return not found")
+    return gstr
+
+
 @router.post("/gst/returns", response_model=GSTReturnOut)
 async def create_gst_return(
     payload: GSTReturnCreate,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
-    gstr = GSTReturn(**payload.model_dump())
+    company_id = _require_company_id(current_user)
+    data = payload.model_dump()
+    data.pop("company_id", None)
+    gstr = GSTReturn(company_id=company_id, **data)
     db.add(gstr)
     await db.commit()
     await db.refresh(gstr)
+    await _invalidate_gst_dashboard_cache(redis)
     return gstr
+
 
 @router.get("/gst/returns", response_model=list[GSTReturnOut])
 async def list_gst_returns(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
 ):
-    result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
+    company_id = _require_company_id(current_user)
+    result = await db.scalars(
+        select(GSTReturn)
+        .where(GSTReturn.company_id == company_id)
+        .order_by(GSTReturn.created_at.desc())
+    )
     return result.all()
+
+
+def _require_company_id(current_user: User) -> int:
+    company_id = getattr(current_user, "company_id", None)
+    if company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="User does not belong to any tenant company.",
+        )
+    return company_id
+
+
+def _tds_company_joins(stmt):
+    from app.models.project import Project
+
+    return (
+        stmt.outerjoin(VendorBill, TDSDeduction.vendor_bill_id == VendorBill.id)
+        .outerjoin(RABill, TDSDeduction.ra_bill_id == RABill.id)
+        .outerjoin(Project, RABill.project_id == Project.id)
+        .outerjoin(User, TDSDeduction.created_by == User.id)
+    )
+
+
+def _tds_strict_company_filter(company_id: int):
+    from sqlalchemy import and_, or_
+    from app.models.project import Project
+
+    # Every present source link must resolve to `company_id` (disagreement => fail closed);
+    # when neither bill FK is present, `created_by` must belong to `company_id`.
+    return and_(
+        or_(TDSDeduction.vendor_bill_id.is_(None), VendorBill.company_id == company_id),
+        or_(TDSDeduction.ra_bill_id.is_(None), Project.company_id == company_id),
+        or_(
+            TDSDeduction.created_by.is_(None),
+            User.company_id.is_(None),
+            User.company_id == company_id,
+        ),
+        or_(
+            TDSDeduction.vendor_bill_id.isnot(None),
+            TDSDeduction.ra_bill_id.isnot(None),
+            User.company_id == company_id,
+        ),
+    )
+
+
+async def _validate_tds_source_links(
+    db: AsyncSession,
+    company_id: int,
+    vendor_bill_id: Optional[int],
+    ra_bill_id: Optional[int],
+) -> None:
+    from app.models.project import Project
+
+    if vendor_bill_id is not None:
+        vb_owned = await db.scalar(
+            select(VendorBill.id).where(
+                VendorBill.id == vendor_bill_id,
+                VendorBill.company_id == company_id,
+            )
+        )
+        if not vb_owned:
+            raise HTTPException(status_code=404, detail="Vendor Bill not found")
+
+    if ra_bill_id is not None:
+        rab_owned = await db.scalar(
+            select(RABill.id)
+            .join(Project, RABill.project_id == Project.id)
+            .where(
+                RABill.id == ra_bill_id,
+                Project.company_id == company_id,
+            )
+        )
+        if not rab_owned:
+            raise HTTPException(status_code=404, detail="RA Bill not found")
+
+
+async def _get_owned_tds_deduction(
+    db: AsyncSession,
+    tds_id: int,
+    company_id: int,
+) -> TDSDeduction:
+    from app.core.logger import logger
+    from app.models.project import Project
+
+    row = (
+        await db.execute(
+            _tds_company_joins(
+                select(
+                    TDSDeduction,
+                    VendorBill.company_id.label("vb_company_id"),
+                    Project.company_id.label("ra_company_id"),
+                    User.company_id.label("user_company_id"),
+                ).where(TDSDeduction.id == tds_id)
+            )
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+
+    tds, vb_cid, ra_cid, user_cid = row
+    source_cids = set()
+    if tds.vendor_bill_id is not None:
+        if vb_cid is None:
+            logger.warning("tds.ownership_incomplete tds_id=%s source=vendor_bill", tds.id)
+            raise HTTPException(status_code=404, detail="TDS Deduction not found")
+        source_cids.add(vb_cid)
+    if tds.ra_bill_id is not None:
+        if ra_cid is None:
+            logger.warning("tds.ownership_incomplete tds_id=%s source=ra_bill", tds.id)
+            raise HTTPException(status_code=404, detail="TDS Deduction not found")
+        source_cids.add(ra_cid)
+    if tds.created_by is not None and user_cid is not None:
+        source_cids.add(user_cid)
+
+    if len(source_cids) > 1:
+        logger.warning("tds.ownership_conflict tds_id=%s", tds.id)
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+    if source_cids != {company_id}:
+        raise HTTPException(status_code=404, detail="TDS Deduction not found")
+    return tds
 
 
 @router.get("/tds/deductions", response_model=list[TDSDeductionOut])
@@ -2812,9 +2986,14 @@ async def list_tds_deductions(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
+    if current_user.company_id is None:
+        return []
+
+    stmt = _tds_company_joins(select(TDSDeduction)).where(
+        _tds_strict_company_filter(current_user.company_id)
+    )
     result = await db.scalars(
-        select(TDSDeduction)
-        .order_by(TDSDeduction.created_at.desc())
+        stmt.order_by(TDSDeduction.created_at.desc())
         .offset(skip)
         .limit(limit)
     )
@@ -2826,51 +3005,79 @@ async def create_tds_deduction(
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from fastapi import HTTPException
-    from app.utils.accounting import resolve_tax_accounts
-    
-    # Duplicate checking
-    if getattr(payload, 'vendor_bill_id', None) is not None:
-        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == payload.vendor_bill_id))
+    company_id = _require_company_id(current_user)
+    vendor_bill_id = getattr(payload, "vendor_bill_id", None)
+    ra_bill_id = getattr(payload, "ra_bill_id", None)
+
+    await _validate_tds_source_links(db, company_id, vendor_bill_id, ra_bill_id)
+
+    # Duplicate checking within verified bill links
+    if vendor_bill_id is not None:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == vendor_bill_id))
         if existing:
             raise HTTPException(status_code=400, detail="TDS Deduction already exists for this Vendor Bill.")
-            
-    if getattr(payload, 'ra_bill_id', None) is not None:
-        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.ra_bill_id == payload.ra_bill_id))
+
+    if ra_bill_id is not None:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.ra_bill_id == ra_bill_id))
         if existing:
             raise HTTPException(status_code=400, detail="TDS Deduction already exists for this RA Bill.")
 
     tds = TDSDeduction(**payload.model_dump())
     tds.created_by = current_user.id
-    
+
     db.add(tds)
-    
-    # Process Auto Journal if posted directly
+
+    # Process Auto Journal if posted directly (strictly tenant-scoped tax accounts)
     if tds.status == "Posted":
+        from app.models.settings import CompanySettings
         try:
-            tds_acc = await resolve_tax_accounts(db, 'tds_payable')
+            tds_acc = None
+            comp_settings = await db.scalar(
+                select(CompanySettings).where(CompanySettings.company_id == company_id)
+            )
+            if comp_settings and getattr(comp_settings, "tds_payable_account_id", None):
+                tds_acc = await db.scalar(
+                    select(Account).where(
+                        Account.id == comp_settings.tds_payable_account_id,
+                        Account.company_id == company_id,
+                    )
+                )
+            if not tds_acc:
+                tds_acc = await db.scalar(
+                    select(Account).where(
+                        Account.code == "TDS_PAYABLE",
+                        Account.company_id == company_id,
+                    )
+                )
             if not tds_acc:
                 raise HTTPException(status_code=400, detail="TDS payable account is not configured.")
-                
-            vendor_acc = await db.scalar(select(Account).where(Account.code == "VENDOR_PAYABLE"))
+
+            vendor_acc = await db.scalar(
+                select(Account).where(
+                    Account.code == "VENDOR_PAYABLE",
+                    Account.company_id == company_id,
+                )
+            )
             if not vendor_acc:
                 raise HTTPException(status_code=400, detail="Vendor liability account is not configured.")
-            
-            if tds_acc and vendor_acc:
-                je = JournalEntry(
-                    entry_date=date.today(),
-                    description=f"TDS Deduction for {tds.party_name}",
-                    entry_type="Auto",
-                    status="Posted",
-                    created_by=current_user.id
-                )
-                db.add(je)
-                await db.flush()
-                
-                # Debit Vendor, Credit TDS
-                jl_debit = JournalLine(entry_id=je.id, account_id=vendor_acc.id, debit=tds.tds_amount, credit=0.0)
-                jl_credit = JournalLine(entry_id=je.id, account_id=tds_acc.id, debit=0.0, credit=tds.tds_amount)
-                db.add_all([jl_debit, jl_credit])
+
+            je = JournalEntry(
+                entry_date=date.today(),
+                description=f"TDS Deduction for {tds.party_name}",
+                entry_type="Auto",
+                status="Posted",
+                created_by=current_user.id
+            )
+            db.add(je)
+            await db.flush()
+
+            # Debit Vendor, Credit TDS
+            jl_debit = JournalLine(entry_id=je.id, account_id=vendor_acc.id, debit=tds.tds_amount, credit=0.0)
+            jl_credit = JournalLine(entry_id=je.id, account_id=tds_acc.id, debit=0.0, credit=tds.tds_amount)
+            db.add_all([jl_debit, jl_credit])
+        except HTTPException:
+            await db.rollback()
+            raise
         except Exception as e:
             await db.rollback()
             raise HTTPException(status_code=400, detail=str(e))
@@ -2890,11 +3097,8 @@ async def get_tds_deduction(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from fastapi import HTTPException
-    tds = await db.get(TDSDeduction, id)
-    if not tds:
-        raise HTTPException(status_code=404, detail="TDS Deduction not found")
-    return tds
+    company_id = _require_company_id(current_user)
+    return await _get_owned_tds_deduction(db, id, company_id)
 
 @router.patch("/tds/deductions/{id}", response_model=TDSDeductionOut)
 async def update_tds_deduction(
@@ -2903,15 +3107,12 @@ async def update_tds_deduction(
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from fastapi import HTTPException
-    
-    tds = await db.get(TDSDeduction, id)
-    if not tds:
-        raise HTTPException(status_code=404, detail="TDS Deduction not found")
-        
+    company_id = _require_company_id(current_user)
+    tds = await _get_owned_tds_deduction(db, id, company_id)
+
     is_posted = tds.status == "Posted"
     is_payment_service = tds.status == "PENDING" and tds.vendor_bill_id is not None
-    
+
     if is_posted or is_payment_service:
         # Prevent accounting-sensitive updates
         sensitive_fields = ['payment_amount', 'tds_rate', 'tds_amount', 'vendor_bill_id', 'ra_bill_id', 'status']
@@ -2919,18 +3120,27 @@ async def update_tds_deduction(
         for field in sensitive_fields:
             if field in payload_data and payload_data[field] != getattr(tds, field):
                 raise HTTPException(status_code=400, detail=f"Cannot modify accounting-sensitive field '{field}' on a POSTED or PaymentService-generated record.")
-                
+
     if getattr(payload, 'status', None) == "Posted" and tds.status != "Posted":
         raise HTTPException(status_code=400, detail="Cannot change TDS status to Posted through update. Use the TDS posting workflow.")
-        
+
+    new_vb_id = getattr(payload, 'vendor_bill_id', None)
+    new_rab_id = getattr(payload, 'ra_bill_id', None)
+    await _validate_tds_source_links(
+        db,
+        company_id,
+        new_vb_id if new_vb_id is not None and new_vb_id != tds.vendor_bill_id else None,
+        new_rab_id if new_rab_id is not None and new_rab_id != tds.ra_bill_id else None,
+    )
+
     # Duplicate checking if changing bill ids
-    if getattr(payload, 'vendor_bill_id', None) is not None and payload.vendor_bill_id != tds.vendor_bill_id:
-        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == payload.vendor_bill_id, TDSDeduction.id != id))
+    if new_vb_id is not None and new_vb_id != tds.vendor_bill_id:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.vendor_bill_id == new_vb_id, TDSDeduction.id != id))
         if existing:
             raise HTTPException(status_code=400, detail="TDS Deduction already exists for this Vendor Bill.")
-            
-    if getattr(payload, 'ra_bill_id', None) is not None and payload.ra_bill_id != tds.ra_bill_id:
-        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.ra_bill_id == payload.ra_bill_id, TDSDeduction.id != id))
+
+    if new_rab_id is not None and new_rab_id != tds.ra_bill_id:
+        existing = await db.scalar(select(TDSDeduction).where(TDSDeduction.ra_bill_id == new_rab_id, TDSDeduction.id != id))
         if existing:
             raise HTTPException(status_code=400, detail="TDS Deduction already exists for this RA Bill.")
 
@@ -2938,7 +3148,7 @@ async def update_tds_deduction(
         update_data = payload.model_dump(exclude_unset=True)
         for key, value in update_data.items():
             setattr(tds, key, value)
-            
+
         await db.commit()
         await db.refresh(tds)
         return tds
@@ -2953,18 +3163,15 @@ async def delete_tds_deduction(
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from fastapi import HTTPException
-    
-    tds = await db.get(TDSDeduction, id)
-    if not tds:
-        raise HTTPException(status_code=404, detail="TDS Deduction not found")
-        
+    company_id = _require_company_id(current_user)
+    tds = await _get_owned_tds_deduction(db, id, company_id)
+
     is_posted = tds.status == "Posted"
     is_payment_service = tds.status == "PENDING" and tds.vendor_bill_id is not None
-    
+
     if is_posted or is_payment_service:
         raise HTTPException(status_code=400, detail="Cannot delete a POSTED or PaymentService-generated TDS record. Please use a reversal mechanism if applicable.")
-        
+
     try:
         await db.delete(tds)
         await db.commit()
@@ -2979,10 +3186,12 @@ async def gst_invoice_register(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    # Combine Invoice and VendorBill
+    company_id = _require_company_id(current_user)
     items = []
-    
-    invoices = await db.scalars(select(Invoice))
+
+    invoices = await db.scalars(
+        select(Invoice).where(Invoice.company_id == company_id)
+    )
     for inv in invoices:
         items.append(GSTRegisterItem(
             date=inv.invoice_date or inv.created_at.date(),
@@ -3000,8 +3209,10 @@ async def gst_invoice_register(
             gst_document_url=inv.gst_document_url,
             attachments=inv.invoice_copy_url
         ))
-        
-    vendor_bills = await db.scalars(select(VendorBill))
+
+    vendor_bills = await db.scalars(
+        select(VendorBill).where(VendorBill.company_id == company_id)
+    )
     for vb in vendor_bills:
         items.append(GSTRegisterItem(
             date=vb.bill_date,
@@ -3012,7 +3223,7 @@ async def gst_invoice_register(
             gst_amount=0.0, # Simplified
             invoice_total=float(vb.total_amount)
         ))
-        
+
     return items
 
 @router.get("/gst/returns/generate", response_model=GSTReturnOut)
@@ -3020,8 +3231,11 @@ async def generate_gst_return(
     filing_period: str,
     return_type: str,
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
+    company_id = _require_company_id(current_user)
+
     # Calculate from existing tables for the filing period
     # Assuming filing_period format like "2026-07"
     try:
@@ -3029,9 +3243,10 @@ async def generate_gst_return(
     except ValueError:
         year, month = date.today().year, date.today().month
 
-    # Taxable Value & GST Liability from Invoices
+    # Taxable Value & GST Liability from company-owned Invoices
     sales = await db.execute(
         select(func.sum(Invoice.amount), func.sum(Invoice.gst_amount))
+        .where(Invoice.company_id == company_id)
         .where(extract('year', Invoice.created_at) == year)
         .where(extract('month', Invoice.created_at) == month)
     )
@@ -3039,15 +3254,17 @@ async def generate_gst_return(
     taxable_value = float(taxable_value or 0.0)
     gst_liability = float(gst_liability or 0.0)
 
-    # ITC Available from Vendor Bills
+    # ITC Available from company-owned Vendor Bills
     purchases = await db.execute(
         select(func.sum(VendorBill.total_amount)) # Simplified as VendorBill lacks gst_amount currently
+        .where(VendorBill.company_id == company_id)
         .where(extract('year', VendorBill.bill_date) == year)
         .where(extract('month', VendorBill.bill_date) == month)
     )
     itc_available = float(purchases.scalar() or 0.0) * 0.18 # Mock 18% ITC for demo
 
     gst = GSTReturn(
+        company_id=company_id,
         filing_period=filing_period,
         return_type=return_type,
         taxable_value=taxable_value,
@@ -3059,7 +3276,45 @@ async def generate_gst_return(
     db.add(gst)
     await db.commit()
     await db.refresh(gst)
+    await _invalidate_gst_dashboard_cache(redis)
     return gst
+
+
+async def _match_portal_gst_entry(
+    db: AsyncSession,
+    company_id: int,
+    inv_no: str,
+    vendor: str,
+    portal_gst: float,
+) -> Optional[GSTReconciliationMismatch]:
+    erp_bill = await db.scalar(
+        select(VendorBill).where(
+            VendorBill.bill_number == inv_no,
+            VendorBill.company_id == company_id,
+        )
+    )
+    if not erp_bill:
+        return GSTReconciliationMismatch(
+            invoice_no=inv_no,
+            vendor=vendor,
+            erp_gst=0.0,
+            portal_gst=portal_gst,
+            difference=portal_gst,
+            status="MISSING_IN_ERP",
+        )
+    erp_gst = float(erp_bill.total_amount) * 0.18  # Mock ERP GST
+    diff = abs(erp_gst - portal_gst)
+    if diff > 1.0:  # 1 rupee tolerance
+        return GSTReconciliationMismatch(
+            invoice_no=inv_no,
+            vendor=vendor,
+            erp_gst=erp_gst,
+            portal_gst=portal_gst,
+            difference=diff,
+            status="MISMATCH",
+        )
+    return None
+
 
 @router.post("/gst/reconciliation/match", response_model=list[GSTReconciliationMismatch])
 async def reconcile_gst(
@@ -3068,13 +3323,15 @@ async def reconcile_gst(
     db: AsyncSession = Depends(get_db_session)
 ):
     import json
-    
+
+    company_id = _require_company_id(current_user)
+
     # In-memory comparison
     content = await file.read()
     text = content.decode('utf-8')
-    
+
     mismatches = []
-    
+
     # Try parsing as JSON first
     try:
         data = json.loads(text)
@@ -3086,29 +3343,17 @@ async def reconcile_gst(
                     portal_gst = float(row.get('gst_amount', row.get('portal_gst', row.get('Total GST', 0.0))))
                 except (ValueError, TypeError):
                     portal_gst = 0.0
-                
+
                 if not inv_no:
                     continue
-                    
-                # Query ERP
-                erp_bill = await db.scalar(select(VendorBill).where(VendorBill.bill_number == inv_no))
-                if not erp_bill:
-                    mismatches.append(GSTReconciliationMismatch(
-                        invoice_no=inv_no, vendor=vendor, erp_gst=0.0, portal_gst=portal_gst,
-                        difference=portal_gst, status="MISSING_IN_ERP"
-                    ))
-                else:
-                    erp_gst = float(erp_bill.total_amount) * 0.18 # Mock ERP GST
-                    diff = abs(erp_gst - portal_gst)
-                    if diff > 1.0: # 1 rupee tolerance
-                        mismatches.append(GSTReconciliationMismatch(
-                            invoice_no=inv_no, vendor=vendor, erp_gst=erp_gst, portal_gst=portal_gst,
-                            difference=diff, status="MISMATCH"
-                        ))
+
+                mismatch = await _match_portal_gst_entry(db, company_id, inv_no, vendor, portal_gst)
+                if mismatch:
+                    mismatches.append(mismatch)
             return mismatches
     except json.JSONDecodeError:
         pass # Fallback to CSV parsing below
-        
+
     lines = text.splitlines()
     # Assume CSV: invoice_no, vendor, gst_amount
     for line in lines[1:]: # Skip header
@@ -3117,216 +3362,17 @@ async def reconcile_gst(
         if len(parts) >= 3:
             inv_no = parts[0].strip()
             vendor = parts[1].strip()
+            if not inv_no:
+                continue
             try:
                 portal_gst = float(parts[2].strip())
             except ValueError:
                 portal_gst = 0.0
-                
-            # Query ERP
-            erp_bill = await db.scalar(select(VendorBill).where(VendorBill.bill_number == inv_no))
-            if not erp_bill:
-                mismatches.append(GSTReconciliationMismatch(
-                    invoice_no=inv_no, vendor=vendor, erp_gst=0.0, portal_gst=portal_gst,
-                    difference=portal_gst, status="MISSING_IN_ERP"
-                ))
-            else:
-                erp_gst = float(erp_bill.total_amount) * 0.18 # Mock ERP GST
-                diff = abs(erp_gst - portal_gst)
-                if diff > 1.0: # Tolerance
-                    mismatches.append(GSTReconciliationMismatch(
-                        invoice_no=inv_no, vendor=vendor, erp_gst=erp_gst, portal_gst=portal_gst,
-                        difference=diff, status="MISMATCH"
-                    ))
-    return mismatches
 
-# ===================== GST & TAXATION =====================
+            mismatch = await _match_portal_gst_entry(db, company_id, inv_no, vendor, portal_gst)
+            if mismatch:
+                mismatches.append(mismatch)
 
-@router.post("/gst/returns", response_model=GSTReturnOut)
-async def create_gst_return(
-    payload: GSTReturnCreate,
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    gstr = GSTReturn(**payload.model_dump())
-    db.add(gstr)
-    await db.commit()
-    await db.refresh(gstr)
-    return gstr
-
-@router.get("/gst/returns", response_model=list[GSTReturnOut])
-async def list_gst_returns(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    result = await db.scalars(select(GSTReturn).order_by(GSTReturn.created_at.desc()))
-    return result.all()
-
-
-
-@router.get("/gst/invoice-register", response_model=list[GSTRegisterItem])
-async def gst_invoice_register(
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    # Combine Invoice and VendorBill
-    items = []
-    
-    invoices = await db.scalars(select(Invoice))
-    for inv in invoices:
-        items.append(GSTRegisterItem(
-            date=inv.invoice_date or inv.created_at.date(),
-            invoice_no=inv.invoice_number or str(inv.id),
-            type='SALES',
-            party_name='Customer',
-            gstin=inv.party_gstin,
-            taxable_amount=float(inv.amount),
-            gst_amount=float(inv.gst_amount),
-            invoice_total=float(inv.total_amount),
-            cgst=float(inv.cgst or 0.0),
-            sgst=float(inv.sgst or 0.0),
-            igst=float(inv.igst or 0.0),
-            invoice_copy_url=inv.invoice_copy_url,
-            gst_document_url=inv.gst_document_url,
-            attachments=inv.invoice_copy_url
-        ))
-        
-    vendor_bills = await db.scalars(select(VendorBill))
-    for vb in vendor_bills:
-        items.append(GSTRegisterItem(
-            date=vb.bill_date,
-            invoice_no=vb.bill_number,
-            type='PURCHASE',
-            party_name='Vendor', # Would join Vendor
-            taxable_amount=float(vb.total_amount), # Simplified
-            gst_amount=0.0, # Simplified
-            invoice_total=float(vb.total_amount)
-        ))
-        
-    return items
-
-@router.get("/gst/returns/generate", response_model=GSTReturnOut)
-async def generate_gst_return(
-    filing_period: str,
-    return_type: str,
-    current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    # Calculate from existing tables for the filing period
-    # Assuming filing_period format like "2026-07"
-    try:
-        year, month = map(int, filing_period.split("-"))
-    except ValueError:
-        year, month = date.today().year, date.today().month
-
-    # Taxable Value & GST Liability from Invoices
-    sales = await db.execute(
-        select(func.sum(Invoice.amount), func.sum(Invoice.gst_amount))
-        .where(extract('year', Invoice.created_at) == year)
-        .where(extract('month', Invoice.created_at) == month)
-    )
-    taxable_value, gst_liability = sales.one()
-    taxable_value = float(taxable_value or 0.0)
-    gst_liability = float(gst_liability or 0.0)
-
-    # ITC Available from Vendor Bills
-    purchases = await db.execute(
-        select(func.sum(VendorBill.total_amount)) # Simplified as VendorBill lacks gst_amount currently
-        .where(extract('year', VendorBill.bill_date) == year)
-        .where(extract('month', VendorBill.bill_date) == month)
-    )
-    itc_available = float(purchases.scalar() or 0.0) * 0.18 # Mock 18% ITC for demo
-
-    gst = GSTReturn(
-        filing_period=filing_period,
-        return_type=return_type,
-        taxable_value=taxable_value,
-        gst_liability=gst_liability,
-        itc_available=itc_available,
-        net_gst_payable=gst_liability - itc_available,
-        status="Draft"
-    )
-    db.add(gst)
-    await db.commit()
-    await db.refresh(gst)
-    return gst
-
-@router.post("/gst/reconciliation/match", response_model=list[GSTReconciliationMismatch])
-async def reconcile_gst(
-    file: UploadFile = File(...),
-    current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
-):
-    import json
-    
-    # In-memory comparison
-    content = await file.read()
-    text = content.decode('utf-8')
-    
-    mismatches = []
-    
-    # Try parsing as JSON first
-    try:
-        data = json.loads(text)
-        if isinstance(data, list):
-            for row in data:
-                inv_no = str(row.get('invoice_no', row.get('inv_no', row.get('Invoice Number', '')))).strip()
-                vendor = str(row.get('vendor', row.get('party', row.get('Vendor Name', '')))).strip()
-                try:
-                    portal_gst = float(row.get('gst_amount', row.get('portal_gst', row.get('Total GST', 0.0))))
-                except (ValueError, TypeError):
-                    portal_gst = 0.0
-                
-                if not inv_no:
-                    continue
-                    
-                # Query ERP
-                erp_bill = await db.scalar(select(VendorBill).where(VendorBill.bill_number == inv_no))
-                if not erp_bill:
-                    mismatches.append(GSTReconciliationMismatch(
-                        invoice_no=inv_no, vendor=vendor, erp_gst=0.0, portal_gst=portal_gst,
-                        difference=portal_gst, status="MISSING_IN_ERP"
-                    ))
-                else:
-                    erp_gst = float(erp_bill.total_amount) * 0.18 # Mock ERP GST
-                    diff = abs(erp_gst - portal_gst)
-                    if diff > 1.0: # 1 rupee tolerance
-                        mismatches.append(GSTReconciliationMismatch(
-                            invoice_no=inv_no, vendor=vendor, erp_gst=erp_gst, portal_gst=portal_gst,
-                            difference=diff, status="MISMATCH"
-                        ))
-            return mismatches
-    except json.JSONDecodeError:
-        pass # Fallback to CSV parsing below
-        
-    lines = text.splitlines()
-    # Assume CSV: invoice_no, vendor, gst_amount
-    for line in lines[1:]: # Skip header
-        if not line.strip(): continue
-        parts = line.split(',')
-        if len(parts) >= 3:
-            inv_no = parts[0].strip()
-            vendor = parts[1].strip()
-            try:
-                portal_gst = float(parts[2].strip())
-            except ValueError:
-                portal_gst = 0.0
-                
-            # Query ERP
-            erp_bill = await db.scalar(select(VendorBill).where(VendorBill.bill_number == inv_no))
-            if not erp_bill:
-                mismatches.append(GSTReconciliationMismatch(
-                    invoice_no=inv_no, vendor=vendor, erp_gst=0.0, portal_gst=portal_gst,
-                    difference=portal_gst, status="MISSING_IN_ERP"
-                ))
-            else:
-                erp_gst = float(erp_bill.total_amount) * 0.18 # Mock ERP GST
-                diff = abs(erp_gst - portal_gst)
-                if diff > 1.0: # 1 rupee tolerance
-                    mismatches.append(GSTReconciliationMismatch(
-                        invoice_no=inv_no, vendor=vendor, erp_gst=erp_gst, portal_gst=portal_gst,
-                        difference=diff, status="MISMATCH"
-                    ))
-                    
     return mismatches
 
 @router.get("/gst/returns/{id}", response_model=GSTReturnOut)
@@ -3335,54 +3381,52 @@ async def get_gst_return(
     current_user: User = Depends(require_roles(ACCOUNTANT_READ_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
-    from fastapi import HTTPException
-    gstr = await db.get(GSTReturn, id)
-    if not gstr:
-        raise HTTPException(status_code=404, detail="GST Return not found")
-    return gstr
+    company_id = _require_company_id(current_user)
+    return await _get_owned_gst_return(db, id, company_id)
 
 @router.patch("/gst/returns/{id}", response_model=GSTReturnOut)
 async def update_gst_return(
     id: int,
     payload: GSTReturnUpdate,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
-    from fastapi import HTTPException
-    gstr = await db.get(GSTReturn, id)
-    if not gstr:
-        raise HTTPException(status_code=404, detail="GST Return not found")
-        
+    company_id = _require_company_id(current_user)
+    gstr = await _get_owned_gst_return(db, id, company_id)
+
     if gstr.status == "Filed":
         raise HTTPException(status_code=400, detail="Filed GST Return cannot be modified.")
-        
+
     if getattr(payload, 'status', None) == "Filed" and gstr.status != "Filed":
         raise HTTPException(status_code=400, detail="GST Return cannot be marked as Filed through update. Use the GST filing workflow.")
 
     update_data = payload.model_dump(exclude_unset=True)
+    update_data.pop("company_id", None)
     for key, value in update_data.items():
         setattr(gstr, key, value)
-        
+
     await db.commit()
     await db.refresh(gstr)
+    await _invalidate_gst_dashboard_cache(redis)
     return gstr
 
 @router.delete("/gst/returns/{id}", status_code=204)
 async def delete_gst_return(
     id: int,
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
-    db: AsyncSession = Depends(get_db_session)
+    db: AsyncSession = Depends(get_db_session),
+    redis=Depends(get_request_redis),
 ):
-    from fastapi import HTTPException
-    gstr = await db.get(GSTReturn, id)
-    if not gstr:
-        raise HTTPException(status_code=404, detail="GST Return not found")
-        
+    company_id = _require_company_id(current_user)
+    gstr = await _get_owned_gst_return(db, id, company_id)
+
     if gstr.status == "Filed":
         raise HTTPException(status_code=400, detail="Filed GST Return cannot be deleted.")
-        
+
     await db.delete(gstr)
     await db.commit()
+    await _invalidate_gst_dashboard_cache(redis)
     return None
 
 @router.get("/gst/export")
@@ -3392,18 +3436,24 @@ async def export_gst(
 ):
     import io
     import csv
-    
-    # Combine Invoice and VendorBill
-    invoices = await db.scalars(select(Invoice))
-    vendor_bills = await db.scalars(select(VendorBill))
-    
+
+    company_id = _require_company_id(current_user)
+
+    # Combine company-owned Invoice and VendorBill records
+    invoices = await db.scalars(
+        select(Invoice).where(Invoice.company_id == company_id)
+    )
+    vendor_bills = await db.scalars(
+        select(VendorBill).where(VendorBill.company_id == company_id)
+    )
+
     stream = io.StringIO()
     writer = csv.writer(stream)
     writer.writerow([
         "Invoice No", "Date", "Type", "Party", "GSTIN",
         "Taxable Amount", "GST Amount", "Total Amount", "Status"
     ])
-    
+
     for inv in invoices:
         writer.writerow([
             inv.invoice_number or str(inv.id),
@@ -3416,7 +3466,7 @@ async def export_gst(
             float(inv.total_amount),
             inv.status
         ])
-        
+
     for vb in vendor_bills:
         writer.writerow([
             vb.bill_number,
@@ -3429,7 +3479,7 @@ async def export_gst(
             float(vb.total_amount),
             vb.status
         ])
-        
+
     response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
     response.headers["Content-Disposition"] = "attachment; filename=gst_register.csv"
     return response
@@ -3440,14 +3490,15 @@ async def import_gst(
     current_user: User = Depends(require_roles(ACCOUNTANT_WRITE_ROLES)),
     db: AsyncSession = Depends(get_db_session)
 ):
+    _require_company_id(current_user)
     content = await file.read()
     text = content.decode('utf-8')
     lines = text.splitlines()
-    
+
     total = max(0, len(lines) - 1)
     valid = 0
     errors = []
-    
+
     for i, line in enumerate(lines[1:], start=2):
         if not line.strip():
             continue
@@ -3456,9 +3507,9 @@ async def import_gst(
             errors.append(f"Line {i}: Invalid format")
         else:
             valid += 1
-            
+
     # Do NOT mutate database here
-    
+
     return GSTImportResult(
         total_records=total,
         valid_records=valid,

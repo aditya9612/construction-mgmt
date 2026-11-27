@@ -1,4 +1,5 @@
 import pytest
+import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
@@ -18,14 +19,15 @@ async def test_subscription_invoice_creation_and_scoping():
             plan = await db.scalar(select(Plan).where(Plan.is_active == True))
             sub = Subscription(
                 company_id=1,
-                plan_id=plan.id,
+                plan_id=plan.id if plan else 1,
                 status="active",
                 start_date=datetime.utcnow(),
             )
             db.add(sub)
-            await db.flush()
+            await db.commit()
+            await db.refresh(sub)
 
-        inv_num = f"INV-TEST-{int(datetime.utcnow().timestamp())}"
+        inv_num = f"INV-TEST-{uuid.uuid4().hex[:10]}"
         invoice = SubscriptionInvoice(
             company_id=1,
             subscription_id=sub.id,
@@ -49,12 +51,28 @@ async def test_subscription_invoice_creation_and_scoping():
         assert invoice.subscription_id == sub.id
         assert invoice.total_amount == Decimal("5898.82")
 
+        # Cleanup test-created invoice
+        await db.delete(invoice)
+        await db.commit()
+
 
 @pytest.mark.asyncio
 async def test_subscription_invoice_unique_number():
     async with AsyncSessionLocal() as db:
         sub = await db.scalar(select(Subscription).where(Subscription.company_id == 1))
-        inv_num = f"INV-UNIQ-{int(datetime.utcnow().timestamp())}"
+        if not sub:
+            plan = await db.scalar(select(Plan).where(Plan.is_active == True))
+            sub = Subscription(
+                company_id=1,
+                plan_id=plan.id if plan else 1,
+                status="active",
+                start_date=datetime.utcnow(),
+            )
+            db.add(sub)
+            await db.commit()
+            await db.refresh(sub)
+
+        inv_num = f"INV-UNIQ-{uuid.uuid4().hex[:10]}"
         
         inv1 = SubscriptionInvoice(
             company_id=1,
@@ -77,11 +95,15 @@ async def test_subscription_invoice_unique_number():
             await db.commit()
         await db.rollback()
 
+        # Cleanup test-created invoice
+        await db.delete(inv1)
+        await db.commit()
+
 
 @pytest.mark.asyncio
 async def test_billing_webhook_event_idempotency_constraint():
     async with AsyncSessionLocal() as db:
-        evt_id = f"evt_{int(datetime.utcnow().timestamp())}"
+        evt_id = f"evt_{uuid.uuid4().hex[:12]}"
         
         event1 = BillingWebhookEvent(
             provider="razorpay",
@@ -105,3 +127,7 @@ async def test_billing_webhook_event_idempotency_constraint():
         with pytest.raises(IntegrityError):
             await db.commit()
         await db.rollback()
+
+        # Cleanup test-created event
+        await db.delete(event1)
+        await db.commit()

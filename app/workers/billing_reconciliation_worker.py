@@ -70,26 +70,30 @@ class BillingReconciliationWorker:
         return MockPaymentProvider()
 
     async def _acquire_lock(self) -> bool:
-        if self.redis is not None:
-            try:
-                # Atomic SET key val NX EX ttl
-                acquired = await self.redis.set(
-                    self.LOCK_KEY,
-                    self.worker_id,
-                    nx=True,
-                    ex=self.lock_ttl_seconds,
-                )
-                return bool(acquired)
-            except Exception as e:
-                logger.warning(
-                    f"[{self.worker_id}] Redis lock acquire failed: {e}. Falling back to in-process lock."
-                )
-
-        # Fallback to local in-process lock
-        if self._in_process_lock.locked():
+        if self.redis is None:
+            logger.warning(
+                f"[{self.worker_id}] BILLING_RECONCILIATION_LOCK_UNAVAILABLE: "
+                f"Redis client is not configured or unavailable. "
+                f"Failing closed to prevent unsynchronized concurrent reconciliation across workers."
+            )
             return False
-        await self._in_process_lock.acquire()
-        return True
+
+        try:
+            # Atomic SET key val NX EX ttl
+            acquired = await self.redis.set(
+                self.LOCK_KEY,
+                self.worker_id,
+                nx=True,
+                ex=self.lock_ttl_seconds,
+            )
+            return bool(acquired)
+        except Exception as e:
+            logger.warning(
+                f"[{self.worker_id}] BILLING_RECONCILIATION_REDIS_OUTAGE: "
+                f"Redis lock acquire failed: {e}. "
+                f"Failing closed to prevent unsynchronized concurrent execution across workers."
+            )
+            return False
 
     async def _release_lock(self) -> None:
         if self.redis is not None:
@@ -101,9 +105,6 @@ class BillingReconciliationWorker:
                 logger.warning(
                     f"[{self.worker_id}] Redis lock release failed: {e}"
                 )
-
-        if self._in_process_lock.locked():
-            self._in_process_lock.release()
 
     async def run_once(self) -> Optional[Dict[str, Any]]:
         """

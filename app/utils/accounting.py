@@ -66,21 +66,17 @@ async def get_primary_cash_account(
         stmt = stmt.where(CompanySettings.company_id == company_id)
 
     settings = await db.scalar(stmt)
-    if not settings and company_id is not None:
-        settings = await db.scalar(select(CompanySettings))
 
     if settings and settings.primary_cash_account_id:
         cash_acc = await db.get(Account, settings.primary_cash_account_id)
-        if cash_acc:
+        if cash_acc and (company_id is None or cash_acc.company_id == company_id):
             return cash_acc
 
-    # Fallback to standard Cash account by code
+    # Fallback to standard Cash account by code (strictly scoped when company_id is provided)
     cash_by_code_stmt = select(Account).where(Account.code == "CASH")
     if company_id is not None:
         cash_by_code_stmt = cash_by_code_stmt.where(Account.company_id == company_id)
     cash_acc = await db.scalar(cash_by_code_stmt)
-    if not cash_acc and company_id is not None:
-        cash_acc = await db.scalar(select(Account).where(Account.code == "CASH"))
     if cash_acc:
         return cash_acc
 
@@ -128,86 +124,86 @@ async def get_payroll_account(db: AsyncSession, account_field_name: str) -> Acco
 from fastapi import HTTPException
 
 
+async def _get_or_create_company_account(
+    db: AsyncSession,
+    *,
+    code: str,
+    name: str,
+    account_type,
+    company_id: Optional[int],
+) -> Account:
+    """
+    Resolves or creates a company-owned ledger account.
+    Fails closed when company_id is None to prevent cross-tenant posting.
+    """
+    if company_id is None:
+        raise ValueError(
+            f"company_id is required to resolve or create '{code}' account."
+        )
+
+    acc = await db.scalar(
+        select(Account).where(
+            Account.code == code,
+            Account.company_id == company_id,
+        )
+    )
+    if not acc:
+        acc = Account(
+            name=name,
+            code=code,
+            type=account_type,
+            company_id=company_id,
+        )
+        db.add(acc)
+        await db.flush()
+    return acc
+
+
 async def resolve_tax_accounts(
     db: AsyncSession,
     account_type_name: str,
     company_id: Optional[int] = None,
 ) -> Account:
     """
-    Dynamically resolves a tax account (e.g., Input GST, Output GST, TDS Payable)
-    using pattern matching or CompanySettings if available.
-    If missing, automatically creates / seeds the standard account.
+    Dynamically resolves a company-scoped tax account (Input GST, Output GST, TDS Payable)
+    using CompanySettings or standard company account code.
+    If missing for that company, automatically creates / seeds it under that company_id.
+    Fails closed when company_id is None.
     """
     from app.models.settings import CompanySettings
     from app.core.enums import AccountType
 
-    settings_stmt = select(CompanySettings)
-    if company_id is not None:
-        settings_stmt = settings_stmt.where(CompanySettings.company_id == company_id)
-    settings = await db.scalar(settings_stmt)
-    if not settings and company_id is not None:
-        settings = await db.scalar(select(CompanySettings))
+    tax_specs = {
+        "tds_payable": ("TDS Payable", "TDS_PAYABLE", AccountType.LIABILITY),
+        "input_gst": ("Input GST", "INPUT_GST", AccountType.ASSET),
+        "output_gst": ("Output GST", "OUTPUT_GST", AccountType.LIABILITY),
+    }
+    if account_type_name not in tax_specs:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown tax account type request: {account_type_name}"
+        )
+
+    if company_id is None:
+        raise ValueError(
+            f"company_id is required to resolve or create '{account_type_name}' account."
+        )
 
     if account_type_name == "tds_payable":
+        settings = await db.scalar(
+            select(CompanySettings).where(CompanySettings.company_id == company_id)
+        )
         if settings and getattr(settings, "tds_payable_account_id", None):
             acc = await db.get(Account, settings.tds_payable_account_id)
-            if acc:
+            if acc and acc.company_id == company_id:
                 return acc
-        query = select(Account).where(Account.code == "TDS_PAYABLE")
-        if company_id is not None:
-            query = query.where(Account.company_id == company_id)
-        acc = await db.scalar(query)
-        if not acc:
-            acc = await db.scalar(select(Account).where(Account.code == "TDS_PAYABLE"))
-        if not acc:
-            acc = Account(
-                name="TDS Payable",
-                code="TDS_PAYABLE",
-                type=AccountType.LIABILITY,
-                company_id=company_id,
-            )
-            db.add(acc)
-            await db.flush()
-        return acc
 
-    elif account_type_name == "input_gst":
-        query = select(Account).where(Account.code == "INPUT_GST")
-        if company_id is not None:
-            query = query.where(Account.company_id == company_id)
-        acc = await db.scalar(query)
-        if not acc:
-            acc = await db.scalar(select(Account).where(Account.code == "INPUT_GST"))
-        if not acc:
-            acc = Account(
-                name="Input GST",
-                code="INPUT_GST",
-                type=AccountType.ASSET,
-                company_id=company_id,
-            )
-            db.add(acc)
-            await db.flush()
-        return acc
-
-    elif account_type_name == "output_gst":
-        query = select(Account).where(Account.code == "OUTPUT_GST")
-        if company_id is not None:
-            query = query.where(Account.company_id == company_id)
-        acc = await db.scalar(query)
-        if not acc:
-            acc = await db.scalar(select(Account).where(Account.code == "OUTPUT_GST"))
-        if not acc:
-            acc = Account(
-                name="Output GST",
-                code="OUTPUT_GST",
-                type=AccountType.LIABILITY,
-                company_id=company_id,
-            )
-            db.add(acc)
-            await db.flush()
-        return acc
-
-    raise HTTPException(
-        status_code=400, detail=f"Unknown tax account type request: {account_type_name}"
+    acc_name, acc_code, acc_type = tax_specs[account_type_name]
+    return await _get_or_create_company_account(
+        db,
+        code=acc_code,
+        name=acc_name,
+        account_type=acc_type,
+        company_id=company_id,
     )
 
 
@@ -217,22 +213,13 @@ async def get_accounts_receivable(
 ) -> Account:
     from app.core.enums import AccountType
 
-    query = select(Account).where(Account.code == "ACCOUNTS_RECEIVABLE")
-    if company_id is not None:
-        query = query.where(Account.company_id == company_id)
-    acc = await db.scalar(query)
-    if not acc:
-        acc = await db.scalar(select(Account).where(Account.code == "ACCOUNTS_RECEIVABLE"))
-    if not acc:
-        acc = Account(
-            name="Accounts Receivable",
-            code="ACCOUNTS_RECEIVABLE",
-            type=AccountType.ASSET,
-            company_id=company_id,
-        )
-        db.add(acc)
-        await db.flush()
-    return acc
+    return await _get_or_create_company_account(
+        db,
+        code="ACCOUNTS_RECEIVABLE",
+        name="Accounts Receivable",
+        account_type=AccountType.ASSET,
+        company_id=company_id,
+    )
 
 
 async def get_revenue_account(
@@ -241,22 +228,13 @@ async def get_revenue_account(
 ) -> Account:
     from app.core.enums import AccountType
 
-    query = select(Account).where(Account.code == "SALES_REVENUE")
-    if company_id is not None:
-        query = query.where(Account.company_id == company_id)
-    acc = await db.scalar(query)
-    if not acc:
-        acc = await db.scalar(select(Account).where(Account.code == "SALES_REVENUE"))
-    if not acc:
-        acc = Account(
-            name="Sales Revenue",
-            code="SALES_REVENUE",
-            type=AccountType.INCOME,
-            company_id=company_id,
-        )
-        db.add(acc)
-        await db.flush()
-    return acc
+    return await _get_or_create_company_account(
+        db,
+        code="SALES_REVENUE",
+        name="Sales Revenue",
+        account_type=AccountType.INCOME,
+        company_id=company_id,
+    )
 
 
 STANDARD_SYSTEM_ACCOUNTS = [

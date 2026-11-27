@@ -94,11 +94,12 @@ async def setup_batch_s_data():
         db.add_all([supp_a, supp_b])
         await db.flush()
 
-        # 5. Purchase Orders
+        # 5. Purchase Orders (self-contained, no dummy foreign-key material_id)
         po_a = PurchaseOrder(
+            company_id=comp_a.id,
             project_id=proj_a.id,
             supplier_id=supp_a.id,
-            material_id=1,  # dummy reference
+            material_id=None,
             material_name="Cement Grade 53",
             quantity=Decimal("100.000"),
             rate=Decimal("350.00"),
@@ -106,9 +107,10 @@ async def setup_batch_s_data():
             status="APPROVED",
         )
         po_b = PurchaseOrder(
+            company_id=comp_b.id,
             project_id=proj_b.id,
             supplier_id=supp_b.id,
-            material_id=1,
+            material_id=None,
             material_name="Steel TMT",
             quantity=Decimal("50.000"),
             rate=Decimal("600.00"),
@@ -468,7 +470,22 @@ async def setup_batch_s_data():
                 super_admin.id, admin_a.id, admin_b.id, user_custom_a.id,
                 legacy_admin_no_perm.id, dummy_none_company_user.id
             ])))
-            await cleanup_db.execute(delete(Transaction).where(Transaction.linked_to.like("vendor_bill:%")))
+            # Collect only bill IDs belonging to this test run's isolated companies
+            test_bill_ids = (
+                await cleanup_db.execute(
+                    select(VendorBill.id).where(VendorBill.company_id.in_([comp_a.id, comp_b.id]))
+                )
+            ).scalars().all()
+            test_bill_links = [f"vendor_bill:{bid}" for bid in test_bill_ids]
+            if test_bill_links:
+                await cleanup_db.execute(
+                    delete(Transaction).where(
+                        (Transaction.linked_to.in_(test_bill_links))
+                        | (Transaction.project_id.in_([proj_a.id, proj_b.id]))
+                    )
+                )
+            else:
+                await cleanup_db.execute(delete(Transaction).where(Transaction.project_id.in_([proj_a.id, proj_b.id])))
             # Delete bill items first
             await cleanup_db.execute(delete(VendorBillItem).where(VendorBillItem.vendor_bill_id.in_(
                 select(VendorBill.id).where(VendorBill.company_id.in_([comp_a.id, comp_b.id]))
@@ -493,7 +510,6 @@ async def setup_batch_s_data():
                 super_admin.id, admin_a.id, admin_b.id, user_custom_a.id,
                 legacy_admin_no_perm.id, dummy_none_company_user.id
             ])))
-            await cleanup_db.execute(delete(Permission).where(Permission.code == "vendor_bills.*"))
             await cleanup_db.execute(delete(Company).where(Company.id.in_([comp_a.id, comp_b.id])))
             await cleanup_db.commit()
 

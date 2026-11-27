@@ -59,6 +59,7 @@ from app.utils.accounting import (
     get_accounts_receivable,
     get_primary_cash_account,
     get_revenue_account,
+    resolve_tax_accounts,
 )
 from app.utils.common import assert_project_access, create_system_alert
 from app.utils.helpers import InvalidStateError, NotFoundError, PermissionDeniedError, ValidationError
@@ -691,6 +692,16 @@ async def generate_invoice_pdf(
 
 
 async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
+    if invoice.company_id is None:
+        return
+
+    try:
+        ar_acc = await get_accounts_receivable(db, company_id=invoice.company_id)
+        rev_acc = await get_revenue_account(db, company_id=invoice.company_id)
+    except (ValueError, Exception):
+        # AR or Revenue account cannot be resolved safely — skip journal posting
+        return
+
     je = JournalEntry(
         entry_type="Invoice",
         journal_number=f"J-INV-{invoice.id}",
@@ -700,13 +711,6 @@ async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
     )
     db.add(je)
     await db.flush()
-
-    try:
-        ar_acc = await get_accounts_receivable(db)
-        rev_acc = await get_revenue_account(db)
-    except (ValueError, Exception):
-        # AR or Revenue account not configured — skip journal lines
-        return
 
     # DR AR
     db.add(
@@ -729,12 +733,12 @@ async def _post_invoice_journal(db: AsyncSession, invoice: Invoice):
         )
     )
 
-    # CR GST Payable if any
+    # CR GST Payable if any (strictly scoped to invoice's owning company)
     if invoice.gst_amount > 0:
-        from app.utils.accounting import resolve_tax_accounts
-
         try:
-            gst_acc = await resolve_tax_accounts(db, "output_gst")
+            gst_acc = await resolve_tax_accounts(
+                db, "output_gst", company_id=invoice.company_id
+            )
             db.add(
                 JournalLine(
                     entry_id=je.id,
@@ -1169,32 +1173,37 @@ async def pay_invoice(
     else:
         invoice.status = InvoiceStatus.PARTIAL
 
-    # 3. Create Journal Entry
-    je = JournalEntry(
-        entry_type="Receipt",
-        journal_number=f"J-REC-{txn.id or 'INV'+str(invoice.id)}",
-        entry_date=date.today(),
-        description=f"Payment received for Invoice {invoice.id}",
-        status="Posted",
+    # 3. Create Journal Entry (strictly scoped to invoice/user company)
+    inv_company_id = (
+        invoice.company_id
+        if invoice.company_id is not None
+        else current_user.company_id
     )
-    db.add(je)
-    await db.flush()
-
-    try:
-        ar_acc = await get_accounts_receivable(db)
-        cash_acc = await get_primary_cash_account(db)
-        db.add(
-            JournalLine(
-                entry_id=je.id, account_id=cash_acc.id, debit=amount, credit=Decimal(0)
+    if inv_company_id is not None:
+        try:
+            ar_acc = await get_accounts_receivable(db, company_id=inv_company_id)
+            cash_acc = await get_primary_cash_account(db, company_id=inv_company_id)
+            je = JournalEntry(
+                entry_type="Receipt",
+                journal_number=f"J-REC-{txn.id or 'INV'+str(invoice.id)}",
+                entry_date=date.today(),
+                description=f"Payment received for Invoice {invoice.id}",
+                status="Posted",
             )
-        )
-        db.add(
-            JournalLine(
-                entry_id=je.id, account_id=ar_acc.id, debit=Decimal(0), credit=amount
+            db.add(je)
+            await db.flush()
+            db.add(
+                JournalLine(
+                    entry_id=je.id, account_id=cash_acc.id, debit=amount, credit=Decimal(0)
+                )
             )
-        )
-    except (ValueError, Exception):
-        pass
+            db.add(
+                JournalLine(
+                    entry_id=je.id, account_id=ar_acc.id, debit=Decimal(0), credit=amount
+                )
+            )
+        except (ValueError, Exception):
+            pass
 
     await db.commit()
 
@@ -1348,8 +1357,13 @@ async def get_client_ledger(
     if not is_super and current_user.company_id is not None and owner.company_id != current_user.company_id:
         raise NotFoundError("Client not found")
 
+    client_company_id = (
+        owner.company_id
+        if owner.company_id is not None
+        else current_user.company_id
+    )
     try:
-        ar_acc = await get_accounts_receivable(db)
+        ar_acc = await get_accounts_receivable(db, company_id=client_company_id)
         ar_acc_id = ar_acc.id
     except (ValueError, Exception):
         return ClientLedgerResponse(
@@ -1473,6 +1487,20 @@ async def create_manual_receivable(
     if not is_super and current_user.company_id is not None and owner.company_id != current_user.company_id:
         raise NotFoundError("Client not found")
 
+    client_company_id = (
+        owner.company_id
+        if owner.company_id is not None
+        else current_user.company_id
+    )
+    if client_company_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Company context required to post manual receivable",
+        )
+
+    ar_acc = await get_accounts_receivable(db, company_id=client_company_id)
+    rev_acc = await get_revenue_account(db, company_id=client_company_id)
+
     je = JournalEntry(
         entry_type="Manual Receivable",
         journal_number=f"J-MAN-REC-{payload.client_id}-{date.today().strftime('%Y%m%d')}",
@@ -1483,27 +1511,22 @@ async def create_manual_receivable(
     db.add(je)
     await db.flush()
 
-    try:
-        ar_acc = await get_accounts_receivable(db)
-        rev_acc = await get_revenue_account(db)
-        db.add(
-            JournalLine(
-                entry_id=je.id,
-                account_id=ar_acc.id,
-                debit=Decimal(str(payload.amount)),
-                credit=Decimal(0),
-            )
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=ar_acc.id,
+            debit=Decimal(str(payload.amount)),
+            credit=Decimal(0),
         )
-        db.add(
-            JournalLine(
-                entry_id=je.id,
-                account_id=rev_acc.id,
-                debit=Decimal(0),
-                credit=Decimal(str(payload.amount)),
-            )
+    )
+    db.add(
+        JournalLine(
+            entry_id=je.id,
+            account_id=rev_acc.id,
+            debit=Decimal(0),
+            credit=Decimal(str(payload.amount)),
         )
-    except (ValueError, Exception):
-        pass
+    )
 
     await db.commit()
     return {"message": "Manual receivable posted", "journal_id": je.id}
@@ -1621,8 +1644,13 @@ async def export_client_ledger(
     writer = csv.writer(output)
     writer.writerow(["Date", "Particulars", "Debit", "Credit", "Balance"])
 
+    client_company_id = (
+        owner.company_id
+        if owner.company_id is not None
+        else current_user.company_id
+    )
     try:
-        ar_acc = await get_accounts_receivable(db)
+        ar_acc = await get_accounts_receivable(db, company_id=client_company_id)
         ar_acc_id = ar_acc.id
     except (ValueError, Exception):
         ar_acc_id = None

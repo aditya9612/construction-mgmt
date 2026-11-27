@@ -6,8 +6,23 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import uuid
 import os
 from sqlalchemy.exc import IntegrityError
-from fastapi import APIRouter, Depends, HTTPException, Query, Header, Body, status
-from sqlalchemy import exists, func, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Header, Body, status, UploadFile, File, Form, Response
+from app.schemas.material import (
+    BulkMaterialPreviewResponse,
+    BulkMaterialCommitRequest,
+    BulkMaterialCommitResponse,
+)
+from app.services.bulk_material_service import (
+    generate_material_upload_template,
+    parse_material_file,
+    validate_bulk_material_rows,
+    execute_bulk_material_commit,
+    store_import_token,
+    retrieve_and_consume_import_token,
+    TOKEN_TTL_SECONDS,
+    TOKEN_KEY_PREFIX,
+)
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from reportlab.platypus import SimpleDocTemplate, Table
 from openpyxl import Workbook
@@ -102,6 +117,8 @@ from decimal import Decimal
 import tempfile, os, uuid
 from datetime import datetime
 from app.models.master_data import MaterialMaster, Unit
+from app.models.inventory import StockBatch, ProjectMaterialValuation
+from app.models.purchase_order import PurchaseOrderItem
 from reportlab.platypus import (
     BaseDocTemplate,
     Frame,
@@ -1693,8 +1710,11 @@ async def create_po(
         raise HTTPException(400, "Material does not belong to project")
 
     total_amount = payload.quantity * payload.rate
+    po_num = f"PO-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
 
     po = PurchaseOrder(
+        po_number=po_num,
+        company_id=getattr(current_user, "company_id", 1) or 1,
         supplier_id=payload.supplier_id,
         boq_item_id=payload.boq_item_id,
         project_id=payload.project_id,
@@ -1708,6 +1728,20 @@ async def create_po(
 
     db.add(po)
     await db.flush()
+
+    # Synchronize line item in purchase_order_items for workflow & report consistency
+    po_item = PurchaseOrderItem(
+        purchase_order_id=po.id,
+        material_master_id=material.material_master_id or 1,
+        material_id=material.id,
+        material_name=material.material_name,
+        quantity=payload.quantity,
+        received_quantity=Decimal("0.000"),
+        rate=payload.rate,
+        total_amount=total_amount,
+        status="PENDING",
+    )
+    db.add(po_item)
     db.add(
         ActivityLog(
             action="CREATE_PO",
@@ -2345,7 +2379,7 @@ async def update_transfer_status(
     final_status = None
     if payload is not None and payload.status:
         body_status = payload.status.upper().strip()
-        if status:
+        if status and isinstance(status, str):
             query_status = status.upper().strip()
             if body_status != query_status:
                 raise HTTPException(
@@ -2353,7 +2387,7 @@ async def update_transfer_status(
                     detail=f"Conflicting status provided in body ('{body_status}') and query ('{query_status}')",
                 )
         final_status = body_status
-    elif status:
+    elif status and isinstance(status, str):
         final_status = status.upper().strip()
     else:
         raise HTTPException(
@@ -2570,7 +2604,138 @@ async def update_transfer_status(
         db.add(ledger_out)
         db.add(ledger_in)
 
-        # 5. Mark COMPLETED
+        # 5. Synchronize StockBatch (FIFO depletion at source, batch creation at destination) & MWA Valuations
+        if material.material_master_id:
+            # A. Deplete source StockBatch in strict FIFO order
+            stmt_src_batches = (
+                select(StockBatch)
+                .where(
+                    and_(
+                        StockBatch.project_id == obj.from_project_id,
+                        StockBatch.material_master_id == material.material_master_id,
+                        StockBatch.status == "ACTIVE",
+                        StockBatch.current_balance > Decimal("0.000"),
+                    )
+                )
+                .order_by(
+                    case((StockBatch.receipt_date.is_(None), 0), else_=1).asc(),
+                    StockBatch.receipt_date.asc(),
+                    StockBatch.id.asc(),
+                )
+                .with_for_update()
+            )
+            src_batches = (await db.execute(stmt_src_batches)).scalars().all()
+
+            rem_transfer = obj.quantity
+            total_transferred_val = Decimal("0.00")
+
+            for sb in src_batches:
+                if rem_transfer <= Decimal("0.000"):
+                    break
+                alloc = min(sb.current_balance, rem_transfer)
+                sb.current_balance -= alloc
+                if sb.current_balance <= Decimal("0.000"):
+                    sb.status = "DEPLETED"
+                rem_transfer -= alloc
+                batch_cost = (alloc * sb.purchase_rate).quantize(Decimal("0.01"))
+                total_transferred_val += batch_cost
+
+                # B. Create corresponding StockBatch at destination preserving provenance and rate
+                dest_batch = StockBatch(
+                    batch_number=f"TRF-{obj.reference_id or obj.id}-{sb.id}",
+                    project_id=obj.to_project_id,
+                    material_master_id=material.material_master_id,
+                    supplier_id=material.supplier_id,
+                    initial_quantity=alloc,
+                    current_balance=alloc,
+                    purchase_rate=sb.purchase_rate,
+                    receipt_date=sb.receipt_date or datetime.utcnow(),
+                    batch_source="TRANSFER_IN",
+                    status="ACTIVE",
+                )
+                db.add(dest_batch)
+
+            # If legacy unbatched stock was transferred, handle remaining quantity
+            if rem_transfer > Decimal("0.000"):
+                unbatched_cost = (rem_transfer * avg_rate).quantize(Decimal("0.01"))
+                total_transferred_val += unbatched_cost
+                dest_fallback_batch = StockBatch(
+                    batch_number=f"TRF-{obj.reference_id or obj.id}-UNBATCHED",
+                    project_id=obj.to_project_id,
+                    material_master_id=material.material_master_id,
+                    supplier_id=material.supplier_id,
+                    initial_quantity=rem_transfer,
+                    current_balance=rem_transfer,
+                    purchase_rate=avg_rate,
+                    receipt_date=datetime.utcnow(),
+                    batch_source="TRANSFER_IN",
+                    status="ACTIVE",
+                )
+                db.add(dest_fallback_batch)
+
+            # C. Recalculate Source ProjectMaterialValuation
+            stmt_val_src = (
+                select(ProjectMaterialValuation)
+                .where(
+                    and_(
+                        ProjectMaterialValuation.project_id == obj.from_project_id,
+                        ProjectMaterialValuation.material_master_id == material.material_master_id,
+                    )
+                )
+                .with_for_update()
+            )
+            val_src = (await db.execute(stmt_val_src)).scalar_one_or_none()
+            if val_src:
+                rem_qty_src = max(Decimal("0.000"), val_src.total_purchased_quantity - obj.quantity)
+                rem_amt_src = max(Decimal("0.00"), val_src.total_purchased_amount - total_transferred_val)
+                val_src.total_purchased_quantity = rem_qty_src
+                val_src.total_purchased_amount = rem_amt_src
+                val_src.current_moving_weighted_average_rate = (
+                    (rem_amt_src / rem_qty_src).quantize(Decimal("0.01"))
+                    if rem_qty_src > Decimal("0.000")
+                    else Decimal("0.00")
+                )
+                val_src.last_recalculated_at = datetime.utcnow()
+
+            # D. Recalculate Destination ProjectMaterialValuation
+            stmt_val_dst = (
+                select(ProjectMaterialValuation)
+                .where(
+                    and_(
+                        ProjectMaterialValuation.project_id == obj.to_project_id,
+                        ProjectMaterialValuation.material_master_id == material.material_master_id,
+                    )
+                )
+                .with_for_update()
+            )
+            val_dst = (await db.execute(stmt_val_dst)).scalar_one_or_none()
+            if not val_dst:
+                eff_rate = (
+                    (total_transferred_val / obj.quantity).quantize(Decimal("0.01"))
+                    if obj.quantity > Decimal("0.000")
+                    else avg_rate
+                )
+                val_dst = ProjectMaterialValuation(
+                    project_id=obj.to_project_id,
+                    material_master_id=material.material_master_id,
+                    total_purchased_quantity=obj.quantity,
+                    total_purchased_amount=total_transferred_val,
+                    current_moving_weighted_average_rate=eff_rate,
+                )
+                db.add(val_dst)
+            else:
+                new_qty_dst = val_dst.total_purchased_quantity + obj.quantity
+                new_amt_dst = val_dst.total_purchased_amount + total_transferred_val
+                val_dst.total_purchased_quantity = new_qty_dst
+                val_dst.total_purchased_amount = new_amt_dst
+                val_dst.current_moving_weighted_average_rate = (
+                    (new_amt_dst / new_qty_dst).quantize(Decimal("0.01"))
+                    if new_qty_dst > Decimal("0.000")
+                    else Decimal("0.00")
+                )
+                val_dst.last_recalculated_at = datetime.utcnow()
+
+        # 6. Mark COMPLETED
         obj.status = "COMPLETED"
 
         await db.commit()
@@ -2866,6 +3031,32 @@ async def usage(
 
         update_material_fields(obj)
         obj.remaining_stock = max(Decimal("0"), current_stock - qty)
+
+        # Synchronize StockBatch depletion to prevent stock divergence
+        if obj.material_master_id:
+            stmt_batches = (
+                select(StockBatch)
+                .where(
+                    and_(
+                        StockBatch.project_id == data.project_id,
+                        StockBatch.material_master_id == obj.material_master_id,
+                        StockBatch.status == "ACTIVE",
+                        StockBatch.current_balance > Decimal("0.000"),
+                    )
+                )
+                .order_by(StockBatch.receipt_date.asc(), StockBatch.id.asc())
+                .with_for_update()
+            )
+            batches = (await db.execute(stmt_batches)).scalars().all()
+            rem_qty = qty
+            for b in batches:
+                if rem_qty <= Decimal("0.000"):
+                    break
+                alloc = min(b.current_balance, rem_qty)
+                b.current_balance -= alloc
+                if b.current_balance <= Decimal("0.000"):
+                    b.status = "DEPLETED"
+                rem_qty -= alloc
 
         await db.commit()
 
@@ -3386,6 +3577,51 @@ async def purchase(
             )
         )
 
+        # Synchronize StockBatch and ProjectMaterialValuation to prevent stock divergence
+        if obj.material_master_id:
+            batch = StockBatch(
+                batch_number=f"BATCH-PUR-{reference}",
+                project_id=data.project_id,
+                material_master_id=obj.material_master_id,
+                supplier_id=obj.supplier_id,
+                initial_quantity=qty,
+                current_balance=qty,
+                purchase_rate=rate,
+                receipt_date=datetime.utcnow(),
+                batch_source="DIRECT_PURCHASE",
+                status="ACTIVE",
+            )
+            db.add(batch)
+
+            stmt_val = (
+                select(ProjectMaterialValuation)
+                .where(
+                    and_(
+                        ProjectMaterialValuation.project_id == data.project_id,
+                        ProjectMaterialValuation.material_master_id == obj.material_master_id,
+                    )
+                )
+                .with_for_update()
+            )
+            val = (await db.execute(stmt_val)).scalar_one_or_none()
+            if not val:
+                val = ProjectMaterialValuation(
+                    project_id=data.project_id,
+                    material_master_id=obj.material_master_id,
+                    total_purchased_quantity=qty,
+                    total_purchased_amount=total,
+                    current_moving_weighted_average_rate=rate,
+                )
+                db.add(val)
+            else:
+                new_qty = val.total_purchased_quantity + qty
+                new_amt = val.total_purchased_amount + total
+                new_mwa = (new_amt / new_qty).quantize(Decimal("0.01")) if new_qty > Decimal("0") else rate
+                val.total_purchased_quantity = new_qty
+                val.total_purchased_amount = new_amt
+                val.current_moving_weighted_average_rate = new_mwa
+                val.last_recalculated_at = datetime.utcnow()
+
         await db.commit()
 
         result = await db.execute(
@@ -3638,6 +3874,116 @@ async def adjust_inventory(
         # ================= SET ACTUAL STOCK =================
 
         material.remaining_stock = new_stock
+
+        # ================= SYNCHRONIZE STOCKBATCH & MWA VALUATION =================
+        if material.material_master_id:
+            if diff > 0:
+                # Positive adjustment: create adjustment batch
+                adj_batch = StockBatch(
+                    batch_number=f"BATCH-ADJ-{reference}",
+                    project_id=material.project_id,
+                    material_master_id=material.material_master_id,
+                    supplier_id=material.supplier_id,
+                    initial_quantity=diff,
+                    current_balance=diff,
+                    purchase_rate=avg_rate,
+                    receipt_date=datetime.utcnow(),
+                    batch_source="ADJUSTMENT_IN",
+                    status="ACTIVE",
+                )
+                db.add(adj_batch)
+
+                stmt_val = (
+                    select(ProjectMaterialValuation)
+                    .where(
+                        and_(
+                            ProjectMaterialValuation.project_id == material.project_id,
+                            ProjectMaterialValuation.material_master_id == material.material_master_id,
+                        )
+                    )
+                    .with_for_update()
+                )
+                val = (await db.execute(stmt_val)).scalar_one_or_none()
+                adj_amt = (diff * avg_rate).quantize(Decimal("0.01"))
+                if not val:
+                    val = ProjectMaterialValuation(
+                        project_id=material.project_id,
+                        material_master_id=material.material_master_id,
+                        total_purchased_quantity=diff,
+                        total_purchased_amount=adj_amt,
+                        current_moving_weighted_average_rate=avg_rate,
+                    )
+                    db.add(val)
+                else:
+                    new_qty = val.total_purchased_quantity + diff
+                    new_total_val = val.total_purchased_amount + adj_amt
+                    val.total_purchased_quantity = new_qty
+                    val.total_purchased_amount = new_total_val
+                    val.current_moving_weighted_average_rate = (
+                        (new_total_val / new_qty).quantize(Decimal("0.01"))
+                        if new_qty > Decimal("0.000")
+                        else avg_rate
+                    )
+                    val.last_recalculated_at = datetime.utcnow()
+
+            elif diff < 0:
+                # Negative adjustment: deplete StockBatch in strict FIFO order
+                reduce_qty = abs(diff)
+                stmt_batches = (
+                    select(StockBatch)
+                    .where(
+                        and_(
+                            StockBatch.project_id == material.project_id,
+                            StockBatch.material_master_id == material.material_master_id,
+                            StockBatch.status == "ACTIVE",
+                            StockBatch.current_balance > Decimal("0.000"),
+                        )
+                    )
+                    .order_by(
+                        case((StockBatch.receipt_date.is_(None), 0), else_=1).asc(),
+                        StockBatch.receipt_date.asc(),
+                        StockBatch.id.asc(),
+                    )
+                    .with_for_update()
+                )
+                batches = (await db.execute(stmt_batches)).scalars().all()
+                rem_reduce = reduce_qty
+                total_reduced_val = Decimal("0.00")
+                for b in batches:
+                    if rem_reduce <= Decimal("0.000"):
+                        break
+                    alloc = min(b.current_balance, rem_reduce)
+                    b.current_balance -= alloc
+                    if b.current_balance <= Decimal("0.000"):
+                        b.status = "DEPLETED"
+                    rem_reduce -= alloc
+                    total_reduced_val += (alloc * b.purchase_rate).quantize(Decimal("0.01"))
+
+                if rem_reduce > Decimal("0.000"):
+                    total_reduced_val += (rem_reduce * avg_rate).quantize(Decimal("0.01"))
+
+                stmt_val = (
+                    select(ProjectMaterialValuation)
+                    .where(
+                        and_(
+                            ProjectMaterialValuation.project_id == material.project_id,
+                            ProjectMaterialValuation.material_master_id == material.material_master_id,
+                        )
+                    )
+                    .with_for_update()
+                )
+                val = (await db.execute(stmt_val)).scalar_one_or_none()
+                if val:
+                    rem_qty = max(Decimal("0.000"), val.total_purchased_quantity - reduce_qty)
+                    rem_amt = max(Decimal("0.00"), val.total_purchased_amount - total_reduced_val)
+                    val.total_purchased_quantity = rem_qty
+                    val.total_purchased_amount = rem_amt
+                    val.current_moving_weighted_average_rate = (
+                        (rem_amt / rem_qty).quantize(Decimal("0.01"))
+                        if rem_qty > Decimal("0.000")
+                        else Decimal("0.00")
+                    )
+                    val.last_recalculated_at = datetime.utcnow()
 
         # ================= PAYMENT FIELDS =================
 
@@ -5035,6 +5381,158 @@ async def price_history(
             last_rate = rate
 
     return history
+
+
+# ================= BULK MATERIAL UPLOAD ROUTES =================
+
+
+@router.get(
+    "/bulk-upload/template",
+    summary="Download Bulk Material Upload Template",
+    description="Generates and downloads a standardized template (.xlsx or .csv) for bulk material upload.",
+)
+async def download_bulk_material_template(
+    format: str = Query("xlsx", pattern="^(xlsx|csv)$"),
+    current_user: User = Depends(require_permission("materials.upload")),
+):
+    content, filename, media_type = generate_material_upload_template(file_format=format)
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@router.post(
+    "/bulk-upload/preview",
+    response_model=BulkMaterialPreviewResponse,
+    summary="Preview and Validate Bulk Material Upload",
+    description="Parses and validates an uploaded Excel or CSV file without writing to the database. Returns row-by-row validation results and an import token if valid.",
+)
+async def preview_bulk_material_upload(
+    file: UploadFile = File(...),
+    project_id: Optional[int] = Form(None),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("materials.upload")),
+    redis=Depends(get_request_redis),
+):
+    content = await file.read()
+    raw_rows = parse_material_file(content=content, filename=file.filename or "")
+    previews, errors = await validate_bulk_material_rows(
+        db=db,
+        current_user=current_user,
+        rows=raw_rows,
+        default_project_id=project_id,
+    )
+    total_rows = len(previews)
+    error_rows = len({e.row for e in errors})
+    valid_rows = total_rows - error_rows
+    can_commit = error_rows == 0 and valid_rows > 0
+    import_token = None
+
+    if can_commit:
+        import_token = f"mat_imp_{uuid.uuid4().hex}"
+        valid_items_to_cache = [
+            p.model_dump(mode="json") for p in previews if p.status == "VALID"
+        ]
+        cache_payload = {
+            "user_id": current_user.id,
+            "company_id": current_user.company_id,
+            "created_at": datetime.utcnow().isoformat(),
+            "items": valid_items_to_cache,
+        }
+        await store_import_token(
+            redis=redis,
+            token=import_token,
+            data=cache_payload,
+            ttl_seconds=TOKEN_TTL_SECONDS,
+        )
+
+    return BulkMaterialPreviewResponse(
+        total_rows=total_rows,
+        valid_rows=valid_rows,
+        error_rows=error_rows,
+        can_commit=can_commit,
+        import_token=import_token,
+        errors=errors,
+        preview_data=previews,
+    )
+
+
+@router.post(
+    "/bulk-upload/commit",
+    response_model=BulkMaterialCommitResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Commit Validated Bulk Material Upload",
+    description="Commits a previously previewed and validated bulk material upload using the secure import token.",
+)
+async def commit_bulk_material_upload(
+    payload: BulkMaterialCommitRequest,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("materials.upload")),
+    redis=Depends(get_request_redis),
+):
+    cached_data = await retrieve_and_consume_import_token(
+        redis=redis,
+        token=payload.import_token,
+    )
+    if not cached_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired import token. Please re-upload and preview your file.",
+        )
+    if cached_data.get("user_id") != current_user.id:
+        raise HTTPException(
+            status_code=403, detail="Unauthorized access to import token."
+        )
+
+    items = cached_data.get("items", [])
+    return await execute_bulk_material_commit(
+        db=db,
+        current_user=current_user,
+        valid_items=items,
+        redis=redis,
+    )
+
+
+@router.post(
+    "/bulk-upload",
+    response_model=BulkMaterialCommitResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Direct Atomic Bulk Material Upload",
+    description="Directly uploads, validates, and imports materials in a single atomic transaction. Fails if any row has an error.",
+)
+async def direct_bulk_material_upload(
+    file: UploadFile = File(...),
+    project_id: Optional[int] = Form(None),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_permission("materials.upload")),
+    redis=Depends(get_request_redis),
+):
+    content = await file.read()
+    raw_rows = parse_material_file(content=content, filename=file.filename or "")
+    previews, errors = await validate_bulk_material_rows(
+        db=db,
+        current_user=current_user,
+        rows=raw_rows,
+        default_project_id=project_id,
+    )
+    if errors:
+        error_details = [e.model_dump() for e in errors]
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"Bulk upload failed with {len(errors)} validation errors across {len({e.row for e in errors})} rows.",
+                "errors": error_details,
+            },
+        )
+    valid_items = [p.model_dump(mode="json") for p in previews if p.status == "VALID"]
+    return await execute_bulk_material_commit(
+        db=db,
+        current_user=current_user,
+        valid_items=valid_items,
+        redis=redis,
+    )
 
 
 # ================= MATERIALS - DYNAMIC ROUTES =================

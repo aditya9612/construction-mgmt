@@ -44,9 +44,15 @@ async def test_legacy_project_insert():
     # Simulate old application insert without company_id
     async for db in get_db_session():
         try:
-            # Create a mock owner first for FK constraint
-            await db.execute(text("INSERT IGNORE INTO owners (id, owner_code, owner_name, email, mobile, created_at, updated_at) VALUES (999, 'OW-999', 'Test Owner', 'owner@example.com', '1234567890', NOW(), NOW())"))
-            await db.commit()
+            # Fetch an existing owner for FK constraint or insert one
+            owner_res = await db.execute(text("SELECT id FROM owners LIMIT 1"))
+            owner_row = owner_res.fetchone()
+            if owner_row:
+                owner_id = owner_row[0]
+            else:
+                await db.execute(text("INSERT INTO owners (id, owner_code, owner_name, email, mobile, created_at, updated_at) VALUES (999, 'OW-999', 'Test Owner', 'owner999@example.com', '9999999999', NOW(), NOW())"))
+                await db.commit()
+                owner_id = 999
             
             project_name = "Legacy Test Project"
             await db.execute(text("DELETE FROM projects WHERE project_name = :name"), {"name": project_name})
@@ -54,10 +60,10 @@ async def test_legacy_project_insert():
 
             insert_sql = text("""
                 INSERT INTO projects (project_name, business_id, status, owner_id, grace_period_minutes, created_at, updated_at)
-                VALUES (:name, 'TEST-PRJ-999', 'PLANNED', 999, 15, NOW(), NOW())
+                VALUES (:name, 'TEST-PRJ-999', 'PLANNED', :owner_id, 15, NOW(), NOW())
             """)
             
-            await db.execute(insert_sql, {"name": project_name})
+            await db.execute(insert_sql, {"name": project_name, "owner_id": owner_id})
             await db.commit()
 
             result = await db.execute(text("SELECT company_id FROM projects WHERE project_name = :name"), {"name": project_name})

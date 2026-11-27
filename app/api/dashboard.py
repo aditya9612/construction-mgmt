@@ -744,7 +744,8 @@ async def accountant_dashboard(
         gst_due = (
             await db.scalar(
                 select(func.sum(GSTReturn.net_gst_payable)).where(
-                    GSTReturn.status == "Draft"
+                    GSTReturn.company_id == current_user.company_id,
+                    GSTReturn.status == "Draft",
                 )
             )
             or 0
@@ -990,7 +991,10 @@ async def accountant_dashboard(
         # 9. Notifications
         notifications = []
         gst_due_upcoming = await db.scalar(
-            select(func.count(GSTReturn.id)).where(GSTReturn.status == "Draft")
+            select(func.count(GSTReturn.id)).where(
+                GSTReturn.company_id == current_user.company_id,
+                GSTReturn.status == "Draft",
+            )
         )
         if gst_due_upcoming and gst_due_upcoming > 0:
             notifications.append(
@@ -1026,12 +1030,13 @@ async def accountant_dashboard(
             upcoming_collections=upcoming_collections,
             recent_activities=recent_activities,
             notifications=notifications,
-        )
+        ).model_dump(mode="json")
 
     version = await r.get_cache_version(redis, VERSION_KEY)
-    return await cache_get_set(
-        redis, f"accountant_dashboard:{current_user.company_id}", version, logic
+    payload = await cache_get_set(
+        redis, f"accountant_dashboard:v2:{current_user.company_id}", version, logic
     )
+    return AccountantDashboardOut.model_validate(payload)
 
 
 # =========================================

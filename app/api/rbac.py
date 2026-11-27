@@ -31,12 +31,12 @@ class RBACAuditLogOut(BaseSchema):
     company_id: Optional[int] = None
     actor_id: Optional[int] = None
     action: str
-    target_type: str
+    target_type: Optional[str] = None
     target_id: Optional[str] = None
     permission: Optional[str] = None
     old_value: Optional[str] = None
     new_value: Optional[str] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
 
 class RBACAuditLogsResponse(BaseSchema):

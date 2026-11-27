@@ -22,7 +22,11 @@ def get_superadmin():
     return mock_superadmin
 
 
-app.dependency_overrides[get_current_active_user] = get_superadmin
+@pytest.fixture(autouse=True)
+def setup_dummy_quotation_auth():
+    app.dependency_overrides[get_current_active_user] = get_superadmin
+    yield
+    app.dependency_overrides.pop(get_current_active_user, None)
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -333,9 +337,14 @@ def test_preview_pdf_invalid_payload():
 def test_preview_pdf_unauthorized():
     """Unauthorized users should be rejected."""
     original_override = app.dependency_overrides.pop(get_current_active_user, None)
-    with TestClient(app) as tc:
-        resp = tc.post("/api/v1/dummy-quotations/preview/pdf", json={"items": []})
-        assert resp.status_code in [401, 403]
-
-    if original_override:
-        app.dependency_overrides[get_current_active_user] = original_override
+    from app.core.dependencies import get_current_user
+    user_override = app.dependency_overrides.pop(get_current_user, None)
+    try:
+        with TestClient(app) as tc:
+            resp = tc.post("/api/v1/dummy-quotations/preview/pdf", json={"items": []})
+            assert resp.status_code in [401, 403]
+    finally:
+        if original_override:
+            app.dependency_overrides[get_current_active_user] = original_override
+        if user_override:
+            app.dependency_overrides[get_current_user] = user_override

@@ -19,7 +19,8 @@ async def assert_project_access(
     if getattr(current_user, "is_super_admin", False):
         return
 
-    if current_user.role in [UserRole.ADMIN.value, UserRole.ACCOUNTANT.value]:
+    role_str = str(current_user.role or "").strip().lower()
+    if role_str.startswith("admin") or role_str.startswith("accountant") or current_user.role in [UserRole.ADMIN.value, UserRole.ACCOUNTANT.value]:
         # Check tenant access
         project = await db.get(m.Project, project_id)
         if not project:
@@ -142,37 +143,35 @@ async def generate_business_id(
     max_retries: int = 5,
 ):
     """
-    Generic, race-condition safe business ID generator.
-    Works for PRJ, CNT, MAT, etc.
+    Generic business ID generator.
+    For MAT material codes, delegates to the atomic database sequence service
+    to guarantee race-condition free sequential allocation across concurrent requests.
     """
+    if prefix == "MAT" and column_name == "material_code":
+        from app.services.sequence_service import allocate_material_code
+        return await allocate_material_code(db=db, prefix=prefix, padding=padding)
 
     column = getattr(model, column_name)
 
+    result = await db.execute(select(column).where(column.like(f"{prefix}%")))
+    existing_codes = set(result.scalars().all())
+
+    max_num = 0
+    for code in existing_codes:
+        if code and code.startswith(prefix):
+            suffix = code[len(prefix):].lstrip("-").lstrip("_")
+            if suffix.isdigit():
+                max_num = max(max_num, int(suffix))
+
+    new_number = max_num + 1
     for _ in range(max_retries):
-        #  Get latest ID with prefix
-        result = await db.execute(
-            select(func.max(column)).where(column.like(f"{prefix}%"))
-        )
-        last_id = result.scalar()
-
-        if last_id:
-            try:
-                last_number = int(last_id.replace(prefix, ""))
-            except ValueError:
-                last_number = 0
-            new_number = last_number + 1
-        else:
-            new_number = 1
-
         new_id = f"{prefix}{str(new_number).zfill(padding)}"
+        if new_id not in existing_codes:
+            exists = await db.scalar(select(func.count()).where(column == new_id))
+            if not exists:
+                return new_id
+        new_number += 1
 
-        #  Check if already exists (extra safety)
-        exists = await db.scalar(select(func.count()).where(column == new_id))
-
-        if not exists:
-            return new_id
-
-    # If still failing
     raise Exception("Unable to generate unique business ID after retries")
 
 

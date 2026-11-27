@@ -8,6 +8,15 @@ from app.core.logger import logger
 from app.core.config import settings
 
 
+LUA_ATOMIC_GETDEL = """
+local val = redis.call('GET', KEYS[1])
+if val then
+    redis.call('DEL', KEYS[1])
+end
+return val
+"""
+
+
 async def create_redis_client(redis_url: str) -> Redis:
     # decode_responses=False to keep bytes storage for speed.
     return Redis.from_url(redis_url, decode_responses=False)

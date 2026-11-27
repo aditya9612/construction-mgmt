@@ -230,6 +230,12 @@ class GSTReturn(Base):
     __tablename__ = "gst_returns"
 
     id = Column(Integer, primary_key=True)
+    company_id = Column(
+        Integer,
+        ForeignKey("companies.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
 
     filing_period = Column(String(20), nullable=False, index=True)  # e.g. "2026-06"
     return_type = Column(String(50), nullable=False)  # e.g. "GSTR-1", "GSTR-3B"
@@ -253,6 +259,10 @@ class GSTReturn(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_gst_returns_company_created", "company_id", "created_at"),
     )
 
 
