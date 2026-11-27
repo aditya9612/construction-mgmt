@@ -10,7 +10,7 @@ from app.db.session import AsyncSessionLocal
 from app.models.user import User
 from app.models.company import Company
 from app.models.owner import Owner
-from app.models.project import Project, ProjectMember
+from app.models.project import Project
 from app.models.settings import CompanySettings, UserSettings
 from app.models.rbac import Role, Permission, RolePermission, UserPermissionOverride
 from app.models.alert import Alert
@@ -157,12 +157,6 @@ async def setup_batch_a_data():
         rp1 = RolePermission(role=custom_role_name, role_id=role_record_a.id, permission_id=p_drawings_view.id)
         rp2 = RolePermission(role=custom_role_name, role_id=role_record_a.id, permission_id=p_projects_view.id)
         db.add_all([rp1, rp2])
-
-        # Add project members so tenant project checks pass and tests evaluate RBAC permissions
-        pm_custom = ProjectMember(project_id=proj_a.id, user_id=user_custom.id)
-        pm_noperm = ProjectMember(project_id=proj_a.id, user_id=user_noperm.id)
-        pm_b = ProjectMember(project_id=proj_b.id, user_id=user_comp_b.id)
-        db.add_all([pm_custom, pm_noperm, pm_b])
         await db.commit()
 
         batch_data = {
@@ -193,7 +187,6 @@ async def setup_batch_a_data():
     finally:
         # Cleanup
         async with AsyncSessionLocal() as db:
-            await db.execute(delete(ProjectMember).where(ProjectMember.project_id.in_([proj_a.id, proj_b.id])))
             await db.execute(delete(RolePermission).where(RolePermission.role == custom_role_name))
             await db.execute(delete(UserPermissionOverride).where(
                 UserPermissionOverride.user_id.in_([

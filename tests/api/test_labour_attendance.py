@@ -79,13 +79,7 @@ async def test_create_labour_sets_company_id_and_allows_checkin():
 
         owner = await db.scalar(select(Owner).where(Owner.company_id == 1))
         if not owner:
-            owner = Owner(
-                owner_code=f"OWN-ATT-{uuid.uuid4().hex[:6]}",
-                owner_name="Owner Test",
-                mobile=f"99{uuid.uuid4().int % 100000000:08d}",
-                email="owner_test@test.com",
-                company_id=1,
-            )
+            owner = Owner(name="Owner Test", phone="9988776655", email="owner_test@test.com", company_id=1)
             db.add(owner)
             await db.flush()
 

@@ -14,21 +14,3 @@ _null_pool = NullPool(
 )
 _null_pool._is_asyncio = True
 async_engine.sync_engine.pool = _null_pool
-
-from app.main import app
-
-@pytest.fixture(autouse=True)
-def clean_dependency_overrides():
-    """
-    Safely isolate dependency overrides per test lifecycle:
-    1. Capture a snapshot of app.dependency_overrides prior to test execution.
-    2. Allow the test and its fixtures to register or modify overrides.
-    3. On completion or failure, restore app.dependency_overrides to the pre-test snapshot,
-       reverting test-specific mutations while preserving outer fixture overrides.
-    """
-    snapshot = dict(app.dependency_overrides)
-    try:
-        yield
-    finally:
-        app.dependency_overrides.clear()
-        app.dependency_overrides.update(snapshot)

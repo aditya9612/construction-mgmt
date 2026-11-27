@@ -7,8 +7,6 @@ from app.db.session import get_db_session
 from app.main import app
 from app.models.rbac import Permission, Role, RolePermission, UserPermissionOverride, RBACAuditLog
 from app.models.user import User, UserRole, ActivityLog, UserAuditLog
-from app.models.company import Company
-from app.models.notification import Notification
 from app.services.rbac_audit import record_rbac_audit
 
 
@@ -136,13 +134,8 @@ async def test_cross_tenant_isolation_all_endpoints():
     user_b = make_security_user(user_id=8821, company_id=102, role="SiteEngineer")
 
     async with get_test_client() as client:
-        # Create companies & users in DB for FK
+        # Create users in DB for FK
         async for db in get_db_session():
-            for cid, cname in [(101, "SecComp 101"), (102, "SecComp 102")]:
-                c_exist = await db.scalar(select(Company).where(Company.id == cid))
-                if not c_exist:
-                    db.add(Company(id=cid, name=cname))
-            await db.flush()
             for u in [admin_a, admin_b, user_b]:
                 existing = await db.scalar(select(User).where(User.id == u.id))
                 if not existing:
@@ -236,9 +229,7 @@ async def test_cross_tenant_isolation_all_endpoints():
 
         # DB cleanup
         async for db in get_db_session():
-            await db.execute(delete(Notification).where(Notification.user_id.in_([admin_a.id, admin_b.id, user_b.id])))
             await db.execute(delete(User).where(User.id.in_([admin_a.id, admin_b.id, user_b.id])))
-            await db.execute(delete(Company).where(Company.id.in_([101, 102])))
             await db.commit()
 
     app.dependency_overrides.clear()
@@ -593,7 +584,6 @@ async def test_rbac_mutations_generate_audit_logs():
                 assert log.company_id == 1, f"Audit log {log.action} must have company_id=1, got {log.company_id}"
 
             # Cleanup
-            await db.execute(delete(Notification).where(Notification.user_id.in_([admin.id, target_user.id])))
             await db.execute(delete(UserPermissionOverride).where(UserPermissionOverride.user_id == target_user.id))
             await db.execute(delete(RBACAuditLog).where(RBACAuditLog.actor_id == admin.id))
             await db.execute(delete(User).where(User.id.in_([admin.id, target_user.id])))
@@ -681,7 +671,6 @@ async def test_rbac_mutation_rollback_atomicity():
             assert audit_persisted is None, "Rolled-back audit record must NOT persist"
 
             # Cleanup admin user
-            await db.execute(delete(Notification).where(Notification.user_id == admin.id))
             await db.execute(delete(User).where(User.id == admin.id))
             await db.commit()
 
@@ -830,11 +819,6 @@ async def test_rbac_audit_logs_query_api():
 
         # Seed audit records in DB for Company 201 (Tenant A) and Company 202 (Tenant B)
         async for db in get_db_session():
-            for cid, cname in [(201, "SecComp 201"), (202, "SecComp 202")]:
-                c_exist = await db.scalar(select(Company).where(Company.id == cid))
-                if not c_exist:
-                    db.add(Company(id=cid, name=cname))
-            await db.flush()
             # Clean any old test records for these tenants
             await db.execute(delete(RBACAuditLog).where(RBACAuditLog.company_id.in_([201, 202])))
             await db.commit()
@@ -939,7 +923,6 @@ async def test_rbac_audit_logs_query_api():
         # Cleanup DB
         async for db in get_db_session():
             await db.execute(delete(RBACAuditLog).where(RBACAuditLog.company_id.in_([201, 202])))
-            await db.execute(delete(Company).where(Company.id.in_([201, 202])))
             await db.commit()
 
     app.dependency_overrides.clear()
@@ -965,13 +948,8 @@ async def test_role_assignment_escalation_and_audit():
     app.dependency_overrides.clear()
 
     async with get_test_client() as client:
-        # Seed companies and users in DB
+        # Seed users in DB
         async for db in get_db_session():
-            for cid, cname in [(301, "SecComp 301"), (302, "SecComp 302")]:
-                c_exist = await db.scalar(select(Company).where(Company.id == cid))
-                if not c_exist:
-                    db.add(Company(id=cid, name=cname))
-            await db.flush()
             for u in [admin_a, target_user_a, user_b]:
                 existing = await db.scalar(select(User).where(User.id == u.id))
                 if not existing:
@@ -1027,10 +1005,8 @@ async def test_role_assignment_escalation_and_audit():
             await db.execute(delete(ActivityLog).where(ActivityLog.performed_by.in_([admin_a.id, target_user_a.id, user_b.id])))
             await db.execute(delete(UserAuditLog).where(UserAuditLog.changed_by.in_([admin_a.id, target_user_a.id, user_b.id])))
             await db.execute(delete(UserAuditLog).where(UserAuditLog.user_id.in_([admin_a.id, target_user_a.id, user_b.id])))
-            await db.execute(delete(Notification).where(Notification.user_id.in_([admin_a.id, target_user_a.id, user_b.id])))
             await db.execute(update(User).where(User.id.in_([admin_a.id, target_user_a.id, user_b.id])).values(updated_by=None))
             await db.execute(delete(User).where(User.id.in_([admin_a.id, target_user_a.id, user_b.id])))
-            await db.execute(delete(Company).where(Company.id.in_([301, 302])))
             await db.commit()
 
     app.dependency_overrides.clear()

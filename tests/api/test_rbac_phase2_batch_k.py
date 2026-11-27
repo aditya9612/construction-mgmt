@@ -224,14 +224,12 @@ async def setup_batch_k_data():
 
         # 8. Equipment
         eq_a = Equipment(
-            company_id=comp_a.id,
             project_id=proj_a.id,
             equipment_name=f"Excavator KA {uid}",
             equipment_code=f"EQ-KA-{uid}",
             rental_cost=Decimal("1500.00"),
         )
         eq_b = Equipment(
-            company_id=comp_b.id,
             project_id=proj_b.id,
             equipment_name=f"Excavator KB {uid}",
             equipment_code=f"EQ-KB-{uid}",

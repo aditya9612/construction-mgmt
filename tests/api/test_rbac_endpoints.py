@@ -1,6 +1,6 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select
 
 from app.core.dependencies import get_current_active_user, get_effective_user_permissions
 from app.db.session import get_db_session
@@ -294,11 +294,6 @@ async def test_custom_role_delete_and_protections():
 
         # Create a user with this role in DB
         async for db in get_db_session():
-            # Clean up user if leftover from previous run
-            await db.execute(text("DELETE FROM notifications WHERE user_id = 99881"))
-            await db.execute(delete(User).where((User.id == 99881) | (User.email == "assigned_user_test@test.com")))
-            await db.commit()
-
             assigned_user = User(
                 id=99881,
                 email="assigned_user_test@test.com",
@@ -315,8 +310,7 @@ async def test_custom_role_delete_and_protections():
             assert del_conflict.status_code == 409
 
             # Clean up user
-            await db.execute(text("DELETE FROM notifications WHERE user_id = 99881"))
-            await db.execute(delete(User).where((User.id == 99881) | (User.email == "assigned_user_test@test.com")))
+            await db.execute(delete(User).where(User.id == 99881))
             await db.commit()
 
             # Now deletion succeeds -> 200
@@ -675,7 +669,6 @@ async def test_user_override_precedence():
             finally:
                 # Cleanup overrides and test users
                 await db.execute(delete(UserPermissionOverride).where(UserPermissionOverride.user_id.in_([target_user_id, admin_id])))
-                await db.execute(text(f"DELETE FROM notifications WHERE user_id IN ({target_user_id}, {admin_id})"))
                 await db.execute(delete(User).where(User.id.in_([target_user_id, admin_id])))
                 await db.commit()
 
