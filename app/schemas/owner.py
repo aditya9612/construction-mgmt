@@ -57,9 +57,9 @@ class OwnerOut(BaseSchema):
     owner_code: str
     owner_name: str
     mobile: str
-    email: Optional[EmailStr]
-    address: Optional[str]
-    pan: Optional[str]
+    email: Optional[str] = None
+    address: Optional[str] = None
+    pan: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 

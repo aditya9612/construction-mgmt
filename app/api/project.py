@@ -206,6 +206,8 @@ async def _get_scoped_project(
     query = select(m.Project).where(m.Project.id == project_id)
     if getattr(current_user, "is_super_admin", False) is not True:
         query = query.where(m.Project.company_id == current_user.company_id)
+    elif not current_user.company_id:
+        query = query.where(m.Project.company_id == None)
     if load_relations:
         query = query.options(
             selectinload(m.Project.milestones).selectinload(m.Milestone.tasks),
@@ -2425,6 +2427,10 @@ class AlertsService:
             base_query = base_query.where(
                 m.Project.company_id == current_user.company_id
             )
+        elif not current_user.company_id:
+            base_query = base_query.where(
+                m.Project.company_id == None
+            )
 
         base_query = base_query.distinct()
 
@@ -2480,6 +2486,10 @@ class AlertsService:
         if getattr(current_user, "is_super_admin", False) is not True:
             base_query = base_query.where(
                 m.Project.company_id == current_user.company_id
+            )
+        elif not current_user.company_id:
+            base_query = base_query.where(
+                m.Project.company_id == None
             )
 
         base_query = base_query.distinct()
@@ -5627,6 +5637,8 @@ async def list_issues(
     )
     if getattr(current_user, "is_super_admin", False) is not True:
         base_query = base_query.where(m.Project.company_id == current_user.company_id)
+    elif not current_user.company_id:
+        base_query = base_query.where(m.Project.company_id == None)
 
     if project_id is not None:
         await _get_scoped_project(db, project_id, current_user, load_relations=False)

@@ -591,6 +591,17 @@ async def approve_bill(
     if obj.status != "Submitted":
         raise ValidationError("Bill must be submitted first")
 
+    project = await db.get(Project, obj.project_id)
+    company_id = (
+        getattr(project, "company_id", None)
+        or getattr(current_user, "company_id", None)
+    )
+    if company_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Company context required to approve RA Bill and post journal entries",
+        )
+
     obj.status = "Approved"
 
     # sync approval table
@@ -615,12 +626,6 @@ async def approve_bill(
     )
     db.add(je)
     await db.flush()
-
-    project = await db.get(Project, obj.project_id)
-    company_id = (
-        getattr(project, "company_id", None)
-        or getattr(current_user, "company_id", None)
-    )
 
     ar_acc = await get_accounts_receivable(db, company_id=company_id)
     rev_acc = await get_revenue_account(db, company_id=company_id)

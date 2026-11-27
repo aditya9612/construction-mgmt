@@ -134,6 +134,8 @@ async def list_work_orders(
     current_user: User = Depends(require_permission("work_orders.view")),
 ):
     is_sa = getattr(current_user, "is_super_admin", False) is True
+    role_str = str(current_user.role or "").strip().lower()
+    is_admin = role_str.startswith("admin") or getattr(current_user, "is_admin", False) is True
 
     if not is_sa and current_user.company_id is None:
         raise PermissionDeniedError("User does not belong to any company")
@@ -146,7 +148,7 @@ async def list_work_orders(
         effective_perms = await get_effective_user_permissions(db, current_user)
         has_manage = has_permission(effective_perms, "work_orders.manage")
 
-        if not has_manage:
+        if not is_admin and not has_manage:
             query = query.where(Project.members.any(user_id=current_user.id))
 
     result = await db.execute(query.order_by(WorkOrder.id.desc()))

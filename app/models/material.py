@@ -323,7 +323,7 @@ class MaterialTransaction(Base, TimestampMixin):
     )
 
     transaction_date = mapped_column(
-        Date, nullable=False, server_default=func.current_date()
+        Date, nullable=False, server_default=text("(CURRENT_DATE)")
     )
 
     __table_args__ = (
@@ -360,6 +360,23 @@ class PurchaseOrder(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
+    company_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("companies.id"),
+        nullable=True,
+        index=True,
+    )
+    po_number: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        unique=True,
+        index=True,
+        nullable=True,
+    )
+    is_company_wide: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("0"),
+    )
+
     boq_item_id = Column(
         Integer,
         ForeignKey("boq_items.id", ondelete="SET NULL"),
@@ -368,24 +385,45 @@ class PurchaseOrder(Base, TimestampMixin):
     )
 
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"))
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
-    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"))
+    project_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("projects.id"),
+        nullable=True,
+        index=True,
+    )
+    material_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("materials.id"),
+        nullable=True,
+    )
 
-    material_name: Mapped[str] = mapped_column(String(255))
+    material_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    quantity: Mapped[Decimal] = mapped_column(DECIMAL(18, 3))
-    rate: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
-    total_amount: Mapped[Decimal] = mapped_column(DECIMAL(18, 2))
+    quantity: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(18, 3), nullable=True)
+    rate: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(18, 2), nullable=True)
+    total_amount: Mapped[Optional[Decimal]] = mapped_column(DECIMAL(18, 2), nullable=True)
 
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="CREATED", server_default=text("'CREATED'")
     )
+    approved_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=True,
+    )
+    approved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
 
     supplier = relationship("Supplier", lazy="selectin")
     project = relationship("Project", lazy="selectin")
     material = relationship("Material", lazy="selectin")
+    items = relationship(
+        "PurchaseOrderItem",
+        back_populates="purchase_order",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
 
     __table_args__ = (Index("idx_po_project", "project_id"),)
 
@@ -465,7 +503,7 @@ class MaterialLedger(Base, TimestampMixin):
     remarks: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     transaction_date = mapped_column(
-        Date, nullable=False, server_default=func.current_date()
+        Date, nullable=False, server_default=text("(CURRENT_DATE)")
     )
 
     __table_args__ = (

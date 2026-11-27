@@ -237,7 +237,9 @@ class MockPeripheralSession:
             return MockResult(items)
 
         # RBAC permissions resolution for Tenant Admin
-        if "role_permissions" in stmt_str:
+        if "user_permission_overrides" in stmt_str:
+            return MockResult([])
+        if "role_permissions" in stmt_str or "permissions" in stmt_str:
             return MockResult(["*"])
 
         return MockResult([])

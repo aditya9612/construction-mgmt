@@ -24,6 +24,7 @@ from app.services.otp import (
     is_otp_locked,
     clear_otp_lockout,
     record_failed_otp_attempt,
+    OTPStorageError,
 )
 from app.services.sms import send_otp_sms
 from app.utils.helpers import AppError
@@ -80,21 +81,12 @@ async def login(
     redis: Redis | None = Depends(get_request_redis),
     db: AsyncSession = Depends(get_db_session),
 ):
-    logger.info(f"OTP login requested mobile={payload.mobile}") 
-
-    if redis is None and settings.APP_ENV == "production":
-        logger.error("Redis unavailable for OTP login")  
-        raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
-
+    logger.info(f"OTP login requested mobile={payload.mobile}")
 
     mobile = _normalize_mobile(payload.mobile)
 
     if len(mobile) < 10:
         raise AppError(status_code=422, message="Invalid mobile number")
-
-    if await is_otp_locked(redis, mobile):
-        logger.warning(f"OTP login attempted while locked mobile={mobile}")
-        raise AppError(status_code=401, message="Account temporarily locked due to too many failed attempts. Please try again after 5 minutes.")
 
     user = await db.scalar(select(User).where(User.mobile == mobile))
     if user is None:
@@ -107,26 +99,38 @@ async def login(
             message="Your account has been deleted. Please contact Admin.",
         )
 
-    # existing logic continues
-    if not await check_otp_rate_limit(redis, mobile):
-        logger.warning(f"OTP rate limit hit for mobile={mobile}") 
-        raise AppError(status_code=429, message="Too many OTP requests. Try again later.")
+    if redis is None and settings.APP_ENV == "production":
+        logger.error("Redis unavailable for OTP login")
+        raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
+
+    if await is_otp_locked(redis, mobile):
+        logger.warning(f"OTP login attempted while locked mobile={mobile}")
+        raise AppError(status_code=401, message="Account temporarily locked due to too many failed attempts. Please try again after 5 minutes.")
 
     try:
+        if not await check_otp_rate_limit(redis, mobile):
+            logger.warning(f"OTP rate limit hit for mobile={mobile}")
+            raise AppError(status_code=429, message="Too many OTP requests. Try again later.")
+
         otp = generate_otp()
         await store_otp(redis, mobile, otp)
 
         sent = await send_otp_sms(mobile, otp)
         if not sent:
-            logger.error(f"Failed to send OTP mobile={mobile}") 
+            logger.error(f"Failed to send OTP mobile={mobile}")
             raise AppError(status_code=503, message="Failed to send OTP")
 
-        logger.info(f"OTP sent successfully mobile={mobile}")  
+        logger.info(f"OTP sent successfully mobile={mobile}")
 
         return OTPLoginResponse(message="OTP sent", mobile=mobile)
 
+    except OTPStorageError as exc:
+        logger.error(f"OTP service unavailable during request_otp: {exc}")
+        raise AppError(status_code=503, message="OTP service temporarily unavailable. Please try again later.")
+    except AppError:
+        raise
     except Exception:
-        logger.exception("OTP login process failed") 
+        logger.exception("OTP login process failed")
         raise
 
 
@@ -140,11 +144,7 @@ async def verify_otp(
     redis: Redis | None = Depends(get_request_redis),
     db: AsyncSession = Depends(get_db_session),
 ):
-    logger.info(f"OTP verification attempt mobile={payload.mobile}") 
-
-    if redis is None and settings.APP_ENV == "production":
-        logger.error("Redis unavailable for OTP verification")
-        raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
+    logger.info(f"OTP verification attempt mobile={payload.mobile}")
 
     mobile = _normalize_mobile(payload.mobile)
 
@@ -161,23 +161,31 @@ async def verify_otp(
             message="Your account has been deleted. Please contact Admin.",
         )
 
-    if await is_otp_locked(redis, mobile):
-        logger.warning(f"OTP verification attempted while locked mobile={mobile}")
-        raise AppError(status_code=401, message="Account temporarily locked due to too many failed attempts. Please try again after 5 minutes.")
+    if redis is None and settings.APP_ENV == "production":
+        logger.error("Redis unavailable for OTP verification")
+        raise AppError(status_code=503, message="OTP service unavailable (Redis required)")
 
-    if not await verify_otp_service(redis, mobile, payload.otp):
-        logger.warning(f"Invalid OTP attempt mobile={mobile}")
-        await record_failed_otp_attempt(redis, mobile)
-        raise AppError(status_code=401, message="Invalid or expired OTP")
-        
-    # On successful verify, clear any accumulated failed attempts
-    await clear_otp_lockout(redis, mobile)
+    try:
+        if await is_otp_locked(redis, mobile):
+            logger.warning(f"OTP verification attempted while locked mobile={mobile}")
+            raise AppError(status_code=401, message="Account temporarily locked due to too many failed attempts. Please try again after 5 minutes.")
+
+        if not await verify_otp_service(redis, mobile, payload.otp):
+            logger.warning(f"Invalid OTP attempt mobile={mobile}")
+            await record_failed_otp_attempt(redis, mobile)
+            raise AppError(status_code=401, message="Invalid or expired OTP")
+
+        # On successful verify, clear any accumulated failed attempts
+        await clear_otp_lockout(redis, mobile)
+    except OTPStorageError as exc:
+        logger.error(f"OTP verification unavailable due to Redis outage: {exc}")
+        raise AppError(status_code=503, message="OTP service temporarily unavailable. Please try again later.")
 
     try:
         user = await db.scalar(select(User).where(User.mobile == mobile))
 
         if user is None:
-            logger.info(f"Creating new user via OTP mobile={mobile}")  
+            logger.info(f"Creating new user via OTP mobile={mobile}")
 
             placeholder_email = f"otp_{mobile}@construction.local"
             user = User(
@@ -214,7 +222,7 @@ async def verify_otp(
         }
 
     except Exception:
-        logger.exception("OTP verification process failed") 
+        logger.exception("OTP verification process failed")
         raise
 
 @router.post(
@@ -234,12 +242,12 @@ async def logout(
         payload = decode_access_token(token)
         jti = payload.get("jti")
         exp = payload.get("exp")
-        
+
         if jti and exp:
             ttl = int(exp) - int(time.time())
             if ttl > 0:
                 await redis.setex(f"blocklist:jti:{jti}", ttl, "true")
-        
+
         return {"message": "Logged out successfully"}
     except Exception as e:
         logger.exception("Logout failed")

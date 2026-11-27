@@ -185,7 +185,7 @@ async def create_boq(
             version_no=1,
             is_latest=True,
             item_name=payload.item_name,
-            category=activity.category,
+            category=activity.category or "General",
             description=payload.description,
             quantity=quantity,
             unit=unit_name,
@@ -535,7 +535,7 @@ async def update_boq(
             if not activity:
                 raise NotFoundError("Invalid activity type")
 
-            obj.category = activity.category
+            obj.category = activity.category or obj.category or "General" or obj.category or "General"
             unit_name = "unit"
 
             if activity.default_unit_id:
@@ -883,7 +883,7 @@ async def add_item(
         version_no=parent.version_no,
         is_latest=True,
         item_name=payload.item_name,
-        category=activity.category,
+        category=activity.category or "General",
         description=payload.description,
         quantity=quantity,
         unit=unit_name,
@@ -974,7 +974,7 @@ async def update_item(
         if not activity:
             raise NotFoundError("Invalid activity type")
 
-        obj.category = activity.category
+        obj.category = activity.category or obj.category or "General"
         unit_name = "unit"
 
         if activity.default_unit_id:
@@ -1063,7 +1063,7 @@ async def bulk_add_items(
                 version_no=parent.version_no,
                 is_latest=True,
                 item_name=item.item_name,
-                category=activity.category,
+                category=activity.category or "General",
                 description=item.description,
                 quantity=quantity,
                 unit=unit_name,

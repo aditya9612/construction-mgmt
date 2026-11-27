@@ -1,7 +1,8 @@
 from datetime import datetime
-from typing import Optional, List
+from typing import Any, List, Optional
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     ForeignKey,
@@ -247,6 +248,7 @@ class RBACAuditLog(Base):
 
     company_id: Mapped[Optional[int]] = mapped_column(
         Integer,
+        ForeignKey("companies.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -258,14 +260,14 @@ class RBACAuditLog(Base):
     )
 
     action: Mapped[str] = mapped_column(
-        String(50),
+        String(100),
         nullable=False,
         index=True,
     )
 
-    target_type: Mapped[str] = mapped_column(
+    target_type: Mapped[Optional[str]] = mapped_column(
         String(50),
-        nullable=False,
+        nullable=True,
         index=True,
     )
 
@@ -290,10 +292,31 @@ class RBACAuditLog(Base):
         nullable=True,
     )
 
-    created_at: Mapped[datetime] = mapped_column(
+    entity_type: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+
+    entity_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    performed_by: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+
+    details: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+
+    created_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         server_default=func.now(),
-        nullable=False,
+        nullable=True,
         index=True,
     )
