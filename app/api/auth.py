@@ -151,10 +151,10 @@ async def verify_otp(
     if len(mobile) < 10:
         raise AppError(status_code=422, message="Invalid mobile number")
 
-    user_check = await db.scalar(select(User).where(User.mobile == mobile))
-    if user_check is not None and user_check.is_deleted:
+    user = await db.scalar(select(User).where(User.mobile == mobile))
+    if user is not None and user.is_deleted:
         logger.warning(
-            f"Deleted user OTP verification attempt mobile={mobile} user_id={user_check.id}"
+            f"Deleted user OTP verification attempt mobile={mobile} user_id={user.id}"
         )
         raise AppError(
             status_code=403,
@@ -182,8 +182,6 @@ async def verify_otp(
         raise AppError(status_code=503, message="OTP service temporarily unavailable. Please try again later.")
 
     try:
-        user = await db.scalar(select(User).where(User.mobile == mobile))
-
         if user is None:
             logger.info(f"Creating new user via OTP mobile={mobile}")
 

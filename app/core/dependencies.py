@@ -10,7 +10,7 @@ from app.core.logger import logger
 from app.core.security import decode_access_token
 from app.db.session import get_db_session
 from app.models.user import User, UserRole, ROLES
-from app.core.request_context import set_current_user_id
+from app.core.request_context import set_current_user_id, get_request_permissions_cache
 from app.models.rbac import Permission, RolePermission, Role, UserPermissionOverride
 from app.models.company import Company
 
@@ -303,6 +303,16 @@ async def get_effective_user_permissions(
        - Built-in non-admin roles NEVER inherit global/system fallback permissions.
        - Applies user-level overrides (is_granted=True adds, is_granted=False removes).
     """
+    cache = get_request_permissions_cache()
+    cache_key = None
+    if cache is not None:
+        user_id = getattr(user, "id", None)
+        company_id = getattr(user, "company_id", None)
+        role = getattr(user, "role", None)
+        cache_key = (user_id, company_id, role)
+        if cache_key in cache:
+            return cache[cache_key]
+
     is_super = getattr(user, "is_super_admin", False) is True
     is_admin = (
         is_super
@@ -334,6 +344,8 @@ async def get_effective_user_permissions(
             if "." in rev:
                 mod = rev.split(".")[0]
                 effective_permissions.discard(f"{mod}.*")
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = effective_permissions
         return effective_permissions
 
     # =========================================================================
@@ -396,6 +408,8 @@ async def get_effective_user_permissions(
                         effective_permissions.discard(mod_wc)
 
             effective_permissions -= revoked
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = effective_permissions
         return effective_permissions
 
     # =========================================================================
@@ -501,6 +515,8 @@ async def get_effective_user_permissions(
                 mod = rev.split(".")[0]
                 effective_permissions.discard(f"{mod}.*")
 
+    if cache is not None and cache_key is not None:
+        cache[cache_key] = effective_permissions
     return effective_permissions
 
 

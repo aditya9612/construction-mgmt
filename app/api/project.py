@@ -397,7 +397,6 @@ async def _get_scoped_site_photo(
 router = APIRouter(
     prefix="/projects",
     tags=["project_management"],
-    dependencies=[default_rate_limiter_dependency()],
 )
 
 

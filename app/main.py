@@ -76,7 +76,12 @@ from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.utils.helpers import AppError
 from app.core.logger import setup_logger, setup_audit_logger
 from fastapi.staticfiles import StaticFiles
-from app.core.request_context import set_request_id, get_request_id
+from app.core.request_context import (
+    set_request_id,
+    get_request_id,
+    init_request_permissions_cache,
+    reset_request_permissions_cache,
+)
 from app.core.logger import logger
 from app.middlewares.audit_logger import AuditLogMiddleware
 from app.middlewares.security_headers import SecurityHeadersMiddleware
@@ -251,6 +256,7 @@ def create_app() -> FastAPI:
 
         set_request_id(request_id)
         request.state.request_id = request_id
+        perm_token = init_request_permissions_cache()
 
         start_time = time.time()
 
@@ -283,6 +289,8 @@ def create_app() -> FastAPI:
                 f"time={process_time}ms"
             )
             raise
+        finally:
+            reset_request_permissions_cache(perm_token)
 
     @application.middleware("http")
     async def track_user_activity(request: Request, call_next):
