@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from typing import List, Optional, Dict, Any, Tuple
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
+from starlette.concurrency import run_in_threadpool
 
 from sqlalchemy import select, and_, asc, case, func, text
 from sqlalchemy.exc import IntegrityError
@@ -450,7 +451,7 @@ async def parse_and_validate_bulk_outward_file(
     if filename.lower().endswith(".xlsx"):
         try:
             formula_flagged_rows = scan_xlsx_formula_rows(file_bytes, numeric_cols={0, 1, 2, 5, 6})
-            wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+            wb = await run_in_threadpool(load_workbook, io.BytesIO(file_bytes), data_only=True)
             ws = wb.active
             all_rows = list(ws.iter_rows(values_only=True))
             if not all_rows or len(all_rows) < 2:

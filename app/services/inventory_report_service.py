@@ -675,14 +675,22 @@ async def get_combined_material_movement_report(
 
     material_ids = [m.id for m, _ in mat_rows]
     led_stmt = (
-        select(MaterialLedger)
+        select(
+            MaterialLedger.material_id,
+            MaterialLedger.type,
+            MaterialLedger.quantity,
+            MaterialLedger.created_at,
+        )
         .where(MaterialLedger.material_id.in_(material_ids))
         .order_by(MaterialLedger.created_at.asc(), MaterialLedger.id.asc())
     )
-    all_ledgers = (await db.execute(led_stmt)).scalars().all()
-    ledgers_by_mat: Dict[int, List[MaterialLedger]] = {}
-    for led in all_ledgers:
-        ledgers_by_mat.setdefault(led.material_id, []).append(led)
+    if end_date:
+        led_stmt = led_stmt.where(MaterialLedger.created_at <= end_date)
+
+    all_ledgers = (await db.execute(led_stmt)).all()
+    ledgers_by_mat: Dict[int, List[Tuple[Any, Any, Any]]] = {}
+    for mat_id, ltype, qty, ts in all_ledgers:
+        ledgers_by_mat.setdefault(mat_id, []).append((ltype, qty, ts))
 
     summary_rows: List[Dict[str, Any]] = []
     for mat, mwa_rate in mat_rows:
@@ -691,11 +699,10 @@ async def get_combined_material_movement_report(
         outward_qty = Decimal("0.000")
         adjustment_qty = Decimal("0.000")
 
-        for led in ledgers_by_mat.get(mat.id, []):
-            ltype = led.type.value if hasattr(led.type, "value") else str(led.type)
-            qty = Decimal(str(led.quantity or "0.000"))
+        for ltype_raw, qty_raw, ts in ledgers_by_mat.get(mat.id, []):
+            ltype = ltype_raw.value if hasattr(ltype_raw, "value") else str(ltype_raw)
+            qty = Decimal(str(qty_raw or "0.000"))
             delta = -qty if ltype == "USAGE" else qty
-            ts = led.created_at
             if start_date and ts and ts < start_date:
                 opening += delta
                 continue

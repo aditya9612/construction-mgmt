@@ -7,6 +7,7 @@ import uuid
 import os
 from sqlalchemy.exc import IntegrityError
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Body, status, UploadFile, File, Form, Response
+from starlette.concurrency import run_in_threadpool
 from app.schemas.material import (
     BulkMaterialPreviewResponse,
     BulkMaterialCommitRequest,
@@ -311,11 +312,11 @@ def build_po_response(po: PurchaseOrder) -> PurchaseOrderOut:
         project_id=po.project_id,
         material_id=po.material_id,
         boq_item_id=po.boq_item_id,
-        material_name=(po.material_name or "").strip().title(),
+        material_name=(po.material_name or "").strip().title() if po.material_name else None,
         quantity=round(float(po.quantity or 0), 2),
         rate=round(float(po.rate or 0), 2),
         total_amount=round(float(po.total_amount or 0), 2),
-        status=po.status,
+        status=po.status or "CREATED",
         created_at=po.created_at,
     )
 
@@ -5417,7 +5418,7 @@ async def preview_bulk_material_upload(
     redis=Depends(get_request_redis),
 ):
     content = await file.read()
-    raw_rows = parse_material_file(content=content, filename=file.filename or "")
+    raw_rows = await run_in_threadpool(parse_material_file, content=content, filename=file.filename or "")
     previews, errors = await validate_bulk_material_rows(
         db=db,
         current_user=current_user,
@@ -5510,7 +5511,7 @@ async def direct_bulk_material_upload(
     redis=Depends(get_request_redis),
 ):
     content = await file.read()
-    raw_rows = parse_material_file(content=content, filename=file.filename or "")
+    raw_rows = await run_in_threadpool(parse_material_file, content=content, filename=file.filename or "")
     previews, errors = await validate_bulk_material_rows(
         db=db,
         current_user=current_user,

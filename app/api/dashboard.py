@@ -3,14 +3,16 @@ from pyrate_limiter import abstracts
 from pyrate_limiter import abstracts
 from pyrate_limiter import abstracts
 from pyrate_limiter import abstracts
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query, logger
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from sqlalchemy import desc, select, func, case, cast, Date
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import io
 from typing import Optional, List, Dict, Any
+from app.core.config import settings
 
 from app.core.enums import (
     PRIORITY_MAP,
@@ -243,19 +245,37 @@ async def cache_get_set(redis, key, version, func):
 
 
 # =========================================
-# KPI COMPARISON (NEW)
+# KPI COMPARISON & CACHE LOCK
 # =========================================
-async def get_kpi_comparison(db):
+_dashboard_locks: Dict[str, asyncio.Lock] = {}
+_dashboard_lock_guard = asyncio.Lock()
+
+
+async def get_dashboard_lock(key: str) -> asyncio.Lock:
+    async with _dashboard_lock_guard:
+        if key not in _dashboard_locks:
+            if len(_dashboard_locks) >= 512:
+                stale_keys = [k for k, lk in _dashboard_locks.items() if not lk.locked()]
+                for k in stale_keys[: len(_dashboard_locks) - 256]:
+                    del _dashboard_locks[k]
+            _dashboard_locks[key] = asyncio.Lock()
+        return _dashboard_locks[key]
+
+
+async def get_kpi_comparison(db, company_id: Optional[int] = None):
     now = get_naive_local_now()
     last_month = now - timedelta(days=30)
 
-    current = await db.scalar(
-        select(func.sum(Expense.amount)).where(Expense.created_at >= last_month)
-    )
+    stmt_curr = select(func.sum(Expense.amount)).where(Expense.created_at >= last_month)
+    stmt_prev = select(func.sum(Expense.amount)).where(Expense.created_at < last_month)
 
-    previous = await db.scalar(
-        select(func.sum(Expense.amount)).where(Expense.created_at < last_month)
-    )
+    if company_id is not None:
+        proj_subq = select(m.Project.id).where(m.Project.company_id == company_id)
+        stmt_curr = stmt_curr.where(Expense.project_id.in_(proj_subq))
+        stmt_prev = stmt_prev.where(Expense.project_id.in_(proj_subq))
+
+    current = await db.scalar(stmt_curr)
+    previous = await db.scalar(stmt_prev)
 
     return {
         "current_month": float(current or 0),
@@ -419,21 +439,31 @@ async def admin_dashboard(
 
         # ==========================================
         # 4. Master Projects
-        # (optimized: avg progress fetched in ONE grouped
-        #  query instead of N queries inside the loop)
+        # (optimized: scalar projection + company-scoped
+        #  progress query in ONE grouped query)
         # ==========================================
+        proj_subq = select(m.Project.id).where(m.Project.company_id == current_user.company_id)
+
         projects_query = await db.execute(
-            select(m.Project)
+            select(
+                m.Project.id,
+                m.Project.project_name,
+                m.Project.start_date,
+                m.Project.end_date,
+                m.Project.status,
+            )
             .where(m.Project.company_id == current_user.company_id)
             .order_by(m.Project.id.asc())
         )
-        projects = projects_query.scalars().all()
+        projects = projects_query.all()
 
         avg_progress_rows = await db.execute(
             select(
                 m.Task.project_id,
                 func.avg(m.Task.completion_percentage),
-            ).group_by(m.Task.project_id)
+            )
+            .where(m.Task.project_id.in_(proj_subq))
+            .group_by(m.Task.project_id)
         )
         avg_progress_map = {
             pid: float(avg or 0) for pid, avg in avg_progress_rows.all()
@@ -441,14 +471,14 @@ async def admin_dashboard(
 
         master_projects = []
 
-        for p in projects:
-            avg_progress = avg_progress_map.get(p.id, 0.0)
+        for pid, pname, pstart, pend, pstatus in projects:
+            avg_progress = avg_progress_map.get(pid, 0.0)
 
             # Planned Progress
             planned = 0.0
-            if p.start_date and p.end_date and p.start_date <= today:
-                total_days = (p.end_date - p.start_date).days
-                elapsed_days = (today - p.start_date).days
+            if pstart and pend and pstart <= today:
+                total_days = (pend - pstart).days
+                elapsed_days = (today - pstart).days
                 if total_days > 0:
                     elapsed_days = max(0, min(elapsed_days, total_days))
                     planned = (elapsed_days / total_days) * 100
@@ -460,15 +490,15 @@ async def admin_dashboard(
             # Dynamic Health (same logic as PM Dashboard)
             health = "ON TRACK"
 
-            if p.status == ProjectStatus.COMPLETED.value:
+            if pstatus == ProjectStatus.COMPLETED.value:
                 health = "COMPLETED"
-            elif p.status == ProjectStatus.ON_HOLD.value:
+            elif pstatus == ProjectStatus.ON_HOLD.value:
                 health = "ON_HOLD"
-            elif p.end_date and p.end_date < today:
+            elif pend and pend < today:
                 health = "DELAYED"
-            elif p.start_date and p.end_date and p.start_date <= today:
-                total_days = (p.end_date - p.start_date).days
-                elapsed_days = (today - p.start_date).days
+            elif pstart and pend and pstart <= today:
+                total_days = (pend - pstart).days
+                elapsed_days = (today - pstart).days
                 if total_days > 0:
                     expected_progress = (
                         max(0, min(elapsed_days, total_days)) / total_days
@@ -477,15 +507,15 @@ async def admin_dashboard(
                         expected_progress - 20
                     ):
                         health = "AT RISK"
-            elif p.status == ProjectStatus.PLANNED.value:
+            elif pstatus == ProjectStatus.PLANNED.value:
                 health = "PLANNED"
 
             master_projects.append(
                 AdminProjectOverview(
-                    id=p.id,
-                    name=p.project_name,
-                    start_date=p.start_date,
-                    end_date=p.end_date,
+                    id=pid,
+                    name=pname,
+                    start_date=pstart,
+                    end_date=pend,
                     progress=round(avg_progress, 2),
                     performance_score=performance_score,
                     health=health,
@@ -531,7 +561,10 @@ async def admin_dashboard(
                 m.Task.discipline,
                 func.avg(m.Task.completion_percentage),
             )
-            .where(m.Task.discipline.is_not(None))
+            .where(
+                m.Task.discipline.is_not(None),
+                m.Task.project_id.in_(proj_subq),
+            )
             .group_by(m.Task.discipline)
         )
 
@@ -549,7 +582,7 @@ async def admin_dashboard(
         # ==========================================
         # 6. KPI Comparison
         # ==========================================
-        kpi_comparison = await get_kpi_comparison(db)
+        kpi_comparison = await get_kpi_comparison(db, company_id=current_user.company_id)
 
         # ==========================================
         # 7. Final Response
@@ -566,17 +599,55 @@ async def admin_dashboard(
         ).model_dump(mode="json")
 
     # ==========================================
-    # Cache wrapper
+    # Cache wrapper (Single-Flight Lock + Fast Raw Response)
     # ==========================================
-    version = await r.get_cache_version(redis, VERSION_KEY)
-
-    payload = await cache_get_set(
-        redis,
-        f"admin_dashboard:v2:{current_user.company_id}",
-        version,
-        logic,
+    # admin_dashboard filters financials & vitals via get_user_project_ids(),
+    # which returns all company projects for Tenant Admin and assigned ProjectMember rows
+    # for non-Admin users with dashboard.view. Scope the cache key accordingly.
+    is_tenant_admin = (
+        current_user.role == UserRole.ADMIN.value
+        and not getattr(current_user, "is_super_admin", False)
     )
-    return AdminDashboardOut.model_validate(payload)
+    scope_key = (
+        "role:Admin"
+        if is_tenant_admin
+        else f"role:{current_user.role}:user:{current_user.id}"
+    )
+    version = await r.get_cache_version(redis, VERSION_KEY)
+    cache_key = f"admin_dashboard:v2:{current_user.company_id}:{scope_key}:{version}"
+
+    # 1. Fast path: return cached JSON bytes directly without event-loop CPU re-serialization
+    if redis is not None:
+        try:
+            raw = await redis.get(cache_key)
+            if raw is not None:
+                return Response(content=raw, media_type="application/json")
+        except Exception as exc:
+            logger.warning(f"Redis get failed key={cache_key}: {exc}")
+
+    # 2. Cold path: single-flight per-key lock prevents cache stampede under concurrency
+    lock = await get_dashboard_lock(cache_key)
+    async with lock:
+        # Double-check inside lock in case another request populated it while waiting
+        if redis is not None:
+            try:
+                raw = await redis.get(cache_key)
+                if raw is not None:
+                    return Response(content=raw, media_type="application/json")
+            except Exception:
+                pass
+
+        payload = await logic()
+
+        if redis is not None:
+            try:
+                raw_to_cache = r._dumps(payload)
+                await redis.set(cache_key, raw_to_cache, ex=settings.REDIS_CACHE_TTL_SECONDS)
+                return Response(content=raw_to_cache, media_type="application/json")
+            except Exception as exc:
+                logger.warning(f"Redis set failed key={cache_key}: {exc}")
+
+        return AdminDashboardOut.model_validate(payload)
 
 
 # =========================================
@@ -1033,9 +1104,25 @@ async def accountant_dashboard(
             notifications=notifications,
         ).model_dump(mode="json")
 
+    # Scope accountant dashboard cache: if a non-admin accountant has specific project assignments,
+    # scope by user ID so project_cost_summary does not leak between accountants with different project memberships.
+    # Company-wide / unassigned accountants retain the standard company-scoped key for full backward compatibility.
+    user_has_projects = False
+    if current_user.role != UserRole.ADMIN.value:
+        count_proj = await db.scalar(
+            select(func.count(m.ProjectMember.project_id))
+            .join(m.Project, m.Project.id == m.ProjectMember.project_id)
+            .where(
+                m.ProjectMember.user_id == current_user.id,
+                m.Project.company_id == current_user.company_id,
+            )
+        )
+        user_has_projects = bool(count_proj and count_proj > 0)
+
+    key_suffix = f":user:{current_user.id}" if user_has_projects else ""
     version = await r.get_cache_version(redis, VERSION_KEY)
     payload = await cache_get_set(
-        redis, f"accountant_dashboard:v2:{current_user.company_id}", version, logic
+        redis, f"accountant_dashboard:v2:{current_user.company_id}{key_suffix}", version, logic
     )
     return AccountantDashboardOut.model_validate(payload)
 

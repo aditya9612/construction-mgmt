@@ -2,6 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, Query, HTTPException, status, Response
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db_session
@@ -357,7 +358,7 @@ async def export_inventory_report_excel_endpoint(
         end_date=end_date,
         can_view_price=can_view_price,
     )
-    buf = export_report_to_excel(report_name, data)
+    buf = await run_in_threadpool(export_report_to_excel, report_name, data)
     filename = f"{report_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
     return Response(
         content=buf.getvalue(),
@@ -398,7 +399,7 @@ async def export_inventory_report_pdf_endpoint(
         end_date=end_date,
         can_view_price=can_view_price,
     )
-    buf = export_report_to_pdf(report_name, data)
+    buf = await run_in_threadpool(export_report_to_pdf, report_name, data)
     filename = f"{report_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
     return Response(
         content=buf.getvalue(),

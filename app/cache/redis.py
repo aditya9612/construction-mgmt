@@ -20,7 +20,14 @@ return val
 
 async def create_redis_client(redis_url: str) -> Redis:
     # decode_responses=False to keep bytes storage for speed.
-    return Redis.from_url(redis_url, decode_responses=False)
+    # explicit socket_timeout and socket_connect_timeout protect against hanging connections.
+    return Redis.from_url(
+        redis_url,
+        decode_responses=False,
+        socket_timeout=getattr(settings, "REDIS_SOCKET_TIMEOUT", 2.0),
+        socket_connect_timeout=2.0,
+        max_connections=50,
+    )
 
 
 def _dumps(value: Any) -> bytes:

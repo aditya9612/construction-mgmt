@@ -484,17 +484,17 @@ class PurchaseOrderOut(BaseSchema):
 
     id: int
 
-    material_id: int
-    supplier_id: int
-    project_id: int
+    material_id: Optional[int] = None
+    supplier_id: Optional[int] = None
+    project_id: Optional[int] = None
     boq_item_id: Optional[int] = None
 
-    material_name: str
+    material_name: Optional[str] = None
 
-    quantity: float
-    rate: float
+    quantity: float = 0.0
+    rate: float = 0.0
 
-    total_amount: float
+    total_amount: float = 0.0
 
     status: Optional[str] = "CREATED"
     created_at: Optional[datetime] = None
