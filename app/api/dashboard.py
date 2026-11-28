@@ -234,7 +234,7 @@ async def get_waterfall_budget_dict(
 async def cache_get_set(redis, key, version, func):
     cache_key = f"{key}:{version}"
     cached = await r.cache_get_json(redis, cache_key)
-    if cached:
+    if cached is not None:
         return cached
 
     result = await func()
@@ -517,7 +517,7 @@ async def admin_dashboard(
                 type=act.action,
                 user="System",
                 description=act.action,
-                time=act.created_at.strftime("%d %b %H:%M"),
+                time=act.created_at.strftime("%d %b %H:%M") if act.created_at else "",
                 project_name="Global",
             )
             for act in activities_query.scalars().all()
@@ -563,19 +563,20 @@ async def admin_dashboard(
             master_projects=master_projects,
             recent_activities=recent_activities,
             kpi_comparison=kpi_comparison,
-        )
+        ).model_dump(mode="json")
 
     # ==========================================
     # Cache wrapper
     # ==========================================
     version = await r.get_cache_version(redis, VERSION_KEY)
 
-    return await cache_get_set(
+    payload = await cache_get_set(
         redis,
-        f"admin_dashboard:{current_user.company_id}",
+        f"admin_dashboard:v2:{current_user.company_id}",
         version,
         logic,
     )
+    return AdminDashboardOut.model_validate(payload)
 
 
 # =========================================
@@ -2251,7 +2252,7 @@ async def labour_trend(
     cache_key = f"dashboard:{version}:labour:{current_user.id}"
 
     cached = await r.cache_get_json(redis, cache_key)
-    if cached:
+    if cached is not None:
         return cached
 
     project_ids = await get_user_project_ids(db, current_user)
@@ -2283,7 +2284,7 @@ async def expense_trend(
     cache_key = f"dashboard:{version}:expense:{current_user.id}"
 
     cached = await r.cache_get_json(redis, cache_key)
-    if cached:
+    if cached is not None:
         return cached
 
     project_ids = await get_user_project_ids(db, current_user)
@@ -2326,7 +2327,7 @@ async def dashboard_graph(
     cache_key = f"dashboard:{version}:graph:{current_user.id}:{start_date}:{end_date}:{group_by}"
 
     cached = await r.cache_get_json(redis, cache_key)
-    if cached:
+    if cached is not None:
         return cached
 
     project_ids = await get_user_project_ids(db, current_user)

@@ -4,6 +4,7 @@ from typing import Any, Optional
 import orjson
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
+from redis.exceptions import RedisError
 from app.core.logger import logger
 from app.core.config import settings
 
@@ -23,6 +24,10 @@ async def create_redis_client(redis_url: str) -> Redis:
 
 
 def _dumps(value: Any) -> bytes:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    elif hasattr(value, "dict"):
+        value = value.dict()
     # Prefer orjson for speed; fall back to std json if needed.
     return orjson.dumps(value, default=str)
 
@@ -39,7 +44,11 @@ async def cache_get_json(redis: Redis, key: str) -> Optional[Any]:
     if redis is None:
         return None
 
-    raw = await redis.get(key)
+    try:
+        raw = await redis.get(key)
+    except (RedisError, OSError) as exc:
+        logger.warning(f"Redis get failed key={key}: {exc}")
+        return None
 
     if raw is None:
         return None
@@ -56,13 +65,23 @@ async def cache_set_json(redis: Redis, key: str, value: Any, ttl_seconds: int = 
     if redis is None:
         return
     ttl = ttl_seconds if ttl_seconds is not None else settings.REDIS_CACHE_TTL_SECONDS
-    await redis.set(key, _dumps(value), ex=ttl)
+    try:
+        data = _dumps(value)
+        await redis.set(key, data, ex=ttl)
+    except (RedisError, OSError) as exc:
+        logger.warning(f"Redis set failed key={key}: {exc}")
+    except Exception as exc:
+        logger.warning(f"Cache serialization failed key={key}: {exc}")
 
 
 async def get_cache_version(redis: Redis, version_key: str, default: int = 1) -> int:
     if redis is None:
         return default
-    raw = await redis.get(version_key)
+    try:
+        raw = await redis.get(version_key)
+    except (RedisError, OSError) as exc:
+        logger.warning(f"Redis get version failed key={version_key}: {exc}")
+        return default
     if raw is None:
         return default
     try:
@@ -75,5 +94,10 @@ async def bump_cache_version(redis: Redis, version_key: str) -> int:
     if redis is None:
         return 1
     # Atomic increment prevents cache stampedes across concurrent workers.
-    return int(await redis.incr(version_key))
+    try:
+        return int(await redis.incr(version_key))
+    except (RedisError, OSError) as exc:
+        logger.warning(f"Redis bump version failed key={version_key}: {exc}")
+        return 1
+
 

@@ -76,7 +76,7 @@ from app.middlewares.rate_limiter import default_rate_limiter_dependency
 from app.utils.helpers import AppError
 from app.core.logger import setup_logger, setup_audit_logger
 from fastapi.staticfiles import StaticFiles
-from app.core.request_context import set_request_id
+from app.core.request_context import set_request_id, get_request_id
 from app.core.logger import logger
 from app.middlewares.audit_logger import AuditLogMiddleware
 from app.middlewares.security_headers import SecurityHeadersMiddleware
@@ -96,11 +96,19 @@ async def lifespan(app: FastAPI):
     app.state.redis = await create_redis_client(settings.REDIS_URL)
     try:
         await init_rate_limiter(app, app.state.redis)
-    except (RedisConnectionError, OSError) as exc:
+    except (RedisError, OSError) as exc:
         logger.warning(
             f"Redis unavailable; continuing without Redis rate limiting. error={exc}"
         )
         app.state.rate_limiter = None
+        if app.state.redis is not None:
+            try:
+                if hasattr(app.state.redis, "aclose"):
+                    await app.state.redis.aclose()
+                elif hasattr(app.state.redis, "close"):
+                    await app.state.redis.close()
+            except Exception:
+                pass
         app.state.redis = None
 
     logger.info(
@@ -242,6 +250,7 @@ def create_app() -> FastAPI:
         request_id = str(uuid.uuid4())
 
         set_request_id(request_id)
+        request.state.request_id = request_id
 
         start_time = time.time()
 
@@ -311,19 +320,45 @@ def create_app() -> FastAPI:
 
         return response
 
+    def _cors_headers(req: Request) -> dict[str, str]:
+        headers = {}
+        origin = req.headers.get("origin")
+        if origin and (origin in origins or "*" in origins):
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Access-Control-Allow-Credentials"] = "true"
+        req_id = getattr(req.state, "request_id", None) or get_request_id()
+        if req_id:
+            headers["X-Request-ID"] = req_id
+        return headers
+
     @application.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):
         logger.warning(
             f"AppError status={exc.status_code} message={exc.message} path={request.url.path}"
         )
         return JSONResponse(
-            status_code=exc.status_code, content={"detail": exc.message}
+            status_code=exc.status_code,
+            content={"detail": exc.message},
+            headers=_cors_headers(request),
         )
 
     @application.exception_handler(SQLAlchemyError)
     async def sqlalchemy_error_handler(request: Request, exc: SQLAlchemyError):
         logger.exception("database.error")
-        return JSONResponse(status_code=500, content={"detail": "Database error"})
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Database error"},
+            headers=_cors_headers(request),
+        )
+
+    @application.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        logger.exception(f"Unhandled server error path={request.url.path}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal Server Error"},
+            headers=_cors_headers(request),
+        )
 
     @application.get("/health", tags=["health"])
     async def health():
